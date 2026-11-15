@@ -50,6 +50,19 @@ class Channel(queue.Queue):
         pass
 
 
+def artifact_reply(directory, generation, request_id, result):
+    destination = directory / (uuid4().hex + ".json")
+    temporary = destination.with_suffix(".part")
+    temporary.write_text(result.model_dump_json())
+    temporary.replace(destination)
+    return {
+        "generation": generation,
+        "request_id": str(request_id),
+        "kind": "result",
+        "artifact": destination.name,
+    }
+
+
 class FakeProcess:
     def __init__(self, context, args):
         self.context, self.args = context, args
@@ -88,29 +101,12 @@ class FakeProcess:
             if self.context.stale:
                 stale_result = response(request).model_copy(update={"text": "STALE"})
                 out_q.put(
-                    {
-                        "generation": generation - 1,
-                        "request_id": request.request_id,
-                        "kind": "result",
-                        "result": stale_result,
-                    }
+                    artifact_reply(self.args[-1], generation - 1, request.request_id, stale_result)
                 )
-                out_q.put(
-                    {
-                        "generation": generation,
-                        "request_id": uuid4(),
-                        "kind": "result",
-                        "result": stale_result,
-                    }
-                )
+                out_q.put(artifact_reply(self.args[-1], generation, uuid4(), stale_result))
             self.active_request = None
             out_q.put(
-                {
-                    "generation": generation,
-                    "request_id": request.request_id,
-                    "kind": "result",
-                    "result": response(request),
-                }
+                artifact_reply(self.args[-1], generation, request.request_id, response(request))
             )
 
     def is_alive(self):
@@ -202,7 +198,7 @@ def test_timeout_kills_joins_and_replaces_channels_before_next_request(tmp_path)
     try:
         for _ in range(2):
             wait_ready(worker)
-            old = context.channels[-2:]
+            old = [worker._in_q, worker._out_q, worker._reply_sender]
             with pytest.raises(OcrWorkerError, match="ocr_deadline_exceeded"):
                 worker.infer(request(tmp_path), deadline_monotonic=time.monotonic() + 0.03)
             assert context.events[-3:] == ["join", "kill", "join"]
@@ -326,17 +322,23 @@ def test_native_entrypoint_qualifies_before_predict(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
     from ocr_service import pipeline
-    from ocr_service.worker import _worker_main
+    from ocr_service.worker import _worker_main, read_result
 
     calls = []
+    item = request(tmp_path)
+
+    def predict(*args, **kwargs):
+        calls.append("predict")
+        return response(item)
+
     adapter = SimpleNamespace(
         profile_id="qualified",
         qualify=lambda image: calls.append("qualify"),
-        predict=lambda *args, **kwargs: calls.append("predict"),
+        predict=predict,
     )
     monkeypatch.setattr(pipeline, "build_pipeline", lambda profile, runtime: adapter)
     incoming, outgoing = queue.Queue(), queue.Queue()
-    incoming.put(request(tmp_path))
+    incoming.put(item)
     incoming.put(None)
     _worker_main(
         incoming,
@@ -345,9 +347,13 @@ def test_native_entrypoint_qualifies_before_predict(tmp_path, monkeypatch):
         Path(__file__).parents[1] / "paddleocr-service/profile.json",
         object(),
         tmp_path,
+        tmp_path,
     )
     assert calls == ["qualify", "predict"]
     assert outgoing.get()["kind"] == "ready"
+    completion = outgoing.get()
+    assert completion["kind"] == "result"
+    assert read_result(tmp_path, completion["artifact"]).request_id == item.request_id
 
 
 @pytest.mark.parametrize("seconds", [float("inf"), float("nan"), 0, -1])
@@ -380,4 +386,238 @@ def test_failed_termination_reports_safe_error_and_preserves_input(tmp_path, mon
         assert not worker.readiness().ready
     finally:
         monkeypatch.setattr(process, "terminate", original_terminate)
+        worker.stop()
+
+
+def _real_partial_reply_worker(args, failure_mode):
+    """Actual OS process: partial publication/death, with old stream proof support."""
+    import os
+    import struct
+
+    in_channel, out_channel, generation, *_ = args
+    legacy_stream = hasattr(out_channel, "_writer")
+    ready = {"kind": "ready", "generation": generation, "profile_id": "real-process"}
+    out_channel.put(ready)
+    item = in_channel.get()
+    if generation == 1:
+        if legacy_stream:
+            # Exact reviewer counterexample; only the pre-fix transport takes this path.
+            out_channel._sem.acquire()
+            os.write(out_channel._writer.fileno(), struct.pack("!i", 100000) + b"partial")
+        elif failure_mode == "partial_artifact":
+            (args[-1] / "unfinished.part").write_bytes(b'{"working_image":')
+        elif failure_mode == "oversized_notification":
+            out_channel.socket.send(b"x" * 5000)
+        elif failure_mode == "oversized_artifact":
+            result_path = args[-1] / (uuid4().hex + ".json")
+            with result_path.open("wb") as output:
+                output.truncate(64 * 1024 * 1024 + 1)
+            out_channel.put(
+                {
+                    "kind": "result",
+                    "generation": generation,
+                    "request_id": str(item.request_id),
+                    "artifact": result_path.name,
+                }
+            )
+        else:
+            out_channel.socket.send(b'{"kind":"result",')
+        os._exit(7)
+    result = response(item)
+    if legacy_stream:
+        out_channel.put(
+            {
+                "kind": "result",
+                "generation": generation,
+                "request_id": item.request_id,
+                "result": result,
+            }
+        )
+    else:
+        result_path = args[-1] / (uuid4().hex + ".json")
+        temporary = result_path.with_suffix(".part")
+        temporary.write_text(result.model_dump_json())
+        temporary.replace(result_path)
+        out_channel.put(
+            {
+                "kind": "result",
+                "generation": generation,
+                "request_id": str(item.request_id),
+                "artifact": result_path.name,
+            }
+        )
+    # Remain alive until the manager retires this real process.
+    in_channel.get()
+
+
+class RealReplyContext:
+    def __init__(self, failure_mode):
+        import multiprocessing as mp
+
+        self.context = mp.get_context("spawn")
+        self.failure_mode = failure_mode
+        self.processes = []
+
+    def Queue(self, maxsize=0):
+        return self.context.Queue(maxsize=maxsize)
+
+    def Process(self, *, target, args, daemon):
+        process = self.context.Process(
+            target=_real_partial_reply_worker, args=(args, self.failure_mode), daemon=daemon
+        )
+        self.processes.append(process)
+        return process
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "truncated_notification",
+        "partial_artifact",
+        "oversized_notification",
+        "oversized_artifact",
+    ],
+)
+def test_real_process_partial_reply_is_bounded_and_next_generation_works(tmp_path, failure_mode):
+    from ocr_service.worker import OcrWorkerError, OcrWorkerManager
+
+    context = RealReplyContext(failure_mode)
+    worker = OcrWorkerManager(mp_context=context, startup_timeout=2)
+    worker.start()
+    assert worker.readiness().ready
+    old_reply, old_process = worker._out_q, worker._proc
+    old_directory, old_sender = Path(worker._reply_directory.name), worker._reply_sender
+    outcome = []
+    finished = threading.Event()
+
+    def infer():
+        try:
+            worker.infer(request(tmp_path), deadline_monotonic=time.monotonic() + 0.1)
+        except Exception as error:  # noqa: BLE001 - detect unclassified thread failures
+            outcome.append(error)
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=infer, daemon=True)
+    thread.start()
+    bounded = finished.wait(0.7)
+    try:
+        if not bounded and hasattr(old_reply, "_writer"):
+            # Force EOF only to clean up the old implementation after observing RED.
+            old_reply._writer.close()
+        assert finished.wait(1), "supervisor remained stuck after cleanup"
+        thread.join(0.2)
+        assert bounded, "partial native reply defeated the 100ms deadline at 700ms"
+        assert len(outcome) == 1 and isinstance(outcome[0], OcrWorkerError)
+        assert str(outcome[0]) in {
+            "ocr_worker_crashed",
+            "ocr_deadline_exceeded",
+            "ocr_invalid_result",
+        }
+        assert old_process._closed
+        assert old_reply.closed
+        assert old_sender.closed
+        assert not old_directory.exists()
+        wait_ready(worker)
+        item = request(tmp_path)
+        result = worker.infer(item, deadline_monotonic=time.monotonic() + 1)
+        assert result.request_id == item.request_id and result.text == "SHOP"
+    finally:
+        worker.stop()
+        assert all(process._closed for process in context.processes)
+
+
+def test_stop_completed_after_readiness_cannot_dispatch(tmp_path, monkeypatch):
+    from ocr_service.worker import OcrWorkerError
+
+    context = FakeContext()
+    worker = manager(context)
+    observed, release = threading.Event(), threading.Event()
+    original = worker.readiness
+
+    def pause_readiness():
+        result = original()
+        if threading.current_thread().name == "inference-dispatch":
+            observed.set()
+            assert release.wait(1)
+        return result
+
+    monkeypatch.setattr(worker, "readiness", pause_readiness)
+    outcome = []
+
+    def infer():
+        try:
+            worker.infer(request(tmp_path), deadline_monotonic=time.monotonic() + 1)
+        except Exception as error:  # noqa: BLE001 - detect unclassified thread failures
+            outcome.append(error)
+
+    thread = threading.Thread(target=infer, name="inference-dispatch", daemon=True)
+    thread.start()
+    try:
+        assert observed.wait(1)
+        worker.stop()  # Teardown finishes before the ready observation is released.
+        release.set()
+        thread.join(1)
+        assert not thread.is_alive()
+        assert len(outcome) == 1 and isinstance(outcome[0], OcrWorkerError)
+        assert str(outcome[0]) == "ocr_stopped"
+        assert not context.requests
+    finally:
+        release.set()
+        thread.join(1)
+        worker.stop()
+
+
+def test_active_process_probe_holds_lifecycle_ownership_against_stop(tmp_path, monkeypatch):
+    from ocr_service.worker import OcrWorkerError
+
+    context = FakeContext("hang")
+    worker = manager(context)
+    process = context.processes[0]
+    entered, release, stop_called, stopped = (threading.Event() for _ in range(4))
+    original = process.is_alive
+
+    def paused_probe():
+        if (
+            threading.current_thread().name == "inference-probe"
+            and context.entered.is_set()
+            and not entered.is_set()
+        ):
+            entered.set()
+            assert release.wait(1)
+        return original()
+
+    monkeypatch.setattr(process, "is_alive", paused_probe)
+    outcome = []
+
+    def infer():
+        try:
+            worker.infer(request(tmp_path), deadline_monotonic=time.monotonic() + 1)
+        except Exception as error:  # noqa: BLE001 - detect unclassified thread failures
+            outcome.append(error)
+
+    def stop():
+        stop_called.set()
+        worker.stop()
+        stopped.set()
+
+    inference = threading.Thread(target=infer, name="inference-probe", daemon=True)
+    shutdown = threading.Thread(target=stop, daemon=True)
+    inference.start()
+    try:
+        assert entered.wait(1)
+        shutdown.start()
+        assert stop_called.wait(1)
+        assert not stopped.wait(0.05), "stop closed the process during its live probe"
+        release.set()
+        inference.join(1)
+        shutdown.join(1)
+        assert not inference.is_alive() and stopped.is_set()
+        assert len(outcome) == 1 and isinstance(outcome[0], OcrWorkerError)
+        assert str(outcome[0]) == "ocr_stopped"
+    finally:
+        release.set()
+        inference.join(1)
+        if shutdown.ident is not None:
+            shutdown.join(1)
         worker.stop()

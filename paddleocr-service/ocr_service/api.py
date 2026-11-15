@@ -1,4 +1,4 @@
-"""Validated PNG HTTP boundary and asynchronous worker lifecycle."""
+"""Original-image HTTP ingress, validated working PNGs, and worker lifecycle."""
 
 import asyncio
 import base64
@@ -25,6 +25,14 @@ from .worker import OcrRequest, OcrWorkerError, OcrWorkerManager
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_IMAGE_PIXELS = 40_000_000
+SOURCE_FORMATS = {
+    "image/jpeg": "JPEG",
+    "image/png": "PNG",
+    "image/webp": "WEBP",
+    "image/heic": "HEIF",
+    "image/heif": "HEIF",
+    "image/gif": "GIF",
+}
 
 
 def configured_worker() -> OcrWorkerManager:
@@ -52,6 +60,29 @@ def validate_png(raw: bytes, *, limit: int) -> None:
             decoded.verify()
     except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
         raise HTTPException(415, "ocr_invalid_png") from None
+
+
+def validate_source(raw: bytes, media_type: str | None, *, limit: int) -> None:
+    if len(raw) > limit:
+        raise HTTPException(413, "ocr_payload_too_large")
+    if media_type not in SOURCE_FORMATS:
+        raise HTTPException(415, "ocr_unsupported_media_type")
+    from pillow_heif.as_plugin import register_heif_opener
+
+    register_heif_opener()
+    try:
+        with Image.open(BytesIO(raw)) as decoded:
+            if (
+                decoded.format != SOURCE_FORMATS[media_type]
+                or decoded.width * decoded.height > MAX_IMAGE_PIXELS
+            ):
+                raise ValueError("Invalid source format or dimensions")
+            decoded.verify()
+        with Image.open(BytesIO(raw)) as decoded:
+            decoded.seek(0)
+            decoded.load()
+    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+        raise HTTPException(415, "ocr_invalid_image") from None
 
 
 def validate_result(result: OcrResponse) -> None:
@@ -151,14 +182,12 @@ def create_app(
         deadline = time.monotonic() + timeout_ms / 1000
         if worker is None:
             raise HTTPException(503, "ocr_init_failed" if startup_failed else "ocr_starting")
-        if image.content_type != "image/png":
-            raise HTTPException(415, "ocr_png_required")
         raw = image.file.read(max_upload_bytes + 1)
-        validate_png(raw, limit=max_upload_bytes)
+        validate_source(raw, image.content_type, limit=max_upload_bytes)
         if hashlib.sha256(raw).hexdigest() != source_sha256:
             raise HTTPException(422, "ocr_source_hash_mismatch")
         with tempfile.NamedTemporaryFile(
-            prefix="vision-bill-upload-", suffix=".png", delete=False
+            prefix="vision-bill-upload-", suffix=".source", delete=False
         ) as f:
             f.write(raw)
             path = Path(f.name)

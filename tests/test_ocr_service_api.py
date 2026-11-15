@@ -232,3 +232,97 @@ def test_explicit_runtime_startup_inputs_are_consumed(tmp_path, monkeypatch):
     assert worker._startup_timeout == 17
     assert worker._smoke_path == tmp_path / "smoke.png"
     worker.stop()
+
+
+@pytest.mark.parametrize(
+    "source_format,media_type",
+    [("JPEG", "image/jpeg"), ("HEIF", "image/heic"), ("GIF", "image/gif")],
+)
+def test_original_ingress_preserves_raw_identity_and_real_normalization(source_format, media_type):
+    from ocr_service.api import create_app
+    from ocr_service.images import normalize_source
+    from test_ocr_worker_lifecycle import response
+
+    from vision_bill.model.ocr import WorkerReadiness
+
+    original = BytesIO()
+    image = Image.new("RGB", (9, 5), "red")
+    if source_format == "JPEG":
+        exif = Image.Exif()
+        exif[274] = 6
+        image.save(original, "JPEG", exif=exif)
+    elif source_format == "HEIF":
+        from pillow_heif import from_pillow
+
+        from_pillow(image).save(original)
+    else:
+        image.save(original, "GIF", save_all=True, append_images=[Image.new("RGB", (9, 5), "blue")])
+    raw = original.getvalue()
+    seen = []
+
+    class NormalizingWorker:
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def readiness(self):
+            return WorkerReadiness(ready=True, generation=1)
+
+        def infer(self, request, *, deadline_monotonic):
+            seen.append(request.original_path.read_bytes())
+            with normalize_source(request.original_path, request.source_sha256) as normalized:
+                derived = normalized.path.read_bytes()
+                with Image.open(normalized.path) as decoded:
+                    size = decoded.size
+                    assert decoded.mode == "RGB"
+                result = response(request)
+                import base64
+
+                result.working_image.png_base64 = base64.b64encode(derived).decode()
+                result.working_image.sha256 = hashlib.sha256(derived).hexdigest()
+                result.working_image.width, result.working_image.height = size
+                result.working_image.transforms = normalized.transforms
+                result.telemetry = {"findings": normalized.findings}
+                return result
+
+    with TestClient(create_app(worker_factory=NormalizingWorker)) as client:
+        result = client.post(
+            "/ocr", files={"image": ("original", raw, media_type)}, data=fields(raw)
+        )
+    assert result.status_code == 200, result.text
+    page = result.json()
+    assert seen == [raw]
+    assert page["source_sha256"] == hashlib.sha256(raw).hexdigest()
+    transform = page["working_image"]["transforms"][0]
+    assert transform["source_format"] == source_format
+    assert transform["selected_frame"] == 0
+    if source_format == "JPEG":
+        assert transform["exif_orientation"] == 6
+        assert (page["working_image"]["width"], page["working_image"]["height"]) == (5, 9)
+    if source_format == "GIF":
+        assert transform["frame_count"] == 2
+        assert page["telemetry"]["findings"] == ["multiframe_first_frame_only"]
+
+
+def test_ingress_rejects_unsupported_actual_format_and_forged_hash():
+    from ocr_service.api import create_app
+
+    context = FakeContext()
+    worker = manager(context)
+    output = BytesIO()
+    Image.new("RGB", (2, 2)).save(output, "TIFF")
+    raw = output.getvalue()
+    with TestClient(create_app(worker_factory=lambda: worker)) as client:
+        result = client.post(
+            "/ocr", files={"image": ("original", raw, "image/jpeg")}, data=fields(raw)
+        )
+        assert result.status_code == 415
+        jpeg = BytesIO()
+        Image.new("RGB", (2, 2)).save(jpeg, "JPEG")
+        raw = jpeg.getvalue()
+        data = fields(raw) | {"source_sha256": "0" * 64}
+        result = client.post("/ocr", files={"image": ("original", raw, "image/jpeg")}, data=data)
+        assert result.status_code == 422
+        assert not context.requests

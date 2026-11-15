@@ -1,18 +1,92 @@
 """Single native process with bounded admission and request-owned deadlines."""
 
+import json
 import math
 import multiprocessing as mp
+import os
 import queue
+import socket
+import stat
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from vision_bill.model.ocr import OcrResponse, WorkerReadiness
 
 from .profile import RuntimeSettings, load_profile
+
+MAX_CONTROL_BYTES = 4096
+MAX_RESULT_BYTES = 64 * 1024 * 1024
+
+
+class ControlChannel:
+    """Atomic small datagrams: receive never waits for a second frame fragment."""
+
+    def __init__(self, endpoint: socket.socket):
+        self.socket = endpoint
+
+    @property
+    def closed(self) -> bool:
+        return self.socket.fileno() < 0
+
+    def put(self, message: dict[str, Any]) -> None:
+        payload = json.dumps(message, default=str).encode()
+        if len(payload) > MAX_CONTROL_BYTES:
+            raise ValueError("Control notification exceeds its fixed bound")
+        self.socket.settimeout(0.1)
+        self.socket.send(payload)
+
+    def get(self, *, timeout: float) -> dict[str, Any]:
+        self.socket.settimeout(timeout)
+        try:
+            payload, _, flags, _ = self.socket.recvmsg(MAX_CONTROL_BYTES)
+        except TimeoutError:
+            raise queue.Empty from None
+        if flags & socket.MSG_TRUNC:
+            raise ValueError("Truncated control datagram")
+        message = json.loads(payload)
+        if not isinstance(message, dict):
+            raise TypeError("Control notification is not an object")
+        return message
+
+    def cancel_join_thread(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.socket.close()
+
+
+def publish_result(result: OcrResponse, directory: Path) -> str:
+    payload = result.model_dump_json().encode()
+    if len(payload) > MAX_RESULT_BYTES:
+        raise ValueError("Result artifact exceeds its fixed bound")
+    destination = directory / (uuid4().hex + ".json")
+    with tempfile.NamedTemporaryFile(dir=directory, suffix=".part", delete=False) as temporary:
+        temporary.write(payload)
+        pending = Path(temporary.name)
+    pending.replace(destination)
+    return destination.name
+
+
+def read_result(directory: Path, name: Any) -> OcrResponse:
+    if not isinstance(name, str) or Path(name).name != name or Path(name).suffix != ".json":
+        raise ValueError("Invalid result artifact identity")
+    UUID(Path(name).stem)
+    path = directory / name
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "rb") as artifact:
+        info = os.fstat(artifact.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_RESULT_BYTES:
+            raise ValueError("Invalid result artifact type or size")
+        payload = artifact.read(MAX_RESULT_BYTES + 1)
+        if len(payload) > MAX_RESULT_BYTES:
+            raise ValueError("Result artifact exceeds its fixed bound")
+    path.unlink()
+    return OcrResponse.model_validate_json(payload)
 
 
 @dataclass(frozen=True)
@@ -38,6 +112,7 @@ def _worker_main(
     profile_path: Path,
     runtime: RuntimeSettings | None,
     smoke_path: Path | None,
+    reply_directory: Path,
 ) -> None:
     # No exception text or receipt content crosses the general error/log boundary.
     try:
@@ -68,7 +143,7 @@ def _worker_main(
                 photo_index=request.photo_index,
                 source_sha256=request.source_sha256,
             )
-            message.update(kind="result", result=result)
+            message.update(kind="result", artifact=publish_result(result, reply_directory))
         except Exception:  # noqa: BLE001 - native boundary must hide exception details
             message.update(kind="error", code="ocr_inference_failed")
         output_channel.put(message)
@@ -103,6 +178,8 @@ class OcrWorkerManager:
         self._proc: Any = None
         self._in_q: Any = None
         self._out_q: Any = None
+        self._reply_sender: ControlChannel | None = None
+        self._reply_directory: tempfile.TemporaryDirectory[str] | None = None
 
     @property
     def pending_count(self) -> int:
@@ -111,7 +188,10 @@ class OcrWorkerManager:
 
     def readiness(self) -> WorkerReadiness:
         with self._state:
-            alive = self._ready and self._proc is not None and self._proc.is_alive()
+            try:
+                alive = self._ready and self._proc is not None and self._proc.is_alive()
+            except (OSError, ValueError):
+                alive = False
             ready = self._ready and alive and not self._stopped.is_set()
             reason = self._reason if not ready else None
             if self._stopped.is_set():
@@ -140,16 +220,20 @@ class OcrWorkerManager:
             self._generation += 1
             try:
                 self._in_q = self._ctx.Queue(maxsize=1)
-                self._out_q = self._ctx.Queue(maxsize=2)
+                receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+                self._out_q = ControlChannel(receiver)
+                self._reply_sender = ControlChannel(sender)
+                self._reply_directory = tempfile.TemporaryDirectory(prefix="vision-bill-replies-")
                 self._proc = self._ctx.Process(
                     target=_worker_main,
                     args=(
                         self._in_q,
-                        self._out_q,
+                        self._reply_sender,
                         self._generation,
                         self._profile_path,
                         self._runtime,
                         self._smoke_path,
+                        Path(self._reply_directory.name),
                     ),
                     daemon=True,
                 )
@@ -184,6 +268,9 @@ class OcrWorkerManager:
 
     def _teardown(self) -> None:
         """Never release a process's input ownership until death is confirmed."""
+        with self._state:
+            self._ready = False
+            self._profile_id = None
         proc = self._proc
         if proc is not None:
             try:
@@ -199,11 +286,15 @@ class OcrWorkerManager:
                 self._set_unready("ocr_worker_unstoppable")
                 raise OcrWorkerError("ocr_worker_unstoppable", 503, cleanup_safe=False) from None
             proc.close()
-        for channel in (self._in_q, self._out_q):
+        for channel in (self._in_q, self._out_q, self._reply_sender):
             if channel is not None:
                 channel.cancel_join_thread()
                 channel.close()
         self._proc = self._in_q = self._out_q = None
+        self._reply_sender = None
+        if self._reply_directory is not None:
+            self._reply_directory.cleanup()
+            self._reply_directory = None
 
     def _recover(self, reason: str) -> None:
         with self._control:
@@ -228,8 +319,27 @@ class OcrWorkerManager:
             ready = self.readiness()
             if not ready.ready:
                 raise OcrWorkerError(ready.reason_code or "ocr_not_ready", 503)
-            generation, proc, in_q, out_q = (self._generation, self._proc, self._in_q, self._out_q)
-            in_q.put(request)
+            with self._control:
+                # The earlier readiness observation is advisory. This check and
+                # dispatch share ownership with stop's channel/process retirement.
+                if self._stopped.is_set():
+                    raise OcrWorkerError("ocr_stopped", 503)
+                ready = self.readiness()
+                if not ready.ready:
+                    raise OcrWorkerError(ready.reason_code or "ocr_not_ready", 503)
+                generation, proc, in_q, out_q = (
+                    self._generation,
+                    self._proc,
+                    self._in_q,
+                    self._out_q,
+                )
+                assert self._reply_directory is not None
+                reply_directory = Path(self._reply_directory.name)
+                try:
+                    in_q.put(request, block=False)
+                except (OSError, ValueError, queue.Full):
+                    self._recover("ocr_worker_crashed")
+                    raise OcrWorkerError("ocr_worker_crashed", 503) from None
             while True:
                 if self._stopped.is_set():
                     with self._control:
@@ -242,38 +352,45 @@ class OcrWorkerManager:
                 try:
                     message = out_q.get(timeout=min(0.05, remaining))
                 except queue.Empty:
-                    if self._stopped.is_set():
-                        with self._control:
+                    with self._control:
+                        if self._stopped.is_set():
                             self._teardown()
-                        raise OcrWorkerError("ocr_stopped", 503) from None
-                    if not proc.is_alive():
-                        self._recover("ocr_worker_crashed")
-                        raise OcrWorkerError("ocr_worker_crashed", 503) from None
+                            raise OcrWorkerError("ocr_stopped", 503) from None
+                        if proc is not self._proc or not proc.is_alive():
+                            self._recover("ocr_worker_crashed")
+                            raise OcrWorkerError("ocr_worker_crashed", 503) from None
                     continue
-                except (OSError, ValueError):
+                except (OSError, ValueError, TypeError, RecursionError):
                     if self._stopped.is_set():
                         with self._control:
                             self._teardown()
                         raise OcrWorkerError("ocr_stopped", 503) from None
                     self._recover("ocr_worker_crashed")
                     raise OcrWorkerError("ocr_worker_crashed", 503) from None
-                if (
-                    message.get("generation") != generation
-                    or message.get("request_id") != request.request_id
+                if message.get("generation") != generation or message.get("request_id") != str(
+                    request.request_id
                 ):
                     continue
                 if message.get("kind") != "result":
                     raise OcrWorkerError("ocr_inference_failed", 502)
                 try:
-                    result = OcrResponse.model_validate(message["result"])
+                    result = read_result(reply_directory, message["artifact"])
                     if (
                         result.request_id != request.request_id
                         or result.photo_index != request.photo_index
                         or result.source_sha256 != request.source_sha256
                     ):
                         raise ValueError("Response identity mismatch")
-                except (ValueError, TypeError, KeyError):
+                except (OSError, ValueError, TypeError, KeyError):
+                    if self._stopped.is_set():
+                        with self._control:
+                            self._teardown()
+                        raise OcrWorkerError("ocr_stopped", 503) from None
+                    self._recover("ocr_invalid_result")
                     raise OcrWorkerError("ocr_invalid_result", 502) from None
+                if time.monotonic() >= deadline_monotonic:
+                    self._recover("ocr_deadline_exceeded")
+                    raise OcrWorkerError("ocr_deadline_exceeded", 504)
                 return result
         finally:
             if acquired:
