@@ -1,51 +1,155 @@
-import logging
+"""Local v2 OCR transport. Original bytes and identities cross this boundary unchanged."""
+
+import base64
+import binascii
+import hashlib
+from io import BytesIO
 from pathlib import Path
+from time import monotonic
 from typing import Any
+from uuid import uuid4
 
 import httpx
+from PIL import Image
 
-from .base import OcrProvider
-
-logger = logging.getLogger(__name__)
+from ...model.ocr import OcrCapabilities, OcrResponse, WorkerReadiness
+from .base import OcrProvider, compact_ocr_text
 
 
 class PaddleOcrProvider(OcrProvider):
-    """PaddleOCR-VL-1.6 provider communicating with an external HTTP service."""
-
     def __init__(self, service_url: str, timeout: int = 300):
         self.service_url = service_url.rstrip("/")
         self.timeout = timeout
 
-    async def extract_text(self, image: Path) -> dict[str, Any]:
-        """Send image to PaddleOCR service and return structured OCR result."""
-        logger.debug("Sending image %s to PaddleOCR service at %s", image.name, self.service_url)
+    async def get_capabilities(self) -> OcrCapabilities:
+        reachable = False
+        try:
+            async with httpx.AsyncClient(timeout=5, trust_env=False) as client:
+                info_response = await client.get(f"{self.service_url}/info")
+                info_response.raise_for_status()
+                reachable = True
+                info = info_response.json()
+                if (
+                    not isinstance(info, dict)
+                    or info.get("contract_version") != 2
+                    or not isinstance(info.get("profile"), dict)
+                    or not isinstance(info.get("worker", {}), dict)
+                ):
+                    raise ValueError("ocr_contract_mismatch")
+                response = await client.get(f"{self.service_url}/ready")
+                if response.status_code not in (200, 503):
+                    response.raise_for_status()
+                ready = WorkerReadiness.model_validate(response.json())
+                info_profile = info.get("worker", {}).get("profile_id")
+                if ready.ready and (
+                    response.status_code != 200
+                    or not ready.profile_id
+                    or (info_profile is not None and ready.profile_id != info_profile)
+                ):
+                    raise ValueError("ocr_profile_mismatch")
+                reported_limit = info["profile"].get("max_new_tokens")
+                ocr_limit = (
+                    reported_limit
+                    if ready.ready
+                    and info_profile == ready.profile_id
+                    and type(reported_limit) is int
+                    and reported_limit > 0
+                    else None
+                )
+                return OcrCapabilities(
+                    enabled=True,
+                    configured=True,
+                    reachable=True,
+                    ready=ready.ready,
+                    profile_id=ready.profile_id,
+                    reason_code=ready.reason_code,
+                    ocr_max_new_tokens=ocr_limit,
+                )
+        except (httpx.HTTPError, OSError, ValueError):
+            return OcrCapabilities(
+                enabled=True,
+                configured=True,
+                reachable=reachable,
+                ready=False,
+                reason_code="ocr_unavailable",
+            )
 
-        # Read image bytes before async HTTP call (blocking I/O on local file)
-        image_bytes = image.read_bytes()
-        logger.debug("Image size: %d bytes", len(image_bytes))
+    async def extract_page(
+        self,
+        image: Path,
+        *,
+        photo_index: int,
+        source_sha256: str,
+        deadline: float,
+        expected_profile_id: str | None = None,
+    ) -> OcrResponse:
+        raw = image.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != source_sha256:
+            raise ValueError("ocr_source_hash_mismatch")
+        from pillow_heif.as_plugin import register_heif_opener
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            files = {"image": (image.name, image_bytes, "image/jpeg")}
-            logger.debug("POST %s/ocr", self.service_url)
-            response = await client.post(f"{self.service_url}/ocr", files=files)
-            logger.debug("PaddleOCR response status: %d", response.status_code)
-            if response.status_code != 200:
-                logger.debug("PaddleOCR response body: %s", response.text)
+        register_heif_opener()
+        with Image.open(BytesIO(raw)) as decoded:
+            media_type = {
+                "JPEG": "image/jpeg",
+                "PNG": "image/png",
+                "WEBP": "image/webp",
+                "HEIF": "image/heif",
+                "GIF": "image/gif",
+            }.get(decoded.format or "")
+        if media_type is None:
+            raise ValueError("ocr_unsupported_media_type")
+        remaining = min(float(self.timeout), deadline - monotonic())
+        if remaining <= 0:
+            raise TimeoutError("ocr_deadline")
+        request_id = uuid4()
+        async with httpx.AsyncClient(timeout=remaining, trust_env=False) as client:
+            response = await client.post(
+                f"{self.service_url}/ocr",
+                files={"image": (image.name, raw, media_type)},
+                data={
+                    "request_id": str(request_id),
+                    "photo_index": str(photo_index),
+                    "source_sha256": source_sha256,
+                    "timeout_ms": str(max(1, min(600000, int(remaining * 1000)))),
+                },
+            )
             response.raise_for_status()
-            result: dict[str, Any] = response.json()
-            logger.debug("PaddleOCR result keys: %s", list(result.keys()))
+            page = OcrResponse.model_validate(response.json())
+        if (
+            page.request_id != request_id
+            or page.photo_index != photo_index
+            or page.source_sha256 != source_sha256
+            or (expected_profile_id is not None and page.profile_id != expected_profile_id)
+        ):
+            raise ValueError("ocr_identity_mismatch")
+        compact_ocr_text({"text": page.text})
+        try:
+            png = base64.b64decode(page.working_image.png_base64, validate=True)
+            with Image.open(BytesIO(png)) as working:
+                if (
+                    working.format != "PNG"
+                    or working.size != (page.working_image.width, page.working_image.height)
+                    or getattr(working, "n_frames", 1) != 1
+                ):
+                    raise ValueError("ocr_invalid_working_image")
+                working.verify()
+            if hashlib.sha256(png).hexdigest() != page.working_image.sha256:
+                raise ValueError("ocr_invalid_working_image")
+        except (OSError, binascii.Error, SyntaxError) as exc:
+            raise ValueError("ocr_invalid_working_image") from exc
+        return page
 
-        logger.debug("PaddleOCR extraction completed for %s", image.name)
-        return result
+    async def extract_text(self, image: Path) -> dict[str, Any]:
+        """Compatibility API; live sidecars still require a validated v2 response."""
+        return (
+            await self.extract_page(
+                image,
+                photo_index=0,
+                source_sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+                deadline=monotonic() + self.timeout,
+            )
+        ).model_dump(mode="json")
 
     async def check_connection(self) -> bool:
-        """Check if PaddleOCR service is reachable."""
-        logger.debug("Checking PaddleOCR service connection at %s", self.service_url)
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                response = await client.get(f"{self.service_url}/health")
-            logger.debug("PaddleOCR health check status: %d", response.status_code)
-            return response.status_code == 200
-        except (httpx.HTTPError, OSError) as exc:
-            logger.debug("PaddleOCR service connection check failed: %s", exc)
-            return False
+        return (await self.get_capabilities()).ready

@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
@@ -14,9 +13,10 @@ import httpx
 from fastapi import UploadFile
 from openai import APITimeoutError
 
-from ..config import ImageSettings, PGSettings
+from ..config import ImageSettings, OcrSettings, PGSettings
 from ..model.db.image import ImagePart, ImageRow
 from ..model.db.receipt import ReceiptRow, ReceiptWithDetails
+from ..model.extraction import InferenceEnvelope
 from ..model.receipt import Receipt
 from ..model.search import ProductSearchResponse
 from ..model.statistics import ReceiptStatistics
@@ -61,9 +61,11 @@ class ReceiptService:
         pg_settings: PGSettings,
         provider: LLMProvider,
         ocr_provider: OcrProvider | None = None,
+        ocr_settings: OcrSettings | None = None,
     ):
         self._provider: LLMProvider = provider
         self._ocr_provider: OcrProvider | None = ocr_provider
+        self._ocr_settings = ocr_settings or OcrSettings(enabled=ocr_provider is not None)
         self._image_service = ImageService(image_settings)
         self._db = ReceiptDB(pg_settings)
         self._image_db = ImageDB(pg_settings)
@@ -155,8 +157,8 @@ class ReceiptService:
             active = await self._collection_db.active_collection(user_id, can_see_all=False)
             if active is not None:
                 await self._collection_db.assign(active.id, receipt_id)
-        except Exception:
-            logger.warning("auto-capture to active collection failed", exc_info=True)
+        except Exception:  # noqa: BLE001 - optional capture must not fail extraction
+            logger.warning("collection_capture_failed")
 
     async def get_receipt_by_id(
         self, receipt_id: UUID, user_id: UUID | None = None, can_see_all: bool = False
@@ -366,62 +368,27 @@ class ReceiptService:
             return list(self._experiment_tags)
         return await self._db.list_tags() if self.db_ready else []
 
+    async def extract_receipt(self, model_id: str, paths: Sequence[Path], *,
+                              options: "ExperimentOptions", deadline: float,
+                              tags: Sequence[str]) -> InferenceEnvelope:
+        """Shared typed entry point for uploads, workers and experiments."""
+        from .extraction_pipeline import ExtractionPipeline
+        return await ExtractionPipeline(self._provider, self._ocr_provider, self._ocr_settings).extract(
+            model_id, paths, options=options, deadline=deadline, tags=tags)
+
     async def analyse_receipt_with_ocr(self, model_id: str, image_path: Path) -> Receipt:
-        """Two-stage analysis: OCR extraction followed by LLM formatting.
+        """Compatibility wrapper: unwrap a complete shared pipeline result only."""
+        from time import monotonic
 
-        If OCR is not available or fails, falls back to direct LLM analysis.
-        """
-        logger.info("Starting two-stage OCR+LLM analysis for image %s", image_path.name)
-
-        if self._ocr_provider is None:
-            logger.info("OCR provider not configured, using direct LLM analysis")
+        from ..model.experiment import ExperimentOptions
+        if self._ocr_provider is None and not self._ocr_settings.enabled:
             return await self.analyse_receipt_from_path(model_id, image_path)
-
-        # Stage 1: OCR text extraction
-        logger.info("Stage 1/2: Running OCR extraction on image %s", image_path.name)
-        try:
-            ocr_start = time.time()
-            ocr_result = await self._ocr_provider.extract_text(image_path)
-            ocr_elapsed = time.time() - ocr_start
-            logger.info(
-                "OCR extraction completed in %.2fs. Result type: %s, keys: %s",
-                ocr_elapsed,
-                type(ocr_result).__name__,
-                list(ocr_result.keys()) if isinstance(ocr_result, dict) else "N/A",
-            )
-        except (httpx.HTTPError, OSError, ValueError) as exc:
-            logger.warning(
-                "OCR extraction failed (%s), falling back to direct LLM analysis: %s",
-                type(exc).__name__,
-                exc,
-            )
-            return await self.analyse_receipt_from_path(model_id, image_path)
-
-        # Stage 2: LLM formatting of OCR text
-        logger.info("Stage 2/2: Sending OCR text to LLM for formatting (model: %s)", model_id)
-        tags = await self._available_tags()
-        try:
-            llm_start = time.time()
-            async with asyncio.timeout(self._provider.analysis_timeout_seconds):
-                result = await self._provider.analyse_receipt_from_ocr_text(
-                    model_id, ocr_result, tags=tags
-                )
-            llm_elapsed = time.time() - llm_start
-            logger.info(
-                "OCR+LLM pipeline completed in %.2fs total (OCR: %.2fs, LLM: %.2fs). "
-                "Merchant: %s, Total: %s",
-                ocr_elapsed + llm_elapsed,
-                ocr_elapsed,
-                llm_elapsed,
-                result.merchant_name,
-                result.total,
-            )
-            return result
-        except (TimeoutError, httpx.TimeoutException, APITimeoutError) as exc:
-            raise AnalysisTimeoutError("The LLM request timed out. Please try again.") from exc
-        except Exception:
-            logger.exception("Failed to analyse receipt with OCR+LLM pipeline")
-            raise
+        result = await self.extract_receipt(model_id, [image_path],
+            options=ExperimentOptions(allow_ocr_fallback=self._ocr_settings.allow_vision_fallback),
+            deadline=monotonic()+self._provider.analysis_timeout_seconds, tags=await self._available_tags())
+        if result.receipt is None:
+            raise ValueError(result.findings[-1].code if result.findings else "receipt_incomplete")
+        return result.receipt
 
     async def analyse_receipt_from_path(
         self, model_id: str, image_path: Path | Sequence[Path]
@@ -439,7 +406,7 @@ class ReceiptService:
         except (TimeoutError, httpx.TimeoutException, APITimeoutError) as exc:
             raise AnalysisTimeoutError("The LLM request timed out. Please try again.") from exc
         except Exception:
-            logger.exception("Failed to analyse receipt with model %s", model_id)
+            logger.warning("receipt_extraction_failed")
             raise
 
     async def analyse_receipt_from_model(self, model_id: str, image: bytes) -> Receipt:
@@ -467,10 +434,10 @@ class ReceiptService:
                 )
                 return ModelResult(model_id=model.id, receipt=receipt)
             except ValueError as e:
-                logger.warning("Model %s failed with expected warning: %s", model.id, e)
+                logger.warning("receipt_model_failed: %s", type(e).__name__)
                 return ModelResult(model_id=model.id, receipt=None, error=str(e))
-            except Exception as e:
-                logger.exception("Unexpected failure for model %s", model.id)
+            except Exception as e:  # noqa: BLE001 - isolate independent model failures
+                logger.warning("receipt_model_failed")
                 return ModelResult(model_id=model.id, receipt=None, error=str(e))
 
         try:

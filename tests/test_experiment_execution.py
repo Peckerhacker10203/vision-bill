@@ -42,28 +42,41 @@ async def test_thinking_override_is_sent_as_top_level_option():
 
 async def test_upload_execution_preserves_all_photo_paths_and_frozen_tags(settings, tmp_path):
     import json
+
     from ollama import ChatResponse
-    from vision_bill.service.receipt_service import ReceiptService
-    from vision_bill.service.experiment_execution import execute_submission
     from test_experiment_scoring import receipt
 
+    from vision_bill.service.experiment_execution import execute_submission
+    from vision_bill.service.receipt_service import ReceiptService
+
     first, second = tmp_path / "first.jpg", tmp_path / "second.jpg"
-    first.write_bytes(b"first")
-    second.write_bytes(b"second")
+    from PIL import Image
+
+    from vision_bill.provider.llm.base import ModelInfo
+    for path, color in ((first, "red"), (second, "blue")):
+        Image.new("RGB", (5, 7), color).save(path, format="JPEG")
     provider = OllamaProvider("http://localhost:11434", temperature=0.7)
+    available = ModelInfo("model")
+    available.capabilities = ["vision", "completion"]
+    provider.get_available_models = AsyncMock(return_value=[available])
     payload = receipt(("Milk",)).model_dump(mode="json")
     payload["line_items"][0]["source_image"] = 0
     payload["duplicate_candidates"] = []
-    provider._client.chat = AsyncMock(return_value=ChatResponse(
+    provider._client.chat = AsyncMock(side_effect=[ChatResponse(
         message={"role": "assistant", "content": json.dumps(payload)},
-        eval_count=10, eval_duration=20_000_000))
+        eval_count=10, eval_duration=20_000_000), ChatResponse(
+        message={"role": "assistant", "content": json.dumps({"category": "grocery", "line_items": [
+            {"spending_category": "food", "tags": ["frozen_tag"]}]})})])
     service = ReceiptService(settings.images, settings.pg, provider)
     result = await execute_submission(service, "model", [first, second],
                                       ExperimentOptions(temperature=0), ["frozen_tag"])
     assert result.receipt.line_items[0].description == "Milk"
-    request = provider._client.chat.call_args.kwargs
-    assert request["messages"][0]["images"] == [first, second]
-    assert "frozen_tag" in request["messages"][0]["content"]
+    calls = provider._client.chat.call_args_list
+    request = calls[0].kwargs
+    assert len(request["messages"][0]["images"]) == 2
+    assert "frozen_tag" not in request["messages"][0]["content"]
+    assert "frozen_tag" in calls[1].kwargs["messages"][0]["content"]
+    assert result.receipt.line_items[0].tags == ["frozen_tag"]
     assert request["options"]["temperature"] == 0
     assert provider._temperature == 0.7
     assert result.metadata["image_count"] == 2
@@ -71,8 +84,8 @@ async def test_upload_execution_preserves_all_photo_paths_and_frozen_tags(settin
 
 
 async def test_forced_ocr_is_not_silently_replaced_with_vision(settings, tmp_path):
-    from vision_bill.service.receipt_service import ReceiptService
     from vision_bill.service.experiment_execution import execute_submission
+    from vision_bill.service.receipt_service import ReceiptService
     path = tmp_path / "receipt.jpg"
     path.write_bytes(b"image")
     service = ReceiptService(settings.images, settings.pg,
@@ -83,6 +96,7 @@ async def test_forced_ocr_is_not_silently_replaced_with_vision(settings, tmp_pat
 
 def test_ocr_fingerprint_detects_endpoint_and_timeout_changes():
     from types import SimpleNamespace
+
     from vision_bill.service.experiment_execution import ocr_fingerprint
     provider = SimpleNamespace(service_url="http://ocr-one:8080", timeout=300)
     original = ocr_fingerprint(provider)
@@ -99,6 +113,7 @@ def test_ocr_fingerprint_detects_endpoint_and_timeout_changes():
 async def test_reevaluation_rejects_changed_or_missing_model(missing):
     from types import SimpleNamespace
     from uuid import uuid4
+
     from vision_bill.service.benchmark_service import BenchmarkService
     run_id, receipt_id = uuid4(), uuid4()
     run = SimpleNamespace(receipt_ids=[receipt_id], model_ids=["model"])
@@ -118,6 +133,7 @@ async def test_reevaluation_enforces_saved_run_deadline():
     import asyncio
     from types import SimpleNamespace
     from uuid import uuid4
+
     from vision_bill.service.benchmark_service import BenchmarkService
     run_id, receipt_id = uuid4(), uuid4()
     run = SimpleNamespace(receipt_ids=[receipt_id], model_ids=["model"])
@@ -141,10 +157,12 @@ async def test_reevaluation_enforces_saved_run_deadline():
 async def test_published_ocr_extension_contract(settings, tmp_path, mode):
     import json
     from types import SimpleNamespace
+
     from ollama import ChatResponse
-    from vision_bill.service.receipt_service import ReceiptService
-    from vision_bill.service.experiment_execution import execute_submission, ExperimentFailure
     from test_experiment_scoring import receipt
+
+    from vision_bill.service.experiment_execution import ExperimentFailure, execute_submission
+    from vision_bill.service.receipt_service import ReceiptService
     if not hasattr(ReceiptService, "analyse_receipt_with_ocr"):
         pytest.skip("Run after merging the optional OCR extension")
     path = tmp_path / "receipt.jpg"
@@ -158,7 +176,7 @@ async def test_published_ocr_extension_contract(settings, tmp_path, mode):
         return_value=result if mode == "success" else {"text": ""}))
     options = ExperimentOptions(pipeline="ocr", allow_ocr_fallback=mode == "fallback")
     if mode == "strict":
-        with pytest.raises(ExperimentFailure, match="no recognized text"):
+        with pytest.raises(ExperimentFailure, match="ocr_no_recognized_text"):
             await execute_submission(service, "model", [path], options, [])
         provider._client.chat.assert_not_awaited()
         return
@@ -170,3 +188,25 @@ async def test_published_ocr_extension_contract(settings, tmp_path, mode):
         assert "Milk 2.00" in content
         assert "pixels" not in content
         assert output.metadata["ocr_characters"] == len("Milk 2.00")
+
+
+async def test_typed_experiment_ocr_uses_complete_photo_pipeline(settings, tmp_path):
+    import time
+
+    from PIL import Image
+    from test_extraction_pipeline import formatter, sidecar
+
+    from vision_bill.service.experiment_execution import execute_submission
+    from vision_bill.service.receipt_service import ReceiptService
+    paths = [tmp_path / f"part-{i}.png" for i in range(2)]
+    for path in paths:
+        Image.new("RGB", (4, 5)).save(path)
+    llm, ocr = formatter(False), sidecar()
+    service = ReceiptService(settings.images, settings.pg, llm, ocr_provider=ocr)
+    result = await execute_submission(service, "fixture", paths,
+        ExperimentOptions(pipeline="ocr", include_classification=False), [])
+    assert result.metadata["used_pipeline"] == "ocr"
+    assert result.metadata["image_count"] == 2
+    assert ocr.extract_page.await_count == 2
+    assert [call.kwargs["photo_index"] for call in ocr.extract_page.await_args_list] == [0, 1]
+    assert all(call.kwargs["deadline"] > time.monotonic()-1 for call in ocr.extract_page.await_args_list)

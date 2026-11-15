@@ -71,12 +71,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     ocr_provider = None
     try:
         ocr_provider = get_ocr_provider(settings.ocr)
-        logger.info("OCR provider initialized: %s", settings.ocr.provider)
+        logger.info("OCR provider configured: %s", ocr_provider is not None)
     except ValueError as exc:
-        logger.warning("Failed to initialize OCR provider: %s", exc)
+        logger.warning("OCR initialization failed: %s", type(exc).__name__)
 
     receipt_service = ReceiptService(
-        settings.images, settings.pg, provider, ocr_provider=ocr_provider
+        settings.images, settings.pg, provider, ocr_provider=ocr_provider, ocr_settings=settings.ocr
     )
     try:
         await receipt_service.init_db()

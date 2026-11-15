@@ -2,7 +2,6 @@ import base64
 import json
 import logging
 import mimetypes
-import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from time import perf_counter
@@ -13,12 +12,11 @@ from ...helper.logging_config import setup_logging
 setup_logging()
 
 from ...model.receipt import Receipt
-from ...provider.llm.base import AnalysisResult, LLMProvider, ModelInfo
-from ..ocr.base import compact_ocr_text
+from ...provider.llm.base import TEXT_CAPABILITIES, AnalysisResult, LLMProvider, ModelInfo
 from .experiment import chat_telemetry
 
 try:
-    from openai import APIConnectionError, APIStatusError, AsyncOpenAI
+    from openai import APIConnectionError, APIStatusError, AsyncOpenAI, DefaultAsyncHttpxClient
 except ImportError:
     raise ImportError(
         "The 'openai' package is required for OpenAIProvider. Please install it with 'uv add openai'."
@@ -67,10 +65,16 @@ class OpenAIProvider(LLMProvider):
         api_key: str,
         temperature: float = 0.0,
         analysis_timeout_seconds: float = 600,
+        max_output_tokens: int = 8192,
     ):
         self.analysis_timeout_seconds = analysis_timeout_seconds
+        self.max_output_tokens = max_output_tokens
         self._client = AsyncOpenAI(
-            base_url=host, api_key=api_key, timeout=analysis_timeout_seconds, max_retries=0
+            base_url=host,
+            api_key=api_key,
+            timeout=analysis_timeout_seconds,
+            max_retries=0,
+            http_client=DefaultAsyncHttpxClient(trust_env=False),
         )
         self._temperature = temperature
 
@@ -86,10 +90,10 @@ class OpenAIProvider(LLMProvider):
             # APIConnectionError (incl. APITimeoutError for timeouts) once
             # retries are exhausted, and HTTP error responses into
             # APIStatusError — so these two cover all "unreachable" modes.
-            logger.warning("OpenAI-compatible connection check failed: %s", e)
+            logger.warning("OpenAI-compatible connection check failed: %s", type(e).__name__)
             return False
 
-    async def get_available_models(self) -> list[ModelInfo]:
+    async def get_available_models(self, *, capability: str = "vision") -> list[ModelInfo]:
         response = await self._client.models.with_raw_response.list()
         # llama.cpp serves a hybrid body: an Ollama-style "models" array
         # (with capabilities/details) alongside the OpenAI-style "data"
@@ -112,7 +116,16 @@ class OpenAIProvider(LLMProvider):
             capabilities = entry.get("capabilities")
             if not isinstance(capabilities, list):
                 capabilities = []
-            if not _is_vision_capable(data_by_id.get(model_id, {}), capabilities):
+            if capability == "vision" and not _is_vision_capable(
+                data_by_id.get(model_id, {}), capabilities
+            ):
+                continue
+
+            if (
+                capability == "text"
+                and capabilities
+                and not any(c in capabilities for c in TEXT_CAPABILITIES)
+            ):
                 continue
 
             details = entry.get("details")
@@ -127,7 +140,13 @@ class OpenAIProvider(LLMProvider):
                     parameter_size = _format_parameter_size(n_params)
 
             mi = ModelInfo(id=model_id)
+            capacity = data_by_id.get(model_id, {}).get("context_length")
+            mi.context_window_tokens = capacity if type(capacity) is int and capacity > 0 else None
             mi.capabilities = capabilities
+            if _is_vision_capable(data_by_id.get(model_id, {}), capabilities) and not any(
+                c in mi.capabilities for c in VISION_CAPABILITY_FIELDS
+            ):
+                mi.capabilities.append("vision")
             digest = str(entry.get("digest") or "")
             mi.digest = digest or None
             mi.parameter_size = parameter_size or None
@@ -141,11 +160,27 @@ class OpenAIProvider(LLMProvider):
                 model_id = str(entry.get("id") or "")
                 if not model_id:
                     continue
-                if not _is_vision_capable(entry, None):
+                capabilities = entry.get("capabilities")
+                capabilities = capabilities if isinstance(capabilities, list) else []
+                if (
+                    capability == "text"
+                    and capabilities
+                    and not any(c in capabilities for c in TEXT_CAPABILITIES)
+                ):
+                    continue
+                if capability == "vision" and not _is_vision_capable(entry, capabilities):
                     continue
                 mi = ModelInfo(id=model_id)
+                capacity = entry.get("context_length")
+                mi.context_window_tokens = (
+                    capacity if type(capacity) is int and capacity > 0 else None
+                )
                 capabilities = entry.get("capabilities")
                 mi.capabilities = capabilities if isinstance(capabilities, list) else []
+                if _is_vision_capable(entry, mi.capabilities) and not any(
+                    c in mi.capabilities for c in VISION_CAPABILITY_FIELDS
+                ):
+                    mi.capabilities.append("vision")
                 digest = str(entry.get("digest") or "")
                 mi.digest = digest or None
                 mi.parameter_size = None
@@ -162,9 +197,12 @@ class OpenAIProvider(LLMProvider):
             messages=cast(Any, messages),
             temperature=self._temperature,
             reasoning_effort=REASONING_EFFORT,
+            max_tokens=self.max_output_tokens,
         )
         if self.experiment_trace is not None:
-            self.experiment_trace.append(chat_telemetry(response, messages, (perf_counter() - started) * 1000))
+            self.experiment_trace.append(
+                chat_telemetry(response, messages, (perf_counter() - started) * 1000)
+            )
         return response.choices[0].message.content or ""
 
     def _build_image_messages(
@@ -197,124 +235,19 @@ class OpenAIProvider(LLMProvider):
     async def analyse_receipt_from_ocr_text(
         self, model_id: str, ocr_result: dict[str, Any], tags: Sequence[str] | None = None
     ) -> Receipt:
-        """Send OCR text to the LLM for formatting into a Receipt."""
-        logger.info("Sending OCR text to model %s for formatting", model_id)
+        """Explicit legacy/replay adapter for historical untyped OCR transcripts."""
+        from ..ocr.base import compact_ocr_text
 
-        # Convert OCR result to text format for the LLM
-        ocr_text = self._ocr_result_to_text(ocr_result)
-        logger.debug("OCR text length: %d characters", len(ocr_text))
-        if len(ocr_text) > 200:
-            logger.debug("OCR text (first 200 chars): %s...", ocr_text[:200])
-        else:
-            logger.debug("OCR text: %s", ocr_text)
-
-        messages: list[dict[str, Any]] = [
-            {
-                "role": "user",
-                "content": self._build_ocr_formatting_prompt(ocr_text, tags),
-            }
+        messages = [
+            {"role": "user", "content": self.build_ocr_prompt(compact_ocr_text(ocr_result), tags)}
         ]
-
-        last_error: Exception | None = None
-        for attempt in range(1, RETRY_LIMIT + 1):
-            logger.info("LLM attempt %d/%d for OCR text formatting", attempt, RETRY_LIMIT)
-            content = await self.send_message(model_id, messages)
-
-            if not content:
-                logger.warning("Attempt %d/%d: model returned no content", attempt, RETRY_LIMIT)
-                last_error = ValueError("Empty response from model")
-                continue
-
-            logger.debug("LLM response length: %d characters", len(content))
-            try:
-                return self.parse_llm_response(content)
-            except ValueError as e:
-                logger.warning(
-                    "Attempt %d/%d: failed to parse LLM response: %s",
-                    attempt,
-                    RETRY_LIMIT,
-                    e,
-                )
-                last_error = e
-                messages = self._append_repair_message(messages, content, e)
-
-        raise ValueError(
-            f"Failed to get a valid response from model '{model_id}' after {RETRY_LIMIT} attempts"
-        ) from last_error
-
-    def _ocr_result_to_text(self, ocr_result: dict[str, Any]) -> str:
-        """Require recognized text before invoking the formatting model."""
-        return compact_ocr_text(ocr_result)
-
-    def _build_ocr_formatting_prompt(self, ocr_text: str, tags: Sequence[str] | None = None) -> str:
-        """Build a prompt for formatting OCR text into a Receipt."""
-        return self.build_ocr_prompt(ocr_text, tags)
+        return (await self._legacy_analysis(model_id, messages)).receipt
 
     async def analyse_receipt_with_metadata(
         self, model_id: str, image: Path | Sequence[Path], tags: Sequence[str] | None = None
     ) -> AnalysisResult:
-        from time import perf_counter
-
-        started = perf_counter()
-        messages = self._build_image_messages(image, tags)
-
-        last_error: Exception | None = None
-        for attempt in range(1, RETRY_LIMIT + 1):
-            content = await self.send_message(model_id, messages)
-
-            if not content:
-                logger.warning("Attempt %d/%d: model returned no content", attempt, RETRY_LIMIT)
-                last_error = ValueError("Empty response from model")
-                continue
-
-            logger.warning(f"Attempt {attempt}/{RETRY_LIMIT}: model returned content: {content}")
-
-            if not content.lstrip().startswith(("{", "```")) and re.search(
-                r"provide.*image", content, re.IGNORECASE | re.DOTALL
-            ):
-                raise ValueError(
-                    f"Model '{model_id}' returned a message indicating it cannot process images. "
-                    "Please ensure the model supports vision capabilities."
-                )
-
-            try:
-                return AnalysisResult(
-                    receipt=self.parse_llm_response(
-                        content, image_count=1 if isinstance(image, Path) else len(image)
-                    ),
-                    attempts=attempt,
-                    elapsed_ms=(perf_counter() - started) * 1000,
-                )
-            except ValueError as e:
-                logger.warning(
-                    "Attempt %d/%d: failed to parse LLM response: %s",
-                    attempt,
-                    RETRY_LIMIT,
-                    e,
-                )
-                last_error = e
-                # Feed the parse error back so the retry has a chance to self-correct
-                messages = self._append_repair_message(messages, content, e)
-
-        raise ValueError(
-            f"Failed to get a valid response from model '{model_id}' after {RETRY_LIMIT} attempts"
-        ) from last_error
-
-    def _append_repair_message(
-        self,
-        messages: list[dict[str, Any]],
-        bad_output: str,
-        error: ValueError,
-    ) -> list[dict[str, Any]]:
-        """Append the failed output + error so the model can self-correct on retry."""
-        return [
-            *messages,
-            {"role": "assistant", "content": bad_output},
-            {
-                "role": "user",
-                "content": (
-                    "That response was not valid JSON matching the required schema. "
-                    f"Error: {error}\n\nPlease respond again with ONLY corrected JSON."
-                ),
-            },
-        ]
+        return await self._legacy_analysis(
+            model_id,
+            self._build_image_messages(image, tags),
+            image_count=1 if isinstance(image, Path) else len(image),
+        )

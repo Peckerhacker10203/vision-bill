@@ -2,6 +2,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+from ...model.ocr import OcrCapabilities, OcrResponse
+
 
 def compact_ocr_text(result: dict[str, Any]) -> str:
     """Extract transcription only; never send layout/image arrays to an LLM."""
@@ -32,6 +34,27 @@ def compact_ocr_text(result: dict[str, Any]) -> str:
 
 class OcrProvider(ABC):
     """Abstract base class for OCR providers."""
+
+    async def get_capabilities(self) -> OcrCapabilities:
+        """Legacy replay providers must opt into typed readiness explicitly."""
+        return OcrCapabilities(
+            enabled=True,
+            configured=True,
+            reachable=False,
+            ready=False,
+            reason_code="ocr_legacy_replay_only",
+        )
+
+    async def extract_page(
+        self,
+        image: Path,
+        *,
+        photo_index: int,
+        source_sha256: str,
+        deadline: float,
+        expected_profile_id: str | None = None,
+    ) -> OcrResponse:
+        raise NotImplementedError("ocr_legacy_replay_only")
 
     @abstractmethod
     async def extract_text(self, image: Path) -> dict[str, Any]:

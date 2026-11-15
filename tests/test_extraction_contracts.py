@@ -217,3 +217,21 @@ def test_existing_image_row_responses_cannot_serialize_new_internal_claim_fields
     image = ImageRow(id=uuid4(), claim_token=uuid4(), lease_expires_at=datetime.now(UTC))
     assert "claim_token" not in image.model_dump(mode="json")
     assert "lease_expires_at" not in image.model_dump(mode="json")
+
+
+def test_direct_input_views_are_internal_and_cannot_dump_png():
+    from test_ocr_provider import wire_page
+
+    from vision_bill.model import extraction
+    from vision_bill.model.ocr import OcrResponse
+    assert hasattr(extraction, "DerivedInputView"), "direct derivative contract missing"
+    page = OcrResponse.model_validate(wire_page())
+    view = extraction.DerivedInputView(photo_index=0, source_sha256=page.source_sha256,
+                                       working_image=page.working_image)
+    envelope = extraction.InferenceEnvelope(provenance=extraction.PipelineProvenance(
+        requested_pipeline="direct_vision", used_pipeline="direct_vision", source_image_count=1,
+        ordered_source_sha256=[page.source_sha256], model_id="model"),
+        telemetry=extraction.InferenceTelemetry(elapsed_ms=0, max_output_tokens=8192), input_views=[view])
+    assert envelope.input_views[0].working_image.png_base64
+    assert "input_views" not in envelope.model_dump()
+    assert "png_base64" not in envelope.model_dump_json()

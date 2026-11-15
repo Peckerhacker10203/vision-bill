@@ -14,6 +14,7 @@ def get_llm_provider(llm_settings: LLMSettings) -> LLMProvider:
             host=llm_settings.host,
             temperature=llm_settings.temperature,
             analysis_timeout_seconds=llm_settings.analysis_timeout_seconds,
+            max_output_tokens=llm_settings.max_output_tokens,
         )
 
     if provider == LLMProviderEnum.OPENAI:
@@ -24,13 +25,16 @@ def get_llm_provider(llm_settings: LLMSettings) -> LLMProvider:
             api_key=llm_settings.api_key,
             temperature=llm_settings.temperature,
             analysis_timeout_seconds=llm_settings.analysis_timeout_seconds,
+            max_output_tokens=llm_settings.max_output_tokens,
         )
 
     raise ValueError(f"Unsupported LLM provider: {provider}")
 
 
-def get_ocr_provider(ocr_settings: OcrSettings) -> OcrProvider:
+def get_ocr_provider(ocr_settings: OcrSettings) -> OcrProvider | None:
     """Create an OCR provider based on settings."""
+    if not ocr_settings.enabled:
+        return None
     if ocr_settings.provider == "paddleocr":
         from .ocr.paddleocr import PaddleOcrProvider
 

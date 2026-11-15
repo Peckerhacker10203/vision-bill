@@ -19,8 +19,9 @@ from scripts.ocr_harness.runner import digest
 
 def case_files(tmp_path):
     first, second = tmp_path / "one.png", tmp_path / "two.png"
-    first.write_bytes(b"one")
-    second.write_bytes(b"two")
+    from PIL import Image
+    Image.new("RGB", (5, 7), "red").save(first)
+    Image.new("RGB", (5, 7), "blue").save(second)
     expected = tmp_path / "expected.json"
     expected.write_text(receipt().model_dump_json())
     manifest = tmp_path / "dataset.json"
@@ -81,6 +82,10 @@ async def test_direct_service_gets_all_photos_and_ocr_gets_replayed_text(setting
 
     case = case_files(tmp_path)
     provider = OllamaProvider("http://localhost:11434")
+    from vision_bill.provider.llm.base import ModelInfo
+    available = ModelInfo("model")
+    available.capabilities = ["vision", "completion"]
+    provider.get_available_models = AsyncMock(return_value=[available])
     payload = receipt().model_dump(mode="json")
     for item in payload["line_items"]:
         item["source_image"] = 0
@@ -90,7 +95,9 @@ async def test_direct_service_gets_all_photos_and_ocr_gets_replayed_text(setting
     )
     result = await compare_case(provider, "model", case, "direct_vision", None, tmp_path, 5)
     assert result.metadata["used_pipeline"] == "direct_vision"
-    assert provider._client.chat.call_args.kwargs["messages"][0]["images"] == case["images"]
+    transported = provider._client.chat.call_args.kwargs["messages"][0]["images"]
+    assert len(transported) == len(case["images"])
+    assert "2 ordered photos" in provider._client.chat.call_args.kwargs["messages"][0]["content"]
     result = await compare_case(provider, "model", case, "ocr", "both photos OCR", tmp_path, 5)
     request = provider._client.chat.call_args.kwargs["messages"][0]
     assert "both photos OCR" in request["content"] and not request.get("images")

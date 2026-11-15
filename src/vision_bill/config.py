@@ -98,6 +98,7 @@ class OcrSettings(BaseModel):
     timeout_seconds: int = Field(default=300, ge=1)
     required: bool = False
     allow_vision_fallback: bool = False
+    vision_fallback_model_id: str | None = None
 
     @model_validator(mode="after")
     def required_needs_enabled(self) -> Self:

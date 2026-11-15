@@ -83,6 +83,7 @@ class OcrCapabilities(BaseModel):
     profile_id: str | None = None
     runtime_fingerprint: str | None = None
     reason_code: str | None = None
+    ocr_max_new_tokens: int | None = Field(default=None, gt=0)
 
 
 class WorkerReadiness(BaseModel):

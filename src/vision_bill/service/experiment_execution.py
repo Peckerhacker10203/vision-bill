@@ -3,14 +3,15 @@
 The optional OCR extension is supplied by the existing OCR branch. This module
 neither creates another OCR service nor changes the application's provider.
 """
+
 import asyncio
 import hashlib
 import json
 from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
-from time import perf_counter
-from typing import TYPE_CHECKING, Any, cast
+from time import monotonic, perf_counter
+from typing import TYPE_CHECKING, Any
 
 from ..model.experiment import ExperimentOptions, ExtractionPipeline
 from ..model.receipt import Receipt
@@ -46,9 +47,11 @@ def ocr_fingerprint(provider: Any) -> str | None:
     """
     if provider is None:
         return None
-    identity = {"provider": type(provider).__name__,
-                "endpoint": getattr(provider, "service_url", None),
-                "timeout": getattr(provider, "timeout", None)}
+    identity = {
+        "provider": type(provider).__name__,
+        "endpoint": getattr(provider, "service_url", None),
+        "timeout": getattr(provider, "timeout", None),
+    }
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
 
@@ -70,9 +73,9 @@ class ObservedOcr:
             self.metadata["ocr_error"] = type(exc).__name__
             self.metadata["fallback_used"] = self.allow_fallback
             if not self.allow_fallback:
-                raise StrictOcrFailure(str(exc)) from exc
+                raise StrictOcrFailure("ocr_no_recognized_text") from exc
             # Normalize an extension failure to its existing fallback contract.
-            raise ValueError(str(exc)) from exc
+            raise ValueError("ocr_replay_failed") from exc
         finally:
             self.metadata["ocr_ms"] = (perf_counter() - started) * 1000
 
@@ -85,8 +88,13 @@ def image_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-async def execute_submission(service: "ReceiptService", model_id: str, paths: list[Path],
-                             options: ExperimentOptions, tags: list[str]) -> ExperimentResult:
+async def execute_submission(
+    service: "ReceiptService",
+    model_id: str,
+    paths: list[Path],
+    options: ExperimentOptions,
+    tags: list[str],
+) -> ExperimentResult:
     if not paths or any(not path.is_file() for path in paths):
         raise FileNotFoundError("Receipt image or additional photo is unavailable")
     started = perf_counter()
@@ -94,30 +102,58 @@ async def execute_submission(service: "ReceiptService", model_id: str, paths: li
     provider = service._provider.for_experiment(options)
     probe._provider = provider
     probe._experiment_tags = list(tags)
-    metadata: dict[str, Any] = {"requested_pipeline": options.pipeline.value,
-                               "fallback_used": False, "image_count": len(paths),
-                               "provider": type(provider).__name__,
-                               "options": provider.experiment_options.model_dump(mode="json")
-                               if provider.experiment_options else options.model_dump(mode="json")}
+    metadata: dict[str, Any] = {
+        "requested_pipeline": options.pipeline.value,
+        "fallback_used": False,
+        "image_count": len(paths),
+        "provider": type(provider).__name__,
+        "options": provider.experiment_options.model_dump(mode="json")
+        if provider.experiment_options
+        else options.model_dump(mode="json"),
+    }
     original_ocr = getattr(service, "_ocr_provider", None)
-    use_ocr = options.pipeline != ExtractionPipeline.DIRECT and original_ocr is not None and len(paths) == 1
-    if options.pipeline == ExtractionPipeline.OCR and not use_ocr:
-        raise ValueError("OCR mode requires the OCR extension and one source image")
+    # Explicit historical replay adapter: untyped recorded OCR fixtures are not live readiness.
+    legacy_replay = original_ocr is not None and not hasattr(original_ocr, "get_capabilities")
+    if options.pipeline == ExtractionPipeline.OCR and original_ocr is None:
+        raise ValueError("OCR mode requires the OCR extension")
     try:
         async with asyncio.timeout(provider.analysis_timeout_seconds):
-            if use_ocr:
-                extension = cast(Any, probe)
-                extension._ocr_provider = ObservedOcr(original_ocr, metadata, options.allow_ocr_fallback)
-                receipt = await extension.analyse_receipt_with_ocr(model_id, paths[0])
+            if legacy_replay and options.pipeline != ExtractionPipeline.DIRECT:
+                if len(paths) != 1:
+                    raise ValueError("legacy_ocr_replay_requires_one_photo")
+                observed = ObservedOcr(original_ocr, metadata, options.allow_ocr_fallback)
+                try:
+                    transcript = await observed.extract_text(paths[0])
+                except ValueError:
+                    receipt = await provider.analyse_receipt_from_model(model_id, paths, tags=tags)
+                else:
+                    receipt = await provider.analyse_receipt_from_ocr_text(
+                        model_id, transcript, tags=tags
+                    )
+                metadata["used_pipeline"] = "direct_vision" if metadata["fallback_used"] else "ocr"
+                metadata["calls"] = provider.experiment_trace or []
+                metadata["legacy_replay"] = True
             else:
-                receipt = await probe.analyse_receipt_from_path(model_id, paths[0] if len(paths) == 1 else paths)
+                envelope = await probe.extract_receipt(
+                    model_id,
+                    paths,
+                    options=options,
+                    deadline=monotonic() + provider.analysis_timeout_seconds,
+                    tags=tags,
+                )
+                metadata.update(envelope.provenance.model_dump(mode="json"))
+                metadata["calls"] = envelope.telemetry.calls
+                metadata["telemetry"] = envelope.telemetry.model_dump(mode="json")
+                if envelope.receipt is None:
+                    code = envelope.findings[-1].code if envelope.findings else "receipt_incomplete"
+                    raise ValueError(code)
+                receipt = envelope.receipt
     except Exception as exc:
-        metadata["calls"] = provider.experiment_trace or []
+        metadata.setdefault("calls", provider.experiment_trace or [])
         metadata["elapsed_ms"] = (perf_counter() - started) * 1000
-        raise ExperimentFailure(f"{type(exc).__name__}: {exc}", metadata) from exc
-    metadata["used_pipeline"] = "ocr" if use_ocr and not metadata["fallback_used"] else "direct_vision"
-    metadata["calls"] = provider.experiment_trace or []
-    metadata["llm_ms"] = sum(call["elapsed_ms"] for call in metadata["calls"])
+        code = "ocr_no_recognized_text" if isinstance(exc, StrictOcrFailure) else type(exc).__name__
+        raise ExperimentFailure(code, metadata) from exc
+    metadata["llm_ms"] = sum(call.get("elapsed_ms", 0) for call in metadata["calls"])
     elapsed = (perf_counter() - started) * 1000
     metadata["elapsed_ms"] = elapsed
     return ExperimentResult(receipt, len(metadata["calls"]) or 1, elapsed, metadata)

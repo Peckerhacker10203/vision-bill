@@ -8,7 +8,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .item_category import SpendingCategory, llm_category
-from .ocr import OcrPageMetadata, OcrResponse, Sha256, SourceRef
+from .ocr import OcrPageMetadata, OcrResponse, Sha256, SourceRef, WorkingImage
 from .receipt import Category, Currency, LineItem, Receipt, ReceiptTime
 from .review import AmountPolicy, ReviewFinding, SourceView
 
@@ -105,6 +105,15 @@ class InferenceTelemetry(BaseModel):
     finish_reason: str | None = None
     max_output_tokens: int = Field(gt=0)
     context_window_tokens: int | None = Field(default=None, gt=0)
+    ocr_max_new_tokens: int | None = Field(default=None, gt=0)
+
+
+class DerivedInputView(BaseModel):
+    """Internal Direct/fallback transport derivative; persist bytes before exposing metadata."""
+
+    photo_index: int = Field(ge=0)
+    source_sha256: Sha256
+    working_image: WorkingImage
 
 
 class InferenceEnvelope(BaseModel):
@@ -117,6 +126,7 @@ class InferenceEnvelope(BaseModel):
     provenance: PipelineProvenance
     telemetry: InferenceTelemetry
     ocr_pages: list[OcrResponse] = Field(default_factory=list, repr=False)
+    input_views: list[DerivedInputView] = Field(default_factory=list, repr=False, exclude=True)
 
 
 class DraftView(BaseModel):
