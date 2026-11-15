@@ -196,3 +196,96 @@ def test_kernel_targets_come_from_metadata_not_object_filenames(tmp_path, monkey
     output = "\n".join("arch            " + target for target in sorted(module.TARGETS))
     monkeypatch.setattr(module.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout=output))
     assert module.inventory([lib], tmp_path / "llvm-objdump")["offline_status"] == "verified"
+
+
+def cuda_lock_fixture(tmp_path):
+    import hashlib
+
+    module = load_build_module("resolve_cuda")
+    lock = tmp_path / "requirements.cuda.lock"
+    (tmp_path / "requirements.runtime.lock").write_bytes(
+        (SERVICE / "requirements.runtime.lock").read_bytes()
+    )
+    url = "https://paddle-whl.bj.bcebos.com/stable/cu126/paddlepaddle_gpu-3.3.1-cp312-cp312-linux_x86_64.whl"
+    digest = hashlib.sha256(b"synthetic wheel test bytes").hexdigest()
+    native = f"paddlepaddle-gpu @ {url} \\\n    --hash=sha256:{digest}\n"
+    text = (SERVICE / "requirements.runtime.lock").read_text() + "\n" + native
+    data = {
+        "index": module.INDEX,
+        "index_sha256": hashlib.sha256(b"test index").hexdigest(),
+        "wheel_url": url,
+        "wheel_sha256": digest,
+        "metadata_sha256": hashlib.sha256(b"test metadata").hexdigest(),
+        "metadata_name": "paddlepaddle-gpu",
+        "metadata_version": "3.3.1",
+        "requires_dist": ["numpy>=1.21", "opt_einsum==3.3.0"],
+        "platform": "linux-x86_64-cp312",
+    }
+
+    def write(contents=text, fields=None):
+        lock.write_text(contents)
+        attested = {**data, "lock_sha256": hashlib.sha256(contents.encode()).hexdigest()}
+        if fields is not None:
+            attested = fields(attested)
+        lock.with_suffix(".attestation.json").write_text(json.dumps(attested))
+        return lock
+
+    return module, write, text, native
+
+
+def test_cuda_validator_accepts_complete_resolver_shaped_executable_lock(tmp_path):
+    module, write, _, _ = cuda_lock_fixture(tmp_path)
+    assert module.validate_lock(write())["metadata_version"] == "3.3.1"
+
+
+def test_cuda_validator_rejects_comment_only_and_shadowed_native_requirements(tmp_path):
+    import pytest
+
+    module, write, text, native = cuda_lock_fixture(tmp_path)
+    commented = "\n".join("# " + line for line in native.splitlines()) + "\n"
+    variants = [
+        commented,
+        text.replace(native, commented),
+        text.replace(native, commented + "paddlepaddle==3.3.1 --hash=sha256:" + "b" * 64 + "\n"),
+        text.replace(native, commented + native.replace("cu126/", "cu128/")),
+        text + native.replace("paddlepaddle-gpu", "PaddlePaddle_GPU"),
+        text.replace("paddlepaddle-gpu @", "paddlepaddle-gpu[other] @"),
+        text.replace(native, native.replace(" \\\n", ' ; python_version < "1" \\\n')),
+    ]
+    for contents in variants:
+        with pytest.raises(ValueError):
+            module.validate_lock(write(contents))
+
+
+def test_cuda_validator_rejects_incomplete_attestation_or_unclosed_lock(tmp_path):
+    import pytest
+
+    module, write, text, _ = cuda_lock_fixture(tmp_path)
+    for field in ("index_sha256", "metadata_sha256", "requires_dist", "platform"):
+        with pytest.raises(ValueError):
+            module.validate_lock(
+                write(
+                    fields=lambda data, field=field: {k: v for k, v in data.items() if k != field}
+                )
+            )
+    for field, value in [
+        ("index_sha256", "not-a-hash"),
+        ("requires_dist", "numpy"),
+        ("platform", "windows"),
+        ("requires_dist", ["absent-gpu-dependency==1"]),
+    ]:
+        with pytest.raises(ValueError):
+            module.validate_lock(
+                write(fields=lambda data, field=field, value=value: {**data, field: value})
+            )
+    variants = [
+        text.replace("numpy==2.2.6", "numpy==1.0.0"),
+        text.replace("pillow-heif==1.7.0", "unrelated==1.7.0"),
+        text + "\n-r another.lock\n",
+        text + "\n--index-url https://evil.invalid\n",
+        text + "\nunpinned-package\n",
+        text + "\nno-hash==1\n",
+    ]
+    for contents in variants:
+        with pytest.raises(ValueError):
+            module.validate_lock(write(contents))

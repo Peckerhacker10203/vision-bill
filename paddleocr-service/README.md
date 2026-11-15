@@ -22,7 +22,11 @@ exact official cu126 Paddle GPU 3.3.1 cp312 x86_64 wheel, inspects its real
 METADATA, freezes the full closure, hashes the bytes, and emits the lock plus
 `requirements.cuda.attestation.json`. Review both outputs before
 `make ocr-build-cuda`. Missing, changed, substituted or unresolved locks fail the
-Docker check; there is no PyPI/CPU/ROCm wheel fallback.
+Docker check; there is no PyPI/CPU/ROCm wheel fallback. Validation parses actual
+executable requirements, preserves every entry of the pinned common runtime lock,
+and requires the complete attestation. Includes, install options, duplicate or
+conditional native requirements and comment-only evidence are rejected. The Make
+targets provide the pinned packaging parser in an isolated uv tool environment.
 
 `make ocr-build-rocm` builds the full TheRock SDK and Paddle from the approved
 source pins. Provision substantial disk/RAM/CPU capacity first; this is a large
@@ -117,8 +121,10 @@ cold smoke, first case **after smoke**, and warm case timings; they do not claim
 cold case inference after warming with smoke. Dynamic VL parameters and all three
 static models must pass FP32/device checks on each replay.
 
-Only a full pass writes `qualification.runtime.json`; a new failed attempt removes
-a stale file at that output path. `qualification.json` records exact profile,
+Only a full pass publishes `qualification.runtime.json` and a successful report.
+Publication errors keep qualification false and remove stale or partially written
+serving settings; the CLI exits nonzero. A failure report is written when storage
+permits. `qualification.json` records exact profile,
 model/image/runtime identities, actual device/GFX, source hashes, timing and audit
 counts/digests. It contains no OCR text or images. Only the actual target is added
 to `qualified_targets`; repeat the release gate on each physical target.

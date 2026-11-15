@@ -135,10 +135,10 @@ fe: ## Run an npm script in frontend/ (make fe CMD=<script> [ARGS="..."])
 
 .PHONY: ocr-lock-cuda ocr-build-cuda ocr-build-rocm ocr-qualify-cuda ocr-qualify-rocm
 ocr-lock-cuda: ## Resolve official cu126 wheel + full hash lock (network required)
-	SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEX=3.7.2 SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEOCR=3.7.0 python3 paddleocr-service/build/resolve_cuda.py
+	SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEX=3.7.2 SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEOCR=3.7.0 uv run --no-project --with packaging==26.2 python paddleocr-service/build/resolve_cuda.py
 
 ocr-build-cuda: ## Build candidate CUDA image after official lock resolution
-	python3 paddleocr-service/build/resolve_cuda.py --check paddleocr-service/requirements.cuda.lock
+	uv run --no-project --with packaging==26.2 python paddleocr-service/build/resolve_cuda.py --check paddleocr-service/requirements.cuda.lock
 	docker compose --profile ocr -f docker-compose.yml -f docker-compose.cuda.yml build paddleocr-service
 
 ocr-build-rocm: ## Build native full-SDK RDNA2 candidate (large build; no support claim)

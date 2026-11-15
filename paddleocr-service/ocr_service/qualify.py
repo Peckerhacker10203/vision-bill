@@ -348,8 +348,12 @@ def qualify_runtime(runtime: RuntimeSettings, cases: Path, output: Path) -> Qual
     report = QualificationReport(
         accelerator=runtime.accelerator, image_identity=runtime.image_identity
     )
-    output.with_suffix(".runtime.json").unlink(missing_ok=True)
+    serving = output.with_suffix(".runtime.json")
     try:
+        report.stage = "publication_prepare"
+        serving.unlink(missing_ok=True)
+        output.unlink(missing_ok=True)
+        report.stage = "inputs"
         inputs = load_cases(cases)
         if not re.search(r"(?:^|@)sha256:[0-9a-f]{64}$", runtime.image_identity):
             raise ValueError("An immutable built image digest is required")
@@ -423,14 +427,33 @@ def qualify_runtime(runtime: RuntimeSettings, cases: Path, output: Path) -> Qual
             }:
                 raise ValueError("Model bytes changed during qualification")
             verify_dependencies(expected, dependencies)
-        report.qualified = True
+        report.stage = "publish_runtime"
+        write_json(serving, runtime.model_dump(mode="json"))
         target = report.device.get("gfx_target") or report.device.get("name")
-        report.qualified_targets = [str(target)]
-        report.stage = "complete"
-        write_json(output.with_suffix(".runtime.json"), runtime.model_dump(mode="json"))
+        completed = report.model_copy(
+            update={
+                "qualified": True,
+                "qualified_targets": [str(target)],
+                "stage": "complete",
+            }
+        )
+        report.stage = "publish_report"
+        write_json(output, completed.model_dump())
+        return completed  # Both mandatory publications succeeded before committing success.
     except Exception as exc:  # noqa: BLE001 -- unknown native/build errors fail closed
+        report.qualified = False
+        report.qualified_targets = []
         report.failure = type(exc).__name__
-    write_json(output, report.model_dump())
+        # A writer can fail after replacing its destination. Revoke both stale and
+        # partially published artifacts before attempting a sanitized failure report.
+        serving.unlink(missing_ok=True)
+        output.unlink(missing_ok=True)
+        try:
+            write_json(output, report.model_dump())
+        except OSError:
+            # Unwritable report storage must not turn a failed attempt into success.
+            # A post-replacement error can leave this false report, never a true one.
+            pass
     return report
 
 

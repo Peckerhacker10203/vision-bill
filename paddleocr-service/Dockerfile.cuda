@@ -18,7 +18,7 @@ ENV PATH="/opt/venv/bin:$PATH" \
 COPY paddleocr-service/requirements.build.lock paddleocr-service/requirements.bootstrap.lock /opt/locks/
 RUN python -m pip install --require-hashes --no-deps --only-binary=:all: -r /opt/locks/requirements.bootstrap.lock \
  && python -m pip install --require-hashes --no-deps --no-build-isolation -r /opt/locks/requirements.build.lock
-COPY paddleocr-service/requirements.cuda.* /opt/locks/
+COPY paddleocr-service/requirements.cuda.* paddleocr-service/requirements.runtime.lock /opt/locks/
 COPY paddleocr-service/build/resolve_cuda.py /opt/ocr/build/resolve_cuda.py
 RUN python /opt/ocr/build/resolve_cuda.py --check /opt/locks/requirements.cuda.lock \
  && python -m pip install --require-hashes --no-deps --no-build-isolation -r /opt/locks/requirements.cuda.lock \

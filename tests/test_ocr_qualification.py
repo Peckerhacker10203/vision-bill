@@ -329,7 +329,8 @@ def test_fresh_replay_reports_real_cold_smoke_separately_from_warm_case(tmp_path
     assert "cold_seconds" not in result
 
 
-def test_coordinator_inspects_then_collects_then_seals_then_fresh_replays(tmp_path, monkeypatch):
+@pytest.fixture
+def successful_qualification(tmp_path, monkeypatch):
     module = qualification()
     from ocr_service.profile import MODEL_NAMES, RuntimeSettings
 
@@ -390,6 +391,13 @@ def test_coordinator_inspects_then_collects_then_seals_then_fresh_replays(tmp_pa
         }
 
     monkeypatch.setattr(module, "run_stage", stage)
+    return module, runtime, stages
+
+
+def test_coordinator_inspects_then_collects_then_seals_then_fresh_replays(
+    tmp_path, successful_qualification
+):
+    module, runtime, stages = successful_qualification
     report = module.qualify_runtime(
         runtime, tmp_path / "cases.toml", tmp_path / "qualification.json"
     )
@@ -436,3 +444,67 @@ def test_stage_timeout_reaps_child_even_if_it_exits_during_kill(tmp_path, monkey
     with pytest.raises(TimeoutError):
         module.run_stage("collect", {}, tmp_path)
     assert calls == [600, 30]
+
+
+@pytest.mark.parametrize("failed_artifact", ["runtime", "report"])
+def test_publication_failure_resets_success_and_removes_partial_runtime(
+    tmp_path, monkeypatch, successful_qualification, failed_artifact
+):
+    module, runtime, _ = successful_qualification
+    output = tmp_path / "qualification.json"
+    serving = output.with_suffix(".runtime.json")
+    serving.write_text("stale serving settings")
+    output.write_text('{"qualified": true}')
+    original = module.write_json
+
+    def fail_write(path, value):
+        if path == (serving if failed_artifact == "runtime" else output):
+            # A write may fail after replacement, not only before creating its file.
+            original(path, value)
+            raise OSError("injected publication failure")
+        original(path, value)
+
+    monkeypatch.setattr(module, "write_json", fail_write)
+    report = module.qualify_runtime(runtime, tmp_path / "cases.toml", output)
+    assert not report.qualified and report.qualified_targets == []
+    assert report.failure == "OSError" and report.stage == "publish_" + failed_artifact
+    assert not serving.exists()
+    if output.exists():
+        assert json.loads(output.read_text())["qualified"] is False
+
+
+def test_cli_exits_nonzero_when_serving_runtime_publication_fails(
+    tmp_path, monkeypatch, successful_qualification
+):
+    module, runtime, _ = successful_qualification
+    candidate = tmp_path / "candidate.runtime.json"
+    candidate.write_text(runtime.model_dump_json())
+    output = tmp_path / "qualification.json"
+    original = module.write_json
+
+    def fail_write(path, value):
+        if path == output.with_suffix(".runtime.json"):
+            raise OSError("injected publication failure")
+        original(path, value)
+
+    monkeypatch.setattr(module, "write_json", fail_write)
+    monkeypatch.setattr(
+        module.sys,
+        "argv",
+        [
+            "qualify",
+            "--accelerator",
+            "cuda",
+            "--runtime",
+            str(candidate),
+            "--cases",
+            str(tmp_path / "cases.toml"),
+            "--output",
+            str(output),
+        ],
+    )
+    with pytest.raises(SystemExit) as stopped:
+        module.main()
+    assert stopped.value.code == 1
+    assert json.loads(output.read_text())["qualified"] is False
+    assert not output.with_suffix(".runtime.json").exists()
