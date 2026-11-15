@@ -1,8 +1,11 @@
+import json
 from datetime import date as Date
 from decimal import Decimal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from ..review import AmountPolicy, ReviewFinding
 
 
 class ReceiptRow(BaseModel):
@@ -29,6 +32,16 @@ class ReceiptRow(BaseModel):
     thumbnail_path: str | None = None
     verified: bool = False
     user_id: UUID | None = None
+    operation_revision: int = Field(default=1, ge=1)
+    review_revision: int = Field(default=1, ge=1)
+    amount_policy: AmountPolicy = Field(default_factory=AmountPolicy)
+    findings: list[ReviewFinding] = Field(default_factory=list)
+    verification_source: str | None = None
+
+    @field_validator("amount_policy", "findings", mode="before")
+    @classmethod
+    def decode_review_json(cls, value: object) -> object:
+        return json.loads(value) if isinstance(value, str) else value
 
 
 class LineItemRow(BaseModel):

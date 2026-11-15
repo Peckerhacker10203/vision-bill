@@ -4,10 +4,10 @@ import logging
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Self
 
 import yaml
-from pydantic import BaseModel, Field, PostgresDsn, computed_field
+from pydantic import BaseModel, Field, PostgresDsn, computed_field, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -54,6 +54,7 @@ class LLMSettings(BaseModel):
     temperature: float
     # Keep the complete extraction deadline below the 15-minute image claim lease.
     analysis_timeout_seconds: float = Field(default=600, gt=0, le=600)
+    max_output_tokens: int = Field(default=8192, gt=0)
 
 
 class ApiSettings(BaseModel):
@@ -73,15 +74,36 @@ class WorkerSettings(BaseModel):
     """Background analysis worker tuning."""
 
     check_interval_seconds: int = Field(default=300, ge=1)
+    attempt_timeout_seconds: int = Field(default=600, gt=0, le=600)
+    max_attempts: int = Field(default=3, ge=1, le=3)
+    retry_backoff_seconds: tuple[Annotated[int, Field(gt=0)], ...] = (30, 60)
+    retry_backoff_cap_seconds: int = Field(default=300, gt=0)
+    claim_lease_seconds: int = Field(default=900, gt=0)
+
+    @model_validator(mode="after")
+    def validate_budgets(self) -> Self:
+        if self.claim_lease_seconds <= self.attempt_timeout_seconds:
+            raise ValueError("claim lease must exceed the complete attempt deadline")
+        if len(self.retry_backoff_seconds) < self.max_attempts - 1:
+            raise ValueError("a backoff is required for each automatic retry")
+        return self
 
 
 class OcrSettings(BaseModel):
     """OCR service settings for the two-stage extraction pipeline."""
 
     provider: OcrProviderEnum = OcrProviderEnum.PADDLEOCR
+    enabled: bool = False
     service_url: str = "http://paddleocr-service:8082"
     timeout_seconds: int = Field(default=300, ge=1)
     required: bool = False
+    allow_vision_fallback: bool = False
+
+    @model_validator(mode="after")
+    def required_needs_enabled(self) -> Self:
+        if self.required and not self.enabled:
+            raise ValueError("required OCR must also be enabled")
+        return self
 
 
 class PGSettings(BaseModel):

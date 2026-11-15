@@ -142,3 +142,22 @@ def test_receipt_accepts_net_negative_pfand_return() -> None:
     )
     assert receipt.subtotal == Decimal("-0.75")
     assert receipt.total == Decimal("-0.75")
+
+
+@pytest.mark.parametrize(
+    "field,value", [("time", "25:00"), ("time", "12:60"), ("currency", "usd"), ("currency", "EURO")]
+)
+def test_receipt_rejects_invalid_formatter_time_and_currency(field: str, value: str) -> None:
+    from pydantic import ValidationError
+
+    values = {
+        "confidence": 90,
+        "merchant_name": "Shop",
+        "date": "2025-01-01",
+        "line_items": [],
+        "subtotal": "1.00",
+        "total": "1.00",
+    }
+    values[field] = value
+    with pytest.raises(ValidationError):
+        Receipt(**values)

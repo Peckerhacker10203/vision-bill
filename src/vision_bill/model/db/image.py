@@ -37,6 +37,16 @@ class ImageRow(BaseModel):
     processing_at: datetime | None = None
     additional_images: list[ImagePart] = Field(default_factory=list)
     model_id: str | None = None
+    generation: int = Field(default=1, ge=1)
+    attempt_count: int = Field(default=0, ge=0)
+    max_attempts: int = Field(default=3, ge=1, le=3)
+    retry_at: datetime | None = None
+    result_code: str | None = None
+    wait_reason: str | None = None
+    draft_available: bool = False
+    # Internal fencing/lease fields. Public responses use SubmissionStatus.
+    claim_token: UUID | None = Field(default=None, repr=False, exclude=True)
+    lease_expires_at: datetime | None = Field(default=None, repr=False, exclude=True)
 
     @field_validator("additional_images", mode="before")
     @classmethod

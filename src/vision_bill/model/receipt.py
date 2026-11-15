@@ -1,6 +1,6 @@
 from datetime import date as Date
 from decimal import Decimal
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
@@ -19,6 +19,8 @@ Category = Literal[
 
 
 MAX_TAG_LENGTH = 100
+Currency = Annotated[str, Field(pattern=r"^[A-Z]{3}$")]
+ReceiptTime = Annotated[str, Field(pattern=r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")]
 
 
 class LineItem(BaseModel):
@@ -87,9 +89,9 @@ class Receipt(BaseModel):
     )
     receipt_number: str | None = Field(default=None, description="Transaction/receipt ID")
     date: Date = Field(description="Date of purchase, ISO format YYYY-MM-DD")
-    time: str | None = Field(default=None, description="Time of purchase, HH:MM 24h format")
+    time: ReceiptTime | None = Field(default=None, description="Time of purchase, HH:MM 24h format")
 
-    currency: str = Field(default="EUR", description="ISO 4217 currency code, e.g. USD, EUR")
+    currency: Currency = Field(default="EUR", description="ISO 4217 currency code, e.g. USD, EUR")
     category: Category = Field(
         default="other", description="Best-guess category for the whole purchase"
     )
