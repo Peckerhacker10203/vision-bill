@@ -1,68 +1,74 @@
-"""Small source-bound substitution: set dtype before the sole native loader call."""
+"""Native VLM substitution with an explicit loader dtype and parameter audit."""
 
 from collections.abc import Callable
 from typing import Any
 
 
 def floating_dtype(dtype: Any) -> str | None:
-    name = str(dtype).removeprefix("paddle.").removeprefix("DataType.").lower()
-    if "float" in name or name in ("fp16", "fp32", "fp64", "bf16"):
-        return name
-    return None
+    normalized = str(dtype).lower().rsplit(".", 1)[-1]
+    floating = "float" in normalized or normalized in {"fp16", "bf16", "fp32", "fp64"}
+    return normalized if floating else None
 
 
 def require_gpu(tensor: Any, gpu_index: int) -> None:
-    place = tensor.place
-    if not place.is_gpu_place() or place.gpu_device_id() != gpu_index:
-        raise ValueError("Floating tensor is not on the requested native GPU")
+    location = tensor.place
+    if not location.is_gpu_place():
+        raise ValueError("Floating tensor is outside the requested GPU")
+    if location.gpu_device_id() != gpu_index:
+        raise ValueError("Floating tensor is on a different GPU index")
 
 
 def audit_dynamic_model(model: Any, gpu_index: int) -> int:
-    floating = 0
-    for parameter in model.parameters():
-        dtype = floating_dtype(parameter.dtype)
-        if dtype is not None:
-            floating += 1
-            if dtype != "float32":
-                raise ValueError("Native VLM has a non-FP32 floating parameter")
-            require_gpu(parameter, gpu_index)
-    if not floating:
-        raise ValueError("Native VLM has no audited floating parameters")
-    return floating
+    inspected = 0
+    for weight in model.parameters():
+        precision = floating_dtype(weight.dtype)
+        if precision is None:
+            continue
+        if precision != "float32":
+            raise ValueError("Native dynamic floating parameter precision must be FP32")
+        require_gpu(weight, gpu_index)
+        inspected += 1
+    if inspected == 0:
+        raise ValueError("Native dynamic model has no verified floating parameters")
+    return inspected
 
 
 def fp32_predictor_class(upstream: type[Any], gpu_index: int) -> type[Any]:
-    class Fp32DocVLMPredictor(upstream):  # type: ignore[misc]
+    class ExplicitFp32Predictor(upstream):  # type: ignore[misc]
         def _build(self, **kwargs: Any) -> Any:
+            # The pinned upstream constructor chooses BF16 immediately before
+            # dispatching here. Override before its original from_pretrained.
             self.dtype = "float32"
-            model, processor = super()._build(**kwargs)
-            audit_dynamic_model(model, gpu_index)
-            return model, processor
+            built = super()._build(**kwargs)
+            audit_dynamic_model(built[0], gpu_index)
+            return built
 
-    return Fp32DocVLMPredictor
+    return ExplicitFp32Predictor
 
 
 def native_pipeline_class(
     upstream: type[Any], predictor: Callable[..., Any], normalize: Callable[..., Any]
 ) -> type[Any]:
-    class NativeFp32Pipeline(upstream):  # type: ignore[misc]
+    class ExplicitNativePipeline(upstream):  # type: ignore[misc]
         def create_model(self, config: dict[str, Any], **kwargs: Any) -> Any:
-            if config.get("module_name") != "vl_recognition":
-                return super().create_model(config, **kwargs)
-            if config["model_name"] != "PaddleOCR-VL-1.6-0.9B" or not config.get("model_dir"):
-                raise ValueError("Explicit pinned VLM model directory is required")
-            engine_config = normalize(
-                "paddle_dynamic",
-                config.get("engine_config", {}),
-                model_name=config["model_name"],
-                device=self.device,
-            )
-            return predictor(
-                model_name=config["model_name"],
-                model_dir=config["model_dir"],
-                batch_size=1,
-                engine_config=engine_config,
-                **kwargs,
-            )
+            if config.get("module_name") == "vl_recognition":
+                name = config["model_name"]
+                directory = config.get("model_dir")
+                if name != "PaddleOCR-VL-1.6-0.9B" or not directory:
+                    raise ValueError("Native VLM requires its pinned name and explicit model path")
+                normalized = normalize(
+                    "paddle_dynamic",
+                    config.get("engine_config", {}),
+                    model_name=name,
+                    device=self.device,
+                )
+                return predictor(
+                    model_name=name,
+                    model_dir=directory,
+                    batch_size=1,
+                    engine_config=normalized,
+                    **kwargs,
+                )
+            return super().create_model(config, **kwargs)
 
-    return NativeFp32Pipeline
+    return ExplicitNativePipeline
