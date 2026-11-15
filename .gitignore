@@ -246,3 +246,7 @@ frontend/.svelte-kit/
 # Built SPA installed into the package via `make fe-build`
 src/vision_bill/static/*
 !src/vision_bill/static/.gitkeep
+
+# Local isolated development and agent execution records
+.worktrees/
+.superpowers/
