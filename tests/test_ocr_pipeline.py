@@ -11,7 +11,11 @@ from PIL import Image
 def tensor(dtype="float32", gpu=0):
     return SimpleNamespace(
         dtype="paddle." + dtype,
-        place=SimpleNamespace(is_gpu_place=lambda: gpu is not None, gpu_device_id=lambda: gpu),
+        place=SimpleNamespace(
+            is_gpu_place=lambda: gpu is not None,
+            gpu_device_id=lambda: gpu,
+            is_cpu_place=lambda: gpu is None,
+        ),
     )
 
 
@@ -370,10 +374,24 @@ def test_factory_bootstraps_then_requires_real_forward_for_all_models(tmp_path, 
         record["model_name"] = name
         record["inspector_identity"] = "paddle:commit-331"
         manifests[name] = record
+    dependency_versions = {
+        "paddleocr": "3.7.0",
+        "paddlex": "3.7.2",
+        "paddlepaddle-gpu": "3.3.1",
+        "pillow": "12.3.0",
+        "pillow-heif": "1.7.0",
+        "numpy": "2.2.6",
+        "pydantic": "2.13.4",
+        "packaging": "26.2",
+    }
     manifest_path = tmp_path / "qualification.json"
     manifest_path.write_text(
         json.dumps(
             {
+                "dependencies": {
+                    name: {"version": version, "content_sha256": "a" * 64}
+                    for name, version in dependency_versions.items()
+                },
                 "image_identity": "image-sha256",
                 "paddle_identity": "paddle:commit-331",
                 "smoke_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
@@ -390,7 +408,7 @@ def test_factory_bootstraps_then_requires_real_forward_for_all_models(tmp_path, 
         model_dirs=model_dirs,
         cache_dir=tmp_path / "cache",
         qualification_manifest=manifest_path,
-        expected_packages={"paddleocr": "3.7.0", "paddlex": "3.7.2", "paddlepaddle-gpu": "3.3.1"},
+        expected_packages=dependency_versions,
         expected_paddle_commit="commit-331",
         image_identity="image-sha256",
     )
@@ -487,7 +505,10 @@ def test_factory_bootstraps_then_requires_real_forward_for_all_models(tmp_path, 
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(factory.importlib, "import_module", importing)
-    monkeypatch.setattr(factory, "dependency_identity", lambda name: "fake-content-" + name)
+    from ocr_service import profile as profile_module
+
+    monkeypatch.setattr(profile_module.importlib.metadata, "requires", lambda name: [])
+    monkeypatch.setattr(profile_module, "dependency_identity", lambda name: "a" * 64)
     adapter = factory.build_pipeline(
         load_profile(Path(__file__).parents[1] / "paddleocr-service/profile.json"), runtime
     )
@@ -586,3 +607,120 @@ def test_effective_predict_arguments_cannot_be_mutated_outside_profile():
     arguments["temperature"] = 0.2
     assert adapter.predict_kwargs["max_pixels"] == 2000000
     assert "temperature" not in adapter.predict_kwargs
+
+
+def test_declared_coverage_cannot_authorize_another_gpu(tmp_path):
+    from ocr_service.precision import HookRecord, StaticAuditSession
+
+    manifest = artifact(tmp_path)
+    manifest.coverage.append(
+        HookRecord(hook="output", op="conv2d", name="other_gpu", dtype="float32", place="gpu:1")
+    )
+    session = StaticAuditSession(manifest, gpu_index=0)
+    session.start()
+    session.observe_input("conv2d", "compiled_w", tensor())
+    session.observe_output("conv2d", "result", tensor())
+    session.observe_output("conv2d", "other_gpu", tensor(gpu=1))
+    with pytest.raises(ValueError, match="device"):
+        session.finish()
+
+
+@pytest.mark.parametrize("place_name", ["gpu_pinned", "custom", "xpu"])
+def test_declared_cpu_coverage_rejects_non_cpu_non_gpu_place(tmp_path, place_name):
+    from ocr_service.precision import HookRecord, StaticAuditSession
+
+    manifest = artifact(tmp_path)
+    manifest.coverage.append(
+        HookRecord(hook="output", op="transfer", name="cpu_fetch", dtype="float32", place="cpu")
+    )
+    session = StaticAuditSession(manifest, gpu_index=0)
+    session.start()
+    session.observe_input("conv2d", "compiled_w", tensor())
+    session.observe_output("conv2d", "result", tensor())
+    unknown_place = SimpleNamespace(
+        is_gpu_place=lambda: False, is_cpu_place=lambda: False, name=place_name
+    )
+    session.observe_output(
+        "transfer", "cpu_fetch", SimpleNamespace(dtype="paddle.float32", place=unknown_place)
+    )
+    with pytest.raises(ValueError, match="device"):
+        session.finish()
+
+
+def test_genuine_cpu_float_requires_exact_approved_transfer_record(tmp_path):
+    from ocr_service.precision import HookRecord, StaticAuditSession
+
+    manifest = artifact(tmp_path)
+    manifest.coverage.append(
+        HookRecord(hook="output", op="transfer", name="cpu_fetch", dtype="float32", place="cpu")
+    )
+    session = StaticAuditSession(manifest, gpu_index=0)
+    session.start()
+    session.observe_input("conv2d", "compiled_w", tensor())
+    session.observe_output("conv2d", "result", tensor())
+    session.observe_output("transfer", "cpu_fetch", tensor(gpu=None))
+    assert session.finish()["output_count"] == 2
+
+
+@pytest.mark.parametrize("drift", ["omission", "version", "content"])
+def test_factory_rejects_dependency_identity_drift_before_heavy_imports(
+    tmp_path, monkeypatch, drift
+):
+    import json
+
+    import ocr_service.pipeline as factory
+    from ocr_service.profile import MODEL_NAMES, RuntimeSettings, load_profile
+
+    expected = {
+        "paddleocr": "3.7.0",
+        "paddlex": "3.7.2",
+        "paddlepaddle-gpu": "3.3.1",
+        "pillow": "12.3.0",
+        "pillow-heif": "1.7.0",
+        "numpy": "2.2.6",
+        "pydantic": "2.13.4",
+        "packaging": "26.2",
+    }
+    manifest = tmp_path / "qualification.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "dependencies": {
+                    name: {"version": version, "content_sha256": "a" * 64}
+                    for name, version in expected.items()
+                }
+            }
+        )
+    )
+    actual_versions = dict(expected)
+    actual_contents = {name: "a" * 64 for name in expected}
+    if drift == "omission":
+        expected.pop("numpy")
+    elif drift == "version":
+        actual_versions["pillow"] = "99.0"
+    else:
+        actual_contents["pillow"] = "b" * 64
+    runtime = RuntimeSettings(
+        accelerator="cuda",
+        gpu_index=0,
+        model_dirs={name: tmp_path / name for name in MODEL_NAMES},
+        cache_dir=tmp_path / "cache",
+        qualification_manifest=manifest,
+        expected_packages=expected,
+        expected_paddle_commit="commit-331",
+        image_identity="image-identity",
+    )
+    from ocr_service import profile as profile_module
+
+    monkeypatch.setattr(factory.importlib.metadata, "version", actual_versions.__getitem__)
+    monkeypatch.setattr(factory.importlib.metadata, "requires", lambda name: [])
+    monkeypatch.setattr(profile_module, "dependency_identity", actual_contents.__getitem__)
+
+    def forbidden_import(name):
+        pytest.fail("Required identity omission reached a heavy import: " + name)
+
+    monkeypatch.setattr(factory.importlib, "import_module", forbidden_import)
+    with pytest.raises(ValueError, match="required|identity"):
+        factory.build_pipeline(
+            load_profile(Path(__file__).parents[1] / "paddleocr-service/profile.json"), runtime
+        )

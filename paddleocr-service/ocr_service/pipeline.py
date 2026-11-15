@@ -25,10 +25,10 @@ from .profile import (
     RuntimeSettings,
     check_accelerator,
     content_identity,
-    dependency_identity,
     effective_pipeline_config,
     file_digest,
     runtime_identity,
+    verify_dependencies,
 )
 
 # Official PaddleX v3.7.2 source bytes. Modifications require a new audited adapter.
@@ -223,18 +223,10 @@ def build_pipeline(profile: OcrProfile, runtime: RuntimeSettings) -> PipelineAda
         raise ValueError("Build native pipeline in a fresh worker before importing PaddleX")
     os.environ["PADDLE_PDX_DISABLE_DEVICE_FALLBACK"] = "1"
     os.environ["PADDLE_PDX_CACHE_HOME"] = str(runtime.cache_dir)
-    required = {"paddleocr": "3.7.0", "paddlex": "3.7.2"}
-    for package, version in required.items():
-        if runtime.expected_packages.get(package) != version:
-            raise ValueError("Native adapter requires pinned PaddleOCR/PaddleX versions")
-    if not any(
-        name.startswith("paddlepaddle") and version.split("+")[0] == "3.3.1"
-        for name, version in runtime.expected_packages.items()
-    ):
-        raise ValueError("Native adapter requires an explicit Paddle 3.3.1 package identity")
-    versions = {name: importlib.metadata.version(name) for name in runtime.expected_packages}
-    if versions != runtime.expected_packages:
-        raise ValueError("Native dependency package identity mismatch")
+    manifest = json.loads(runtime.qualification_manifest.read_text())
+    versions, dependency_content = verify_dependencies(
+        runtime.expected_packages, manifest.get("dependencies", {})
+    )
     if set(runtime.model_dirs) != set(MODEL_NAMES):
         raise ValueError("All four explicit native model directories are required")
     paddle = importlib.import_module("paddle")
@@ -265,7 +257,6 @@ def build_pipeline(profile: OcrProfile, runtime: RuntimeSettings) -> PipelineAda
         or signature.parameters["kwargs"].kind != inspect.Parameter.VAR_KEYWORD
     ):
         raise ValueError("Unsupported native pipeline create_model signature")
-    manifest = json.loads(runtime.qualification_manifest.read_text())
     inspector = f"paddle:{runtime.expected_paddle_commit}"
     if (
         manifest["image_identity"] != runtime.image_identity
@@ -338,7 +329,7 @@ def build_pipeline(profile: OcrProfile, runtime: RuntimeSettings) -> PipelineAda
             "normalizer": NORMALIZER_VERSION,
             "model_content": model_content,
             "dependencies": versions,
-            "dependency_content": {name: dependency_identity(name) for name in versions},
+            "dependency_content": dependency_content,
             "paddlex_sources": PINNED_SOURCES,
             "paddle_commit": runtime.expected_paddle_commit,
         }

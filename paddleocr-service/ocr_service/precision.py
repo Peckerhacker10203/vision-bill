@@ -110,7 +110,16 @@ class StaticAuditSession:
             if dtype is None:
                 return  # CPU integer shape tensors do not imply float fallback.
             place = tensor.place
-            location = f"gpu:{place.gpu_device_id()}" if place.is_gpu_place() else "cpu"
+            if place.is_gpu_place():
+                if place.gpu_device_id() != self.gpu_index:
+                    self.violations.add("Floating tensor uses another GPU device index")
+                    return
+                location = f"gpu:{self.gpu_index}"
+            elif place.is_cpu_place():
+                location = "cpu"
+            else:
+                self.violations.add("Floating tensor uses an unsupported device place")
+                return
             record = (hook, str(op), str(name), dtype, location)
             if dtype != "float32" or record not in self.expected:
                 # Bound memory even if a native graph emits an unbounded stream.

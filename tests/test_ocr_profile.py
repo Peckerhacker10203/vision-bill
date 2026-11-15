@@ -101,3 +101,183 @@ def test_dependency_identity_hashes_installed_content_and_ignores_bytecode(tmp_p
     assert profile.dependency_identity("package") == first
     code.write_text("version = 2")
     assert profile.dependency_identity("package") != first
+
+
+@pytest.fixture
+def native_dependencies(monkeypatch):
+    from ocr_service import profile
+
+    versions = {
+        "paddleocr": "3.7.0",
+        "paddlex": "3.7.2",
+        "paddlepaddle-gpu": "3.3.1",
+        "pillow": "12.3.0",
+        "pillow-heif": "1.7.0",
+        "numpy": "2.2.6",
+        "pydantic": "2.13.4",
+        "packaging": "26.2",
+    }
+    requirements = {name: [] for name in versions}
+    contents = {name: "a" * 64 for name in versions}
+    monkeypatch.setattr(profile.importlib.metadata, "version", versions.__getitem__)
+    monkeypatch.setattr(profile.importlib.metadata, "requires", requirements.__getitem__)
+    monkeypatch.setattr(profile, "dependency_identity", contents.__getitem__)
+    return versions, requirements, contents
+
+
+def sealed_dependencies(versions, contents):
+    return {
+        name: {"version": version, "content_sha256": contents[name]}
+        for name, version in versions.items()
+    }
+
+
+@pytest.mark.parametrize(
+    "omitted",
+    [
+        "pillow",
+        "pillow-heif",
+        "numpy",
+        "pydantic",
+        "packaging",
+        "paddleocr",
+        "paddlex",
+        "paddlepaddle-gpu",
+    ],
+)
+def test_dependency_contract_requires_every_execution_root(native_dependencies, omitted):
+    from ocr_service.profile import verify_dependencies
+
+    versions, _, contents = native_dependencies
+    expected = dict(versions)
+    expected.pop(omitted)
+    with pytest.raises(ValueError, match="required|Paddle"):
+        verify_dependencies(expected, sealed_dependencies(expected, contents))
+
+
+def test_dependency_contract_rejects_two_paddle_distributions(native_dependencies):
+    from ocr_service.profile import verify_dependencies
+
+    versions, _, contents = native_dependencies
+    versions["paddlepaddle"] = "3.3.1"
+    contents["paddlepaddle"] = "a" * 64
+    with pytest.raises(ValueError, match="Paddle"):
+        verify_dependencies(versions, sealed_dependencies(versions, contents))
+
+
+@pytest.mark.parametrize("drift", ["version", "content"])
+@pytest.mark.parametrize("package", ["pillow", "pydantic-core"])
+def test_dependency_contract_rejects_installed_drift(native_dependencies, drift, package):
+    from ocr_service.profile import verify_dependencies
+
+    versions, requirements, contents = native_dependencies
+    if package == "pydantic-core":
+        versions[package] = "2.46.0"
+        contents[package] = "a" * 64
+        requirements[package] = []
+        requirements["pydantic"] = ["pydantic-core==2.46.0"]
+    expected = dict(versions)
+    sealed = sealed_dependencies(expected, contents)
+    if drift == "version":
+        versions[package] = "99.0"
+    else:
+        contents[package] = "b" * 64
+    with pytest.raises(ValueError, match="identity"):
+        verify_dependencies(expected, sealed)
+
+
+def test_dependency_contract_requires_matching_sealed_version(native_dependencies):
+    from ocr_service.profile import verify_dependencies
+
+    versions, _, contents = native_dependencies
+    sealed = sealed_dependencies(versions, contents)
+    sealed["numpy"]["version"] = "1.0"
+    with pytest.raises(ValueError, match="identity"):
+        verify_dependencies(versions, sealed)
+
+
+def test_dependency_graph_activates_extras_markers_and_handles_cycles(native_dependencies):
+    from ocr_service.profile import verify_dependencies
+
+    versions, requirements, contents = native_dependencies
+    versions.update({"layout-extra": "1.0", "leaf": "2.0"})
+    contents.update({"layout-extra": "b" * 64, "leaf": "c" * 64})
+    requirements["paddlex"] = [
+        "Layout_Extra[fast]>=1; extra == 'ocr'",
+        "never-activated; extra == 'other'",
+        "obsolete; python_version < '2.0'",
+    ]
+    requirements["layout-extra"] = ["leaf>=2; extra == 'fast' and python_version >= '3.12'"]
+    requirements["leaf"] = ["paddlex[ocr]==3.7.2"]
+    actual_versions, actual_contents = verify_dependencies(
+        versions, sealed_dependencies(versions, contents)
+    )
+    assert actual_versions == versions
+    assert actual_contents == contents
+    assert "never-activated" not in actual_versions
+    assert "obsolete" not in actual_versions
+
+
+@pytest.mark.parametrize("omitted_from", ["expected", "sealed"])
+def test_active_transitive_dependency_cannot_be_omitted(native_dependencies, omitted_from):
+    from ocr_service.profile import verify_dependencies
+
+    versions, requirements, contents = native_dependencies
+    versions["pydantic-core"] = "2.46.0"
+    contents["pydantic-core"] = "b" * 64
+    requirements["pydantic"] = ["pydantic-core==2.46.0"]
+    requirements["pydantic-core"] = []
+    sealed = sealed_dependencies(versions, contents)
+    if omitted_from == "expected":
+        versions.pop("pydantic-core")
+    else:
+        sealed.pop("pydantic-core")
+    with pytest.raises(ValueError, match="dependency"):
+        verify_dependencies(versions, sealed)
+
+
+def test_dependency_contract_rejects_unrelated_manifest_entries(native_dependencies):
+    from ocr_service.profile import verify_dependencies
+
+    versions, requirements, contents = native_dependencies
+    versions["unrelated-application"] = "7.0"
+    requirements["unrelated-application"] = []
+    contents["unrelated-application"] = "a" * 64
+    with pytest.raises(ValueError, match="closure"):
+        verify_dependencies(versions, sealed_dependencies(versions, contents))
+
+
+def test_dependency_graph_rejects_versions_outside_active_requirements(native_dependencies):
+    from ocr_service.profile import verify_dependencies
+
+    versions, requirements, contents = native_dependencies
+    requirements["paddleocr"] = ["paddlex>=4"]
+    with pytest.raises(ValueError, match="requirement"):
+        verify_dependencies(versions, sealed_dependencies(versions, contents))
+
+
+def test_dependency_graph_revisits_node_when_later_extras_are_activated(native_dependencies):
+    from ocr_service.profile import verify_dependencies
+
+    versions, requirements, contents = native_dependencies
+    versions.update({"shared": "1.0", "bridge": "1.0", "leaf": "1.0"})
+    contents.update({name: "b" * 64 for name in ["shared", "bridge", "leaf"]})
+    requirements["pydantic"] = ["shared"]  # Visited before paddlex's extras branch.
+    requirements["paddlex"] = ["bridge; extra == 'ocr'"]
+    requirements["bridge"] = ["shared[fast]"]
+    requirements["shared"] = ["leaf; extra == 'fast'"]
+    requirements["leaf"] = []
+    actual_versions, _ = verify_dependencies(versions, sealed_dependencies(versions, contents))
+    assert actual_versions == versions
+
+
+def test_dependency_contract_canonicalizes_names(native_dependencies):
+    from ocr_service.profile import verify_dependencies
+
+    versions, _, contents = native_dependencies
+    expected = dict(versions)
+    expected["Pillow"] = expected.pop("pillow")
+    sealed = sealed_dependencies(versions, contents)
+    sealed["pillow_heif"] = sealed.pop("pillow-heif")
+    actual_versions, _ = verify_dependencies(expected, sealed)
+    assert actual_versions == versions

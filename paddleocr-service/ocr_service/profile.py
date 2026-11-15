@@ -7,6 +7,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal
 
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 from pydantic import BaseModel, ConfigDict, Field
 
 ADAPTER_VERSION = "native-fp32-v1"
@@ -100,6 +102,85 @@ def dependency_identity(package: str) -> str:
     if not content:
         raise ValueError("Dependency content inventory is empty")
     return content_identity(content)
+
+
+class DependencyRecord(BaseModel):
+    """One installed distribution pinned by the sealed image-build manifest."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    version: str = Field(min_length=1)
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+def verify_dependencies(
+    expected_packages: dict[str, str], sealed_dependencies: dict[str, Any]
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Verify only the active execution dependency closure, before native imports."""
+
+    def canonical_entries(entries: dict[str, Any]) -> dict[str, Any]:
+        canonical = {str(canonicalize_name(name)): value for name, value in entries.items()}
+        if len(canonical) != len(entries):
+            raise ValueError("Duplicate dependency identity aliases")
+        return canonical
+
+    expected = canonical_entries(expected_packages)
+    required = {"paddleocr", "paddlex", "pillow", "pillow-heif", "numpy", "pydantic", "packaging"}
+    paddle_names = {name for name in expected if name.startswith("paddlepaddle")}
+    if len(paddle_names) != 1 or not paddle_names <= {"paddlepaddle", "paddlepaddle-gpu"}:
+        raise ValueError("Exactly one intended native Paddle distribution identity is required")
+    required |= paddle_names
+    if not required <= expected.keys():
+        raise ValueError("All required execution dependency identities must be supplied")
+    if expected["paddleocr"] != "3.7.0" or expected["paddlex"] != "3.7.2":
+        raise ValueError("Native dependency versions must match the pinned OCR adapter")
+    if any(expected[name].split("+", 1)[0] != "3.3.1" for name in paddle_names):
+        raise ValueError("Native Paddle source version must remain 3.3.1")
+    sealed = {
+        name: DependencyRecord.model_validate(record)
+        for name, record in canonical_entries(sealed_dependencies).items()
+    }
+    active = {name: set[str]() for name in required}
+    active["paddlex"].add("ocr")
+    pending = sorted(required)
+    processed: dict[str, frozenset[str]] = {}
+    versions: dict[str, str] = {}
+    while pending:
+        name = pending.pop()
+        extras = frozenset(active[name])
+        if processed.get(name) == extras:
+            continue
+        if name not in expected or name not in sealed:
+            raise ValueError(f"Active dependency identity omitted: {name}")
+        actual_version = versions.setdefault(name, importlib.metadata.version(name))
+        if actual_version != expected[name] or sealed[name].version != expected[name]:
+            raise ValueError(f"Native dependency version identity mismatch: {name}")
+        processed[name] = extras
+        for specification in importlib.metadata.requires(name) or []:
+            requirement = Requirement(specification)
+            contexts = extras | {""}
+            if requirement.marker and not any(
+                requirement.marker.evaluate({"extra": extra}) for extra in contexts
+            ):
+                continue
+            child = str(canonicalize_name(requirement.name))
+            if child not in expected or child not in sealed:
+                raise ValueError(f"Active dependency identity omitted: {child}")
+            if not requirement.specifier.contains(expected[child], prereleases=True):
+                raise ValueError(f"Pinned dependency violates active requirement: {specification}")
+            child_extras = {str(canonicalize_name(extra)) for extra in requirement.extras}
+            if child not in active:
+                active[child] = child_extras
+                pending.append(child)
+            elif not child_extras <= active[child]:
+                active[child].update(child_extras)
+                pending.append(child)
+    if set(active) != set(expected) or set(active) != set(sealed):
+        raise ValueError("Dependency manifest must contain exactly the active execution closure")
+    contents = {name: dependency_identity(name) for name in sorted(active)}
+    for name, digest in contents.items():
+        if digest != sealed[name].content_sha256:
+            raise ValueError(f"Native dependency content identity mismatch: {name}")
+    return versions, contents
 
 
 def runtime_identity(profile_id: str, runtime: dict[str, Any]) -> str:
