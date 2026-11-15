@@ -30,7 +30,7 @@ while (($#)); do
       backup_file="$2"
       shift 2
       ;;
-    --env-file--network)
+    --env-file|--network)
       (($# >= 2)) || die "$1 requires a value"
       case "$1" in
         --env-file) backup_env="$2" ;;
@@ -44,7 +44,7 @@ while (($#)); do
   esac
 done
 
-[[ -n "$backup_mode" && -n "$backup_file" && -n "$backup_image" ]] ||
+[[ -n "$backup_mode" && -n "$backup_file" ]] ||
   { usage >&2; exit 1; }
 
 [[ "$backup_mode" == --restore || "$backup_replace" == 0 ]] ||

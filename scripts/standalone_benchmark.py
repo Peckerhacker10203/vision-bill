@@ -175,7 +175,7 @@ async def fetch_verified_receipts(
                r.subtotal, r.tax_total, r.total, r.currency, r.payment_method,
                r.merchant_address, r.receipt_number, r.time,
                r.discount_total, r.tip,
-               i.path as image_path,
+               i.image_path,
                i.original_filename
         FROM receipts r
         JOIN images i ON r.id = i.receipt_id
@@ -187,7 +187,7 @@ async def fetch_verified_receipts(
         params.append(category)
     query += " ORDER BY r.date DESC"
     if limit:
-        query += " LIMIT $1"
+        query += f" LIMIT ${len(params) + 1}"
         params.append(limit)
 
     rows = await pool.fetch(query, *params)
@@ -227,7 +227,7 @@ async def fetch_receipt_details(
     taxes = await pool.fetch(
         """
         SELECT name, amount
-        FROM tax_lines
+        FROM taxes
         WHERE receipt_id = $1
         ORDER BY id
     """,
