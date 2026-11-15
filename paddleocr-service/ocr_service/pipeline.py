@@ -1,0 +1,365 @@
+"""Lazy native factory, qualification gate, and recognized source-view response."""
+
+import hashlib
+import importlib
+import importlib.metadata
+import inspect
+import json
+import math
+import os
+import sys
+from pathlib import Path
+from typing import Any
+from uuid import UUID
+
+from vision_bill.model.ocr import OcrBlock, OcrResponse
+
+from .fp32 import audit_dynamic_model, fp32_predictor_class, native_pipeline_class
+from .images import normalize_source, working_image
+from .precision import StaticArtifact, StaticAuditSession, begin_static_audit
+from .profile import (
+    ADAPTER_VERSION,
+    MODEL_NAMES,
+    NORMALIZER_VERSION,
+    OcrProfile,
+    RuntimeSettings,
+    check_accelerator,
+    content_identity,
+    dependency_identity,
+    effective_pipeline_config,
+    file_digest,
+    runtime_identity,
+)
+
+# Official PaddleX v3.7.2 source bytes. Modifications require a new audited adapter.
+PINNED_SOURCES = {
+    "pipelines/paddleocr_vl/pipeline.py": "32966d14aad6ac1bc043737c96352a4f0b4efcbead96f9354254dd4b9d1c6675",
+    "pipelines/base.py": "f955c34caa6e630b6853c10a4ad189157def0d547fecd262a2e2f9868d175a30",
+    "models/doc_vlm/predictor.py": "9353a5fa81c1bd57a1e5f2e6bdad0e24c4ed1caccd765f4b5bb127e906e1c45c",
+    "models/predictors/local_model_predictor.py": "f796661ba5a658dcdb7cc1378e2d2348edba3532136c91e6757954b21ce643dd",
+    "models/__init__.py": "b4b5e5cfd94de3fa5b0edd5999226c202160c926f6b5450fac574371eb470812",
+    "models/runners/paddle_static/runner.py": "943d590638a4fb71e8d8ec6a61b0e913e9a6bc4a6e41fd586d466c7938982aa3",
+    "pipelines/doc_preprocessor/pipeline.py": "9d75e4d0c628c8e01bd23c5637b8bce218cab19fc4c1bac5ec898a04b66b23f2",
+}
+
+
+def verify_sources(root: Path) -> None:
+    for relative, expected in PINNED_SOURCES.items():
+        if file_digest(root / "inference" / relative) != expected:
+            raise ValueError(f"Unsupported PaddleX source identity: {relative}")
+
+
+def tree_identity(root: Path) -> str:
+    files = sorted(path for path in root.rglob("*") if path.is_file())
+    if not files:
+        raise ValueError("Model directory contains no sealed content")
+    return content_identity({str(path.relative_to(root)): file_digest(path) for path in files})
+
+
+def recognized_blocks(result: Any, width: int, height: int) -> list[OcrBlock]:
+    blocks = []
+    for index, block in enumerate(result.get("parsing_res_list", []) or []):
+        if isinstance(block, dict):
+            text, label, box = (
+                block.get("block_content"),
+                block.get("block_label", "text"),
+                block.get("block_bbox"),
+            )
+        else:
+            text, label, box = (
+                getattr(block, "content", None),
+                getattr(block, "label", "text"),
+                getattr(block, "bbox", None),
+            )
+        if not isinstance(text, str) or not text.strip():
+            continue
+        # Only the recognized block's geometry is converted, never native result arrays.
+        if box is not None and hasattr(box, "tolist"):
+            box = box.tolist()
+        if not isinstance(box, (list, tuple)):
+            raise TypeError("Recognized block lacks working-space geometry")
+        if len(box) == 4 and all(isinstance(x, (int, float)) for x in box):
+            x1, y1, x2, y2 = map(float, box)
+            points = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+        else:
+            points = [[float(x), float(y)] for x, y in box]
+        if len(points) < 3 or any(
+            not math.isfinite(x)
+            or not math.isfinite(y)
+            or not 0 <= x <= width
+            or not 0 <= y <= height
+            for x, y in points
+        ):
+            raise ValueError("Recognized block exceeds working-image bounds")
+        blocks.append(OcrBlock(id=str(index), label=str(label), text=text.strip(), bbox=points))
+    if not blocks:
+        raise ValueError("OCR returned no recognized text")
+    return blocks
+
+
+class PipelineAdapter:
+    def __init__(
+        self,
+        pipeline: Any,
+        profile: OcrProfile,
+        profile_id: str,
+        runtime_fingerprint: str,
+        static_audits: list[StaticAuditSession],
+        *,
+        smoke_sha256: str | None = None,
+        gpu_index: int = 0,
+    ):
+        self.pipeline = pipeline
+        self.profile = profile
+        self.profile_id = profile_id
+        self.runtime_fingerprint = runtime_fingerprint
+        self.static_audits = static_audits
+        self.smoke_sha256 = smoke_sha256
+        self.gpu_index = gpu_index
+        self.qualified = False
+        self.evidence: list[dict[str, Any]] = []
+
+    @property
+    def predict_kwargs(self) -> dict[str, Any]:
+        return {
+            "use_doc_orientation_classify": True,
+            "use_doc_unwarping": True,
+            "use_queues": False,
+            "min_pixels": self.profile.min_pixels,
+            "max_pixels": self.profile.max_pixels,
+            "max_new_tokens": self.profile.max_new_tokens,
+        }
+
+    def _execute(self, image: Path) -> Any:
+        for session in self.static_audits:
+            session.start()
+        try:
+            results = iter(self.pipeline.predict(str(image), **self.predict_kwargs))
+            result = next(results)
+            if next(results, None) is not None:
+                raise ValueError("Single-image native inference returned multiple pages")
+            evidence = [session.finish() for session in self.static_audits]
+            audit_dynamic_model(self.pipeline.vl_rec_model.infer, self.gpu_index)
+            self.evidence = evidence
+            return result
+        except Exception:
+            self.qualified = False
+            raise
+        finally:
+            for session in self.static_audits:
+                session.enabled = False
+
+    def qualify(self, image: Path) -> list[dict[str, Any]]:
+        """Execute fresh native forward without going through the serving gate."""
+        self.qualified = False
+        if len(self.static_audits) != 3 or {
+            s.artifact.model_name for s in self.static_audits
+        } != set(MODEL_NAMES[:3]):
+            raise ValueError("Qualification requires three static model audits")
+        digest = hashlib.sha256(image.read_bytes()).hexdigest()
+        if not self.smoke_sha256 or digest != self.smoke_sha256:
+            raise ValueError("Qualification image hash differs from sealed smoke coverage")
+        with normalize_source(image, digest) as normalized:
+            result = self._execute(normalized.path)
+            self.convert_result(
+                result,
+                request_id=UUID(int=0),
+                photo_index=0,
+                source_sha256=digest,
+                transforms=normalized.transforms,
+                findings=normalized.findings,
+            )
+        self.qualified = True
+        return list(self.evidence)
+
+    def convert_result(
+        self,
+        result: Any,
+        *,
+        request_id: UUID,
+        photo_index: int,
+        source_sha256: str,
+        transforms: list[dict[str, Any]],
+        findings: list[str],
+    ) -> OcrResponse:
+        view = working_image(result["doc_preprocessor_res"], transforms)
+        blocks = recognized_blocks(result, view.width, view.height)
+        return OcrResponse(
+            request_id=request_id,
+            photo_index=photo_index,
+            source_sha256=source_sha256,
+            text="\n".join(block.text for block in blocks),
+            blocks=blocks,
+            working_image=view,
+            profile_id=self.profile_id,
+            runtime_fingerprint=self.runtime_fingerprint,
+            telemetry={
+                "findings": findings,
+                "coordinate_space": "working",
+                "precision_audits": self.evidence,
+            },
+        )
+
+    def predict(
+        self, image: Path, *, request_id: UUID, photo_index: int, source_sha256: str
+    ) -> OcrResponse:
+        if not self.qualified:
+            raise ValueError("Native pipeline has not been qualified")
+        with normalize_source(image, source_sha256) as normalized:
+            return self.convert_result(
+                self._execute(normalized.path),
+                request_id=request_id,
+                photo_index=photo_index,
+                source_sha256=source_sha256,
+                transforms=normalized.transforms,
+                findings=normalized.findings,
+            )
+
+
+def build_pipeline(profile: OcrProfile, runtime: RuntimeSettings) -> PipelineAdapter:
+    # PaddleX captures this flag at import time. Refuse a pre-imported process,
+    # where setting the environment would create a false fallback guarantee.
+    if any(name == "paddlex" or name.startswith("paddlex.") for name in sys.modules):
+        raise ValueError("Build native pipeline in a fresh worker before importing PaddleX")
+    os.environ["PADDLE_PDX_DISABLE_DEVICE_FALLBACK"] = "1"
+    os.environ["PADDLE_PDX_CACHE_HOME"] = str(runtime.cache_dir)
+    required = {"paddleocr": "3.7.0", "paddlex": "3.7.2"}
+    for package, version in required.items():
+        if runtime.expected_packages.get(package) != version:
+            raise ValueError("Native adapter requires pinned PaddleOCR/PaddleX versions")
+    if not any(
+        name.startswith("paddlepaddle") and version.split("+")[0] == "3.3.1"
+        for name, version in runtime.expected_packages.items()
+    ):
+        raise ValueError("Native adapter requires an explicit Paddle 3.3.1 package identity")
+    versions = {name: importlib.metadata.version(name) for name in runtime.expected_packages}
+    if versions != runtime.expected_packages:
+        raise ValueError("Native dependency package identity mismatch")
+    if set(runtime.model_dirs) != set(MODEL_NAMES):
+        raise ValueError("All four explicit native model directories are required")
+    paddle = importlib.import_module("paddle")
+    paddlex = importlib.import_module("paddlex")
+    normalize_engine_config = importlib.import_module(
+        "paddlex.inference.models"
+    ).normalize_engine_config
+    DocVLMLocalPredictor = importlib.import_module(
+        "paddlex.inference.models.doc_vlm.predictor"
+    ).DocVLMLocalPredictor
+    PaddleStaticRunner = importlib.import_module(
+        "paddlex.inference.models.runners.paddle_static"
+    ).PaddleStaticRunner
+    BasePipeline = importlib.import_module("paddlex.inference.pipelines.base").BasePipeline
+    _PaddleOCRVLPipeline = importlib.import_module(
+        "paddlex.inference.pipelines.paddleocr_vl.pipeline"
+    )._PaddleOCRVLPipeline
+
+    verify_sources(Path(str(paddlex.__file__)).parent)
+    if str(paddle.version.commit) != runtime.expected_paddle_commit:
+        raise ValueError("Paddle source commit mismatch")
+    check_accelerator(paddle, runtime.accelerator, runtime.gpu_index)
+    if str(inspect.signature(DocVLMLocalPredictor._build)) != "(self, **kwargs)":
+        raise ValueError("Unsupported native predictor _build signature")
+    signature = inspect.signature(BasePipeline.create_model)
+    if (
+        list(signature.parameters) != ["self", "config", "kwargs"]
+        or signature.parameters["kwargs"].kind != inspect.Parameter.VAR_KEYWORD
+    ):
+        raise ValueError("Unsupported native pipeline create_model signature")
+    manifest = json.loads(runtime.qualification_manifest.read_text())
+    inspector = f"paddle:{runtime.expected_paddle_commit}"
+    if (
+        manifest["image_identity"] != runtime.image_identity
+        or manifest["paddle_identity"] != inspector
+    ):
+        raise ValueError("Qualification manifest build/source identity mismatch")
+    artifacts = {
+        name: StaticArtifact.model_validate(value)
+        for name, value in manifest["static_artifacts"].items()
+    }
+    if set(artifacts) != set(MODEL_NAMES[:3]):
+        raise ValueError("Qualification manifest must cover every enabled static model")
+    model_content = {name: tree_identity(path) for name, path in runtime.model_dirs.items()}
+    if model_content != manifest["model_content"]:
+        raise ValueError("Native model content identity mismatch")
+    config = effective_pipeline_config(profile)
+    static_config = {
+        "run_mode": "paddle_fp32",
+        "device_type": "gpu",
+        "device_id": runtime.gpu_index,
+        "enable_cinn": False,
+    }
+
+    def resolve(value: Any) -> None:
+        if isinstance(value, dict):
+            if "model_name" in value:
+                value["model_dir"] = str(runtime.model_dirs[value["model_name"]])
+                value["engine"] = (
+                    "paddle_dynamic"
+                    if value["module_name"] == "vl_recognition"
+                    else "paddle_static"
+                )
+                value["engine_config"] = (
+                    {"device_type": "gpu", "device_id": runtime.gpu_index}
+                    if value["module_name"] == "vl_recognition"
+                    else dict(static_config)
+                )
+            for child in value.values():
+                resolve(child)
+        elif isinstance(value, list):
+            for child in value:
+                resolve(child)
+
+    resolve(config)
+    predictor = fp32_predictor_class(DocVLMLocalPredictor, runtime.gpu_index)
+    pipeline_type = native_pipeline_class(_PaddleOCRVLPipeline, predictor, normalize_engine_config)
+    native = pipeline_type(config, device=runtime.device, use_hpip=False)
+    preprocessor = native.doc_preprocessor_pipeline
+    models = (
+        native.layout_det_model,
+        preprocessor.doc_ori_classify_model,
+        preprocessor.doc_unwarping_model,
+    )
+    audits = [
+        begin_static_audit(
+            model,
+            expected_model_name=name,
+            gpu_index=runtime.gpu_index,
+            sealed_artifact=artifacts[name],
+            runner_type=PaddleStaticRunner,
+            inspector_identity=inspector,
+        )
+        for name, model in zip(MODEL_NAMES[:3], models, strict=True)
+    ]
+    profile_id = content_identity(
+        {
+            "effective_config": effective_pipeline_config(profile),
+            "limits": profile.model_dump(),
+            "adapter": ADAPTER_VERSION,
+            "normalizer": NORMALIZER_VERSION,
+            "model_content": model_content,
+            "dependencies": versions,
+            "dependency_content": {name: dependency_identity(name) for name in versions},
+            "paddlex_sources": PINNED_SOURCES,
+            "paddle_commit": runtime.expected_paddle_commit,
+        }
+    )
+    fingerprint = runtime_identity(
+        profile_id,
+        {
+            "accelerator": runtime.accelerator,
+            "gpu_index": runtime.gpu_index,
+            "device_name": paddle.device.cuda.get_device_name(runtime.gpu_index),
+            "paddle_build": paddle.version.full_version,
+            "image_identity": runtime.image_identity,
+            "qualification_manifest": content_identity(manifest),
+        },
+    )
+    return PipelineAdapter(
+        native,
+        profile,
+        profile_id,
+        fingerprint,
+        audits,
+        smoke_sha256=manifest["smoke_sha256"],
+        gpu_index=runtime.gpu_index,
+    )
