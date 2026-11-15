@@ -85,3 +85,73 @@ def working_image(preprocessor: Any, transforms: list[dict[str, Any]]) -> Workin
         transforms=transforms + [preprocessing_transform],
         inverse_mapping=None,
     )
+
+
+# Compatibility for pre-v2 diagnostic callers; serving uses PipelineAdapter.
+def _to_plain(obj: Any) -> Any:
+    """Recursively convert numpy scalars/arrays to plain JSON-safe Python."""
+    if isinstance(obj, dict):
+        return {k: _to_plain(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_plain(v) for v in obj]
+    # Primitives (and None) pass through untouched; this also narrows the type
+    # so the numpy checks below are only reached for non-primitive objects.
+    if obj is None or isinstance(obj, (str, bytes, int, float, bool)):
+        return obj
+    # numpy scalar (has .item) or numpy array (has .tolist)
+    if hasattr(obj, "item"):
+        try:
+            return obj.item()
+        except (ValueError, AttributeError, TypeError):
+            pass
+    if hasattr(obj, "tolist"):
+        try:
+            return obj.tolist()
+        except (ValueError, AttributeError, TypeError):
+            pass
+    return obj
+
+
+def _normalize_bbox(coordinate: Any) -> list[list[float]]:
+    """Normalise a box coordinate to a list of ``[x, y]`` points.
+
+    PaddleOCR may return either a flat list ``[x1, y1, x2, y2, ...]`` or a list
+    of points ``[[x1, y1], [x2, y2], ...]``. Both are handled.
+    """
+    coordinate = _to_plain(coordinate)
+    if not coordinate:
+        return []
+    first = coordinate[0]
+    if isinstance(first, (int, float)) or hasattr(first, "item"):
+        nums = [float(v) for v in coordinate]
+        return [[nums[i], nums[i + 1]] for i in range(0, len(nums) - 1, 2)]
+    return [[float(x) for x in point] for point in coordinate]
+
+
+def process_ocrvl_result(result: Any) -> dict[str, Any]:
+    """Return recognized content in reading order, without image/model internals."""
+    res_dict = result.res if hasattr(result, "res") else result
+    blocks: list[dict[str, Any]] = []
+    for block in (res_dict or {}).get("parsing_res_list", []) or []:
+        # Native PaddleX results contain ParsingBlock objects; exported JSON
+        # contains dictionaries. Both preserve the pipeline's reading order.
+        if isinstance(block, dict):
+            text = block.get("block_content", "")
+            label = block.get("block_label", "text")
+            coordinate = block.get("block_bbox", [])
+        else:
+            text = getattr(block, "content", "")
+            label = getattr(block, "label", "text")
+            coordinate = getattr(block, "bbox", [])
+        if not isinstance(text, str) or not text.strip():
+            continue
+        blocks.append(
+            {
+                "label": str(label),
+                "text": text.strip(),
+                "bbox": _normalize_bbox(coordinate),
+            }
+        )
+    if not blocks:
+        raise ValueError("OCR returned no recognized text; layout boxes are not transcription")
+    return {"text": "\n".join(block["text"] for block in blocks), "blocks": blocks}
