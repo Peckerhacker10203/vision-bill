@@ -10,7 +10,7 @@ services:
       PG__HOST: db
       PG__PORT: "5432"
       OCR__SERVICE_URL: http://paddleocr-service:8082
-      OCR__TIMEOUT_SECONDS: "900"
+      OCR__TIMEOUT_SECONDS: "600"
     ports:
       - "${API__PORT:-8080}:8080"
     extra_hosts:
@@ -20,8 +20,6 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      paddleocr-service:
-        condition: service_healthy
     volumes:
       - ./server_data/logs:/app/logs
       - ./server_data/uploads:/app/uploads
@@ -29,23 +27,30 @@ services:
       - ./server_data/config:/app/config
 
   paddleocr-service:
-    build: ./paddleocr-service
+    profiles: [ocr]
+    build:
+      context: .
+      dockerfile: paddleocr-service/Dockerfile
     container_name: paddleocr-service
     restart: always
     environment:
       OMP_NUM_THREADS: "4"
       OCR_PORT: "8082"
-      OCR_TIMEOUT_SECONDS: "900"
+      PADDLE_PDX_CACHE_HOME: /var/cache/paddlex
+      OCR_RUNTIME_SETTINGS_PATH: /var/lib/ocr/qualification.runtime.json
+      OCR_QUALIFICATION_IMAGE_PATH: /var/lib/ocr/fixtures/upright.png
+      OCR_STARTUP_TIMEOUT_SECONDS: "600"
     volumes:
-      - ./server_data/ocr-models:/root/.paddleocr/models
+      - ./server_data/ocr-cache:/var/cache/paddlex
+      - ./server_data/ocr-runtime:/var/lib/ocr:ro
     networks:
       - postgres_net
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8082/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8082/ready')"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 600s
 
   db:
     image: postgres:18

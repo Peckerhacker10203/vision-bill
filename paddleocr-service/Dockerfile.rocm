@@ -1,0 +1,70 @@
+# syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+FROM ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5 AS native-builder
+RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources \
+ && echo 'deb http://snapshot.ubuntu.com/ubuntu/20261101T000000Z noble main universe' > /etc/apt/sources.list \
+ && echo 'deb http://snapshot.ubuntu.com/ubuntu/20261101T000000Z noble-updates main universe' >> /etc/apt/sources.list \
+ && echo 'deb http://snapshot.ubuntu.com/ubuntu/20261101T000000Z noble-security main universe' >> /etc/apt/sources.list \
+ && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates python3.12 python3.12-venv python3.12-dev libgl1 libglib2.0-0 libgomp1 \
+    git curl build-essential gfortran ninja-build cmake pkg-config xxd automake libtool \
+    libegl1-mesa-dev texinfo bison flex xz-utils libssl-dev libnuma-dev zlib1g-dev \
+ && mkdir -p /opt/ocr/build-evidence \
+ && dpkg-query -W > /opt/ocr/build-evidence/os-packages.txt \
+ && rm -rf /var/lib/apt/lists/*
+RUN python3.12 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH" \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEX=3.7.2 \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEOCR=3.7.0
+COPY paddleocr-service/requirements.build.lock paddleocr-service/requirements.bootstrap.lock /opt/locks/
+RUN python -m pip install --require-hashes --no-deps --only-binary=:all: -r /opt/locks/requirements.bootstrap.lock \
+ && python -m pip install --require-hashes --no-deps --no-build-isolation -r /opt/locks/requirements.build.lock
+# Rust archive identity comes from the official 1.95.0 distribution manifest.
+RUN curl --fail --location https://static.rust-lang.org/dist/2026-04-16/rust-1.95.0-x86_64-unknown-linux-gnu.tar.xz -o /tmp/rust.tar.xz \
+ && echo '2e0338f18ecbaa4a0f631b9e80e8b8e26bb6fe77dd5454fba8a70cf96c1e84a1  /tmp/rust.tar.xz' | sha256sum -c - \
+ && tar -xJf /tmp/rust.tar.xz -C /tmp \
+ && /tmp/rust-1.95.0-x86_64-unknown-linux-gnu/install.sh --prefix=/usr/local --without=rust-docs \
+ && rm -rf /tmp/rust.tar.xz /tmp/rust-1.95.0-x86_64-unknown-linux-gnu
+COPY paddleocr-service/build/ /opt/ocr/build/
+ARG BUILD_JOBS=8
+RUN BUILD_JOBS="$BUILD_JOBS" bash /opt/ocr/build/build_rocm.sh
+COPY paddleocr-service/requirements.runtime.lock /opt/locks/requirements.runtime.lock
+RUN python -m pip install --require-hashes --no-deps --no-build-isolation -r /opt/locks/requirements.runtime.lock \
+ && cd / && sha256sum -c /opt/ocr/build-evidence/native-wheels.sha256 \
+ && python -m pip install --no-deps /opt/wheels/*.whl \
+ && python -m pip check
+ENV LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib:/opt/rocm/lib/rocm_sysdeps/lib
+RUN python /opt/ocr/build/inspect_kernels.py --sdk /opt/rocm \
+    --paddle /opt/venv/lib/python3.12/site-packages/paddle \
+    --output /opt/ocr/build-evidence/kernels.json \
+    --compile-log /opt/ocr/build-evidence/paddle-build.log
+# Candidate native source/build caches stay out of the final artifact.
+FROM ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5
+RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources \
+ && echo 'deb http://snapshot.ubuntu.com/ubuntu/20261101T000000Z noble main universe' > /etc/apt/sources.list \
+ && echo 'deb http://snapshot.ubuntu.com/ubuntu/20261101T000000Z noble-updates main universe' >> /etc/apt/sources.list \
+ && echo 'deb http://snapshot.ubuntu.com/ubuntu/20261101T000000Z noble-security main universe' >> /etc/apt/sources.list \
+ && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    python3.12 ca-certificates libgl1 libglib2.0-0 libgomp1 libnuma1 libstdc++6 \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=native-builder /opt/venv /opt/venv
+COPY --from=native-builder /opt/rocm /opt/rocm
+COPY --from=native-builder /opt/ocr/bin /opt/ocr/bin
+COPY --from=native-builder /opt/ocr/build-evidence /opt/ocr/build-evidence
+ENV PATH="/opt/venv/bin:$PATH" \
+    LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib:/opt/rocm/lib/rocm_sysdeps/lib
+WORKDIR /app
+COPY paddleocr-service/ocr_service/ /app/ocr_service/
+COPY paddleocr-service/profile.json paddleocr-service/server.py /app/
+COPY src/vision_bill/model/ocr.py /app/vision_bill/model/ocr.py
+COPY src/vision_bill/__init__.py /app/vision_bill/__init__.py
+COPY src/vision_bill/model/__init__.py /app/vision_bill/model/__init__.py
+COPY paddleocr-service/runtime-lock.json /opt/ocr/runtime-lock.json
+ENV OMP_NUM_THREADS=4 OCR_PORT=8082 \
+    PADDLE_PDX_DISABLE_DEVICE_FALLBACK=1 \
+    PADDLE_PDX_CACHE_HOME=/var/cache/paddlex \
+    OCR_RUNTIME_SETTINGS_PATH=/var/lib/ocr/qualification.runtime.json \
+    OCR_QUALIFICATION_IMAGE_PATH=/var/lib/ocr/fixtures/upright.png \
+    OCR_STARTUP_TIMEOUT_SECONDS=600
+HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8082/ready')"
+CMD ["python", "server.py"]

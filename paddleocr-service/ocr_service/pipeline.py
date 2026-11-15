@@ -216,17 +216,14 @@ class PipelineAdapter:
             )
 
 
-def build_pipeline(profile: OcrProfile, runtime: RuntimeSettings) -> PipelineAdapter:
+def construct_native(profile: OcrProfile, runtime: RuntimeSettings) -> tuple[Any, Any, type[Any]]:
+    """Construct the pinned native profile; no coverage or serving permission is implied."""
     # PaddleX captures this flag at import time. Refuse a pre-imported process,
     # where setting the environment would create a false fallback guarantee.
     if any(name == "paddlex" or name.startswith("paddlex.") for name in sys.modules):
         raise ValueError("Build native pipeline in a fresh worker before importing PaddleX")
     os.environ["PADDLE_PDX_DISABLE_DEVICE_FALLBACK"] = "1"
     os.environ["PADDLE_PDX_CACHE_HOME"] = str(runtime.cache_dir)
-    manifest = json.loads(runtime.qualification_manifest.read_text())
-    versions, dependency_content = verify_dependencies(
-        runtime.expected_packages, manifest.get("dependencies", {})
-    )
     if set(runtime.model_dirs) != set(MODEL_NAMES):
         raise ValueError("All four explicit native model directories are required")
     paddle = importlib.import_module("paddle")
@@ -257,21 +254,6 @@ def build_pipeline(profile: OcrProfile, runtime: RuntimeSettings) -> PipelineAda
         or signature.parameters["kwargs"].kind != inspect.Parameter.VAR_KEYWORD
     ):
         raise ValueError("Unsupported native pipeline create_model signature")
-    inspector = f"paddle:{runtime.expected_paddle_commit}"
-    if (
-        manifest["image_identity"] != runtime.image_identity
-        or manifest["paddle_identity"] != inspector
-    ):
-        raise ValueError("Qualification manifest build/source identity mismatch")
-    artifacts = {
-        name: StaticArtifact.model_validate(value)
-        for name, value in manifest["static_artifacts"].items()
-    }
-    if set(artifacts) != set(MODEL_NAMES[:3]):
-        raise ValueError("Qualification manifest must cover every enabled static model")
-    model_content = {name: tree_identity(path) for name, path in runtime.model_dirs.items()}
-    if model_content != manifest["model_content"]:
-        raise ValueError("Native model content identity mismatch")
     config = effective_pipeline_config(profile)
     static_config = {
         "run_mode": "paddle_fp32",
@@ -304,6 +286,32 @@ def build_pipeline(profile: OcrProfile, runtime: RuntimeSettings) -> PipelineAda
     predictor = fp32_predictor_class(DocVLMLocalPredictor, runtime.gpu_index)
     pipeline_type = native_pipeline_class(_PaddleOCRVLPipeline, predictor, normalize_engine_config)
     native = pipeline_type(config, device=runtime.device, use_hpip=False)
+    return native, paddle, PaddleStaticRunner
+
+
+def build_pipeline(profile: OcrProfile, runtime: RuntimeSettings) -> PipelineAdapter:
+    if any(name == "paddlex" or name.startswith("paddlex.") for name in sys.modules):
+        raise ValueError("Build native pipeline in a fresh worker before importing PaddleX")
+    manifest = json.loads(runtime.qualification_manifest.read_text())
+    versions, dependency_content = verify_dependencies(
+        runtime.expected_packages, manifest.get("dependencies", {})
+    )
+    inspector = f"paddle:{runtime.expected_paddle_commit}"
+    if (
+        manifest["image_identity"] != runtime.image_identity
+        or manifest["paddle_identity"] != inspector
+    ):
+        raise ValueError("Qualification manifest build/source identity mismatch")
+    artifacts = {
+        name: StaticArtifact.model_validate(value)
+        for name, value in manifest["static_artifacts"].items()
+    }
+    if set(artifacts) != set(MODEL_NAMES[:3]):
+        raise ValueError("Qualification manifest must cover every enabled static model")
+    model_content = {name: tree_identity(path) for name, path in runtime.model_dirs.items()}
+    if model_content != manifest["model_content"]:
+        raise ValueError("Native model content identity mismatch")
+    native, paddle, PaddleStaticRunner = construct_native(profile, runtime)
     preprocessor = native.doc_preprocessor_pipeline
     models = (
         native.layout_det_model,

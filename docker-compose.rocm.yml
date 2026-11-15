@@ -1,0 +1,15 @@
+# Only the selected render node and KFD; no privileged/container-wide DRI access.
+services:
+  paddleocr-service:
+    build:
+      context: .
+      dockerfile: paddleocr-service/Dockerfile.rocm
+      args:
+        BUILD_JOBS: ${OCR_BUILD_JOBS:-8}
+    image: vision-bill-ocr-rocm:${OCR_IMAGE_TAG:-candidate}
+    devices:
+      - /dev/kfd:/dev/kfd
+      - ${OCR_RENDER_NODE:-/dev/dri/renderD128}:/dev/dri/renderD128
+    group_add:
+      - ${OCR_RENDER_GID:-109}
+      - ${OCR_VIDEO_GID:-44}

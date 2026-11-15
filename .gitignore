@@ -252,3 +252,22 @@ src/vision_bill/static/*
 # Local isolated development and agent execution records
 .worktrees/
 .superpowers/
+
+# Native OCR caches, source builds, private corpus and qualification outputs.
+server_data/ocr-cache/
+server_data/ocr-models/
+server_data/ocr-runtime/
+paddleocr-service/.native-build/
+paddleocr-service/.qualification/
+paddleocr-service/.wheelhouse/
+# These are versioned native build recipes, not generated build output.
+!paddleocr-service/build/
+paddleocr-service/build/*
+!paddleocr-service/build/build_rocm.sh
+!paddleocr-service/build/hip-rdna2-v1.patch
+!paddleocr-service/build/hip-device-info.cpp
+!paddleocr-service/build/source_inventory.py
+!paddleocr-service/build/inspect_kernels.py
+!paddleocr-service/build/resolve_cuda.py
+!paddleocr-service/build/runtime.in
+!paddleocr-service/build/native-build.in

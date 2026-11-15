@@ -30,3 +30,29 @@ frontend/.svelte-kit/**
 
 # The locally-synced SPA is rebuilt inside the image; never ship host copies.
 src/vision_bill/static/*
+
+# Native OCR uses the root context for the portable model/ocr.py namespace.
+# Keep this list narrow: never permit model/build caches or qualification outputs.
+!paddleocr-service/
+paddleocr-service/**
+!paddleocr-service/Dockerfile
+!paddleocr-service/Dockerfile.cuda
+!paddleocr-service/Dockerfile.rocm
+!paddleocr-service/server.py
+!paddleocr-service/profile.json
+!paddleocr-service/runtime-lock.json
+!paddleocr-service/requirements.*.lock
+!paddleocr-service/requirements.cuda.attestation.json
+!paddleocr-service/ocr_service/
+paddleocr-service/ocr_service/**
+!paddleocr-service/ocr_service/*.py
+!paddleocr-service/build/
+paddleocr-service/build/**
+!paddleocr-service/build/build_rocm.sh
+!paddleocr-service/build/hip-rdna2-v1.patch
+!paddleocr-service/build/hip-device-info.cpp
+!paddleocr-service/build/source_inventory.py
+!paddleocr-service/build/inspect_kernels.py
+!paddleocr-service/build/resolve_cuda.py
+!paddleocr-service/build/runtime.in
+!paddleocr-service/build/native-build.in

@@ -1,0 +1,14 @@
+# Explicit GPU overlay. OCR remains disabled in app configuration until enabled.
+services:
+  paddleocr-service:
+    build:
+      context: .
+      dockerfile: paddleocr-service/Dockerfile.cuda
+    image: vision-bill-ocr-cuda:${OCR_IMAGE_TAG:-candidate}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${OCR_CUDA_DEVICE_ID:-0}"]
+              capabilities: [gpu]
