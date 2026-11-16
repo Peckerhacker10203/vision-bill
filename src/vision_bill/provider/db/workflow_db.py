@@ -19,7 +19,7 @@ from ...model.db.image import ImageRow
 from ...model.db.receipt import ReceiptRow
 from ...model.extraction import DraftView, ExtractionDraft
 from ...model.ocr import OcrPageMetadata, Sha256, SourceRef, WorkingImageMetadata
-from ...model.review import OriginalAvailability, SourceView
+from ...model.review import AmountPolicy, OriginalAvailability, SourceView
 from ...model.workflow import (
     AccessScope,
     AnalysisClaim,
@@ -708,11 +708,12 @@ class WorkflowDB:
                 assert payload is not None
                 await conn.execute(
                     """INSERT INTO receipt_drafts(image_id,extraction_id,generation,document,
-                    amount_policy,findings,field_sources) VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6::jsonb,$7::jsonb)
+                    amount_policy,findings,field_sources,overlap_decisions) VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb)
                     ON CONFLICT(image_id) DO UPDATE SET extraction_id=EXCLUDED.extraction_id,
                     generation=EXCLUDED.generation,revision=receipt_drafts.revision+1,
                     document=EXCLUDED.document,amount_policy=EXCLUDED.amount_policy,
-                    findings=EXCLUDED.findings,field_sources=EXCLUDED.field_sources""",
+                    findings=EXCLUDED.findings,field_sources=EXCLUDED.field_sources,
+                    overlap_decisions=EXCLUDED.overlap_decisions""",
                     row["id"],
                     extraction_id,
                     claim.generation,
@@ -724,6 +725,7 @@ class WorkflowDB:
                         else payload["findings"]
                     ),
                     _json(payload["field_sources"]),
+                    _json(payload["overlap_decisions"]),
                 )
                 status = "needs_review"
             elif outcome.kind == "retry" and row["attempt_count"] < row["max_attempts"]:
@@ -905,6 +907,8 @@ class WorkflowDB:
             document=ExtractionDraft.model_validate(_decoded(row["document"])),
             amount_policy=_decoded(row["amount_policy"]),
             findings=_decoded(row["findings"]),
+            field_sources=_decoded(row["field_sources"]),
+            overlap_decisions=_decoded(row["overlap_decisions"]),
             finalized_receipt_id=row["finalized_receipt_id"],
             source_views=await self._source_views(conn, row["image_id"]),
         )
@@ -949,17 +953,42 @@ class WorkflowDB:
                 raise ValueError("draft_already_finalized")
             if image["status"] == "processing":
                 raise ValueError("draft_processing_conflict")
-            if set(patch.changes) - set(ExtractionDraft.model_fields):
+            metadata_fields = {"amount_policy", "field_sources", "overlap_decisions"}
+            if set(patch.changes) - (set(ExtractionDraft.model_fields) | metadata_fields):
                 raise ValueError("draft_unknown_field")
             assert_metadata_only(patch.changes)
             document = ExtractionDraft.model_validate(
-                {**_decoded(row["document"]), **patch.changes}
+                {**_decoded(row["document"]), **{key: value for key, value in patch.changes.items()
+                                              if key not in metadata_fields}}
             )
+            policy = AmountPolicy.model_validate(patch.changes.get("amount_policy", _decoded(row["amount_policy"])))
+            sources = TypeAdapter(dict[str, list[SourceRef]]).validate_python(
+                patch.changes.get("field_sources", _decoded(row["field_sources"]))
+            )
+            overlaps = TypeAdapter(list[dict[str, Any]]).validate_python(
+                patch.changes.get("overlap_decisions", _decoded(row["overlap_decisions"]))
+            )
+            parts = await self._parts(conn, image_id)
+            # Validate flexible nested evidence before typed projection can drop extra keys.
+            await self._validate_metadata_refs(conn, image_id, parts, patch.changes)
+            metadata = {"field_sources": {key: [ref.model_dump(mode="json") for ref in refs]
+                                          for key, refs in sources.items()},
+                        "overlap_decisions": overlaps}
+            await self._validate_metadata_refs(conn, image_id, parts, metadata)
+            originals = await self._receipts._review_originals(conn, image_id)
+            review = evaluate_receipt(document, policy, sources, overlaps, originals,
+                                      retained_findings=persistent_findings(
+                                          (await self._draft_view(conn, row)).findings))
             row = await conn.fetchrow(
-                """UPDATE receipt_drafts SET document=$2::jsonb,
+                """UPDATE receipt_drafts SET document=$2::jsonb,amount_policy=$3::jsonb,
+                field_sources=$4::jsonb,overlap_decisions=$5::jsonb,findings=$6::jsonb,
                 revision=revision+1,human_edited=TRUE WHERE image_id=$1 RETURNING *""",
                 image_id,
                 document.model_dump_json(),
+                policy.model_dump_json(),
+                _json(metadata["field_sources"]),
+                _json(overlaps),
+                _json([finding.model_dump(mode="json") for finding in review.findings]),
             )
             # Editing a draft retained during a pending explicit retry prevents later claims.
             await conn.execute(
@@ -1015,8 +1044,7 @@ class WorkflowDB:
             if not originals or not all(o.available and o.sha256_matches for o in originals):
                 raise ValueError("original_integrity_failed")
             sources = TypeAdapter(dict[str, list[SourceRef]]).validate_python(_decoded(row["field_sources"]))
-            extraction = await conn.fetchrow("SELECT envelope FROM receipt_extractions WHERE id=$1", row["extraction_id"])
-            overlaps = _decoded(extraction["envelope"]).get("overlap_decisions", []) if extraction else []
+            overlaps = _decoded(row["overlap_decisions"])
             review = evaluate_receipt(view.document, view.amount_policy, sources, overlaps, originals,
                                       retained_findings=persistent_findings(view.findings))
             if not review.can_finalize:

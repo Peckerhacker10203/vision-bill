@@ -5,6 +5,21 @@ import { queryClient } from '$lib/query/client';
 import ReceiptEditor from './ReceiptEditor.svelte';
 
 const receipt: ReceiptRow = {
+	operation_revision: 1,
+	review_revision: 1,
+	amount_policy: {
+		tax_basis: 'unknown',
+		discount_treatment: 'unknown',
+		tip_treatment: 'unknown',
+		subtotal_origin: 'unknown',
+		tax_information: 'missing'
+	},
+	findings: [],
+	field_sources: {},
+	overlap_decisions: [],
+	acknowledgements: [],
+	verification_source: null,
+	checks_version: null,
 	id: 'receipt-1',
 	confidence: 90,
 	merchant_name: 'Shop A',
@@ -182,4 +197,106 @@ describe('receipt spending category editor', () => {
 		});
 		expect(onSave.mock.calls[1][0].line_items[0]).not.toHaveProperty('remember_category');
 	});
+});
+
+it('captures actual operation revision and explicit policy/source decisions without rebasing dirty edits', async () => {
+	const onSave = vi.fn();
+	const view = render(ReceiptEditor, {
+		receipt: { ...receipt, operation_revision: 9 },
+		lineItems: [line()],
+		taxes: [],
+		onSave
+	});
+	await fireEvent.input(document.querySelector('#re-total')!, {
+		target: { value: '2.00000000000001' }
+	});
+	await view.rerender({
+		receipt: { ...receipt, operation_revision: 10 },
+		lineItems: [line()],
+		taxes: [],
+		onSave
+	});
+	await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+	expect(onSave.mock.calls[0][0]).toMatchObject({
+		expected_operation_revision: 9,
+		total: '2.00000000000001',
+		amount_policy: receipt.amount_policy,
+		field_sources: {},
+		overlap_decisions: []
+	});
+	expect(screen.queryByText(/Expected total/)).toBeNull();
+});
+it('drops shifted numeric source paths after deletion rather than assigning them to another item', async () => {
+	const onSave = vi.fn();
+	const source = {
+		part_id: 'part',
+		photo_index: 0,
+		source_sha256: 'hash',
+		coordinate_space: 'unknown' as const
+	};
+	render(ReceiptEditor, {
+		receipt: {
+			...receipt,
+			field_sources: {
+				'line_items.0.total_price': [source],
+				'line_items.1.total_price': [source],
+				total: [source]
+			}
+		},
+		lineItems: [line(), { ...line(), id: 'second' }],
+		taxes: [],
+		onSave
+	});
+	await fireEvent.click(screen.getAllByRole('button', { name: 'Remove' })[0]);
+	await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+	expect(onSave.mock.calls[0][0].line_items[0].id).toBe('second');
+	expect(Object.keys(onSave.mock.calls[0][0].field_sources)).toEqual(['total']);
+});
+
+it('submits an explicit reviewed overlap decision and invalidates it when its row order changes', async () => {
+	const onSave = vi.fn();
+	const overlap = { first_index: 0, second_index: 1, verified: null };
+	render(ReceiptEditor, {
+		receipt: { ...receipt, overlap_decisions: [overlap] },
+		lineItems: [line(), { ...line(), id: 'second' }],
+		taxes: [],
+		onSave
+	});
+	await fireEvent.click(
+		screen.getByRole('checkbox', { name: 'I reviewed this overlap; keep the current rows' })
+	);
+	await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+	expect(onSave.mock.calls[0][0].overlap_decisions).toEqual([{ ...overlap, verified: true }]);
+	await fireEvent.click(screen.getAllByRole('button', { name: 'Move item down' })[0]);
+	await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+	expect(onSave.mock.calls[1][0].line_items.map((line: { id: string }) => line.id)).toEqual([
+		'second',
+		'line-1'
+	]);
+	expect(onSave.mock.calls[1][0].overlap_decisions[0].verified).toBe(false);
+});
+
+it('navigates from a field source decision to its exact source references', async () => {
+	const source = {
+		part_id: 'part',
+		photo_index: 0,
+		source_sha256: 'hash',
+		coordinate_space: 'working' as const,
+		view_id: 'view',
+		bbox: [
+			[1, 1],
+			[2, 1],
+			[2, 2]
+		]
+	};
+	const onSource = vi.fn();
+	render(ReceiptEditor, {
+		receipt: { ...receipt, field_sources: { total: [source] } },
+		lineItems: [line()],
+		taxes: [],
+		onSource
+	});
+	await fireEvent.click(screen.getByText('Source decisions'));
+	await fireEvent.click(screen.getByRole('button', { name: 'Show source' }));
+	expect(onSource).toHaveBeenCalledWith([source]);
 });

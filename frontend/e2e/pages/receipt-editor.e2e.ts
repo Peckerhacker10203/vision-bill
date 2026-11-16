@@ -119,9 +119,10 @@ test.describe('receipt editor', () => {
 		await page.getByRole('button', { name: 'Save', exact: true }).click();
 		await expect(page.getByText('Changes saved')).toBeVisible({ timeout: 15_000 });
 		await page.reload();
-		// Line items are NOT order-preserved across save (persisted with
-		// random UUIDs, listed `ORDER BY id`), so locate the deposit item by
-		// its description rather than assuming a fixed index.
+		// Persisted positions and retained IDs preserve line order across save.
+		await expect(page.locator('input[placeholder="Description"]').nth(1)).toHaveValue(
+			'Bottle deposit refund'
+		);
 		const totalInputs = page.locator('input[id^="li-"][id$="-total"]');
 		const descInputs = page.locator('input[placeholder="Description"]');
 		// Wait for both line items (Milk + deposit) to render after reload.
@@ -159,15 +160,21 @@ test.describe('receipt editor', () => {
 		await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeDisabled();
 	});
 
-	test('total mismatch warns but still saves', async ({ page, context }) => {
+	test('saved total mismatch appears as a server review finding', async ({ page, context }) => {
 		test.setTimeout(120_000);
 		await uploadFixture(page, context, await loadFixture('a'), { verify: false });
-		// Expected total would be 3.50 - 0 + 0.36 + 0 = 3.86.
+		// Explicit server amount policy determines reconciliation after save.
+		await page.getByLabel('Tax basis', { exact: true }).selectOption('net');
+		await page.getByLabel('Discount treatment', { exact: true }).selectOption('included_in_lines');
+		await page.getByLabel('Tip treatment', { exact: true }).selectOption('none');
+		await page.getByLabel('Subtotal origin', { exact: true }).selectOption('printed');
+		await page.getByLabel('Tax information', { exact: true }).selectOption('present');
 		await page.locator('#re-total').fill('9.00');
-		await expect(page.getByText(/Does not match the entered total by/)).toBeVisible();
+		await expect(page.getByText(/Does not match the entered total by/)).toHaveCount(0);
 		await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
 		await page.getByRole('button', { name: 'Save', exact: true }).click();
 		await expect(page.getByText('Changes saved')).toBeVisible({ timeout: 15_000 });
+		await expect(page.getByText(/review: amount_discrepancy/)).toBeVisible();
 	});
 
 	test('line items can be added, filled and removed', async ({ page, context }) => {

@@ -66,9 +66,11 @@ export async function uploadViaApi(
 	bytes: Uint8Array,
 	mimeType = 'image/png'
 ): Promise<{ status: number; body: Record<string, unknown> }> {
+	const form = new FormData();
+	form.append('receipt', new File([new Uint8Array(bytes)], name, { type: mimeType }));
 	const response = await context.request.post('/api/v1/images', {
 		headers: { 'Idempotency-Key': crypto.randomUUID() },
-		multipart: { receipt: { name, mimeType, buffer: bytes } }
+		multipart: form
 	});
 	const body = (await response.json()) as Record<string, unknown>;
 	if (response.status() !== 202) return { status: response.status(), body };

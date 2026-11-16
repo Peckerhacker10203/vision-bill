@@ -196,7 +196,7 @@ def complete(*, total="90071992547.91"):
 async def test_bootstrap_and_empty_downgrade(db):
     migrate(db)
     conn = await asyncpg.connect(db.pg_dsn)
-    assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0014"
+    assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0015"
     await conn.close()
     migrate(db, "0010", "downgrade")
     migrate(db)
@@ -321,7 +321,7 @@ async def test_finish_atomic_decimal_and_immutable_history(workflow_db, db):
         )
     assert migrate(db, "0010", "downgrade", check=False).returncode != 0
     async with w.pool.acquire() as conn:
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0014"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0015"
         assert await conn.fetchval("SELECT count(*) FROM receipt_review_revisions") == 1
 
 
@@ -1219,3 +1219,106 @@ async def test_long_cycle_rescans_overdue_retry_using_real_wake_query(
     async with w.pool.acquire() as conn:
         assert await conn.fetchval("SELECT attempt_count FROM images WHERE id=$1", first.id) == 2
         assert await conn.fetchval("SELECT status FROM images WHERE id=$1", first.id) == "pending"
+
+async def test_draft_policy_and_sources_are_versioned_partial_changes(workflow_db, tmp_path):
+    from vision_bill.model.workflow import DraftPatch
+    w, scope = workflow_db
+    image = await partial_draft(w, scope, tmp_path / 'original.png')
+    policy = {'tax_basis': 'gross', 'discount_treatment': 'included_in_lines',
+              'tip_treatment': 'none', 'subtotal_origin': 'printed', 'tax_information': 'explicit_zero'}
+    saved = await w.patch_draft(image.id, DraftPatch(expected_revision=1, changes={
+        'merchant_name': None, 'amount_policy': policy, 'field_sources': {}, 'overlap_decisions': []
+    }), scope=scope)
+    assert saved.revision == 2 and saved.document.merchant_name is None and saved.document.total is None
+    assert saved.amount_policy.model_dump() == policy
+    assert saved.field_sources == {} and saved.overlap_decisions == []
+    assert any(f.code == 'missing_mandatory_field' for f in saved.findings)
+    assert not any(f.code == 'unknown_tax_basis' for f in saved.findings)
+    with pytest.raises(ValueError, match='revision'):
+        await w.patch_draft(image.id, DraftPatch(expected_revision=1, changes={'amount_policy': {'tax_basis':'net'}}), scope=scope)
+    current = await w.get_draft(image.id, scope=scope)
+    assert current.revision == 2 and current.amount_policy.tax_basis == 'gross'
+    preserved = await w.patch_draft(image.id, DraftPatch(expected_revision=2, changes={'total':'0.000001'}), scope=scope)
+    assert preserved.amount_policy == saved.amount_policy and preserved.document.merchant_name is None
+
+
+@pytest.mark.parametrize('field', ['field_sources', 'overlap_decisions'])
+async def test_draft_foreign_source_replacement_rolls_back(workflow_db, tmp_path, field):
+    from vision_bill.model.workflow import DraftPatch
+    w, scope = workflow_db
+    image = await partial_draft(w, scope, tmp_path / 'original.png')
+    foreign = {'part_id':str(uuid4()),'photo_index':0,'source_sha256':'a'*64,
+               'view_id':str(uuid4()),'coordinate_space':'working','bbox':[[1,1],[2,1],[2,2]]}
+    metadata = {'total':[foreign]} if field == 'field_sources' else [{'source_refs':[foreign]}]
+    with pytest.raises(ValueError, match='source'):
+        await w.patch_draft(image.id, DraftPatch(expected_revision=1, changes={'total':'99',field:metadata}), scope=scope)
+    current = await w.get_draft(image.id, scope=scope)
+    assert current.revision == 1 and current.document.total is None
+    async with w.pool.acquire() as conn:
+        assert not await conn.fetchval('SELECT human_edited FROM receipt_drafts WHERE image_id=$1', image.id)
+
+async def test_draft_review_metadata_http_contract(workflow_db, tmp_path):
+    from types import SimpleNamespace
+
+    import httpx
+    from fastapi import FastAPI
+
+    from vision_bill.api.drafts import router
+    from vision_bill.security.dependencies import get_current_user
+    from vision_bill.security.models import User
+    w, scope = workflow_db
+    image = await partial_draft(w, scope, tmp_path / 'original.png')
+    app = FastAPI()
+    app.include_router(router, prefix='/api/v1/images')
+    app.dependency_overrides[get_current_user] = lambda: User(id=scope.user_id, username='owner', is_admin=False)
+    app.state.submission_service = SimpleNamespace(db=w, patch_draft=w.patch_draft, get_draft=w.get_draft)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+        path = f'/api/v1/images/{image.id}/draft'
+        saved = await client.patch(path, json={'expected_revision':1,'changes':{
+            'amount_policy':{'tax_basis':'net'},'merchant_name':None,'field_sources':{},'overlap_decisions':[]}})
+        assert saved.status_code == 200
+        assert saved.json()['amount_policy']['tax_basis'] == 'net'
+        assert saved.json()['document']['merchant_name'] is None
+        assert saved.json()['revision'] == 2
+        assert (await client.patch(path, json={'expected_revision':1,'changes':{'total':'4'}})).status_code == 409
+        foreign = {'part_id':str(uuid4()),'photo_index':0,'source_sha256':'a'*64,'coordinate_space':'unknown'}
+        assert (await client.patch(path, json={'expected_revision':2,'changes':{'total':'99','field_sources':{'total':[foreign]}}})).status_code == 422
+        current = (await client.get(path)).json()
+        assert current['revision'] == 2 and current['document']['total'] is None
+
+
+async def test_draft_overlap_migration_backfill_and_guard(db):
+    import json
+    migrate(db, '0014')
+    from vision_bill.provider.db.workflow_db import WorkflowDB
+    w = WorkflowDB(db)
+    await w.init_db()
+    try:
+        async with w.pool.acquire() as conn:
+            owner = await conn.fetchval("INSERT INTO users(username,hashed_password) VALUES('draft-test','hash') RETURNING id")
+            image = await conn.fetchval("INSERT INTO images(image_path,user_id) VALUES('/private-original',$1) RETURNING id", owner)
+            decisions = [{'decision':'retain', 'positions':[0,1], 'reason':'printed twice'}]
+            extraction = await conn.fetchval("""INSERT INTO receipt_extractions(image_id,generation,attempt_number,outcome_kind,envelope,source_views)
+                VALUES($1,1,1,'partial',$2::jsonb,'[]') RETURNING id""", image, json.dumps({'overlap_decisions':decisions}))
+            await conn.execute("""INSERT INTO receipt_drafts(image_id,extraction_id,generation,document,amount_policy,findings,field_sources)
+                VALUES($1,$2,1,'{}','{}','[]','{}')""", image, extraction)
+        migrate(db)
+        async with w.pool.acquire() as conn:
+            assert json.loads(await conn.fetchval('SELECT overlap_decisions FROM receipt_drafts WHERE image_id=$1',image)) == decisions
+            assert json.loads(await conn.fetchval('SELECT envelope FROM receipt_extractions WHERE id=$1',extraction)) == {'overlap_decisions':decisions}
+        assert migrate(db,'0014','downgrade',check=False).returncode != 0
+    finally:
+        await w.destroy_db()
+
+async def test_draft_validates_nested_metadata_before_typed_projection(workflow_db, tmp_path):
+    from vision_bill.model.workflow import DraftPatch
+    w, scope = workflow_db
+    image = await partial_draft(w, scope, tmp_path / 'original.png')
+    part = (await w.get_source_parts(image.id, scope=scope))[0]
+    ref = {'part_id':str(part.part_id),'photo_index':0,'source_sha256':part.source_sha256,
+           'coordinate_space':'unknown','extra':{'part_id':str(uuid4()),'photo_index':0,
+           'source_sha256':'a'*64,'coordinate_space':'unknown'}}
+    with pytest.raises(ValueError, match='source'):
+        await w.patch_draft(image.id, DraftPatch(expected_revision=1, changes={'field_sources':{'total':[ref]},'total':'9'}), scope=scope)
+    current = await w.get_draft(image.id, scope=scope)
+    assert current.revision == 1 and current.document.total is None

@@ -28,6 +28,86 @@ export interface SourceView {
 	inverse_mapping: null;
 }
 
+export interface SourceRef {
+	part_id: string;
+	photo_index: number;
+	source_sha256: string;
+	view_id?: string | null;
+	coordinate_space: 'original' | 'working' | 'unknown';
+	block_id?: string | null;
+	bbox?: number[][] | null;
+	text_span?: [number, number] | null;
+}
+export interface AmountPolicy {
+	tax_basis: 'gross' | 'net' | 'unknown';
+	discount_treatment: 'included_in_lines' | 'subtract' | 'unknown';
+	tip_treatment: 'included' | 'add' | 'outside_receipt' | 'none' | 'unknown';
+	subtotal_origin: 'printed' | 'derived_net' | 'unknown';
+	tax_information: 'present' | 'explicit_zero' | 'missing';
+}
+export interface ReviewFinding {
+	id: string;
+	code: string;
+	severity: 'integrity' | 'review' | 'info';
+	field_path: string;
+	source_refs: SourceRef[];
+	comparison: Record<string, string | null>;
+}
+export interface DraftLineItem {
+	description?: string | null;
+	spending_category?: string | null;
+	quantity?: number | null;
+	unit_price?: string | null;
+	total_price?: string | null;
+	tags?: string[] | null;
+}
+export interface DraftTaxLine {
+	name?: string | null;
+	rate?: number | null;
+	amount?: string | null;
+}
+export interface ExtractionDraft {
+	confidence?: number | null;
+	merchant_name?: string | null;
+	merchant_address?: string | null;
+	receipt_number?: string | null;
+	date?: string | null;
+	time?: string | null;
+	currency?: string | null;
+	category?: Category | null;
+	payment_method?: PaymentMethod | null;
+	subtotal?: string | null;
+	discount_total?: string | null;
+	tax_total?: string | null;
+	tip?: string | null;
+	total?: string | null;
+	line_items?: DraftLineItem[] | null;
+	taxes?: DraftTaxLine[] | null;
+}
+export interface DraftView {
+	image_id: string;
+	revision: number;
+	document: ExtractionDraft;
+	amount_policy: AmountPolicy;
+	findings: ReviewFinding[];
+	source_views: SourceView[];
+	finalized_receipt_id: string | null;
+	field_sources: Record<string, SourceRef[]>;
+	overlap_decisions: Record<string, unknown>[];
+}
+export interface DraftPatch {
+	expected_revision: number;
+	changes: Partial<ExtractionDraft> & {
+		amount_policy?: AmountPolicy;
+		field_sources?: Record<string, SourceRef[]>;
+		overlap_decisions?: Record<string, unknown>[];
+	};
+}
+export interface DraftFinalize {
+	expected_revision: number;
+	request_key: string;
+}
+
 export interface SubmissionStatus {
 	generation: number;
 	terminal: boolean;
@@ -79,6 +159,15 @@ export interface ModelInfo {
 }
 
 export interface ReceiptRow {
+	operation_revision: number;
+	review_revision: number;
+	amount_policy: AmountPolicy;
+	findings: ReviewFinding[];
+	field_sources: Record<string, SourceRef[]>;
+	overlap_decisions: Record<string, unknown>[];
+	acknowledgements: { finding_id: string; comment: string }[];
+	verification_source: string | null;
+	checks_version: string | null;
 	id: string;
 	confidence: number;
 	merchant_name: string;
@@ -106,6 +195,7 @@ export interface ReceiptRow {
 }
 
 export interface LineItemRow {
+	position?: number;
 	id: string;
 	receipt_id: string;
 	description: string;
@@ -271,6 +361,10 @@ export interface TaxLineWrite {
 
 /** Body for PUT /receipts/{id} (mirrors the backend `Receipt` write model). */
 export interface ReceiptWrite {
+	expected_operation_revision: number;
+	amount_policy?: AmountPolicy;
+	field_sources?: Record<string, SourceRef[]>;
+	overlap_decisions?: Record<string, unknown>[];
 	confidence: number;
 	merchant_name: string;
 	merchant_address?: string | null;

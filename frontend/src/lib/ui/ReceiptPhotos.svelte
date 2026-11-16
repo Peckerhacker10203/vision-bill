@@ -2,6 +2,7 @@
 	import { createQuery } from '@tanstack/svelte-query';
 	import { api } from '$lib/api/client';
 	import { queryClient } from '$lib/query/client';
+	import { queryKeys } from '$lib/query/keys';
 	import { t } from '$lib/i18n';
 	import ReceiptImage from './ReceiptImage.svelte';
 
@@ -11,8 +12,12 @@
 		alt
 	}: { imageId: string; thumbnailPath: string | null; alt: string } = $props();
 	let selected = $state(0);
+	$effect(() => {
+		void imageId;
+		selected = 0;
+	});
 	const image = createQuery(
-		() => ({ queryKey: ['image', imageId], queryFn: () => api.getImage(imageId) }),
+		() => ({ queryKey: queryKeys.image(imageId), queryFn: () => api.getImage(imageId) }),
 		() => queryClient
 	);
 	let count = $derived(1 + (image.data?.additional_images?.length ?? 0));

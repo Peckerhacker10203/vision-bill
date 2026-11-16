@@ -11,7 +11,9 @@
 	import Icon from '$lib/ui/Icon.svelte';
 	import ReceiptEditor from '$lib/ui/ReceiptEditor.svelte';
 	import ReceiptPhotos from '$lib/ui/ReceiptPhotos.svelte';
-	import type { ReceiptWrite } from '$lib/types';
+	import type { ReceiptWrite, ReceiptRow, SourceRef } from '$lib/types';
+	import ReviewFindings from '$lib/ui/ReviewFindings.svelte';
+	import ExtractionSourceViewer from '$lib/ui/ExtractionSourceViewer.svelte';
 
 	let id = $derived(page.url.pathname.split('/').pop() ?? '');
 	const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -21,6 +23,22 @@
 	let editorRevision = $state(0);
 	let savedRevision = $state(0);
 	let editorDirty = $state(false);
+	let acknowledgements = $state<{ finding_id: string; comment: string }[]>([]);
+	let acknowledgementReset = $state(0);
+	let reviewMessage = $state('');
+	let needsReload = $state(false);
+	let selectedSources = $state<SourceRef[]>([]);
+	let activeView: object | null = null;
+	$effect(() => {
+		const view = { id };
+		activeView = view;
+		acknowledgements = [];
+		reviewMessage = '';
+		needsReload = false;
+		return () => {
+			if (activeView === view) activeView = null;
+		};
+	});
 
 	const detail = createQuery(
 		() => ({
@@ -36,66 +54,119 @@
 			(detail.status === 'error' && detail.error instanceof ApiError && detail.error.status === 404)
 	);
 	let data = $derived(detail.data ?? null);
+	const sourceJob = createQuery(
+		() => ({
+			queryKey: queryKeys.image(data?.receipt.image_id ?? ''),
+			queryFn: () => api.getImage(data!.receipt.image_id!),
+			enabled: !!data?.receipt.image_id
+		}),
+		() => queryClient
+	);
 	let canVerify = $derived(data !== null && data.receipt.status === 'unverified');
 
-	async function refresh(): Promise<void> {
-		const fresh = await api.getReceipt(id);
-		queryClient.setQueryData(queryKeys.receipt(id), fresh);
+	let reviewReady = $derived(
+		!!data &&
+			!data.receipt.findings.some((f) => f.severity === 'integrity') &&
+			data.receipt.findings
+				.filter((f) => f.severity === 'review')
+				.every((f) => acknowledgements.some((a) => a.finding_id === f.id && a.comment.trim()))
+	);
+	function reviewBody(receipt: ReceiptRow, comments = acknowledgements) {
+		return {
+			expected_operation_revision: receipt.operation_revision,
+			expected_review_revision: receipt.review_revision,
+			acknowledgements: comments
+		};
+	}
+	async function refresh(requestId = id, view = activeView): Promise<void> {
+		const fresh = await api.getReceipt(requestId);
+		if (activeView !== view || id !== requestId) return;
+		queryClient.setQueryData(queryKeys.receipt(requestId), fresh);
 		editorRevision++;
-		await queryClient.invalidateQueries({ queryKey: ['statistics'] });
+		needsReload = false;
+		void queryClient.invalidateQueries({ queryKey: ['statistics'] });
 	}
-
-	async function saveOnly(write: ReceiptWrite) {
+	async function discardReload() {
 		saving = true;
 		try {
-			await api.updateReceipt(id, write);
-			savedRevision++;
-			snackbar.notify('success', translate('receipt.saved'));
 			await refresh();
+			reviewMessage = '';
 		} catch {
-			snackbar.notify('error', translate('receipt.saveFailed'));
+			reviewMessage = translate('receipt.saveFailed');
 		} finally {
 			saving = false;
 		}
 	}
-
-	async function saveAndVerify(write: ReceiptWrite) {
+	async function save(write: ReceiptWrite, verify: boolean) {
+		if (saving || needsReload) return;
+		const requestId = id;
+		const view = activeView;
 		saving = true;
+		reviewMessage = '';
+		let saved: ReceiptRow | null = null;
 		try {
-			await api.updateReceipt(id, write);
+			saved = await api.updateReceipt(requestId, write);
+			if (activeView !== view) return;
 			savedRevision++;
-			await api.verifyReceipt(id);
-			snackbar.notify('success', translate('receipt.verifySuccess'));
-			await refresh();
-		} catch (error) {
-			snackbar.notify(
-				'error',
-				error instanceof ApiError && error.status === 409
-					? translate('receipt.verifyConflict')
-					: translate('receipt.saveFailed')
+			acknowledgementReset++;
+			acknowledgements = [];
+			needsReload = true;
+			queryClient.setQueryData<import('$lib/types').ReceiptWithDetails>(
+				queryKeys.receipt(requestId),
+				(old) => (old ? { ...old, receipt: saved! } : old)
 			);
+			snackbar.notify('success', translate('receipt.saved'));
+			await refresh(requestId, view);
+			if (activeView !== view) return;
+			if (verify) {
+				if (saved.findings.some((f) => f.severity !== 'info')) {
+					reviewMessage = translate('review.savedReview');
+					return;
+				}
+				await api.verifyReceipt(requestId, reviewBody(saved, []));
+				if (activeView !== view) return;
+				snackbar.notify('success', translate('receipt.verifySuccess'));
+				await refresh(requestId, view);
+			}
+		} catch (error) {
+			if (activeView !== view) return;
+			reviewMessage =
+				error instanceof ApiError && error.status === 409
+					? translate('review.conflict')
+					: translate(saved ? 'receipt.verifyFailed' : 'receipt.saveFailed');
+			snackbar.notify('error', reviewMessage);
 		} finally {
-			saving = false;
+			if (activeView === view) saving = false;
 		}
 	}
-
+	function saveOnly(write: ReceiptWrite) {
+		return save(write, false);
+	}
+	function saveAndVerify(write: ReceiptWrite) {
+		return save(write, true);
+	}
 	async function doVerify() {
-		if (verifying) return;
+		if (verifying || !data || !reviewReady || editorDirty || needsReload) return;
+		const requestId = id;
+		const view = activeView;
+		const receipt = data.receipt;
+		const comments = [...acknowledgements];
 		verifying = true;
 		try {
-			await api.verifyReceipt(id);
+			await api.verifyReceipt(requestId, reviewBody(receipt, comments));
+			if (activeView !== view) return;
 			snackbar.notify('success', translate('receipt.verifySuccess'));
 			verifyOpen = false;
-			await refresh();
+			await refresh(requestId, view);
 		} catch (error) {
-			snackbar.notify(
-				'error',
+			if (activeView !== view) return;
+			reviewMessage =
 				error instanceof ApiError && error.status === 409
-					? translate('receipt.verifyConflict')
-					: translate('receipt.verifyFailed')
-			);
+					? translate('review.conflict')
+					: translate('receipt.verifyFailed');
+			snackbar.notify('error', reviewMessage);
 		} finally {
-			verifying = false;
+			if (activeView === view) verifying = false;
 		}
 	}
 </script>
@@ -140,7 +211,7 @@
 				<button
 					type="button"
 					class="flex items-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-on-primary hover:opacity-90 disabled:opacity-50"
-					disabled={editorDirty || saving || verifying}
+					disabled={editorDirty || saving || verifying || !reviewReady || needsReload}
 					onclick={() => (verifyOpen = true)}
 				>
 					<Icon icon="check" />
@@ -155,6 +226,24 @@
 			{/if}
 		</div>
 
+		{#if reviewMessage}<p class="my-3 text-error" role="alert">{reviewMessage}</p>{/if}
+		{#if reviewMessage || needsReload}<button
+				type="button"
+				disabled={saving || verifying}
+				onclick={discardReload}
+				class="my-3 text-primary underline">{$t('review.discardReload')}</button
+			>{/if}
+		<ReviewFindings
+			findings={data.receipt.findings}
+			revision={`${id}:${data.receipt.review_revision}:${acknowledgementReset}`}
+			editable={!editorDirty && !saving && !needsReload}
+			onChange={(value) => (acknowledgements = value)}
+			onSource={(sources) => (selectedSources = sources)}
+		/>
+		{#if selectedSources.length}<ExtractionSourceViewer
+				views={sourceJob.data?.source_views ?? []}
+				sources={selectedSources}
+			/>{/if}
 		<div class="mt-6 min-w-0 lg:grid lg:grid-cols-[minmax(20rem,0.8fr)_minmax(0,1.2fr)] lg:gap-8">
 			{#if data.receipt.image_id !== null}
 				<aside class="mb-6 min-w-0 lg:mb-0">
@@ -176,10 +265,11 @@
 					lineItems={data.line_items}
 					taxes={data.taxes}
 					collectionIds={data.collection_ids}
-					busy={saving || verifying}
+					busy={saving || verifying || needsReload}
 					onSave={saveOnly}
 					onSaveAndVerify={canVerify ? saveAndVerify : undefined}
 					onDirtyChange={(dirty) => (editorDirty = dirty)}
+					onSource={(sources) => (selectedSources = sources)}
 				/>
 			</div>
 		</div>

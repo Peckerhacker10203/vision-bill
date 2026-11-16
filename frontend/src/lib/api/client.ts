@@ -1,5 +1,8 @@
 import type {
 	AnalyzeResponse,
+	DraftView,
+	DraftPatch,
+	DraftFinalize,
 	CategorySuggestion,
 	Collection,
 	CollectionCreate,
@@ -269,6 +272,24 @@ export const api = {
 	},
 
 	/** PUT /receipts/{id} returns the updated receipt row (without line items). */
+	getDraft(id: string): Promise<DraftView> {
+		return request<DraftView>(`/images/${id}/draft`);
+	},
+	patchDraft(id: string, body: DraftPatch): Promise<DraftView> {
+		return request<DraftView>(`/images/${id}/draft`, {
+			method: 'PATCH',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+	},
+	finalizeDraft(id: string, body: DraftFinalize): Promise<ReceiptRow> {
+		return request<ReceiptRow>(`/images/${id}/draft/finalize`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+	},
+
 	updateReceipt(id: string, body: ReceiptWrite): Promise<ReceiptRow> {
 		return request<ReceiptRow>(`/receipts/${id}`, {
 			method: 'PUT',

@@ -5,13 +5,16 @@
 	import { api } from '$lib/api/client';
 	import { queryClient } from '$lib/query/client';
 	import { queryKeys } from '$lib/query/keys';
-	import { formatMoney, isPlainDecimal, isSignedDecimal } from '$lib/ui/money';
+	import { isPlainDecimal, isSignedDecimal } from '$lib/ui/money';
 	import { snackbar } from '$lib/ui/snackbar.svelte';
 	import Icon from '$lib/ui/Icon.svelte';
 	import TagEditor from '$lib/ui/TagEditor.svelte';
 	import CollectionPicker from '$lib/ui/CollectionPicker.svelte';
+	import AmountPolicyEditor from './AmountPolicyEditor.svelte';
 	import type {
 		Category,
+		AmountPolicy,
+		SourceRef,
 		LineItemRow,
 		PaymentMethod,
 		ReceiptRow,
@@ -66,6 +69,10 @@
 	}
 
 	interface EditorForm {
+		expected_operation_revision: number;
+		amount_policy: AmountPolicy;
+		field_sources: Record<string, SourceRef[]>;
+		overlap_decisions: Record<string, unknown>[];
 		confidence: string;
 		merchant_name: string;
 		merchant_address: string;
@@ -92,6 +99,10 @@
 		collectionIds: string[]
 	): EditorForm {
 		return {
+			expected_operation_revision: receipt.operation_revision,
+			amount_policy: structuredClone($state.snapshot(receipt.amount_policy)),
+			field_sources: structuredClone($state.snapshot(receipt.field_sources)),
+			overlap_decisions: structuredClone($state.snapshot(receipt.overlap_decisions)),
 			confidence: String(receipt.confidence),
 			merchant_name: receipt.merchant_name,
 			merchant_address: receipt.merchant_address ?? '',
@@ -140,7 +151,8 @@
 		busy = false,
 		onSave,
 		onSaveAndVerify,
-		onDirtyChange
+		onDirtyChange,
+		onSource
 	}: {
 		receipt: ReceiptRow;
 		lineItems: LineItemRow[];
@@ -159,6 +171,7 @@
 		onSaveAndVerify?: (write: ReceiptWrite) => void;
 		/** Notified with the current dirty state after (re)initialisation. */
 		onDirtyChange?: (dirty: boolean) => void;
+		onSource?: (sources: SourceRef[]) => void;
 	} = $props();
 
 	function initialForm(): EditorForm {
@@ -277,37 +290,14 @@
 	});
 	let valid = $derived(errors.length === 0);
 
-	/** Subtotal − discount + tax + tip, computed with exact decimal math. */
-	let expectedTotal = $derived.by((): number | null => {
-		const subtotal = form.subtotal.trim();
-		if (!isSignedDecimal(subtotal)) {
-			return null;
-		}
-		const discount = form.discount_total.trim() || '0';
-		const taxTotal = form.tax_total.trim() || '0';
-		const tip = form.tip.trim() || '0';
-		if (!isPlainDecimal(discount) || !isPlainDecimal(taxTotal) || !isPlainDecimal(tip)) {
-			return null;
-		}
-		return parseFloat(subtotal) - parseFloat(discount) + parseFloat(taxTotal) + parseFloat(tip);
-	});
-
-	let totalMismatch = $derived.by((): number | null => {
-		if (expectedTotal === null) {
-			return null;
-		}
-		const entered = Number(form.total.trim());
-		if (!Number.isFinite(entered)) {
-			return null;
-		}
-		const diff = Math.abs(expectedTotal - entered);
-		return diff > 0.05 ? diff : null;
-	});
-
 	let hasActions = $derived(Boolean(onSave) || Boolean(onSaveAndVerify));
 
 	function buildWrite(): ReceiptWrite {
 		return {
+			expected_operation_revision: form.expected_operation_revision,
+			amount_policy: form.amount_policy,
+			field_sources: form.field_sources,
+			overlap_decisions: form.overlap_decisions,
 			confidence: Number(form.confidence),
 			merchant_name: form.merchant_name.trim(),
 			merchant_address: form.merchant_address.trim() || null,
@@ -421,7 +411,23 @@
 		line.suggestion = null;
 	}
 
+	function removeLineSources() {
+		form.overlap_decisions = form.overlap_decisions.map((decision) => ({
+			...decision,
+			verified: false
+		}));
+		form.field_sources = Object.fromEntries(
+			Object.entries(form.field_sources).filter(([path]) => !/^line_items(?:\.|\[|$)/.test(path))
+		);
+	}
+	function moveLine(index: number, direction: number) {
+		const other = index + direction;
+		if (other < 0 || other >= form.lines.length) return;
+		[form.lines[index], form.lines[other]] = [form.lines[other], form.lines[index]];
+		removeLineSources();
+	}
 	function removeLine(index: number) {
+		removeLineSources();
 		form.lines.splice(index, 1);
 	}
 
@@ -438,7 +444,7 @@
 		'w-full rounded-lg border border-outline-variant bg-surface-container-lowest px-3 py-2.5 text-sm';
 </script>
 
-<section class="space-y-6">
+<fieldset disabled={busy} class="space-y-6">
 	<!-- Details -->
 	<div class="rounded-xl border border-outline-variant bg-surface-container-low p-4">
 		<h2 class="mb-3 text-sm font-semibold uppercase tracking-wide text-on-surface-variant">
@@ -578,21 +584,49 @@
 				</div>
 			{/each}
 		</div>
-		{#if expectedTotal !== null}
-			<p class="mt-3 text-sm text-on-surface-variant">
-				{$t('editor.expectedTotal')}:
-				<span class="font-medium">{expectedTotal} {form.currency}</span>
-				{#if totalMismatch !== null}
-					<span class="ml-2 font-medium text-error">
-						{$t('editor.totalMismatch', {
-							values: { diff: formatMoney(totalMismatch, form.currency) }
-						})}
-					</span>
-				{/if}
-			</p>
-		{/if}
 	</div>
 
+	<AmountPolicyEditor
+		value={form.amount_policy}
+		disabled={busy}
+		onChange={(value) => (form.amount_policy = value)}
+	/>
+	<details class="rounded-xl border border-outline-variant p-4">
+		<summary>{$t('review.sourceDecisions')}</summary>
+		{#each Object.keys(form.field_sources) as path (path)}<p>
+				{path}
+				{#if onSource}<button type="button" onclick={() => onSource?.(form.field_sources[path])}
+						>{$t('review.showSource')}</button
+					>{/if}
+				<button
+					type="button"
+					onclick={() => (form.field_sources = { ...form.field_sources, [path]: [] })}
+					>{$t('review.markUnknown')}</button
+				>
+			</p>{/each}
+	</details>
+	{#each form.overlap_decisions as decision, index (index)}
+		<div class="rounded-xl border border-outline-variant p-4">
+			<p>{$t('review.overlapNumber', { values: { number: index + 1 } })}</p>
+			{#if typeof decision.first_index === 'number' && typeof decision.second_index === 'number'}
+				<p>
+					{$t('review.overlapRows', {
+						values: { first: decision.first_index + 1, second: decision.second_index + 1 }
+					})}
+				</p>
+			{/if}
+			<label
+				><input
+					type="checkbox"
+					checked={decision.verified === true}
+					onchange={(e) => {
+						form.overlap_decisions[index] = { ...decision, verified: e.currentTarget.checked };
+					}}
+				/>
+				{$t('review.reviewedOverlap')}</label
+			>
+		</div>
+	{/each}
 	<!-- Line items -->
 	<div class="rounded-xl border border-outline-variant bg-surface-container-low p-4">
 		<div class="mb-3 flex items-center justify-between">
@@ -632,6 +666,18 @@
 							>
 								<Icon icon="trash" />
 							</button>
+							<button
+								type="button"
+								aria-label={$t('editor.moveItemUp')}
+								disabled={index === 0 || busy}
+								onclick={() => moveLine(index, -1)}>↑</button
+							>
+							<button
+								type="button"
+								aria-label={$t('editor.moveItemDown')}
+								disabled={index === form.lines.length - 1 || busy}
+								onclick={() => moveLine(index, 1)}>↓</button
+							>
 						</div>
 						{#if line.original_description && line.original_description !== line.description}
 							<p class="mt-1 text-xs text-on-surface-variant">
@@ -834,4 +880,4 @@
 			</div>
 		</div>
 	{/if}
-</section>
+</fieldset>

@@ -169,13 +169,11 @@ describe('durable submissions', () => {
 	it('keeps ordered multipart files and explicit option presence with an idempotency key', async () => {
 		vi.stubGlobal(
 			'fetch',
-			vi
-				.fn()
-				.mockResolvedValue({
-					ok: true,
-					status: 202,
-					json: async () => ({ id: 'job', terminal: false, status: 'pending' })
-				})
+			vi.fn().mockResolvedValue({
+				ok: true,
+				status: 202,
+				json: async () => ({ id: 'job', terminal: false, status: 'pending' })
+			})
 		);
 		const files = [new File(['second'], 'b.png'), new File(['first'], 'a.png')];
 		expect(await api.uploadImages(files, {}, 'stable-key')).toMatchObject({
@@ -217,4 +215,36 @@ it('preserves explicitly empty model selection instead of changing option presen
 	mockOkFetch();
 	await api.uploadImages([new File(['image'], 'a.png')], { model_id: '' }, 'key');
 	expect(vi.mocked(fetch).mock.calls[0][0]).toBe('/api/v1/images?model_id=');
+});
+
+describe('versioned drafts and review', () => {
+	it('sends exact changes, revisions, finalize key and acknowledgements', async () => {
+		mockOkFetch();
+		await api.getDraft('job');
+		await api.patchDraft('job', {
+			expected_revision: 7,
+			changes: { total: null, subtotal: '0.0000000001' }
+		});
+		await api.finalizeDraft('job', { expected_revision: 8, request_key: 'stable' });
+		await api.verifyReceipt('receipt', {
+			expected_operation_revision: 4,
+			expected_review_revision: 3,
+			acknowledgements: [{ finding_id: 'f', comment: 'Checked original' }]
+		});
+		const calls = vi.mocked(fetch).mock.calls;
+		expect(calls[0][0]).toBe('/api/v1/images/job/draft');
+		expect(calls[1][1]?.method).toBe('PATCH');
+		expect(JSON.parse(calls[1][1]?.body as string)).toEqual({
+			expected_revision: 7,
+			changes: { total: null, subtotal: '0.0000000001' }
+		});
+		expect(calls[2][0]).toBe('/api/v1/images/job/draft/finalize');
+		expect(JSON.parse(calls[2][1]?.body as string)).toEqual({
+			expected_revision: 8,
+			request_key: 'stable'
+		});
+		expect(JSON.parse(calls[3][1]?.body as string).acknowledgements).toEqual([
+			{ finding_id: 'f', comment: 'Checked original' }
+		]);
+	});
 });

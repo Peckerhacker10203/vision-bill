@@ -420,7 +420,9 @@
 		"invalidNumber": "Betrag muss eine gültige Zahl sein.",
 		"invalidQuantity": "Menge muss größer als null sein.",
 		"invalidRate": "Satz muss eine Zahl zwischen 0 und 1 sein.",
-		"invalidConfidence": "Konfidenz muss eine ganze Zahl zwischen 0 und 100 sein."
+		"invalidConfidence": "Konfidenz muss eine ganze Zahl zwischen 0 und 100 sein.",
+		"moveItemUp": "Position nach oben",
+		"moveItemDown": "Position nach unten"
 	},
 	"pages": {
 		"search": {
@@ -449,5 +451,55 @@
 			"title": "Einstellungen",
 			"placeholder": "Hier erscheinen die Anwendungseinstellungen."
 		}
+	},
+	"review": {
+		"findings": "Prüfergebnisse des Servers",
+		"comment": "Prüfkommentar",
+		"showSource": "Quelle anzeigen",
+		"sourceView": "Quellenansicht",
+		"sourceBoxes": "Quellenmarkierungen",
+		"mappingUnknown": "Quellenzuordnung unbekannt",
+		"sourceUnavailable": "Quellenbild nicht verfügbar",
+		"amountPolicy": "Betragsregeln",
+		"draft": "Extraktionsentwurf",
+		"original": "Originalfotos",
+		"saveDraft": "Entwurf speichern",
+		"finalizeDraft": "Entwurf abschließen",
+		"addTags": "Tags hinzufügen",
+		"markUnknown": "Quellenzuordnung als unbekannt markieren",
+		"invalidFields": "Ungültige Felder",
+		"missingFields": "Fehlende Pflichtfelder",
+		"saveFirst": "Änderungen vor dem Abschließen speichern",
+		"conflict": "Konflikt: Deine Änderungen bleiben erhalten. Erneut laden verwirft sie ausdrücklich.",
+		"savedReview": "Gespeichert. Prüfe die aktuellen Ergebnisse vor der Bestätigung.",
+		"discardReload": "Änderungen verwerfen und aktuelle Version laden",
+		"unverified": "Ungeprüft",
+		"sourceDecisions": "Quellenentscheidungen",
+		"policy": {
+			"tax_basis": "Steuerbasis",
+			"discount_treatment": "Rabattbehandlung",
+			"tip_treatment": "Trinkgeldbehandlung",
+			"subtotal_origin": "Herkunft der Zwischensumme",
+			"tax_information": "Steuerangaben"
+		},
+		"policyValue": {
+			"unknown": "Unbekannt",
+			"gross": "Brutto",
+			"net": "Netto",
+			"included_in_lines": "In Positionen enthalten",
+			"subtract": "Abziehen",
+			"included": "Enthalten",
+			"add": "Hinzurechnen",
+			"outside_receipt": "Außerhalb des Belegs",
+			"none": "Keines",
+			"printed": "Aufgedruckt",
+			"derived_net": "Abgeleitetes Netto",
+			"missing": "Fehlend",
+			"present": "Vorhanden",
+			"explicit_zero": "Ausdrücklich null"
+		},
+		"overlapNumber": "Überlappung {number}",
+		"overlapRows": "Positionen {first} und {second} anhand der Fotos prüfen.",
+		"reviewedOverlap": "Ich habe die Überlappung geprüft; aktuelle Positionen beibehalten"
 	}
 }

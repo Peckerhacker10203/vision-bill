@@ -420,7 +420,9 @@
 		"invalidNumber": "Amount must be a valid number.",
 		"invalidQuantity": "Quantity must be greater than zero.",
 		"invalidRate": "Rate must be a number between 0 and 1.",
-		"invalidConfidence": "Confidence must be a whole number between 0 and 100."
+		"invalidConfidence": "Confidence must be a whole number between 0 and 100.",
+		"moveItemUp": "Move item up",
+		"moveItemDown": "Move item down"
 	},
 	"pages": {
 		"search": {
@@ -449,5 +451,55 @@
 			"title": "Settings",
 			"placeholder": "Application settings will appear here."
 		}
+	},
+	"review": {
+		"findings": "Server review findings",
+		"comment": "Review comment",
+		"showSource": "Show source",
+		"sourceView": "Source view",
+		"sourceBoxes": "Source boxes",
+		"mappingUnknown": "Source mapping unknown",
+		"sourceUnavailable": "Source image unavailable",
+		"amountPolicy": "Amount policy",
+		"draft": "Extraction draft",
+		"original": "Original photos",
+		"saveDraft": "Save draft",
+		"finalizeDraft": "Finalize draft",
+		"addTags": "Add tags",
+		"markUnknown": "Mark source unknown",
+		"invalidFields": "Invalid fields",
+		"missingFields": "Required missing fields",
+		"saveFirst": "Save changes before finalizing",
+		"conflict": "Conflict: your edits are preserved. Reload explicitly to discard them.",
+		"savedReview": "Saved. Review the current findings before verification.",
+		"discardReload": "Discard edits and load current version",
+		"unverified": "Unverified",
+		"sourceDecisions": "Source decisions",
+		"policy": {
+			"tax_basis": "Tax basis",
+			"discount_treatment": "Discount treatment",
+			"tip_treatment": "Tip treatment",
+			"subtotal_origin": "Subtotal origin",
+			"tax_information": "Tax information"
+		},
+		"policyValue": {
+			"unknown": "Unknown",
+			"gross": "Gross",
+			"net": "Net",
+			"included_in_lines": "Included in lines",
+			"subtract": "Subtract",
+			"included": "Included",
+			"add": "Add",
+			"outside_receipt": "Outside receipt",
+			"none": "None",
+			"printed": "Printed",
+			"derived_net": "Derived net",
+			"missing": "Missing",
+			"present": "Present",
+			"explicit_zero": "Explicit zero"
+		},
+		"overlapNumber": "Overlap {number}",
+		"overlapRows": "Check rows {first} and {second} against the photos.",
+		"reviewedOverlap": "I reviewed this overlap; keep the current rows"
 	}
 }

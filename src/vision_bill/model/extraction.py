@@ -137,3 +137,5 @@ class DraftView(BaseModel):
     findings: list[ReviewFinding] = Field(default_factory=list)
     source_views: list[SourceView] = Field(default_factory=list)
     finalized_receipt_id: UUID | None = None
+    field_sources: dict[str, list[SourceRef]] = Field(default_factory=dict)
+    overlap_decisions: list[dict[str, Any]] = Field(default_factory=list)

@@ -12,6 +12,7 @@
 	import { prepareUpload, readPendingUpload, clearPendingUpload } from '$lib/api/upload';
 	import Icon from '$lib/ui/Icon.svelte';
 	import SubmissionStatus from '$lib/ui/SubmissionStatus.svelte';
+	import ExtractionDraftEditor from '$lib/ui/ExtractionDraftEditor.svelte';
 
 	const ACCEPTED_TYPES = 'image/jpeg,image/png,image/webp,image/heic,image/heif,image/gif';
 
@@ -151,6 +152,7 @@
 	<h1 class="text-2xl font-semibold">{$t('pages.upload.title')}</h1>
 	{#if jobId}
 		<SubmissionStatus id={jobId} />
+		{#if page.url.searchParams.get('draft') === '1'}<ExtractionDraftEditor id={jobId} />{/if}
 	{:else}
 		<p class="mt-3 text-sm text-on-surface-variant">{$t('submission.captureHint')}</p>
 
