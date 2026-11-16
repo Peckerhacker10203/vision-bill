@@ -1,33 +1,25 @@
-"""Standalone benchmark runner that calls vision-bill code directly.
-
-This script runs a benchmark without requiring the Vision Bill API to be running.
-It connects directly to the database, uses the paddleocr service, and calls the
-LLM provider directly.
+"""Benchmark current qualified Gold for one application owner, without the API.
 
 Usage:
-    uv run python scripts/standalone_benchmark.py [options]
+    uv run python scripts/standalone_benchmark.py --user-id OWNER_UUID --model LOCAL_MODEL [options]
 
-Environment variables (or command-line options):
-    PG__HOST, PG__PORT, PG__USER, PG__PASSWORD, PG__DB - Database connection
-    OCR__SERVICE_URL - PaddleOCR service URL (default: http://localhost:8082)
-    LLM__PROVIDER - LLM provider: ollama or openai (default: ollama)
-    LLM__HOST - LLM host (default: http://localhost:11434)
-    LLM__MODEL_NAME - Model to use (required)
-    LLM__API_KEY - API key for OpenAI provider (optional)
-    LLM__TEMPERATURE - Temperature (default: 0.0)
+--user-id is required. Selection uses the owner's current explicitly qualified
+human Gold in a repeatable-read read-only snapshot; legacy/bypass verified flags
+alone are insufficient. Use SELECT-only reporting credentials and make every
+ordered original available at its recorded path. No database mutation or new
+qualification is performed. All selected cases, including failures, remain in
+v4 metrics; historical success-only averages keep their separate meaning.
 
-Options:
-    --limit N - Maximum number of receipts to benchmark (default: all verified)
-    --category CAT - Only benchmark receipts in this category
-    --model MODEL - Model to use (overrides LLM__MODEL_NAME)
-    --db-host HOST - Database host (overrides PG__HOST)
-    --db-port PORT - Database port (overrides PG__PORT)
-    --db-user USER - Database user (overrides PG__USER)
-    --db-password PASS - Database password (overrides PG__PASSWORD)
-    --db-name NAME - Database name (overrides PG__DB)
-    --ocr-url URL - OCR service URL (overrides OCR__SERVICE_URL)
-    --llm-host HOST - LLM host (overrides LLM__HOST)
-    --output FILE - Write results to JSON file
+The runner calls the configured local native OCR service and text formatter.
+PG__HOST, PG__PORT, PG__USER, PG__PASSWORD, PG__DB configure the database;
+OCR__SERVICE_URL selects the OCR endpoint; LLM__PROVIDER, LLM__HOST,
+LLM__MODEL_NAME, LLM__API_KEY and LLM__TEMPERATURE configure the formatter.
+Keep endpoint/credentials local and private. No vision fallback consent is supplied.
+
+--limit and --category filter qualified references, --model overrides the model;
+--db-host/port/user/password/name, --ocr-url and --llm-host override connections.
+Prefer private environment credentials over command-line passwords. --output writes
+private JSON; --verbose enables diagnostics. See scripts/README.md for semantics.
 """
 
 import argparse

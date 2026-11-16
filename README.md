@@ -1,50 +1,70 @@
 # vision-bill — Your Private Invoice Tracker
 
-### 🛡️ Privacy First
-**vision-bill** is a local-first tool designed to process receipts without ever uploading your data to the cloud. Receipts contain highly sensitive personal and financial information (PII); this project ensures that everything—from image processing to LLM reasoning—stays on your machine by default.
+vision-bill extracts receipts with local models and provides a bundled web UI for
+review, collections, search, spending statistics and model comparisons. Ollama is
+the default; a user-configured OpenAI-compatible endpoint is also supported. Keep
+that endpoint local to retain local processing. Argon2 passwords, session cookies,
+owner-scoped data and an optional admin-wide view support multiple users.
 
-### 🚀 Core Features
-- **Multi-modal Local LLMs:** Uses Ollama by default to run vision-capable models (like Llama-3-Vision, Moondream, or Gemma) directly on your hardware; an OpenAI-compatible endpoint is optional.
-- **Local Extraction:** No separate OCR engine is required; the LLM performs both image understanding and structured data extraction in one step.
-- **Privacy-Preserving Architecture:** Built with FastAPI to serve as a local backend for personal use, with a bundled SvelteKit SPA frontend.
-- **Multi-user & Admin:** Argon2-hashed passwords, stateless session cookies, per-user data ownership, an admin Settings page, and a registration toggle.
-- **Model Benchmarking:** Admins can queue benchmark runs that re-examine your verified receipts with any vision model and compare the results field by field.
-- **Insights:** Product search with price history and spending statistics (per currency, merchant, category, payment method, weekday, and week).
-- **Non-sequential identifiers:** Users, receipts, images, line items, taxes, tags, and benchmark runs use UUIDs throughout the database and API.
+## Start with direct vision
 
-### 🛠️ Quickstart (Docker)
-Versioned container publishing is available through the manual Release workflow;
-see [release setup, image references, and recovery](RELEASES.md).
+For a **fresh installation**, copy the template, set a random `AUTH__SECRET_KEY`,
+your database values and an installed vision model:
 
-The fastest way to get started is using Docker Compose:
 ```bash
-cp .env.example .env   # then set AUTH__SECRET_KEY (required) and your model/DB values
-docker compose up -d
+cp .env.example .env
+# Edit .env before starting; host Ollama is reachable as host.docker.internal.
+docker compose up -d --build
 ```
-*Note: You must have [Ollama](https://ollama.com/) installed and running on your host machine with vision-capable models downloaded.*
 
-Sign in at `http://localhost:8080`. By default, self-service registration is open; alternatively set `AUTH__BOOTSTRAP_USERNAME` / `AUTH__BOOTSTRAP_PASSWORD` in `.env` to have the first admin created on an empty database.
+Open `http://localhost:8080`. Registration is open by default; bootstrap credentials
+create the first admin only on an empty users table. PostgreSQL has no published
+host port. The entrypoint runs Alembic with the same `PG__*` identity as the app:
+read the [upgrade and verification guide](UPGRADE_AND_VERIFY.md) before upgrading
+an existing installation or separating owner/runtime credentials.
 
-### ⚙️ Configuration
-The application persists its resolved settings in `/app/config/config.yaml`,
-which Docker stores on the host at `./server_data/config`. The file is created
-on first startup from environment defaults. Environment variables always take
-precedence and are marked as environment-controlled in the admin Settings page.
-The page can change the default model, provider connection settings, and
-registration policy without exposing database credentials or secrets. Model,
-temperature, and registration changes apply immediately; changing the
-provider or host requires a server restart.
+## Processing and review
 
-### 📊 Model Testing & Benchmarking
-Since different LLMs perform differently at image extraction, the project includes a benchmark system:
-- **Benchmark Runs:** Admins queue runs via the API (`POST /api/v1/benchmarks`) or `make script-create-benchmark`. Each run re-extracts your **verified** receipts with the selected vision models — verified receipts serve as the ground truth.
-- **Scoring:** Extracted data is compared against the verified values field by field; runs report per-model summaries (score, confidence, attempts, latency) and are durable across restarts.
-- **Customization:** Swap the provider, model, or temperature from the admin Settings page (or via `LLM__*` environment variables); `make script-context-budget` measures prompt token usage of a model.
+Every upload (one to ten ordered photos, at most 20 MB each) returns committed
+`202 Accepted`, a durable ID and `Location` for authenticated status polling.
+The worker waits for usable capabilities, extracts printed observations, retains
+partial drafts, checks source/amount/overlap evidence, and applies optional
+classification downstream. Missing observations stay null; no amounts or currency
+are invented. Human corrections and original bytes survive review. Verify changes
+database workflow state without moving files. See [multi-photo/API workflow](MULTI_IMAGE_RECEIPTS.md).
 
-### 📦 Tech Stack
-- **Backend:** Python, FastAPI, Pydantic, PostgreSQL (Alembic migrations)
-- **Frontend:** SvelteKit SPA (TypeScript, Tailwind CSS)
-- **Inference:** Ollama (local LLM execution; optional OpenAI-compatible endpoint)
-- **Authentication:** Argon2id password hashing, stateless session cookies
-- **Deployment:** Docker, UV (dependency management)
-- **Testing:** Pytest (API), Vitest + Playwright (frontend)
+OCR is **off in the base app**. Direct vision needs no sidecar. Explicit CUDA or
+ROCm overlays enable OCR and require a physically qualified native sidecar; the
+[OCR release gate](paddleocr-service/README.md) describes candidate builds,
+per-board qualification and the fixed VL1.6/native/FP32 profile. CUDA and Radeon
+candidates have not been physically qualified here. Fallback requires global
+permission **and** an explicit per-upload choice; required OCR forbids fallback.
+
+## Configuration and comparisons
+
+Environment > dotenv > persistent YAML (`/app/config/config.yaml`, mounted from
+`server_data/config`) controls settings. The admin Settings page reports sources;
+model/temperature/registration changes apply immediately, provider/host changes
+need restart. Credentials and database settings are not exposed there. Formatter
+output defaults to 8192 tokens; OCR's 4096-token cap and model context capacity
+are separate limits. Unknown context remains unknown.
+
+Benchmark Gold requires ordinary human verification plus explicit qualification of
+the **current** document and sources. Bypass or legacy `verified` alone is
+insufficient. Admin runs freeze selected Gold, ordered source hashes and execution
+identity; v4 diagnostics include failed cases and exact receipt/item/amount checks.
+See [scripts and role setup](scripts/README.md) and the
+[comparison harness](scripts/ocr_harness/README.md). Historical CPU comparisons
+and [split experiments](scripts/receipt_split_experiment.md) remain research evidence;
+blanket splitting and global product deduplication are not production behavior.
+
+## Development and releases
+
+Python 3.12+, PostgreSQL, uv and Node/npm are used. `make help` lists commands;
+`make setup`, `make migrate`, `make run`, `make fe-install` and `make fe-dev`
+prepare a developer installation. `make lint`, `make test`, `make fe-verify`,
+`make release-test`, `make test-e2e` and `make fe-test-e2e` are verification gates.
+E2E commands create and remove unique owned stacks. See the
+[agent architecture guide](AGENTS.md), [frontend guide](frontend/README.md),
+[accepted evidence and upgrade limits](UPGRADE_AND_VERIFY.md#verification-evidence),
+and [manual release procedure](RELEASES.md). This package is Unreleased.

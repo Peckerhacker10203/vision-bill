@@ -1,196 +1,161 @@
 # Operational scripts
 
-For unattended, isolated comparisons across OCR engines, see
-[`ocr_harness/README.md`](ocr_harness/README.md). Run `make ocr-compare
-ARGS="all --data-dir /path/to/receipts --limit 2"` to build, prepare and test
-all enabled configurations. No application deployment is needed.
-
-The supported scripts run through Make so local endpoints and database values
-can live in one ignored `.env.scripts` file.
-
-## Setup
+Supported Make targets read the trusted shell-compatible ignored `.env.scripts`:
 
 ```bash
 cp .env.scripts.example .env.scripts
 ```
 
-Edit the local file as needed. Make exports its values before invoking a
-script, so they take precedence over values loaded from the application's
-`.env` files. To use another file, pass `SCRIPTS_ENV=/path/to/file`.
+Edit it for deliberately selected local services. `SCRIPTS_ENV=/private/tools.env`
+selects another file. Make exports those values over application dotenv settings.
+The base Compose DB has no host port: host-side scripts need an explicitly
+reachable connection/network; template ports do not publish one. Keep credentials
+in private files, not ARGS or shell history. Reports and traces may contain receipt
+text and must remain private. See [upgrade/roles/recovery](../UPGRADE_AND_VERIFY.md).
 
-## Context-budget measurement
-
-This asks the local Ollama API for exact prompt token counts. It can optionally
-read tags from the running application and sample receipt image paths from
-PostgreSQL.
+## Context-budget diagnostic
 
 ```bash
-make script-context-budget ARGS="--model glm-ocr:latest"
-make script-context-budget ARGS="--model glm-ocr:latest --image tests/data/lidl.jpg"
-make script-context-budget ARGS="--model glm-ocr:latest --db-sample 24"
+make script-context-budget ARGS="--model installed-local-model"
+make script-context-budget ARGS="--model installed-local-model --image /private/sample.png"
+make script-context-budget ARGS="--model installed-local-model --db-sample 24"
 ```
 
-The command sends image content to the configured `OLLAMA_HOST`. Keep that URL
-pointing at the local Ollama instance to preserve Vision Bill's privacy model.
+`--host`/`OLLAMA_HOST` selects local Ollama; `--app-url` reads tag vocabulary,
+`--tags-file` supplies a JSON tag list, and `--db-sample` reads existing image paths.
+The command sends selected images to that endpoint. It requests a prompt count
+with `num_predict=1`, bounding requested context by reported capacity and diagnostic
+`--num-ctx-cap` (default 16384). Missing/zero/truncated counts are rejected; show metadata
+can supply context if tags metadata does not. It counts image/reserved output once;
+projected tag growth is an estimate. `--output-budget` defaults 2000 and `--tag-probe`
+defaults 250. These diagnostic values do not set the app's formatter 8192, OCR 4096 or
+model context window and do not automatically alter resolution/precision/limits.
 
-## Create a benchmark run
+## Create an API benchmark
 
-The API must be running, the account must be an admin, and selected receipt IDs
-must be UUIDs for verified receipts. Put `VB_USERNAME` and `VB_PASSWORD` in the
-ignored `.env.scripts`, or pass them as arguments.
+The API must be running and the account admin. References must have ordinary human
+verification and explicit qualification of the **current** document/sources through
+the benchmark reference preview/confirm UI/API. Legacy or bypass `verified` is
+insufficient. Put `VB_USERNAME`/`VB_PASSWORD` in the private env.
 
 ```bash
-make script-create-benchmark ARGS="--model glm-ocr:latest --limit 10"
+make script-create-benchmark ARGS="--model installed-local-model --limit 10"
 make script-create-benchmark ARGS="--receipt-id 125b2a52-60ac-4e1f-b9bf-d223f15c8cd1"
 ```
 
-## Standalone benchmark (no API required)
+`--model` and `--receipt-id` can repeat; otherwise current eligible scoped Gold is
+selected. Other flags include `--category`, `--max-source-confidence`, `--limit`,
+`--request-timeout-seconds` (default 300, at most 600), `--council-policy` and explicit
+council thresholds/flags. This CLI does not expose every experiment UI/API setting;
+consult `--help` and `BenchmarkCreate` before assuming a pipeline flag exists.
 
-Run a benchmark directly against the database and services without starting
-the Vision Bill API. Useful for testing against remote databases or NAS data.
+## Standalone benchmark (no API)
 
-```bash
-# Basic usage with environment variables
-make script-standalone-benchmark ARGS="--model glm-ocr:latest --limit 20"
-
-# Specify database connection
-make script-standalone-benchmark ARGS="--model glm-ocr:latest --db-host 192.168.1.100 --limit 20"
-
-# Output results to JSON file
-make script-standalone-benchmark ARGS="--model glm-ocr:latest --limit 20 --output benchmark-results.json"
-```
-
-Required environment variables (or command-line options):
-- `LLM__MODEL_NAME` or `--model` - Model to use
-- `PG__HOST`, `PG__USER`, `PG__PASSWORD`, `PG__DB` - Database connection (or `--db-*` options)
-
-Optional:
-- `OCR__SERVICE_URL` or `--ocr-url` - PaddleOCR service URL (default: `http://localhost:8082`)
-- `LLM__HOST` or `--llm-host` - LLM host (default: `http://localhost:11434`)
-- `OCR__TIMEOUT_SECONDS` - OCR timeout in seconds (default: 300)
-
-## Test the OCR service (no API, no LLM)
-
-Send the local receipt images in `tests/data/` straight to the PaddleOCR
-service and print the raw JSON it returns. This exercises only the OCR stage
-of the two-stage pipeline — it never calls the LLM. Useful for checking that
-the service is up and returning sane layout/text blocks before wiring it into
-extraction.
+Requires a real application owner UUID and current explicitly qualified human Gold.
+Use a genuine SELECT-only reporting login and a connection able to read the
+application tables. Original files must be available at their recorded paths.
 
 ```bash
-make script-test-ocr
-make script-test-ocr ARGS="--ocr-url http://localhost:8082"
-make script-test-ocr ARGS="--quiet --output /tmp/ocr-results.json"
+make script-standalone-benchmark ARGS="--user-id 125b2a52-60ac-4e1f-b9bf-d223f15c8cd1 --model installed-local-model --limit 20 --output /private/benchmark-results.json"
 ```
 
-Options:
-- `--ocr-url URL` - PaddleOCR service URL (default: `OCR__SERVICE_URL` or `http://localhost:8082`)
-- `--timeout N` - request timeout in seconds (default: `OCR__TIMEOUT_SECONDS` or 300)
-- `--data-dir DIR` - directory with test images (default: `tests/data`)
-- `--output FILE` - write all raw results to a JSON file
-- `--quiet` - print per-image status and a summary only, not the raw JSON
+`--user-id` is mandatory; omission never means all owners. `--category`, `--limit`,
+`--db-host`, `--db-port`, `--db-user`, `--db-name`, `--ocr-url`, `--llm-host` are
+actual selection/connection flags. Prefer private `PG__PASSWORD` over
+`--db-password`. `LLM__MODEL_NAME`, `LLM__HOST`, `OCR__SERVICE_URL`, `OCR__TIMEOUT_SECONDS` and
+`PG__*` provide defaults. The script explicitly enables OCR and always selects
+the OCR pipeline; it does not adopt every application `OCR__*` policy setting.
+It reads an owner-scoped, repeatable-read read-only snapshot, without row locks,
+DB mutation, API startup or qualification writes. Every selected case, including
+changed/missing sources and extraction failures, stays in the v4 denominator.
 
-The service must be reachable (e.g. `docker compose up paddleocr-service`).
-Keep the URL pointed at the local service to preserve Vision Bill's privacy
-model.
+Output includes manifest hash and model/source/profile/prompt/schema/output/context
+identity, observed-field mask, full-receipt correctness, ordered item precision/
+recall, exact count/order and amounts. `avg_score` remains separately labeled
+**Historical average score (successful cases)**. It is not the all-case score or
+perfect-receipt rate. This CLI disables fallback and supplies no consent flag;
+do not interpret OCR failure as permission to use vision. Unknown context remains null. No expected
+reference values enter inference.
 
-After changing `paddleocr-service/server.py`, rebuild that service with
-`docker compose up -d --build paddleocr-service`. A checkout alone does not
-update code baked into a running container. The compact response contains
-`text` and recognized `blocks` in reading order; image pixels are excluded.
-The diagnostic command treats missing/empty transcription as failure even
-if the server returns HTTP 200. Quiet output reports recognized characters.
+## Native OCR-only diagnostic
 
-For a small CPU smoke test, put one receipt image in a separate directory:
+First build and **physically qualify** the selected sidecar according to the
+[native gate](../paddleocr-service/README.md). Base Compose alone does not build a
+usable backend; default native Dockerfile deliberately fails. To serve a qualified
+ROCm candidate, for example:
 
 ```bash
-make script-test-ocr ARGS="--data-dir /path/to/one-receipt --timeout 900 --quiet"
+docker compose --profile ocr -f docker-compose.yml -f docker-compose.rocm.yml up -d
+# Run only from a client that can reach this deliberately configured local endpoint:
+make script-test-ocr ARGS="--ocr-url http://127.0.0.1:8082 --data-dir /private/synthetic-images --timeout 600 --quiet --output /private/ocr-results.json"
 ```
 
-The Compose OCR service has no published host port. Run a client on the same
-Docker network or use an explicitly configured local endpoint; `localhost:8082`
-works only when that port is actually exposed. CPU inference can take several
-minutes for one receipt.
+Use the CUDA overlay instead for a qualified CUDA image. The GPU overlay explicitly
+enables application OCR; it is not an OCR-only app-off switch. Compose publishes no
+OCR host port. `127.0.0.1:8082` works only if a local deployment explicitly exposes
+it; otherwise use a client on the sidecar network with its service URL. Do not run
+this command against an unrelated endpoint or assume an unqualified image is ready.
 
-The updated app's benchmark form supports forcing the `OCR` pipeline for a
-single-image verified receipt. Disable OCR fallback for diagnostics so a
-direct-vision result cannot hide an OCR failure. Start with temperature 0,
-classification disabled, and thinking disabled if the selected model supports
-it. The benchmark deadline covers both OCR and LLM generation (at most 600
-seconds); increasing the OCR client's timeout does not extend that deadline.
-Rebuilding the app from this branch is necessary to expose these merged
-benchmark controls and applies the new benchmark migration on startup.
+`--timeout`/`OCR__TIMEOUT_SECONDS` defaults 300. Effective requests are bounded at
+600 seconds; increasing it cannot extend the app whole-attempt deadline. This
+explicit diagnostic activates its OCR provider, calls no LLM/API, and treats empty
+transcription as failure even with HTTP200. Current native v2 JSON includes text,
+working-coordinate blocks, profile/runtime identity and actual working PNG payload;
+raw output can contain pixels and receipt text. `--quiet` suppresses raw console
+output, but `--output` is still private. Rebuild the selected image after native
+source changes and rerun qualification: a checkout does not update a running image.
+No production CPU fallback or `--timeout 900` smoke recipe is supported.
 
-## Generate thumbnails for existing images
+## Thumbnails and optional stitcher
 
-Creates a WebP thumbnail (`images.thumbnail_path`) for any image that does not
-have one yet. Configure the database and image directories in `scripts/.env`
-(same directory as the script):
+`scripts/generate_thumbnails.py` loads `scripts/.env` and application defaults.
+Configure its genuine DB credentials and `IMAGES__SAVE_DIR`/`IMAGES__TMP_DIR` for the
+chosen installation. It only selects rows with null thumbnail_path:
 
 ```bash
-PG__HOST=localhost
-PG__PORT=5432
-PG__USER=vision_bill
-PG__PASSWORD=...
-PG__DB=vision_bill
-IMAGES__SAVE_DIR=/path/to/uploads
-IMAGES__TMP_DIR=/path/to/uploads_tmp
+uv run python scripts/generate_thumbnails.py --dry-run
+uv run python scripts/generate_thumbnails.py --limit 20
 ```
 
-Run (directly, not via Make):
+Dry-run reads the DB/filesystem, counts resolvable candidates and missing paths;
+it **does not decode images**, validate image integrity, create directories, generate
+thumbnails or update rows. A candidate count is not a successful-generation count.
+Actual mode makes white-composited EXIF-normalized WebP thumbnails; new uploads
+already do so nonfatally. It does not regenerate existing thumbnails automatically.
 
 ```bash
-uv run python scripts/generate_thumbnails.py --dry-run   # preview
-uv run python scripts/generate_thumbnails.py             # do it
-uv run python scripts/generate_thumbnails.py --limit 20  # cap per run
+docker compose -f docker-compose.image-stichter.yml up -d
 ```
 
-It is idempotent: only rows with `thumbnail_path IS NULL` are touched, so
-re-running is safe. New uploads create their thumbnails automatically; this
-script is only for backfilling images that predate the feature.
+This optional standalone tool binds tracked `image-sticher/image-stitcher.html`
+and serves it on 8081. It keeps selected photo order despite asynchronous reads,
+invalidates export on new/reordered batches and blocks incomplete/failed exports.
+It does not upload to the app automatically or promote blanket stitching/splitting
+into the production extraction path.
 
-## PostgreSQL roles
+## Database roles, backup and upgrade
 
-Use three kinds of database identity in a deployed installation:
+See [the credential-specific procedure](../UPGRADE_AND_VERIFY.md#credentials-and-grants)
+for owner migrations, runtime/readonly grants and missing-group bootstrap. Missing
+groups require admin/CREATEROLE first; then `make db-configure-roles` must use the
+actual Alembic owner for grants/default privileges on current/future tables and
+sequences. `MIGRATION_DATABASE_URL` is only this Make tool's connection; entrypoint
+Alembic uses `PG__*`. Runtime credentials cannot apply pending owner DDL. Stop/drain
+old workers, back up/restore-test DB and files, migrate to 0018 with owner credentials,
+refresh grants and start only compatible workers. No automatic destructive backout.
+`bash scripts/pg-backup.sh --help` lists backup/restore options.
 
-- An owner/migration login runs Alembic and owns schema objects. Do not use it
-  for the application process.
-- A runtime login belongs to the `vision_bill_runtime` group. It can read and
-  modify application rows, but cannot create or alter schema objects.
-- A reporting login belongs to `vision_bill_readonly`. Use this for ad-hoc
-  analysis and scripts that only query data.
+## Comparisons and historical prototypes
 
-The application itself cannot use the read-only role: uploads, receipt review,
-user authentication, and benchmark processing all require writes. To create or
-refresh the two privilege groups, set `MIGRATION_DATABASE_URL` to the owner
-connection and run:
+The [OCR harness](ocr_harness/README.md) is isolated from production native OCR.
+The independent historical CPU Paddle target is built by
+`python3 -m scripts.ocr_harness build --only pp-medium`; its lock does not certify
+physical inference here. The [split experiment](receipt_split_experiment.md)
+remains separate. [OCR historical results](ocr_harness/BENCHMARK_RESULTS.md) and
+[split historical results](receipt_split_results.md) retain their original numerical
+meaning and selected datasets; do not substitute them for current GPU qualification.
 
-```bash
-make db-configure-roles
-```
-
-Create login roles with strong passwords separately, then grant exactly one
-group to each login:
-
-```sql
-CREATE ROLE vision_bill_app LOGIN PASSWORD 'replace-me';
-GRANT vision_bill_runtime TO vision_bill_app;
-
-CREATE ROLE vision_bill_reports LOGIN PASSWORD 'replace-me';
-GRANT vision_bill_readonly TO vision_bill_reports;
-ALTER ROLE vision_bill_reports SET default_transaction_read_only = on;
-ALTER ROLE vision_bill_reports SET statement_timeout = '5s';
-```
-
-Do not make either login a table owner or superuser: owners bypass ordinary
-table grants. `configure_db_roles.sql` must run as the same owner Alembic uses,
-because PostgreSQL default privileges are scoped to the object-creating role.
-
-## Prototype files
-
-`run_functional_tests.py`, `llm_benchmark_runner.py`, `single_image.py`, and
-`test_external_api.py` are historical placeholders with hard-coded or mock
-behavior. They deliberately have no Make targets. Promote or remove each one
-only after replacing its placeholder behavior; in particular, do not connect
-`test_external_api.py` to receipt data because that would violate the local-only
-inference constraint.
+`run_functional_tests.py`, `llm_benchmark_runner.py`, `single_image.py`,
+`test_external_api.py` are historical placeholders with hard-coded/mock behavior
+and no supported Make targets. `test_gpc_tagging.py` is also not a supported
+benchmark target. Do not contact prototype external endpoints with receipt data.

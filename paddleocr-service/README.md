@@ -5,12 +5,34 @@ any Radeon target has been hardware-qualified here. Do not advertise a target
 until its real `qualification.json` has `qualified: true`. No weights or real
 receipt fixtures belong in Git or the Docker build context.
 
+## Fixed extraction policy
+
+PaddleOCR-VL-1.6 (`pipeline_version=v1.6`), PP-DocLayoutV3, native Paddle,
+FP32; batch 1 throughout, internal PaddleX queues off, chart/seal off. Document
+orientation classification and UVDoc unwarping are ON by user choice. EXIF
+orientation normalization is independent and still applies. Region min 112896 /
+max 2000000 pixels (including table regions), OCR max_new_tokens 4096, no extra
+sampling parameters. The official VLM grid alignment applies **per region**;
+2MP is not a whole-working-image downscale. No platform-specific precision,
+backend, resolution or token reduction is permitted. Formatter 8192/context
+capacity are separate app/model facts, and unknown context stays null.
+
+Original bytes/hash/photo identity survive first-frame/EXIF conversion and
+white RGB transparency composition (`white-document-rgb-v2`). Actual preprocessor
+pixels become a separately hashed working PNG with transform metadata. Native v2
+responses contain this PNG and recognized blocks in **working coordinates**.
+No inverse UVDoc transform is fabricated (`inverse_mapping=null`). Raw diagnostic
+responses can contain receipt text/pixels and belong only in private artifacts.
+
 ## Build inputs
 
 `runtime-lock.json` records the immutable Ubuntu base, Ubuntu package snapshot,
 Paddle/PaddleOCR/PaddleX/TheRock source pins, compatibility patch hash, Rust
-archive hash, exact global RDNA2 target list and upstream optional exclusions.
+archive hash, default RDNA2 target list and upstream optional exclusions. The
+selected build candidate profile is recorded in build evidence/kernels.json.
 The common Python execution and native build locks contain real resolved hashes.
+`requirements.txt` is not the production build/install contract; use the selected
+Dockerfile and hashed accelerator/runtime locks.
 Source packages are built without dependency resolution, using the hashed build
 bootstrap. The archived PaddleOCR/PaddleX sources use their pinned release
 versions through `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_*`.
@@ -38,7 +60,21 @@ the forced download of FlashAttention. FP32 runs with FlashAttention off.
 Build evidence is retained under `/opt/ocr/build-evidence`: original gitlinks,
 recursive actual checkout HEADs and dirty patches, patch/`.smrev` hashes, native
 wheel hashes, CMake caches, compiler commands/log, OS packages, and required
-library/payload hashes. Global targets are exactly gfx1030/1031/1032/1034.
+library/payload hashes. Default build candidates are gfx1030/1031/1032/1034.
+`OCR_AMDGPU_TARGETS` selects a semicolon-separated **build-only** candidate list:
+
+```sh
+OCR_AMDGPU_TARGETS='gfx1030;gfx1100' make ocr-build-rocm
+```
+
+Selection changes both TheRock settings and Paddle HIP compiler inputs and is
+sealed into `kernels.json`. It does not prove support: even syntactically accepted
+architectures must compile, provide inspected libraries/kernels and pass the
+physical gate on that exact board. The actual observed HIP architecture must
+match the embedded selected profile. Rebuild/requalify after profile changes;
+there is no runtime allowlist or architecture spoofing. Intended Linux consumer
+scope starts at RX6000/RDNA2 and includes later build candidates requiring their
+own physical qualification; no board is actually qualified here.
 Optional upstream exclusions (including hipBLASLt's gfx1100 fallback) stay intact;
 their host headers/APIs are retained, with no claim of RDNA2 fused/Lt kernels.
 
@@ -53,7 +89,12 @@ Unknown compile/API/kernel/probe failures are failures, never downgrades.
 
 Use ignored `server_data/ocr-runtime/` for the private corpus, model directories,
 and outputs; `server_data/ocr-cache/` is the actual `PADDLE_PDX_CACHE_HOME` mount.
-Download/provision the four approved models separately into `models/`:
+Provision the four exact approved model directories separately into private
+`server_data/ocr-runtime/models/` before qualification (Compose exposes them under
+`/var/lib/ocr/models/`). This repository has no automatic model-download Make target;
+copy/provision the intended model bytes using the official model distribution on
+the target host, then retain their identities in qualification. The mounted cache
+is not a substitute for complete explicit model directories:
 
 - `PP-DocLayoutV3`
 - `PP-LCNet_x1_0_doc_ori`
@@ -134,10 +175,43 @@ to `qualified_targets`; repeat the release gate on each physical target.
 Use the generated `qualification.runtime.json`, the sealed manifest, exact model
 bytes and exact upright image for deployment. Compose mounts runtime inputs
 read-only and exposes no OCR host port. `/health` is liveness; `/ready` becomes
-healthy only after fresh startup qualification. The base stack keeps OCR optional
+healthy only after fresh startup qualification. `/info` reports readiness,
+profile/runtime and qualification identity; liveness alone is not model readiness.
+A model/package/image/source/target change invalidates the seal and requires fresh
+qualification, never an automatic backend/precision fallback. Readiness/capability
+polling observes an idle worker death and schedules one coordinated bounded
+replacement, waiting for in-flight ownership/retirement. Failed replacement
+qualification stays unready without an endless retry loop; shutdown does not revive
+workers. The application can wait on OCR/provider/model startup without spending
+an analysis attempt. The base stack keeps OCR optional
 under profile `ocr`; explicitly select a CUDA/ROCm overlay and configure the
 application OCR enabled/required/fallback policy. Never silently activate OCR or
-reprocess stored receipts as part of packaging.
+reprocess stored receipts as part of packaging. Explicit overlay deployment after
+successful target qualification is:
+
+```sh
+docker compose --profile ocr -f docker-compose.yml -f docker-compose.cuda.yml up -d
+# Or use docker-compose.rocm.yml for a separately qualified ROCm target.
+```
+
+Overlays set application `OCR__ENABLED=true`; `OCR__REQUIRED` and
+`OCR__ALLOW_VISION_FALLBACK` default false. Required OCR forbids fallback. Optional
+fallback needs global permission AND explicit per-upload `allow_ocr_fallback=true`;
+a text formatter may require `OCR__VISION_FALLBACK_MODEL_ID`. Model/digest and
+alternate identity are frozen, not silently changed. The default sidecar Dockerfile
+intentionally fails: base Compose alone is not a CPU runtime. For upgrades, first
+follow [owner migrations/worker drain](../UPGRADE_AND_VERIFY.md).
+
+The historical CPU PP-OCR comparator has an independent hashed build target in
+`scripts/ocr_harness/Dockerfile`, selected with
+`python3 -m scripts.ocr_harness build --only pp-medium`; it is not a production
+sidecar or native v2 qualification source. See the [harness](../scripts/ocr_harness/README.md).
 
 CPU-only unit tests and `docker buildx build --check` validate contracts/recipes,
 not native build success, device kernel support or GPU qualification.
+
+Official CUDA lock resolution, native CUDA/ROCm builds, physical inference and
+qualification, hardware quality/latency/VRAM and current CPU comparator installation/
+inference remain UNEXECUTED here. No VRAM/performance blocker was established.
+Historical numerical reports remain historical; see the
+[accepted software evidence](../UPGRADE_AND_VERIFY.md#verification-evidence).

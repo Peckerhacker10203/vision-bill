@@ -5,7 +5,7 @@ integration PR. It compares one local Gemma model on the same private receipt
 photos. It does not persist receipts, initialize a database, or change uploads.
 
 ```sh
-PYTHONPATH=src .venv/bin/python scripts/receipt_split_experiment.py \
+uv run python scripts/receipt_split_experiment.py \
   --dataset server_data/ocr-harness/paired/dataset.json \
   --ocr-report server_data/ocr-harness/truenas-photo-results/report.json \
   --output server_data/split-experiment/photo-comparison
@@ -21,7 +21,7 @@ engine is installed or run by this script.
 Modes:
 
 - `vision_all`: all photos in one request, existing extraction prompt and overlap
-  reconciliation schema from main.
+  reconciliation schema from the application.
 - `vision_parts`: one request per photo with a nullable partial-receipt schema;
   merge the extracted pieces in code.
 - `ocr_all`: all cached photo transcripts in one request, merged by the model.
@@ -76,3 +76,12 @@ receipts are a regression sample, not a population accuracy estimate.
 Before production integration, replace heuristic overlap decisions with stronger
 source-position evidence, explicitly handle ambiguous/conflicting fields and
 missing parts, test cancellation/retry behavior, and add regression coverage.
+
+[receipt_split_results.md](receipt_split_results.md) is the retained historical
+selected-case report. Its numerical values and score meanings have not been
+rewritten to represent current v4 Gold evaluation. This PR15 experiment remains
+separate from stabilized PR14 optional OCR integration; neither source import is
+claimed as a remotely merged PR. Production uses validated adjacent overlaps and
+durable all-photo extraction, not blanket tiles/rows/heuristic merging. The colleague
+attachment supplied settings only; no colleague project logic is used. See the
+[current workflow and evidence](../UPGRADE_AND_VERIFY.md).

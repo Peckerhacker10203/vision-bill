@@ -1,5 +1,14 @@
 # Manual releases to GHCR
 
+## Unreleased package
+
+Durable 202 uploads/retries, source-preserving review/checks2, exact money, explicit
+Gold/v4 diagnostics, opt-in qualified native OCR candidates and account/view
+isolation are integrated in this local package. Historical split/CPU results retain
+their original meaning. See [upgrade prerequisites and accepted evidence](UPGRADE_AND_VERIFY.md).
+No version/tag/release or deployment has been authorized by this documentation
+update. In particular, publishing the app image does not qualify CUDA/ROCm OCR.
+
 After merging this workflow, open **Actions → Release → Run workflow**, select the
 repository's default branch, and choose `patch`, `minor`, or `major`. Merging a PR
 or adding a label never publishes a release. Only users with repository write

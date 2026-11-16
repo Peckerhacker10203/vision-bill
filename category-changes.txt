@@ -1,3 +1,11 @@
+Historical category-feature handoff (migration 0008)
+===================================================
+The branch/commit suggestions, environment notes and validation counts below are
+historical, not current operator instructions or final package evidence. Current
+head is 0018; drain old workers and follow UPGRADE_AND_VERIFY.md before upgrading.
+The final pipeline extracts nullable printed observations before downstream
+category/tag enrichment. Do not execute the old branch/commit suggestions below.
+
 Branch (already checked out)
 feat/remembered-item-categories
 
