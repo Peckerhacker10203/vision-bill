@@ -211,7 +211,10 @@ async def test_real_gif_direct_uses_rgb_png_and_preserves_original_provenance(tm
 
     async def inspect(**kwargs):
         transported = kwargs["messages"][0]["images"][0]
-        with Image.open(transported) as decoded:
+        from io import BytesIO
+
+        assert isinstance(transported, bytes)
+        with Image.open(BytesIO(transported)) as decoded:
             assert decoded.format == "PNG" and decoded.mode == "RGB"
         return ChatResponse(message={"role": "assistant", "content": receipt().model_dump_json()})
 
@@ -226,6 +229,7 @@ async def test_real_gif_direct_uses_rgb_png_and_preserves_original_provenance(tm
     assert path.read_bytes() == original
     assert result.provenance.ordered_source_sha256 == [hashlib.sha256(original).hexdigest()]
     assert result.field_sources["input"] == []
+    assert result.receipt is not None
     assert result.input_views[0].working_image.transforms[0]["frame_count"] == 2
     assert result.input_views[0].source_sha256 == hashlib.sha256(original).hexdigest()
 
@@ -335,3 +339,207 @@ async def test_ocr_and_formatter_limits_remain_separate(photos):
     assert result.telemetry.ocr_max_new_tokens == 4096
     assert result.telemetry.max_output_tokens == 8192
     assert result.telemetry.context_window_tokens is None
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_configured_standard_openai_vision_model_reaches_inference(
+    settings, photos, fallback
+):
+    from vision_bill.config import LLMProviderEnum
+    from vision_bill.provider.factory import get_llm_provider
+
+    declared = settings.llm.model_copy(update={"provider": LLMProviderEnum.OPENAI})
+    # Assignment must be a supported settings field, not an ignored extra.
+    assert "vision_model_ids" in type(declared).model_fields
+    declared.vision_model_ids = ["configured-vision"]
+    llm = get_llm_provider(declared)
+    llm._client.models.with_raw_response.list = AsyncMock(
+        return_value=SimpleNamespace(
+            http_response=SimpleNamespace(
+                content=json.dumps(
+                    {"data": [{"id": "configured-vision", "object": "model"}]}
+                ).encode()
+            )
+        )
+    )
+    payload = receipt().model_dump(mode="json")
+    for row in payload["line_items"]:
+        row["source_image"] = 0
+    payload["duplicate_candidates"] = []
+    llm._client.chat.completions.create = AsyncMock(
+        return_value=SimpleNamespace(
+            model="actual-vision",
+            usage=None,
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop", message=SimpleNamespace(content=json.dumps(payload))
+                )
+            ],
+        )
+    )
+    result = await pipeline(
+        llm, sidecar(1) if fallback else None, allow_vision_fallback=fallback
+    ).extract(
+        "configured-vision",
+        photos,
+        options=ExperimentOptions(
+            pipeline="ocr" if fallback else "direct_vision",
+            allow_ocr_fallback=fallback,
+            include_classification=False,
+        ),
+        deadline=time.monotonic() + 2,
+        tags=[],
+    )
+    assert result.receipt is not None
+    assert result.provenance.fallback_used is fallback
+    assert len(llm._client.chat.completions.create.call_args.kwargs["messages"][0]["content"]) == 3
+
+
+@pytest.mark.parametrize("stage", ["hash", "normalization"])
+async def test_blocked_preparation_obeys_deadline_and_cleans_owned_files(
+    monkeypatch, tmp_path, photos, stage
+):
+    import tempfile
+    import threading
+    from pathlib import Path
+
+    from PIL import ImageOps
+
+    gate, entered, cleaned = threading.Event(), threading.Event(), threading.Event()
+    timer = threading.Timer(0.5, gate.set)
+    original_read, original_transpose = Path.read_bytes, ImageOps.exif_transpose
+    cleanup = tempfile.TemporaryDirectory.cleanup
+
+    def cleanup_observed(instance):
+        cleanup(instance)
+        cleaned.set()
+
+    def read(path):
+        if stage == "hash" and path == photos[0]:
+            entered.set()
+            gate.wait(0.5)
+        return original_read(path)
+
+    def transpose(image, *args, **kwargs):
+        entered.set()
+        gate.wait(0.5)
+        return original_transpose(image, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", read)
+    if stage == "normalization":
+        monkeypatch.setattr(ImageOps, "exif_transpose", transpose)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(tempfile.TemporaryDirectory, "cleanup", cleanup_observed)
+    llm = formatter()
+    timer.start()
+    began = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError):
+            await pipeline(llm).extract(
+                "fixture",
+                photos,
+                options=ExperimentOptions(pipeline="direct_vision", include_classification=False),
+                deadline=began + 0.08,
+                tags=[],
+            )
+        assert entered.is_set()
+        assert time.monotonic() - began < 0.3
+        llm._client.chat.assert_not_awaited()
+    finally:
+        gate.set()
+        timer.cancel()
+    if stage == "normalization":
+        assert await asyncio.to_thread(cleaned.wait, 0.5)
+        assert not list(tmp_path.glob("vision-bill-vision-*"))
+    assert llm.experiment_trace is None
+
+
+@pytest.mark.parametrize("late_stage", ["repair", "enrichment"])
+async def test_budget_exhausted_after_all_ocr_during_late_call(photos, late_stage):
+    llm, ocr = formatter(False), sidecar()
+    first = llm._client.chat.return_value
+    if late_stage == "repair":
+        first = ChatResponse(
+            message={"role": "assistant", "content": '{"merchant_name":"partial"}'}
+        )
+    entered = asyncio.Event()
+
+    async def late(**kwargs):
+        if llm._client.chat.await_count == 1:
+            return first
+        entered.set()
+        await asyncio.Event().wait()
+
+    llm._client.chat.side_effect = late
+    checkpoint = AsyncMock()
+    began = time.monotonic()
+    with pytest.raises(TimeoutError):
+        await pipeline(llm, ocr).extract(
+            "fixture",
+            photos,
+            options=ExperimentOptions(
+                pipeline="ocr", include_classification=late_stage == "enrichment"
+            ),
+            deadline=began + 0.15,
+            tags=["food"],
+            checkpoint=checkpoint,
+        )
+    assert checkpoint.await_count == 2
+    assert entered.is_set() and llm._client.chat.await_count == 2
+    assert time.monotonic() - began < 0.5
+
+
+async def test_ollama_serializes_exact_prepared_png_after_temporary_cleanup(
+    monkeypatch, tmp_path, photos
+):
+    import base64
+    import tempfile
+    from io import BytesIO
+
+    import httpx
+
+    transported = []
+    payload = receipt().model_dump(mode="json")
+    for row in payload["line_items"]:
+        row["source_image"] = 0
+    payload["duplicate_candidates"] = []
+
+    def handler(request):
+        assert not list(tmp_path.glob("vision-bill-vision-*"))
+        body = json.loads(request.content)
+        transported.extend(base64.b64decode(data) for data in body["messages"][0]["images"])
+        for png in transported:
+            with Image.open(BytesIO(png)) as image:
+                assert image.format == "PNG" and image.mode == "RGB"
+        return httpx.Response(
+            200,
+            json={
+                "model": "actual",
+                "message": {"role": "assistant", "content": json.dumps(payload)},
+                "done": True,
+            },
+        )
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    llm = OllamaProvider("http://local")
+    model = ModelInfo("fixture")
+    model.capabilities = ["vision"]
+    llm.get_available_models = AsyncMock(return_value=[model])
+    async with httpx.AsyncClient(
+        base_url="http://local", transport=httpx.MockTransport(handler)
+    ) as client:
+        llm._client._client = client
+        result = await pipeline(llm).extract(
+            "fixture",
+            photos,
+            options=ExperimentOptions(pipeline="direct_vision", include_classification=False),
+            deadline=time.monotonic() + 2,
+            tags=[],
+        )
+    assert result.receipt is not None
+    assert transported == [
+        base64.b64decode(view.working_image.png_base64) for view in result.input_views
+    ]
+    assert [view.source_sha256 for view in result.input_views] == [
+        hashlib.sha256(path.read_bytes()).hexdigest() for path in photos
+    ]

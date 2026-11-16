@@ -23,6 +23,7 @@ def get_llm_provider(llm_settings: LLMSettings) -> LLMProvider:
         return OpenAIProvider(
             host=llm_settings.host,
             api_key=llm_settings.api_key,
+            vision_model_ids=llm_settings.vision_model_ids,
             temperature=llm_settings.temperature,
             analysis_timeout_seconds=llm_settings.analysis_timeout_seconds,
             max_output_tokens=llm_settings.max_output_tokens,

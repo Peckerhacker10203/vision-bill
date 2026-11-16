@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import hashlib
 import json
 import re
 from abc import ABC, abstractmethod
@@ -6,15 +8,22 @@ from collections.abc import Callable, Mapping, Sequence
 from copy import copy
 from dataclasses import dataclass
 from decimal import Decimal
+from functools import partial
+from io import BytesIO
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from time import monotonic, perf_counter
 from typing import Any, TypeVar
+from uuid import NAMESPACE_URL, uuid5
 
+from PIL import Image, ImageOps
 from pydantic import ValidationError
 
+from ...helper.deadline import check_deadline, run_sync_before
 from ...helper.duplicates import verify_duplicate
 from ...model.experiment import ExperimentOptions
 from ...model.extraction import (
+    DerivedInputView,
     ExtractionDraft,
     InferenceEnvelope,
     InferenceTelemetry,
@@ -22,7 +31,7 @@ from ...model.extraction import (
     ReceiptInput,
 )
 from ...model.item_category import CATEGORY_CODES, CATEGORY_DEFINITIONS
-from ...model.ocr import SourceRef
+from ...model.ocr import SourceRef, WorkingImage
 from ...model.receipt import Receipt
 from ...model.receipt_extraction import MultiImageReceipt
 from ...model.review import AmountPolicy, ReviewFinding
@@ -53,6 +62,12 @@ class AnalysisResult:
     attempts: int
     elapsed_ms: float
     model_digest: str | None = None
+
+
+class _PartialDraftError(ValueError):
+    def __init__(self, envelope: InferenceEnvelope):
+        super().__init__("receipt_incomplete")
+        self.envelope = envelope
 
 
 class LLMProvider(ABC):
@@ -131,6 +146,7 @@ class LLMProvider(ABC):
     ) -> T:
         """One parser/repair loop for live typed input and legacy/replay wrappers."""
         last_error: ValueError | None = None
+        partial_error: _PartialDraftError | None = None
         for attempt in range(3):
             remaining = deadline - monotonic()
             if remaining <= 0:
@@ -138,6 +154,7 @@ class LLMProvider(ABC):
             before = len(self.experiment_trace or [])
             async with asyncio.timeout(remaining):
                 content = await self.send_message(model_id, messages)
+            check_deadline(deadline)
             call = (
                 dict(self.experiment_trace[-1])
                 if self.experiment_trace and len(self.experiment_trace) > before
@@ -154,8 +171,14 @@ class LLMProvider(ABC):
             try:
                 if not content or len(content) > 200000:
                     raise ValueError("invalid_response_size")
-                return parse(content)
+                parsed = await run_sync_before(deadline, parse, content)
+                if isinstance(parsed, InferenceEnvelope):
+                    self._record_supplied_fields(call, parsed)
+                return parsed
             except ValueError as exc:
+                if isinstance(exc, _PartialDraftError):
+                    partial_error = exc
+                    self._record_supplied_fields(call, exc.envelope)
                 last_error = exc
                 messages = [
                     *messages,
@@ -167,7 +190,19 @@ class LLMProvider(ABC):
                         "Please respond again with ONLY corrected JSON.",
                     },
                 ]
+        if partial_error is not None:
+            raise partial_error
         raise ValueError("Failed to get a valid response after 3 attempts") from last_error
+
+    @staticmethod
+    def _record_supplied_fields(call: dict[str, Any], envelope: InferenceEnvelope) -> None:
+        if envelope.draft is not None:
+            call["supplied_fields"] = sorted(envelope.draft.model_fields_set)
+            call["null_fields"] = sorted(
+                key
+                for key in envelope.draft.model_fields_set
+                if getattr(envelope.draft, key) is None
+            )
 
     async def _legacy_analysis(
         self, model_id: str, messages: list[dict[str, Any]], *, image_count: int = 1
@@ -208,22 +243,10 @@ class LLMProvider(ABC):
         started = perf_counter()
         probe = copy(self)
         probe.experiment_trace = []
+        input, messages, views = await run_sync_before(
+            deadline, probe._prepare_receipt_input, input
+        )
         count = len(input.image_paths)
-        if input.mode == "ocr":
-            if len(input.ocr_pages) != count or [p.photo_index for p in input.ocr_pages] != list(
-                range(count)
-            ):
-                raise ValueError("incomplete_ocr_input")
-            messages: list[dict[str, Any]] = [
-                {"role": "user", "content": source_extraction_prompt(input)}
-            ]
-        else:
-            messages = self._build_image_messages([Path(p) for p in input.image_paths], [])
-            # Replace the legacy prompt without changing provider-specific image transport.
-            if isinstance(messages[0]["content"], str):
-                messages[0]["content"] = source_extraction_prompt(input)
-            else:
-                messages[0]["content"][0]["text"] = source_extraction_prompt(input)
         provenance = PipelineProvenance(
             requested_pipeline=input.mode,
             used_pipeline=input.mode,
@@ -238,112 +261,17 @@ class LLMProvider(ABC):
         )
         attempts: list[dict[str, Any]] = []
 
-        def parse(content: str) -> Receipt:
-            raw = content.strip().removeprefix("```json").removesuffix("```").strip()
-            payload = json.loads(raw, parse_float=Decimal)
-            if not isinstance(payload, dict):
-                raise ValueError("invalid_output_object")  # noqa: TRY004 - malformed model output
-            if (
-                isinstance(payload.get("error"), dict)
-                and payload["error"].get("code") == "unreadable"
-            ):
-                raise UnreadableReceiptError("receipt_unreadable")
-            values = payload.get("draft", payload)
-            if not isinstance(values, dict):
-                raise ValueError("invalid_draft")  # noqa: TRY004 - malformed model output
-            draft = ExtractionDraft.model_validate(values)
-            attempts[-1]["supplied_fields"] = sorted(draft.model_fields_set)
-            attempts[-1]["null_fields"] = sorted(
-                key for key in draft.model_fields_set if getattr(draft, key) is None
-            )
-            field_sources: dict[str, list[SourceRef]] = {"input": input.source_refs}
-            supplied_sources = payload.get("field_sources", {})
-            if not isinstance(supplied_sources, dict):
-                raise ValueError("invalid_field_sources")  # noqa: TRY004 - malformed model output
-            for key, refs in supplied_sources.items():
-                if not isinstance(refs, list):
-                    raise ValueError("invalid_field_sources")  # noqa: TRY004 - malformed model output
-                validated = [SourceRef.model_validate(ref) for ref in refs]
-                for ref in validated:
-                    if not any(
-                        ref.part_id == known.part_id
-                        and ref.photo_index == known.photo_index
-                        and ref.source_sha256 == known.source_sha256
-                        and ref.view_id == known.view_id
-                        and ref.coordinate_space == known.coordinate_space
-                        for known in input.source_refs
-                    ):
-                        raise ValueError("unknown_source_reference")
-                    if input.mode == "ocr" and ref.block_id is not None:
-                        blocks = input.ocr_pages[ref.photo_index].blocks
-                        if not any(
-                            block.id == ref.block_id
-                            and (ref.bbox is None or block.bbox == ref.bbox)
-                            for block in blocks
-                        ):
-                            raise ValueError("unknown_source_block")
-                field_sources[str(key)] = validated
-            # Retain original ordered rows in the draft and all proposed overlap decisions.
-            candidates = values.get("duplicate_candidates", [])
-            if not isinstance(candidates, list) or any(
-                not isinstance(pair, dict) for pair in candidates
-            ):
-                raise ValueError("invalid_overlap_candidates")
-            decisions = payload.get("overlap_decisions", [])
-            if not isinstance(decisions, list) or any(not isinstance(d, dict) for d in decisions):
-                raise ValueError("invalid_overlap_decisions")
-            if count > 1:
-                rows = values.get("line_items")
-                if rows is not None:
-                    sources = [row.get("source_image") for row in rows]
-                    if any(
-                        type(i) is not int or not 0 <= i < count for i in sources
-                    ) or sources != sorted(sources):
-                        raise ValueError("invalid_row_source_order")
-                    for index, source in enumerate(sources):
-                        if source < len(input.source_refs):
-                            field_sources.setdefault(
-                                f"line_items.{index}", [input.source_refs[source]]
-                            )
-            result.amount_policy = AmountPolicy.model_validate(payload.get("amount_policy", {}))
-            result.draft = draft
-            result.field_sources = field_sources
-            result.overlap_decisions = decisions + [
-                dict(pair, verified=None, removed_index=None)
-                for pair in candidates
-                if isinstance(pair, dict)
-            ]
-            # Receipt validation uses observed values only; the draft keeps absent/null fields.
-            if count > 1:
-                multi = MultiImageReceipt.model_validate(values)
-                receipt = multi.reconciled(count)
-                verified_groups: dict[int, bool] = {}
-                for pair in multi.duplicate_candidates:
-                    source = multi.line_items[pair.first_index].source_image
-                    matches = verify_duplicate(
-                        multi.line_items[pair.first_index], multi.line_items[pair.second_index]
-                    )
-                    verified_groups[source] = verified_groups.get(source, True) and matches
-                result.overlap_decisions = decisions + [
-                    dict(
-                        pair.model_dump(),
-                        verified=verified_groups[multi.line_items[pair.first_index].source_image],
-                        removed_index=pair.second_index
-                        if verified_groups[multi.line_items[pair.first_index].source_image]
-                        else None,
-                    )
-                    for pair in multi.duplicate_candidates
-                ]
-            else:
-                receipt = Receipt.model_validate(values)
-            result.receipt = receipt
-            return receipt
-
         try:
-            await probe._repair_response(
-                model_id, messages, parse, deadline=deadline, attempts=attempts
+            result = await probe._repair_response(
+                model_id,
+                messages,
+                partial(probe._parse_receipt_input, input=input, prototype=result),
+                deadline=deadline,
+                attempts=attempts,
             )
-        except (json.JSONDecodeError, ValidationError, ValueError):
+        except ValueError as exc:
+            if isinstance(exc, _PartialDraftError):
+                result = exc.envelope
             # A validated nullable draft is useful even when no complete Receipt can be built.
             result.findings.append(
                 ReviewFinding(
@@ -367,8 +295,203 @@ class LLMProvider(ABC):
         if result.receipt is not None and (
             self.experiment_options is None or self.experiment_options.include_classification
         ):
-            await probe._enrich_classification(model_id, result, tags, deadline)
+            result = await probe._enrich_classification(model_id, result, tags, deadline)
+        check_deadline(deadline)
+        result.input_views = views
         result.telemetry.elapsed_ms = (perf_counter() - started) * 1000
+        return result
+
+    def _prepare_receipt_input(
+        self, input: ReceiptInput
+    ) -> tuple[ReceiptInput, list[dict[str, Any]], list[DerivedInputView]]:
+        """Own temporary derivatives until all transport content is materialized as bytes/data."""
+        input = input.model_copy(deep=True)
+        count = len(input.image_paths)
+        if input.mode == "ocr":
+            if len(input.ocr_pages) != count or [p.photo_index for p in input.ocr_pages] != list(
+                range(count)
+            ):
+                raise ValueError("incomplete_ocr_input")
+            return input, [{"role": "user", "content": source_extraction_prompt(input)}], []
+        from pillow_heif.as_plugin import register_heif_opener
+
+        register_heif_opener()
+        views: list[DerivedInputView] = []
+        with TemporaryDirectory(prefix="vision-bill-vision-") as directory:
+            paths: list[Path] = []
+            for index, source in enumerate(input.image_paths):
+                raw = Path(source).read_bytes()
+                source_hash = hashlib.sha256(raw).hexdigest()
+                target = Path(directory) / f"{index}.png"
+                with Image.open(BytesIO(raw)) as original:
+                    original.seek(0)
+                    transforms = [
+                        {
+                            "operation": "first_frame_exif_rgb",
+                            "frame_count": getattr(original, "n_frames", 1),
+                            "frame_index": 0,
+                            "exif_orientation": original.getexif().get(274),
+                            "source_format": original.format,
+                        }
+                    ]
+                    working = ImageOps.exif_transpose(original).convert("RGB")
+                    working.save(target, format="PNG")
+                png = target.read_bytes()
+                digest = hashlib.sha256(png).hexdigest()
+                views.append(
+                    DerivedInputView(
+                        photo_index=index,
+                        source_sha256=source_hash,
+                        working_image=WorkingImage(
+                            view_id=uuid5(NAMESPACE_URL, f"vision:{index}:{source_hash}:{digest}"),
+                            sha256=digest,
+                            width=working.width,
+                            height=working.height,
+                            transforms=transforms,
+                            png_base64=base64.b64encode(png).decode(),
+                        ),
+                    )
+                )
+                paths.append(target)
+            messages = self._build_image_messages(paths, [])
+            # Ollama defers Path reads until chat serialization; detach before our directory closes.
+            for message in messages:
+                if "images" in message:
+                    message["images"] = [path.read_bytes() for path in message["images"]]
+            prompt = source_extraction_prompt(input)
+            if isinstance(messages[0]["content"], str):
+                messages[0]["content"] = prompt
+            else:
+                messages[0]["content"][0]["text"] = prompt
+            return input, messages, views
+
+    def _parse_receipt_input(
+        self, content: str, *, input: ReceiptInput, prototype: InferenceEnvelope
+    ) -> InferenceEnvelope:
+        """Pure worker result; no caller envelope or attempt list is mutated."""
+        result = prototype.model_copy(deep=True)
+        count = len(input.image_paths)
+        raw = content.strip().removeprefix("```json").removesuffix("```").strip()
+        payload = json.loads(raw, parse_float=Decimal)
+        if not isinstance(payload, dict):
+            raise ValueError("invalid_output_object")  # noqa: TRY004 - malformed model output
+        if isinstance(payload.get("error"), dict) and payload["error"].get("code") == "unreadable":
+            raise UnreadableReceiptError("receipt_unreadable")
+        values = payload.get("draft", payload)
+        if not isinstance(values, dict):
+            raise ValueError("invalid_draft")  # noqa: TRY004 - malformed model output
+        draft = ExtractionDraft.model_validate(values)
+        field_sources: dict[str, list[SourceRef]] = {"input": input.source_refs}
+        supplied_sources = payload.get("field_sources", {})
+        if not isinstance(supplied_sources, dict):
+            raise ValueError("invalid_field_sources")  # noqa: TRY004 - malformed model output
+        for key, refs in supplied_sources.items():
+            if not isinstance(refs, list):
+                raise ValueError("invalid_field_sources")  # noqa: TRY004 - malformed model output
+            validated = [SourceRef.model_validate(ref) for ref in refs]
+            for ref in validated:
+                known_refs = [
+                    known
+                    for known in input.source_refs
+                    if ref.part_id == known.part_id
+                    and ref.photo_index == known.photo_index
+                    and ref.source_sha256 == known.source_sha256
+                    and ref.view_id == known.view_id
+                    and ref.coordinate_space == known.coordinate_space
+                ]
+                if not known_refs:
+                    raise ValueError("unknown_source_reference")
+                geometry = (ref.block_id, ref.bbox, ref.text_span)
+                if geometry == (None, None, None) or any(
+                    geometry == (known.block_id, known.bbox, known.text_span)
+                    for known in known_refs
+                ):
+                    continue
+                page = next(
+                    (
+                        page
+                        for page in input.ocr_pages
+                        if page.photo_index == ref.photo_index
+                        and page.source_sha256 == ref.source_sha256
+                        and page.working_image.view_id == ref.view_id
+                    ),
+                    None,
+                )
+                if input.mode != "ocr" or ref.coordinate_space != "working" or page is None:
+                    raise ValueError("unsupported_source_geometry")
+                block = next((block for block in page.blocks if block.id == ref.block_id), None)
+                if block is None or (ref.bbox is not None and ref.bbox != block.bbox):
+                    raise ValueError("unknown_source_block")
+                if ref.text_span is not None:
+                    # Native transcripts concatenate ordered blocks with one newline. Bind to
+                    # this block's actual occurrence, not an equal repeated product elsewhere.
+                    start = 0
+                    for observed in page.blocks:
+                        if observed.id == block.id:
+                            break
+                        start += len(observed.text) + 1
+                    expected_span = (start, start + len(block.text))
+                    if (
+                        page.text != "\n".join(observed.text for observed in page.blocks)
+                        or ref.text_span != expected_span
+                    ):
+                        raise ValueError("unsupported_source_span")
+            field_sources[str(key)] = validated
+        # Retain original ordered rows in the draft and all proposed overlap decisions.
+        candidates = values.get("duplicate_candidates", [])
+        if not isinstance(candidates, list) or any(
+            not isinstance(pair, dict) for pair in candidates
+        ):
+            raise ValueError("invalid_overlap_candidates")
+        decisions = payload.get("overlap_decisions", [])
+        if not isinstance(decisions, list) or any(not isinstance(d, dict) for d in decisions):
+            raise ValueError("invalid_overlap_decisions")
+        if count > 1:
+            rows = values.get("line_items")
+            if rows is not None:
+                sources = [row.get("source_image") for row in rows]
+                if any(
+                    type(i) is not int or not 0 <= i < count for i in sources
+                ) or sources != sorted(sources):
+                    raise ValueError("invalid_row_source_order")
+                for index, source in enumerate(sources):
+                    if source < len(input.source_refs):
+                        field_sources.setdefault(f"line_items.{index}", [input.source_refs[source]])
+        result.amount_policy = AmountPolicy.model_validate(payload.get("amount_policy", {}))
+        result.draft = draft
+        result.field_sources = field_sources
+        result.overlap_decisions = decisions + [
+            dict(pair, verified=None, removed_index=None)
+            for pair in candidates
+            if isinstance(pair, dict)
+        ]
+        # Receipt validation uses observed values only; the draft keeps absent/null fields.
+        try:
+            if count > 1:
+                multi = MultiImageReceipt.model_validate(values)
+                receipt = multi.reconciled(count)
+                verified_groups: dict[int, bool] = {}
+                for pair in multi.duplicate_candidates:
+                    source = multi.line_items[pair.first_index].source_image
+                    matches = verify_duplicate(
+                        multi.line_items[pair.first_index], multi.line_items[pair.second_index]
+                    )
+                    verified_groups[source] = verified_groups.get(source, True) and matches
+                result.overlap_decisions = decisions + [
+                    dict(
+                        pair.model_dump(),
+                        verified=verified_groups[multi.line_items[pair.first_index].source_image],
+                        removed_index=pair.second_index
+                        if verified_groups[multi.line_items[pair.first_index].source_image]
+                        else None,
+                    )
+                    for pair in multi.duplicate_candidates
+                ]
+            else:
+                receipt = Receipt.model_validate(values)
+        except ValueError as exc:
+            raise _PartialDraftError(result) from exc
+        result.receipt = receipt
         return result
 
     def _build_image_messages(
@@ -376,12 +499,10 @@ class LLMProvider(ABC):
     ) -> list[dict[str, Any]]:
         raise NotImplementedError
 
-    async def _enrich_classification(
-        self, model_id: str, result: InferenceEnvelope, tags: Sequence[str], deadline: float
-    ) -> None:
-        # Enrichment may set classification only, never extracted numbers, order or text.
+    @staticmethod
+    def _classification_prompt(result: InferenceEnvelope, tags: Sequence[str]) -> str:
         assert result.receipt is not None
-        prompt = (
+        return (
             "Classify these ordered receipt rows. Return JSON with category and line_items "
             "(spending_category and tags only, same row count). Allowed tags: "
             + json.dumps(list(tags))
@@ -390,28 +511,16 @@ class LLMProvider(ABC):
             + "; receipt: "
             + result.receipt.model_dump_json()
         )
-        before = len(self.experiment_trace or [])
-        async with asyncio.timeout(max(0, deadline - monotonic())):
-            content = await self.send_message(model_id, [{"role": "user", "content": prompt}])
-        call = (
-            dict(self.experiment_trace[-1])
-            if self.experiment_trace and len(self.experiment_trace) > before
-            else {}
-        )
-        call.update(
-            stage="classification",
-            requested_model=model_id,
-            raw_response=content[:200000],
-            response_truncated=len(content) > 200000,
-        )
-        result.telemetry.calls.append(call)
-        if isinstance(call.get("elapsed_ms"), (float, int)):
-            result.telemetry.stage_ms["classification"] = call["elapsed_ms"]
+
+    @staticmethod
+    def _parse_classification(content: str, result: InferenceEnvelope) -> InferenceEnvelope:
+        result = result.model_copy(deep=True)
+        assert result.receipt is not None
         try:
             payload = json.loads(content)
             rows = payload.get("line_items", [])
             if len(rows) != len(result.receipt.line_items):
-                return
+                return result
             updated = result.receipt.model_dump()
             updated["category"] = payload.get("category", updated["category"])
             for row, additions in zip(updated["line_items"], rows, strict=True):
@@ -424,7 +533,34 @@ class LLMProvider(ABC):
                 # The original draft rows include overlap; classification targets only final rows.
                 # Keep per-row enrichment on Receipt rather than misassigning it to overlap rows.
         except (ValueError, TypeError, AttributeError):
-            return
+            return result
+
+        return result
+
+    async def _enrich_classification(
+        self, model_id: str, result: InferenceEnvelope, tags: Sequence[str], deadline: float
+    ) -> InferenceEnvelope:
+        prompt = await run_sync_before(deadline, self._classification_prompt, result, tuple(tags))
+        before = len(self.experiment_trace or [])
+        async with asyncio.timeout(max(0, deadline - monotonic())):
+            content = await self.send_message(model_id, [{"role": "user", "content": prompt}])
+        check_deadline(deadline)
+        call = (
+            dict(self.experiment_trace[-1])
+            if self.experiment_trace and len(self.experiment_trace) > before
+            else {}
+        )
+        call.update(
+            stage="classification",
+            requested_model=model_id,
+            raw_response=content[:200000],
+            response_truncated=len(content) > 200000,
+        )
+        result = await run_sync_before(deadline, self._parse_classification, content, result)
+        result.telemetry.calls.append(call)
+        if isinstance(call.get("elapsed_ms"), (float, int)):
+            result.telemetry.stage_ms["classification"] = call["elapsed_ms"]
+        return result
 
     def _ocr_result_to_text(self, ocr_result: dict[str, Any]) -> str:
         """Historical harness adapter, shared by both provider backends."""

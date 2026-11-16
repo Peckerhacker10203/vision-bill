@@ -1,27 +1,23 @@
 """Deadline-bound, ordered all-photo OCR and formatting without persistence."""
 
 import asyncio
-import base64
 import hashlib
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from time import monotonic, perf_counter
-from uuid import NAMESPACE_URL, uuid5
 
 import httpx
-from PIL import Image, ImageOps
 
 from ..config import OcrSettings
+from ..helper.deadline import check_deadline, run_sync_before
 from ..model.experiment import ExperimentOptions
 from ..model.extraction import (
-    DerivedInputView,
     InferenceEnvelope,
     InferenceTelemetry,
     PipelineProvenance,
     ReceiptInput,
 )
-from ..model.ocr import OcrPageMetadata, OcrResponse, SourceRef, WorkingImage
+from ..model.ocr import OcrPageMetadata, OcrResponse, SourceRef
 from ..model.review import ReviewFinding
 from ..provider.llm.base import LLMProvider
 from ..provider.ocr.base import OcrProvider, compact_ocr_text
@@ -48,10 +44,34 @@ class ExtractionPipeline:
         tags: Sequence[str],
         checkpoint: Callable[[OcrResponse], Awaitable[None]] | None = None,
     ) -> InferenceEnvelope:
+        async with asyncio.timeout(max(0, deadline - monotonic())):
+            result = await self._extract(
+                model_id,
+                tuple(paths),
+                options=options.model_copy(deep=True),
+                deadline=deadline,
+                tags=tuple(tags),
+                checkpoint=checkpoint,
+            )
+        check_deadline(deadline)
+        return result
+
+    async def _extract(
+        self,
+        model_id: str,
+        paths: Sequence[Path],
+        *,
+        options: ExperimentOptions,
+        deadline: float,
+        tags: Sequence[str],
+        checkpoint: Callable[[OcrResponse], Awaitable[None]] | None,
+    ) -> InferenceEnvelope:
         if not paths:
             raise ValueError("source_images_required")
         started = perf_counter()
-        hashes = [hashlib.sha256(path.read_bytes()).hexdigest() for path in paths]
+        hashes = await run_sync_before(
+            deadline, lambda: [hashlib.sha256(path.read_bytes()).hexdigest() for path in paths]
+        )
         # Database part IDs are bound later by photo_index and original hash.
         refs: list[SourceRef] = []
         provider = self.provider.for_experiment(options)
@@ -170,61 +190,20 @@ class ExtractionPipeline:
                         "vision_fallback_unavailable" if use_ocr else "vision_model_unavailable",
                         started,
                     )
-            with TemporaryDirectory(prefix="vision-bill-vision-") as directory:
-                normalized: list[Path] = []
-                views: list[DerivedInputView] = []
-                from pillow_heif.as_plugin import register_heif_opener
-
-                register_heif_opener()
-                for index, path in enumerate(paths):
-                    target = Path(directory) / f"{index}.png"
-                    with Image.open(path) as original:
-                        original.seek(0)
-                        transforms = [
-                            {
-                                "operation": "first_frame_exif_rgb",
-                                "frame_count": getattr(original, "n_frames", 1),
-                                "frame_index": 0,
-                                "exif_orientation": original.getexif().get(274),
-                                "source_format": original.format,
-                            }
-                        ]
-                        working = ImageOps.exif_transpose(original).convert("RGB")
-                        working.save(target, format="PNG")
-                    digest = hashlib.sha256(target.read_bytes()).hexdigest()
-                    view_id = uuid5(NAMESPACE_URL, f"vision:{index}:{hashes[index]}:{digest}")
-                    normalized.append(target)
-                    views.append(
-                        DerivedInputView(
-                            photo_index=index,
-                            source_sha256=hashes[index],
-                            working_image=WorkingImage(
-                                view_id=view_id,
-                                sha256=digest,
-                                width=working.width,
-                                height=working.height,
-                                transforms=transforms,
-                                png_base64=base64.b64encode(target.read_bytes()).decode(),
-                            ),
-                        )
-                    )
-                formatted = await provider.extract_receipt_input(
-                    vision_id,
-                    ReceiptInput(
-                        mode="direct_vision",
-                        image_paths=[str(p) for p in normalized],
-                        source_refs=refs,
-                    ),
-                    tags=tags,
-                    deadline=deadline,
-                )
-                formatted.input_views = views
-                result.provenance.fallback_used = use_ocr
-                result.provenance.model_digest = available[vision_id].digest
-                formatted.telemetry.context_window_tokens = available[
-                    vision_id
-                ].context_window_tokens
-                return self._finish(formatted, result, started)
+            formatted = await provider.extract_receipt_input(
+                vision_id,
+                ReceiptInput(
+                    mode="direct_vision", image_paths=[str(p) for p in paths], source_refs=refs
+                ),
+                tags=tags,
+                deadline=deadline,
+            )
+            if [view.source_sha256 for view in formatted.input_views] != hashes:
+                raise ValueError("vision_source_hash_mismatch")
+            result.provenance.fallback_used = use_ocr
+            result.provenance.model_digest = available[vision_id].digest
+            formatted.telemetry.context_window_tokens = available[vision_id].context_window_tokens
+            return self._finish(formatted, result, started)
 
     @staticmethod
     def _failed(result: InferenceEnvelope, code: str, started: float) -> InferenceEnvelope:

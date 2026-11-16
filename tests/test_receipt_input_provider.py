@@ -348,3 +348,211 @@ async def test_null_overlap_candidates_are_repaired_without_crashing():
         "requested", ocr_input(), tags=[], deadline=time.monotonic() + 2
     )
     assert result.receipt is None and len(result.telemetry.calls) == 3
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"id": "text", "capabilities": ["completion"]},
+        {"id": "text", "capabilities": ["embedding"]},
+        {"id": "text", "architecture": {"input_modalities": ["text"]}},
+    ],
+)
+async def test_configured_vision_does_not_override_known_text_metadata(entry):
+    assert "vision_model_ids" in __import__("inspect").signature(OpenAIProvider).parameters
+    provider = OpenAIProvider("http://local", "local", vision_model_ids=["text"])
+    provider._client.models.with_raw_response.list = AsyncMock(
+        return_value=SimpleNamespace(
+            http_response=SimpleNamespace(content=json.dumps({"data": [entry]}).encode())
+        )
+    )
+    assert await provider.get_available_models() == []
+
+
+async def test_undeclared_standard_openai_model_keeps_vision_discovery_default():
+    provider = OpenAIProvider("http://local", "local")
+    provider._client.models.with_raw_response.list = AsyncMock(
+        return_value=SimpleNamespace(
+            http_response=SimpleNamespace(content=b'{"data":[{"id":"unknown"}]}')
+        )
+    )
+    assert await provider.get_available_models() == []
+    assert [model.id for model in await provider.get_available_models(capability="text")] == [
+        "unknown"
+    ]
+
+
+@pytest.mark.parametrize("mode", ["ocr", "direct_vision"])
+@pytest.mark.parametrize(
+    "added",
+    [
+        {"bbox": [[0, 0], [1, 0], [1, 1]]},
+        {"text_span": [0, 4]},
+        {"block_id": "invented"},
+    ],
+)
+async def test_identity_does_not_authorize_new_geometry(mode, added, tmp_path):
+    from PIL import Image
+    from test_experiment_scoring import receipt
+
+    inp = ocr_input()
+    if mode == "direct_vision":
+        path = tmp_path / "real.png"
+        Image.new("RGB", (3, 4)).save(path)
+        inp = ReceiptInput(mode=mode, image_paths=[str(path)], source_refs=inp.source_refs)
+    ref = inp.source_refs[0].model_dump(mode="json") | added
+    payload = receipt().model_dump(mode="json") | {"field_sources": {"merchant_name": [ref]}}
+    provider = OllamaProvider("http://local")
+    provider.send_message = AsyncMock(return_value=json.dumps(payload))
+    result = await provider.extract_receipt_input(
+        "requested", inp, tags=[], deadline=time.monotonic() + 2
+    )
+    assert result.receipt is None
+    assert "merchant_name" not in result.field_sources
+
+
+@pytest.mark.parametrize("mode", ["ocr", "direct_vision"])
+async def test_exact_supplied_geometry_is_preserved(mode, tmp_path):
+    from PIL import Image
+    from test_experiment_scoring import receipt
+
+    inp = ocr_input()
+    known = inp.source_refs[0].model_copy(
+        update={"bbox": [[0, 0], [1, 0], [1, 1]], "text_span": (0, 4)}
+    )
+    path = tmp_path / "real.png"
+    Image.new("RGB", (3, 4)).save(path)
+    inp = ReceiptInput(
+        mode=mode,
+        image_paths=[str(path)],
+        ocr_pages=inp.ocr_pages if mode == "ocr" else [],
+        source_refs=[known],
+    )
+    payload = receipt().model_dump(mode="json") | {
+        "field_sources": {"merchant_name": [known.model_dump(mode="json")]}
+    }
+    from vision_bill.model.experiment import ExperimentOptions
+
+    provider = OllamaProvider("http://local").for_experiment(
+        ExperimentOptions(include_classification=False)
+    )
+    provider.send_message = AsyncMock(return_value=json.dumps(payload))
+    result = await provider.extract_receipt_input(
+        "requested", inp, tags=[], deadline=time.monotonic() + 2
+    )
+    assert result.receipt is not None
+    assert result.field_sources["merchant_name"] == [known]
+
+
+@pytest.mark.parametrize("span, accepted", [((0, 9), True), ((1, 5), False), ((0, 99), False)])
+async def test_ocr_geometry_must_match_block_and_exact_transcript_span(span, accepted):
+    from test_experiment_scoring import receipt
+
+    from vision_bill.model.experiment import ExperimentOptions
+    from vision_bill.model.ocr import OcrBlock
+
+    inp = ocr_input()
+    block = OcrBlock(
+        id="printed", label="text", text=inp.ocr_pages[0].text, bbox=[[0, 0], [1, 0], [1, 1]]
+    )
+    inp.ocr_pages[0].blocks = [block]
+    ref = inp.source_refs[0].model_copy(
+        update={"bbox": block.bbox, "block_id": block.id, "text_span": span}
+    )
+    payload = receipt().model_dump(mode="json") | {
+        "field_sources": {"merchant_name": [ref.model_dump(mode="json")]}
+    }
+    provider = OllamaProvider("http://local").for_experiment(
+        ExperimentOptions(include_classification=False)
+    )
+    provider.send_message = AsyncMock(return_value=json.dumps(payload))
+    result = await provider.extract_receipt_input(
+        "requested", inp, tags=[], deadline=time.monotonic() + 2
+    )
+    assert (result.receipt is not None) is accepted
+
+
+@pytest.mark.parametrize("stage", ["extraction", "classification"])
+async def test_blocked_parsing_cannot_return_late_success_or_mutate_input(monkeypatch, stage):
+    import asyncio
+    import threading
+
+    from test_experiment_scoring import receipt
+
+    from vision_bill.model.experiment import ExperimentOptions
+
+    inp = ocr_input()
+    before = inp.model_dump()
+    response = receipt().model_dump_json()
+    classification = json.dumps(
+        {"category": "grocery", "line_items": [{"tags": ["late"]} for _ in receipt().line_items]}
+    )
+    provider = OllamaProvider("http://local").for_experiment(
+        ExperimentOptions(include_classification=stage == "classification")
+    )
+    provider.send_message = AsyncMock(side_effect=[response, classification])
+    gate, entered, finished = threading.Event(), threading.Event(), threading.Event()
+    original = json.loads
+    blocked = response if stage == "extraction" else classification
+
+    def loads(raw, *args, **kwargs):
+        if raw == blocked:
+            entered.set()
+            gate.wait(0.5)
+            try:
+                return original(raw, *args, **kwargs)
+            finally:
+                finished.set()
+        return original(raw, *args, **kwargs)
+
+    monkeypatch.setattr(json, "loads", loads)
+    timer = threading.Timer(0.5, gate.set)
+    timer.start()
+    began = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError):
+            await provider.extract_receipt_input(
+                "requested", inp, tags=["food"], deadline=began + 0.08
+            )
+        assert entered.is_set()
+        assert time.monotonic() - began < 0.3
+    finally:
+        gate.set()
+        timer.cancel()
+    assert await asyncio.to_thread(finished.wait, 0.5)
+    assert inp.model_dump() == before
+    assert provider.experiment_trace == []
+
+
+async def test_ocr_repeated_text_span_cannot_point_to_another_block():
+    from test_experiment_scoring import receipt
+
+    from vision_bill.model.experiment import ExperimentOptions
+    from vision_bill.model.ocr import OcrBlock
+
+    inp = ocr_input()
+    inp.ocr_pages[0].blocks = [
+        OcrBlock(
+            id=str(index),
+            label="text",
+            text="Milk 2.00",
+            bbox=[[0, index], [1, index], [1, index + 1]],
+        )
+        for index in range(2)
+    ]
+    inp.ocr_pages[0].text = "Milk 2.00\nMilk 2.00"
+    # Matching text is insufficient: block1 occupies the second occurrence, not the first.
+    ref = inp.source_refs[0].model_copy(
+        update={"block_id": "1", "bbox": inp.ocr_pages[0].blocks[1].bbox, "text_span": (0, 9)}
+    )
+    payload = receipt().model_dump(mode="json") | {
+        "field_sources": {"merchant_name": [ref.model_dump(mode="json")]}
+    }
+    provider = OllamaProvider("http://local").for_experiment(
+        ExperimentOptions(include_classification=False)
+    )
+    provider.send_message = AsyncMock(return_value=json.dumps(payload))
+    output = await provider.extract_receipt_input(
+        "requested", inp, tags=[], deadline=time.monotonic() + 2
+    )
+    assert output.receipt is None

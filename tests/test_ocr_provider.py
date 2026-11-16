@@ -198,3 +198,40 @@ async def test_ocr_limit_comes_from_matching_ready_profile(monkeypatch):
     capabilities = await PaddleOcrProvider("http://local").get_capabilities()
     assert capabilities.ready
     assert getattr(capabilities, "ocr_max_new_tokens", None) == 4096
+
+
+async def test_original_byte_preparation_is_bounded_before_http(monkeypatch, tmp_path):
+    import asyncio
+    import threading
+    from pathlib import Path
+
+    path = image_file(tmp_path)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    original = Path.read_bytes
+    gate, entered, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def read(selected):
+        entered.set()
+        gate.wait(0.5)
+        try:
+            return original(selected)
+        finally:
+            finished.set()
+
+    calls = http_client(monkeypatch, lambda request: httpx.Response(500))
+    monkeypatch.setattr(Path, "read_bytes", read)
+    timer = threading.Timer(0.5, gate.set)
+    timer.start()
+    began = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError):
+            await PaddleOcrProvider("http://local").extract_page(
+                path, photo_index=0, source_sha256=digest, deadline=began + 0.08
+            )
+        assert entered.is_set()
+        assert time.monotonic() - began < 0.3
+    finally:
+        gate.set()
+        timer.cancel()
+    assert await asyncio.to_thread(finished.wait, 0.5)
+    assert calls == []

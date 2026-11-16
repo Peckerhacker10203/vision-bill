@@ -55,6 +55,7 @@ class LLMSettings(BaseModel):
     # Keep the complete extraction deadline below the 15-minute image claim lease.
     analysis_timeout_seconds: float = Field(default=600, gt=0, le=600)
     max_output_tokens: int = Field(default=8192, gt=0)
+    vision_model_ids: list[str] = Field(default_factory=list)
 
 
 class ApiSettings(BaseModel):

@@ -41,8 +41,12 @@ def _format_parameter_size(n_params: int) -> str:
     return str(n_params)
 
 
-def _is_vision_capable(entry: dict[str, Any], capabilities: list[str] | None) -> bool:
+def _is_vision_capable(
+    entry: dict[str, Any], capabilities: list[str] | None, *, declared: bool = False
+) -> bool:
     """True when a model entry advertises image/vision input capability."""
+    entry_caps = entry.get("capabilities")
+    capabilities = [*(capabilities or []), *(entry_caps if isinstance(entry_caps, list) else [])]
     if capabilities and any(field in capabilities for field in VISION_CAPABILITY_FIELDS):
         return True
     architecture = entry.get("architecture")
@@ -55,7 +59,15 @@ def _is_vision_capable(entry: dict[str, Any], capabilities: list[str] | None) ->
         for value in meta.values():
             if isinstance(value, list) and "image" in value:
                 return True
-    return False
+    # An operator declaration fills absent metadata, never contradicts advertised input support.
+    modalities = architecture.get("input_modalities") if isinstance(architecture, dict) else None
+    meta_modalities = meta.get("input_modalities") if isinstance(meta, dict) else None
+    return (
+        declared
+        and not capabilities
+        and not isinstance(modalities, list)
+        and not isinstance(meta_modalities, list)
+    )
 
 
 class OpenAIProvider(LLMProvider):
@@ -66,7 +78,9 @@ class OpenAIProvider(LLMProvider):
         temperature: float = 0.0,
         analysis_timeout_seconds: float = 600,
         max_output_tokens: int = 8192,
+        vision_model_ids: Sequence[str] = (),
     ):
+        self._vision_model_ids = frozenset(vision_model_ids)
         self.analysis_timeout_seconds = analysis_timeout_seconds
         self.max_output_tokens = max_output_tokens
         self._client = AsyncOpenAI(
@@ -117,7 +131,9 @@ class OpenAIProvider(LLMProvider):
             if not isinstance(capabilities, list):
                 capabilities = []
             if capability == "vision" and not _is_vision_capable(
-                data_by_id.get(model_id, {}), capabilities
+                data_by_id.get(model_id, {}),
+                capabilities,
+                declared=model_id in self._vision_model_ids,
             ):
                 continue
 
@@ -143,9 +159,11 @@ class OpenAIProvider(LLMProvider):
             capacity = data_by_id.get(model_id, {}).get("context_length")
             mi.context_window_tokens = capacity if type(capacity) is int and capacity > 0 else None
             mi.capabilities = capabilities
-            if _is_vision_capable(data_by_id.get(model_id, {}), capabilities) and not any(
-                c in mi.capabilities for c in VISION_CAPABILITY_FIELDS
-            ):
+            if _is_vision_capable(
+                data_by_id.get(model_id, {}),
+                capabilities,
+                declared=model_id in self._vision_model_ids,
+            ) and not any(c in mi.capabilities for c in VISION_CAPABILITY_FIELDS):
                 mi.capabilities.append("vision")
             digest = str(entry.get("digest") or "")
             mi.digest = digest or None
@@ -168,7 +186,9 @@ class OpenAIProvider(LLMProvider):
                     and not any(c in capabilities for c in TEXT_CAPABILITIES)
                 ):
                     continue
-                if capability == "vision" and not _is_vision_capable(entry, capabilities):
+                if capability == "vision" and not _is_vision_capable(
+                    entry, capabilities, declared=model_id in self._vision_model_ids
+                ):
                     continue
                 mi = ModelInfo(id=model_id)
                 capacity = entry.get("context_length")
@@ -177,9 +197,9 @@ class OpenAIProvider(LLMProvider):
                 )
                 capabilities = entry.get("capabilities")
                 mi.capabilities = capabilities if isinstance(capabilities, list) else []
-                if _is_vision_capable(entry, mi.capabilities) and not any(
-                    c in mi.capabilities for c in VISION_CAPABILITY_FIELDS
-                ):
+                if _is_vision_capable(
+                    entry, mi.capabilities, declared=model_id in self._vision_model_ids
+                ) and not any(c in mi.capabilities for c in VISION_CAPABILITY_FIELDS):
                     mi.capabilities.append("vision")
                 digest = str(entry.get("digest") or "")
                 mi.digest = digest or None
