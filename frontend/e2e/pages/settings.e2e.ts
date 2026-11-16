@@ -6,7 +6,7 @@ test.describe('settings (admin)', () => {
 	test('loads with source labels and locked env fields', async ({ page, context }) => {
 		await loginAdmin(context);
 		await page.goto('/settings');
-		await expect(page.getByText('Vision model')).toBeVisible();
+		await expect(page.getByRole('group', { name: 'Receipt formatter', exact: true })).toBeVisible();
 		await expect(page.getByText('Environment').first()).toBeVisible();
 		await expect(page.getByText('Config').first()).toBeVisible();
 		await expect(page.getByLabel('Provider')).toBeDisabled();
