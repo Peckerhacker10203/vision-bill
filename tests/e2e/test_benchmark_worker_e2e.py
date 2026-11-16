@@ -303,7 +303,7 @@ async def test_permitted_fallback_preserves_frozen_contract_and_executed_runtime
 
 
 @pytest.mark.parametrize("budget", ["worker", "saved_run"])
-@pytest.mark.parametrize("phase", ["inference", "preflight", "persistence"])
+@pytest.mark.parametrize("phase", ["inference", "preflight", "persistence", "preflight_bookkeeping"])
 async def test_complete_worker_deadline_includes_preflight_and_persistence(workflow_db, tmp_path, phase, budget):
     w, scope = workflow_db
     service, run, _, _, inference, _ = await prepare(w, scope, tmp_path, kind="manifest",
@@ -314,6 +314,7 @@ async def test_complete_worker_deadline_includes_preflight_and_persistence(workf
     reached = asyncio.Event()
     cancelled = asyncio.Event()
     release_inference = asyncio.Event()
+    original_retry = service._db.retry_task
     async def blocked(*args, **kwargs):
         reached.set()
         try:
@@ -324,9 +325,18 @@ async def test_complete_worker_deadline_includes_preflight_and_persistence(workf
         inference.side_effect = blocked
     elif phase == "preflight":
         service._provider.get_available_models.side_effect = blocked
-    else:
-        # Block both finish AND retry after a real begin transition. Bookkeeping
-        # must not extend the total budget; expired-lease recovery owns this case.
+    elif phase == "preflight_bookkeeping":
+        service._provider.get_available_models.side_effect = RuntimeError("discovery unavailable")
+        async def blocked_retry(*args, **kwargs):
+            reached.set()
+            try:
+                return await original_retry(*args, **kwargs)
+            finally:
+                cancelled.set()
+        service._db.retry_task = blocked_retry
+    if phase in ("persistence", "preflight_bookkeeping"):
+        # Hold a real task lock through the deadline. Preflight blocks retry;
+        # persistence blocks finish and retry after a real begin transition.
         blocker = await w.pool.acquire()
         tx = blocker.transaction()
         await tx.start()
@@ -334,9 +344,13 @@ async def test_complete_worker_deadline_includes_preflight_and_persistence(workf
             reached.set()
             await release_inference.wait()
             return inference.return_value
-        inference.side_effect = result_after_barrier
+        if phase == "persistence":
+            inference.side_effect = result_after_barrier
     started = monotonic()
-    work = asyncio.create_task(service._execute(dict(await service._db.lease_task())))
+    original_claim = dict(await service._db.lease_task())
+    if phase == "preflight_bookkeeping":
+        await blocker.fetchval("SELECT 1 FROM benchmark_tasks WHERE run_id=$1 FOR UPDATE", run.id)
+    work = asyncio.create_task(service._execute(dict(original_claim)))
     try:
         if phase == "persistence":
             await asyncio.wait_for(reached.wait(), 1)
@@ -345,29 +359,65 @@ async def test_complete_worker_deadline_includes_preflight_and_persistence(workf
             await claims.wait_blocked(w.pool, 1)
         else:
             await asyncio.wait_for(reached.wait(), 1)
+            if phase == "preflight_bookkeeping":
+                await claims.wait_blocked(w.pool, 1)
         await asyncio.wait_for(work, 2)
         assert monotonic() - started < 1.8
     finally:
         if not work.done():
             work.cancel()
             await asyncio.gather(work, return_exceptions=True)
-        if phase == "persistence":
+        if phase in ("persistence", "preflight_bookkeeping"):
             await tx.rollback()
             await w.pool.release(blocker)
+        service._db.retry_task = original_retry
     task = await claims.saved(w, run.id)
     assert task is not None
-    assert task["inference_attempt_count"] == (0 if phase == "preflight" else 1)
-    assert task["status"] == {"preflight": "waiting_for_model", "inference": "retrying", "persistence": "running"}[phase]
+    count = 0 if phase.startswith("preflight") else 1
+    assert task["inference_attempt_count"] == count
+    assert task["inference_started"] == bool(count)
+    if phase in ("persistence", "preflight_bookkeeping"):
+        assert task["status"] == "running"
+    if task["status"] == "running":
+        # Bookkeeping may exhaust its bounded reserve. Every reservation field
+        # must remain intact, not just an arbitrary acceptable status string.
+        assert dict(task) == {
+            **original_claim, "inference_attempt_count": count, "inference_started": bool(count)
+        }
+    else:
+        assert task["status"] == ("waiting_for_model" if count == 0 else "retrying")
+        assert task["claim_token"] is None and task["leased_until"] is None
+        assert task["retry_at"] is not None and task["retry_at"] > task["started_at"]
+        assert dict(task) == {
+            **original_claim, "inference_attempt_count": count, "inference_started": bool(count),
+            "status": task["status"], "claim_token": None, "leased_until": None,
+            "retry_at": task["retry_at"],
+        }
     assert (await service._db.summaries(run.id))[0].completed == 0
     assert await service._db.results(run.id) == []
     if phase != "persistence":
         assert cancelled.is_set()
-    else:
-        inference.side_effect = None
-        await claims.due(w, run.id, expire=True)
-        await service._execute(dict(await service._db.lease_task()))
-        assert (await service._db.summaries(run.id))[0].completed == 1
-        assert (await service._db.results(run.id))[0]["metadata"]["inference_attempt_count"] == 2
+    service._provider.get_available_models.side_effect = None
+    inference.side_effect = None
+    await claims.due(w, run.id, expire=task["status"] == "running")
+    recovered = dict(await service._db.lease_task())
+    assert recovered["claim_token"] != original_claim["claim_token"]
+    assert recovered["inference_attempt_count"] == count and not recovered["inference_started"]
+    assert recovered["retry_at"] is None and recovered["leased_until"] is not None
+    summaries = await service._db.summaries(run.id)
+    run_before = await service._db.run(run.id)
+    assert await service._db.begin_attempt(original_claim) is None
+    assert not await service._db.retry_task(original_claim, waiting=True)
+    assert not await service._db.finish_task(original_claim, success=True)
+    assert dict(await claims.saved(w, run.id)) == recovered
+    assert await service._db.summaries(run.id) == summaries
+    assert await service._db.run(run.id) == run_before
+    assert await service._db.results(run.id) == []
+    await service._execute(recovered)
+    assert await service._db.lease_task() is None
+    assert (await service._db.summaries(run.id))[0].completed == 1
+    results = await service._db.results(run.id)
+    assert len(results) == 1 and results[0]["metadata"]["inference_attempt_count"] == count + 1
 
 
 async def test_upload_without_permission_waits_despite_global_fallback(workflow_db, tmp_path):

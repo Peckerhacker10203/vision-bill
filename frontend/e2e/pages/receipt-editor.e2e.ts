@@ -265,20 +265,28 @@ test.describe('receipt editor', () => {
 		await expect(page.getByRole('button', { name: 'Add item' })).toBeVisible();
 	});
 
-	test('tags: create, keep, persists after save', async ({ page, context }) => {
+	test('tags: add vocabulary tag and preserve existing tags after save', async ({
+		page,
+		context
+	}) => {
 		test.setTimeout(120_000);
 		await uploadFixture(page, context, await loadFixture('b'), { verify: false });
 
-		// FIX: The TagEditor create-option interaction is unreliable with
-		// Playwright (Svelte combobox event delegation / dropdown timing).
-		// Use a known vocabulary tag "food" to test the tag add → save →
-		// persist flow.  The brief's "create + keep" flow tests the same
-		// end-to-end behaviour (tag appears, persists after save) but via
-		// the create-option path which is flaky in Playwright.
+		// Classification already selected food. Add a different vocabulary tag
+		// and check selected pills, not matching text in the open options list.
 		await page.getByText('Optional tags').first().click();
+		await expect(page.getByRole('button', { name: 'Remove “food”', exact: true })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Remove “beverage”', exact: true })).toHaveCount(
+			0
+		);
 		await page.getByRole('button', { name: 'Tags' }).click();
-		await page.getByRole('option', { name: 'food' }).click();
-		await expect(page.getByText('food').first()).toBeVisible();
+		await page.getByRole('option', { name: 'beverage', exact: true }).click();
+		await page.keyboard.press('Escape');
+		await expect(page.getByRole('listbox')).toBeHidden();
+		await expect(
+			page.getByRole('button', { name: 'Remove “beverage”', exact: true })
+		).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Remove “food”', exact: true })).toBeVisible();
 
 		// Save and verify persistence.
 		await page.getByRole('button', { name: 'Save', exact: true }).click();
@@ -286,7 +294,10 @@ test.describe('receipt editor', () => {
 
 		await page.reload();
 		await page.getByText('Optional tags').first().click();
-		await expect(page.getByText('food')).toBeVisible();
+		await expect(
+			page.getByRole('button', { name: 'Remove “beverage”', exact: true })
+		).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Remove “food”', exact: true })).toBeVisible();
 	});
 
 	test('taxes can be added and removed', async ({ page, context }) => {
