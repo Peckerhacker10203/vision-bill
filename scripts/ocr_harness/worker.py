@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import hashlib
 import importlib.metadata
 import io
 import ipaddress
@@ -12,6 +13,7 @@ import subprocess
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from uuid import uuid4
 
 
 def plain(value):
@@ -166,11 +168,18 @@ def http(options, image):
     # Disable environment proxies: receipt bytes must go straight to the selected local endpoint.
     client = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     if image is None:
-        client.open(endpoint + "/health", timeout=10).close()
+        client.open(endpoint + "/ready", timeout=10).close()
         return None
     boundary = "vision-bill-ocr-harness-boundary"
     content_type = mimetypes.guess_type(str(image))[0] or "application/octet-stream"
-    body = (
+    request_id = str(uuid4())
+    source_sha256 = hashlib.sha256(image.read_bytes()).hexdigest()
+    timeout = min(options.get("timeout", 600), 600)
+    fields = {"request_id": request_id, "photo_index": "0", "source_sha256": source_sha256,
+              "timeout_ms": str(int(timeout * 1000))}
+    prefix = "".join(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'
+                     for key, value in fields.items()).encode()
+    body = prefix + (
         (
             f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="receipt"\r\n'
             f"Content-Type: {content_type}\r\n\r\n"
@@ -183,11 +192,14 @@ def http(options, image):
         data=body,
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
-    with client.open(request, timeout=options.get("timeout", 900)) as response:
+    with client.open(request, timeout=timeout) as response:
         raw = response.read(8_000_001)
         if len(raw) > 8_000_000:
             raise ValueError("HTTP OCR response exceeds compact-result limit")
-    return json.loads(raw)
+    page = json.loads(raw)
+    if page.get("contract_version") != 2 or page.get("request_id") != request_id or page.get("source_sha256") != source_sha256 or page.get("photo_index") != 0:
+        raise ValueError("OCR v2 response identity mismatch")
+    return page
 
 
 ADAPTERS = {
@@ -222,7 +234,10 @@ def main():
                 versions[package] = importlib.metadata.version(package)
             except importlib.metadata.PackageNotFoundError:
                 pass
-        result.setdefault("versions", {}).update(versions)
+        if result.get("contract_version") == 2:
+            result.setdefault("telemetry", {})["client_versions"] = versions
+        else:
+            result.setdefault("versions", {}).update(versions)
         args.result.write_text(json.dumps(result, ensure_ascii=False))
 
 

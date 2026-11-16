@@ -81,6 +81,14 @@ article{margin-bottom:20px;min-width:0}pre{white-space:pre-wrap;overflow-wrap:an
                 parts.append("<p>" + html.escape(row["preview_note"]) + "</p>")
             if row.get("source_images"):
                 parts.append(details("Ordered source photos and hashes", row["source_images"]))
+            parts.append(details("Execution, fallback, repair, timing and cache modes", {
+                "cache_mode": row.get("cache_mode", "unknown"),
+                "llm_cached": row.get("llm_cached", False),
+                "warm_state": row.get("warm_state", "unknown"),
+                "recorded_ocr_ms": row.get("elapsed_ms"),
+                "job_wall_ms": row.get("job_wall_ms"),
+                "metadata": row.get("metadata", {}),
+            }))
             ocr = read_json(row.get("artifact")) if row["status"] == "ok" else None
             parts.append('<section class="stage"><h3>2. OCR output</h3>')
             if row.get("pipeline") == "direct_vision":
@@ -89,7 +97,7 @@ article{margin-bottom:20px;min-width:0}pre{white-space:pre-wrap;overflow-wrap:an
                 parts.append(pre(ocr.get("text", "")))
                 parts.append(
                     details(
-                        "Text sent to LLM (coordinate-grouped rows)",
+                        "Display transcript (actual requests are recorded below)",
                         ocr.get("row_text", ocr.get("text", "")),
                     )
                 )

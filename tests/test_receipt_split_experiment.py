@@ -156,3 +156,17 @@ def test_text_chunks_preserve_ordered_source_lines_and_charge_ocr_once():
         reconstructed.extend(chunk["text"].splitlines()[3:])
     assert reconstructed == original
     assert sum(c["ocr_ms"] for c in chunks) == 100
+
+
+@pytest.mark.parametrize('field,value', [('confidence',101),('confidence',-1),('discount_total','-1'),('tax_total','-1'),('tip','-1'),('currency','euro')])
+def test_nullable_partial_retains_original_validation_constraints(field,value):
+    with pytest.raises(ValidationError):
+        experiment.PartialReceipt(**{field:value})
+    assert getattr(experiment.PartialReceipt(**{field:None}), field) is None
+
+
+def test_partial_primary_schema_excludes_all_classification_fields():
+    schema = str(experiment.PartialReceipt.model_json_schema())
+    assert 'spending_category' not in schema
+    assert 'tags' not in schema
+    assert '"category"' not in schema

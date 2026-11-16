@@ -23,6 +23,7 @@ from ...helper.deadline import check_deadline, run_sync_before
 from ...helper.duplicates import verify_duplicate
 from ...model.experiment import ExperimentOptions
 from ...model.extraction import (
+    SOURCE_PROJECTION_VERSION,
     DerivedInputView,
     ExtractionDraft,
     InferenceEnvelope,
@@ -460,6 +461,8 @@ class LLMProvider(ABC):
         result.amount_policy = AmountPolicy.model_validate(payload.get("amount_policy", {}))
         result.draft = draft
         result.field_sources = field_sources
+        result.raw_field_sources = {key: list(refs) for key, refs in field_sources.items()}
+        result.source_projection_version = SOURCE_PROJECTION_VERSION
         result.overlap_decisions = decisions + [
             dict(pair, verified=None, removed_index=None)
             for pair in candidates
@@ -487,6 +490,26 @@ class LLMProvider(ABC):
                     )
                     for pair in multi.duplicate_candidates
                 ]
+                removed = {
+                    pair.second_index for pair in multi.duplicate_candidates
+                    if verified_groups[multi.line_items[pair.first_index].source_image]
+                }
+                positions = {
+                    old: new for new, old in enumerate(
+                        index for index in range(len(multi.line_items)) if index not in removed
+                    )
+                }
+                projected: dict[str, list[SourceRef]] = {}
+                for key, refs in field_sources.items():
+                    parts = key.split(".")
+                    if len(parts) >= 2 and parts[0] == "line_items" and parts[1].isdigit():
+                        old = int(parts[1])
+                        if old not in positions:
+                            continue
+                        parts[1] = str(positions[old])
+                        key = ".".join(parts)
+                    projected[key] = refs
+                result.field_sources = projected
             else:
                 receipt = Receipt.model_validate(values)
         except ValueError as exc:

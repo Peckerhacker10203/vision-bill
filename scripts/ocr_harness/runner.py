@@ -15,7 +15,7 @@ from .common import normalize_result
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKER = Path(__file__).with_name("worker.py")
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 DEFAULT_LIMITS = {"cpus": "4", "memory": "8g"}
 
 
@@ -65,6 +65,16 @@ def bounded_run(argv, timeout, log):
 
 
 def image_identity(engine):
+    if engine.get("family") == "http":
+        from .worker import require_local_endpoint, urllib
+        endpoint = engine["options"]["url"].rstrip("/")
+        require_local_endpoint(endpoint)
+        client = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with client.open(endpoint + "/ready", timeout=10) as response:
+            ready = json.loads(response.read(100_000))
+        if not ready.get("ready") or not ready.get("profile_id") or not ready.get("runtime_fingerprint"):
+            raise ValueError("Native OCR requires ready profile and runtime identity")
+        return {"profile_id": ready["profile_id"], "runtime_fingerprint": ready["runtime_fingerprint"]}
     if "image" not in engine:
         # Include scripts for custom command adapters, not merely their filenames.
         files = {
@@ -166,7 +176,7 @@ def run_matrix(engines, images, output, timeout=120, force=False, progress=False
     for engine in engines:
         try:
             identities[engine["id"]] = image_identity(engine)
-        except (OSError, subprocess.SubprocessError) as exc:
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
             identities[engine["id"]] = {"unavailable": str(exc)}
         for path in images:
             image = Path(path).resolve()
@@ -179,6 +189,7 @@ def run_matrix(engines, images, output, timeout=120, force=False, progress=False
                 "worker_sha256": digest(WORKER.read_bytes()),
                 "normalizer_sha256": digest(Path(__file__).with_name("common.py").read_bytes()),
                 "contract": CONTRACT_VERSION,
+                "timeout": timeout,
             }
             key = digest(json.dumps(identity, sort_keys=True).encode())
             job = output / "jobs" / key
@@ -196,12 +207,17 @@ def run_matrix(engines, images, output, timeout=120, force=False, progress=False
             }
             start = time.monotonic()
             try:
-                if record.exists() and not force:
-                    saved = json.loads(record.read_text())
+                saved = json.loads(record.read_text()) if record.exists() else {}
+                valid_cache = all(
+                    (job / name).is_file() and saved.get(field) == digest((job / name).read_bytes())
+                    for name, field in (("raw.json", "raw_sha256"), ("ocr.json", "artifact_sha256"))
+                )
+                if valid_cache and not force:
                     normalize_result(json.loads((job / "ocr.json").read_text()))
                     row.update(saved)
                     row["input"] = str(image)
                     row["cached"] = True
+                    row["cache_mode"] = "replay"
                 else:
                     if "unavailable" in identity["runtime"]:
                         raise RuntimeError(identity["runtime"]["unavailable"])
@@ -210,10 +226,19 @@ def run_matrix(engines, images, output, timeout=120, force=False, progress=False
                     execute(engine, image, raw, models, timeout, job / "worker.log")
                     if raw.stat().st_size > 8_000_000:
                         raise ValueError("OCR response exceeds 8 MB compact-result limit")
-                    result = normalize_result(json.loads(raw.read_text()))
+                    raw_data = json.loads(raw.read_text())
+                    if engine.get("family") == "http" and any(
+                        raw_data.get(key) != identity["runtime"].get(key)
+                        for key in ("profile_id", "runtime_fingerprint")
+                    ):
+                        raise ValueError("OCR runtime changed during execution")
+                    result = normalize_result(raw_data)
                     (job / "ocr.json").write_text(json.dumps(result, ensure_ascii=False, indent=2))
                     row.update(
                         status="ok",
+                        raw_artifact=str(raw), raw_sha256=digest(raw.read_bytes()),
+                        artifact_sha256=digest((job / "ocr.json").read_bytes()),
+                        cache_mode="cold", warm_state="unknown",
                         elapsed_ms=round((time.monotonic() - start) * 1000, 2),
                         characters=len(result["text"]),
                         blocks=len(result["blocks"]),

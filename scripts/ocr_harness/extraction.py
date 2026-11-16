@@ -1,7 +1,6 @@
 """Optional local Ollama stage; OCR-only execution does not import app dependencies."""
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -78,41 +77,11 @@ def capture_chat(client, path):
 
 
 async def service_extract(provider, model, row, text, directory):
-    from vision_bill.config import ImageSettings, PGSettings
-    from vision_bill.model.experiment import ExperimentOptions
-    from vision_bill.provider.ocr.base import OcrProvider
-    from vision_bill.service.receipt_service import ReceiptService
-
-    class SavedOCR(OcrProvider):
-        async def check_connection(self):
-            return True
-
-        async def extract_text(self, image):
-            return {"text": text}
-
-    service = ReceiptService(
-        ImageSettings(save_dir=str(directory / "storage"), tmp_dir=str(directory / "tmp")),
-        PGSettings(user="harness", password="unused"),
-        provider,
-        SavedOCR(),
-    )
-    result = await service.analyse_submission_with_metadata(
-        model,
-        [Path(row["input"])],
-        ExperimentOptions(
-            pipeline="ocr",
-            temperature=0,
-            think=False,
-            include_classification=False,
-            allow_ocr_fallback=False,
-        ),
-        [],
-    )
-    return result.receipt, {
-        **result.metadata,
-        "ocr_replayed": True,
-        "execution_path": "receipt_service",
-    }
+    from .comparison import cached_ocr, compare_case
+    case = {"images": [Path(row["input"]).resolve()]}
+    pages, _ = cached_ocr(case, [row], row["engine"])
+    result = await compare_case(provider, model, case, "ocr", pages, directory, 600)
+    return result.receipt, result.metadata
 
 
 async def extract_results(rows, output, host, model, refresh=False):
@@ -135,25 +104,21 @@ async def extract_results(rows, output, host, model, refresh=False):
         try:
             ocr = json.loads(Path(row["artifact"]).read_text())
             text = ocr["row_text"]
-            identity = {
-                "host": host,
-                "model": model,
-                "digest": model_digest,
-                "prompt": provider._build_ocr_formatting_prompt(text),
-                "schema": Receipt.model_json_schema(),
-                "provider_source": digest(
-                    (
-                        Path(__file__).resolve().parents[2]
-                        / "src/vision_bill/provider/llm/ollama.py"
-                    ).read_bytes()
-                ),
-            }
-            key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+            from .comparison import cached_ocr, job_identity
+            case = {"images": [Path(row["input"]).resolve()]}
+            pages, _ = cached_ocr(case, [row], row["engine"])
+            identity = {"host": host, "model": model, "digest": model_digest, "pages": pages}
+            key = job_identity({"host": host, "model": model, "digest": model_digest},
+                               case, "ocr", pages, 600, provider.max_output_tokens)
             directory = output / "extractions" / key
             directory.mkdir(parents=True, exist_ok=True)
             target = directory / "receipt.json"
-            row["llm_cached"] = target.exists()
-            if target.exists() and not refresh:
+            cache_path = directory / "cache.json"
+            cache = json.loads(cache_path.read_text()) if cache_path.exists() else {}
+            valid = bool(cache) and all(Path(p).is_file() and digest(Path(p).read_bytes()) == hashed
+                                       for p, hashed in cache.items())
+            row["llm_cached"] = valid and not refresh
+            if valid and not refresh:
                 receipt = Receipt.model_validate_json(target.read_text())
                 metadata = json.loads((directory / "metadata.json").read_text())
             else:
@@ -170,6 +135,10 @@ async def extract_results(rows, output, host, model, refresh=False):
                 (directory / "metadata.json").write_text(
                     json.dumps({"identity": identity, **metadata}, indent=2)
                 )
+                cache_path.write_text(json.dumps({str(p): digest(p.read_bytes()) for p in
+                    (target, directory / "metadata.json", directory / "trace.json")}))
+            row["metadata"] = metadata
+            row["cache_mode"] = "ocr_replay"
             row["execution_path"] = metadata.get("execution_path", "provider")
             if (directory / "trace.json").exists():
                 row["trace_artifact"] = str(directory / "trace.json")

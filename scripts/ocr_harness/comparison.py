@@ -35,24 +35,57 @@ def load_cases(manifest):
 
 
 def cached_ocr(case, rows, engine):
-    texts, elapsed = [], 0
+    from vision_bill.model.ocr import OcrResponse
+
+    pages, elapsed = [], 0
     for i, image in enumerate(case["images"]):
         found = [r for r in rows if r["engine"] == engine and Path(r["input"]).resolve() == image]
         if len(found) != 1 or found[0]["status"] != "ok":
             raise ValueError(f"Missing successful {engine} OCR for photo {i + 1}")
         row = found[0]
-        if row["identity"]["input_sha256"] != digest(image.read_bytes()):
+        source_hash = digest(image.read_bytes())
+        if row["identity"]["input_sha256"] != source_hash:
             raise ValueError(f"Source photo {i + 1} changed since OCR")
-        data = json.loads(Path(row["artifact"]).read_text())
-        from .common import normalize_result
-
-        normalize_result(data)
-        text = data.get("row_text") or data["text"]
-        texts.append(
-            f"--- Receipt photo {i + 1} of {len(case['images'])} (may overlap other photos of the same receipt) ---\n{text}"
-        )
+        raw_path = Path(row.get("raw_artifact", row["artifact"]))
+        raw = raw_path.read_bytes()
+        data = json.loads(raw)
+        if data.get("contract_version") != 2:
+            raise ValueError("Typed v2 per-photo OCR artifact required; rerun this engine")
+        page = OcrResponse.model_validate(data)
+        if page.source_sha256 != source_hash:
+            raise ValueError("OCR artifact source changed")
+        # A single-photo engine job records index zero; the dataset assigns capture order.
+        page.photo_index = i
+        payload = page.model_dump(mode="json")
+        payload["artifact_identity"] = {
+            "raw_sha256": digest(raw), "engine_identity": row["identity"],
+            "recorded_photo_index": data["photo_index"],
+        }
+        pages.append(payload)
         elapsed += row.get("elapsed_ms", 0)
-    return "\n\n".join(texts), elapsed
+    return pages, elapsed
+
+
+class ReplayOCR:
+    """Typed recorded pages pass through the same all-photo policy as live OCR."""
+
+    def __init__(self, pages):
+        from vision_bill.model.ocr import OcrResponse
+        self.pages = [OcrResponse.model_validate({k: v for k, v in page.items()
+                                                if k != "artifact_identity"}) for page in pages]
+
+    async def get_capabilities(self):
+        from vision_bill.model.ocr import OcrCapabilities
+        first = self.pages[0]
+        return OcrCapabilities(enabled=True, configured=True, reachable=True, ready=True,
+                               profile_id=first.profile_id, runtime_fingerprint=first.runtime_fingerprint,
+                               ocr_max_new_tokens=first.telemetry.get("max_new_tokens"))
+
+    async def extract_page(self, image, *, photo_index, source_sha256, deadline, expected_profile_id=None):
+        page = self.pages[photo_index]
+        if page.photo_index != photo_index or page.source_sha256 != source_sha256:
+            raise ValueError("replay_source_identity_mismatch")
+        return page.model_copy(deep=True)
 
 
 def job_identity(target, case, pipeline, text, timeout, max_tokens):
@@ -66,12 +99,15 @@ def job_identity(target, case, pipeline, text, timeout, max_tokens):
             {
                 "target": target,
                 "images": [digest(p.read_bytes()) for p in case["images"]],
-                "expected": digest(case["expected"].read_bytes()),
+                "expected": digest(case["expected"].read_bytes()) if case.get("expected") else None,
                 "pipeline": pipeline,
                 "ocr": text,
                 "timeout": timeout,
                 "max_tokens": max_tokens,
                 "classification": False,
+                "fallback": False,
+                "source_projection_version": "2",
+                "preprocessing": "native-v2-working-view-or-first-frame-exif-rgb",
                 "source": {str(p.relative_to(root)): digest(p.read_bytes()) for p in source},
             },
             sort_keys=True,
@@ -145,18 +181,14 @@ async def compare_case(provider, model, case, pipeline, text, directory, timeout
 
     if pipeline not in {"ocr", "direct_vision"}:
         raise ValueError("Choose ocr or direct_vision")
-    if pipeline == "ocr" and not text:
-        raise ValueError("OCR text is required; vision fallback is disabled")
-
-    class Replay:
-        async def extract_text(self, image):
-            return {"text": text}
+    if pipeline == "ocr" and (not isinstance(text, list) or len(text) != len(case["images"])):
+        raise ValueError("Typed OCR text pages for every photo are required; vision fallback is disabled")
 
     service = ReceiptService(
         ImageSettings(save_dir=str(directory / "storage"), tmp_dir=str(directory / "tmp")),
         PGSettings(user="harness", password="unused"),
         provider,
-        Replay() if pipeline == "ocr" else None,
+        ReplayOCR(text) if pipeline == "ocr" else None,
     )
     options = ExperimentOptions(
         pipeline=pipeline,
@@ -165,17 +197,15 @@ async def compare_case(provider, model, case, pipeline, text, directory, timeout
         include_classification=False,
         allow_ocr_fallback=False,
     )
-    # The service's OCR path takes one image; the replay contains ALL photo transcripts.
-    # Direct vision uses every source photo and the existing overlap-resolution path.
     async with asyncio.timeout(timeout):
         result = await service.analyse_submission_with_metadata(
-            model, case["images"][:1] if pipeline == "ocr" else case["images"], options, []
+            model, case["images"], options, []
         )
     result.metadata.update(
         execution_path="receipt_service",
         ocr_replayed=pipeline == "ocr",
         source_image_count=len(case["images"]),
-        multi_photo_ocr="concatenated with overlaps retained" if pipeline == "ocr" else None,
+        multi_photo_ocr="typed pages through common complete pipeline" if pipeline == "ocr" else None,
     )
     return result
 
@@ -185,10 +215,16 @@ def summary(rows):
     for label in dict.fromkeys(r["engine"] for r in rows):
         cases = [r for r in rows if r["engine"] == label]
         scores = []
+        scoring_failed = full_correct = 0
         for row in cases:
             if row.get("llm_status") != "ok":
                 continue
-            score = row.get("score") or json.loads(Path(row["score_artifact"]).read_text())
+            try:
+                score = row.get("score") or json.loads(Path(row["score_artifact"]).read_text())
+                full_correct += int(bool(score.get("full_receipt_correct")))
+            except (OSError, ValueError, KeyError):
+                scoring_failed += 1
+                continue
             payment_ok = not any(
                 d["path"] == "payment_method" and not d["equivalent"] for d in score["differences"]
             )
@@ -202,6 +238,9 @@ def summary(rows):
                 "engine": label,
                 "cases": len(cases),
                 "valid": len(scores),
+                "extracted": sum(r.get("llm_status") == "ok" for r in cases),
+                "scoring_failed": scoring_failed,
+                "full_receipt_correct_rate": full_correct / len(cases),
                 "score_excluding_payment": sum(scores) / len(cases),
                 "score_successes_excluding_payment": sum(scores) / len(scores) if scores else None,
                 "exact_totals": sum(bool(r.get("total_exact")) for r in cases),
@@ -244,7 +283,7 @@ def make_target_provider(target, timeout):
     return provider
 
 
-async def run_comparison(cases, targets, ocr_rows, engine, output, timeout=180, max_tokens=8192):
+async def run_comparison(cases, targets, ocr_rows, engine, output, timeout=600, max_tokens=8192):
     from decimal import Decimal
 
     from vision_bill.model.receipt import Receipt
@@ -268,7 +307,6 @@ async def run_comparison(cases, targets, ocr_rows, engine, output, timeout=180, 
                 "OpenAI-compatible targets require an explicit weights/server revision"
             )
         for case in cases:
-            expected = Receipt.model_validate_json(case["expected"].read_text())
             for pipeline in ("direct_vision", "ocr"):
                 label = target["id"] + "/" + (engine + "+llm" if pipeline == "ocr" else "vision")
                 text, ocr_ms, loader_error = None, 0, None
@@ -293,8 +331,10 @@ async def run_comparison(cases, targets, ocr_rows, engine, output, timeout=180, 
                     },
                     "status": "error" if loader_error else "ok",
                     "cached": pipeline == "ocr" and loader_error is None,
+                    "cache_mode": "ocr_replay" if pipeline == "ocr" else "live",
+                    "warm_state": "unknown",
                     "artifact": str(directory / "ocr.json"),
-                    "preview_note": "Display overview only; each prepared source photo is supplied separately. OCR transcripts are combined with overlaps retained.",
+                    "preview_note": "Display overview only; every original photo traverses the complete typed pipeline in capture order.",
                     "source_images": [
                         {"path": str(p), "sha256": digest(p.read_bytes())} for p in case["images"]
                     ],
@@ -307,11 +347,11 @@ async def run_comparison(cases, targets, ocr_rows, engine, output, timeout=180, 
                     Path(row["artifact"]).write_text(
                         json.dumps(
                             {
-                                "text": text,
-                                "row_text": text,
+                                "text": "\n\n".join(page["text"] for page in text),
+                                "row_text": "\n\n".join(page["text"] for page in text),
                                 "blocks": [],
                                 "warnings": [
-                                    "Cached per-photo OCR concatenated in capture order; overlap retained."
+                                    "Display transcript only; inference receives separate typed pages."
                                 ],
                             }
                         )
@@ -322,8 +362,13 @@ async def run_comparison(cases, targets, ocr_rows, engine, output, timeout=180, 
                         row["error"] = str(loader_error)
                         raise loader_error
                     saved = directory / "success.json"
-                    if saved.exists():
-                        row.update(json.loads(saved.read_text()))
+                    cached = json.loads(saved.read_text()) if saved.exists() else {}
+                    valid_cache = bool(cached.get("artifact_hashes")) and all(
+                        Path(path).is_file() and digest(Path(path).read_bytes()) == hashed
+                        for path, hashed in cached.get("artifact_hashes", {}).items()
+                    )
+                    if valid_cache:
+                        row.update(cached)
                         row["llm_cached"] = True
                         Receipt.model_validate_json(Path(row["receipt_artifact"]).read_text())
                     else:
@@ -336,6 +381,8 @@ async def run_comparison(cases, targets, ocr_rows, engine, output, timeout=180, 
                         actual = result.receipt
                         receipt_path = directory / "receipt.json"
                         receipt_path.write_text(actual.model_dump_json(indent=2))
+                        row["llm_status"] = "ok"
+                        expected = Receipt.model_validate_json(case["expected"].read_text())
                         score = detailed_score(expected, actual, classification=False)
                         score_path = directory / "score.json"
                         score_path.write_text(json.dumps(score, indent=2))
@@ -343,6 +390,7 @@ async def run_comparison(cases, targets, ocr_rows, engine, output, timeout=180, 
                             json.dumps(result.metadata, indent=2)
                         )
                         row.update(
+                            metadata=result.metadata,
                             llm_status="ok",
                             llm_cached=False,
                             receipt_artifact=str(receipt_path),
@@ -352,13 +400,19 @@ async def run_comparison(cases, targets, ocr_rows, engine, output, timeout=180, 
                             item_count_exact=len(actual.line_items) == len(expected.line_items),
                             llm_elapsed_ms=(perf_counter() - started) * 1000,
                         )
+                        row["artifact_hashes"] = {str(path): digest(path.read_bytes()) for path in
+                            (receipt_path, score_path, directory / "metadata.json", Path(row["trace_artifact"]))}
                         saved.write_text(json.dumps(row, indent=2))
                 except Exception as exc:  # noqa: BLE001 - record failures and continue the matrix
+                    if hasattr(exc, "metadata"):
+                        row["metadata"] = exc.metadata
                     row.update(
-                        llm_status="error",
+                        score_status="error" if row.get("llm_status") == "ok" else "not_run",
+                        llm_status=row.get("llm_status", "error"),
                         llm_error=f"{type(exc).__name__}: {exc}",
                         llm_elapsed_ms=(perf_counter() - started) * 1000,
                     )
+                row["job_wall_ms"] = (perf_counter() - started) * 1000
                 rows.append(row)
                 write_reports(output, rows)
                 (output / "summary.json").write_text(json.dumps(summary(rows), indent=2))
@@ -410,7 +464,7 @@ def main():
         "--output", type=Path, default=Path("server_data/ocr-harness/paired/results")
     )
     parser.add_argument("--limit", type=int, default=10)
-    parser.add_argument("--timeout", type=float, default=180)
+    parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--max-tokens", type=int, default=8192)
     args = parser.parse_args()
     if args.limit < 1 or args.timeout <= 0 or args.max_tokens < 1:

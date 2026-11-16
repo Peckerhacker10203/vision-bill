@@ -12,28 +12,44 @@ import hashlib
 import html
 import json
 import os
+from copy import deepcopy
 from pathlib import Path
 from time import perf_counter
+from typing import Annotated
 from urllib.parse import urlsplit
 
 from ollama import AsyncClient
 from PIL import Image
-from pydantic import Field, create_model
+from pydantic import create_model
 
 from vision_bill.helper.duplicates import verify_duplicate
-from vision_bill.model.receipt import Receipt
+from vision_bill.model.receipt import LineItem, Receipt
 from vision_bill.model.receipt_extraction import MultiImageReceipt
 from vision_bill.provider.llm.experiment import extraction_prompt
 from vision_bill.service.experiment_scoring import detailed_score
 
-# Partial pieces cannot be required to contain a receipt header or final total.
+# Clone each FieldInfo: nullable observations retain every original constraint.
+PrimaryItem = create_model(
+    "PrimaryItem", **{name: (field.annotation, deepcopy(field))
+                      for name, field in LineItem.model_fields.items()
+                      if name not in {"spending_category", "tags"}},
+)
+
+
+def nullable_field(name, field):
+    cloned = deepcopy(field)
+    annotation = list[PrimaryItem] if name == "line_items" else field.annotation
+    # Constraints belong to the non-null branch, never to the optional union.
+    constrained = Annotated[annotation, *cloned.metadata] if cloned.metadata else annotation
+    cloned.metadata = []
+    cloned.default = None
+    cloned.default_factory = None
+    return constrained | None, cloned
+
+
 PartialReceipt = create_model(
-    "PartialReceipt",
-    **{
-        name: (field.annotation | None, Field(default=None, description=field.description))
-        for name, field in Receipt.model_fields.items()
-        if name != "category"
-    },
+    "PartialReceipt", **{name: nullable_field(name, field)
+                         for name, field in Receipt.model_fields.items() if name != "category"},
 )
 
 

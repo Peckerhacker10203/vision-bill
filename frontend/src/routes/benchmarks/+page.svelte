@@ -6,8 +6,86 @@
 	import BenchmarkExperimentControls from '$lib/ui/BenchmarkExperimentControls.svelte';
 	import { defaultExperiment, experimentRequest } from '$lib/benchmark-experiments';
 
+	type ReferencePreview = {
+		receipt_identity: string;
+		review_revision: number;
+		document_sha256: string;
+		expected: Record<string, unknown>;
+		scored_fields: string[];
+		sources: unknown[];
+		findings: unknown[];
+	};
+	let references = $state<ReferencePreview[]>([]);
+	let referenceSelection = $state('');
+	let qualify = $state(false);
+	let previewing = $state(false);
+	$effect(() => {
+		if (receiptIds !== referenceSelection) {
+			references = [];
+			qualify = false;
+		}
+	});
+	async function previewReferences() {
+		previewing = true;
+		qualify = false;
+		references = [];
+		error = '';
+		const selection = receiptIds;
+		try {
+			const ids = selection
+				.split(',')
+				.map((id) => id.trim())
+				.filter(Boolean);
+			if (!ids.length)
+				throw new Error(
+					'Enter explicit receipt IDs to qualify new references. Filters use existing qualified references.'
+				);
+			const previews = await Promise.all(
+				ids.map(async (id) => {
+					const response = await fetch(`/api/v1/benchmarks/references/${encodeURIComponent(id)}`);
+					if (!response.ok) throw new Error(await response.text());
+					return (await response.json()) as ReferencePreview;
+				})
+			);
+			if (receiptIds === selection) {
+				referenceSelection = selection;
+				references = previews;
+			}
+		} catch (cause) {
+			error = cause instanceof Error ? cause.message : 'Unable to preview references.';
+		} finally {
+			previewing = false;
+		}
+	}
 	let experiment = $state(defaultExperiment());
-	let capabilities = $state({ ocr_available: false, thinking_control: false });
+	let capabilities = $state({ ocr_available: false, ocr_enabled: false, thinking_control: false });
+	let loaded = $state(false);
+	$effect(() => {
+		const capability =
+			experiment.pipeline === 'ocr' ||
+			(experiment.pipeline === 'upload' && capabilities.ocr_enabled)
+				? 'text'
+				: 'vision';
+		if (!loaded) return;
+		let active = true;
+		models = [];
+		selected = [];
+		void fetch(`/api/v1/llm/models${capability === 'text' ? '?capability=text' : ''}`)
+			.then(async (response) => {
+				if (!response.ok) throw new Error();
+				const available = (await response.json()) as Model[];
+				if (active) {
+					models = available;
+					selected = available.map((model) => model.id);
+				}
+			})
+			.catch(() => {
+				if (active) error = 'Unable to load local models.';
+			});
+		return () => {
+			active = false;
+		};
+	});
 	type Model = { id: string };
 	let models = $state<Model[]>([]),
 		selected = $state<string[]>([]),
@@ -15,7 +93,7 @@
 		category = $state(''),
 		maxConfidence = $state<number | undefined>(),
 		limit = $state<number | undefined>(),
-		timeout = $state(300),
+		timeout = $state(600),
 		policy = $state('all'),
 		absolute = $state<number | undefined>(),
 		relative = $state<number | undefined>(),
@@ -42,14 +120,7 @@
 		}
 		const available = await fetch('/api/v1/benchmarks/capabilities').catch(() => null);
 		if (available?.ok) capabilities = await available.json();
-		try {
-			const response = await fetch('/api/v1/llm/models');
-			if (!response.ok) throw new Error();
-			models = (await response.json()) as Model[];
-			selected = models.map((model) => model.id);
-		} catch {
-			error = 'Unable to load local vision models.';
-		}
+		loaded = true;
 	});
 	function toggle(id: string) {
 		selected = selected.includes(id) ? selected.filter((model) => model !== id) : [...selected, id];
@@ -75,6 +146,24 @@
 		if (absolute !== undefined) body.council_absolute_threshold = absolute;
 		if (relative !== undefined) body.council_relative_threshold = relative;
 		try {
+			if (qualify) {
+				if (!references.length || receiptIds !== referenceSelection)
+					throw new Error('Preview the current selection again.');
+				for (const reference of references) {
+					const response = await fetch(
+						`/api/v1/benchmarks/references/${encodeURIComponent(reference.receipt_identity)}`,
+						{
+							method: 'POST',
+							headers: { 'Content-Type': 'application/json' },
+							body: JSON.stringify({
+								expected_review_revision: reference.review_revision,
+								expected_document_sha256: reference.document_sha256
+							})
+						}
+					);
+					if (!response.ok) throw new Error(await response.text());
+				}
+			}
 			const response = await fetch('/api/v1/benchmarks', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
@@ -95,7 +184,8 @@
 <section class="mx-auto max-w-3xl">
 	<h1 class="text-2xl font-semibold">Create benchmark</h1>
 	<p class="mt-1 text-sm text-on-surface-variant">
-		Compare local vision models using verified receipts. Normal receipt data is not changed.
+		Compare complete local pipelines using explicitly qualified frozen human references. Normal
+		receipt data is not changed.
 	</p>
 	{#if error}<p class="mt-4 text-sm text-error" role="alert">{error}</p>{/if}
 	<form
@@ -124,7 +214,40 @@
 					placeholder="Comma-separated receipt UUIDs"
 				/></label
 			>
-			<p class="mt-1 text-xs text-on-surface-variant">Explicit IDs override filters.</p>
+			<p class="mt-1 text-xs text-on-surface-variant">
+				Explicit IDs override filters. Existing verification alone does not qualify a benchmark
+				reference.
+			</p>
+			<button
+				type="button"
+				class="mt-3 rounded-lg border p-2"
+				disabled={previewing}
+				onclick={previewReferences}>Preview human references</button
+			>
+			{#if references.length}
+				{#each references as reference (reference.receipt_identity)}
+					<details class="mt-3 rounded border p-2">
+						<summary>{reference.receipt_identity} · review {reference.review_revision}</summary>
+						<a href={resolve('/receipts/[id]', { id: reference.receipt_identity })}
+							>Inspect receipt and originals</a
+						>
+						<p>Scored observations: {reference.scored_fields.join(', ')}</p>
+						<pre class="overflow-auto text-xs">{JSON.stringify(
+								{
+									expected: reference.expected,
+									sources: reference.sources,
+									findings: reference.findings
+								},
+								null,
+								2
+							)}</pre>
+					</details>
+				{/each}
+				<label class="mt-3 block"
+					><input type="checkbox" bind:checked={qualify} /> I checked these current receipts and originals
+					and explicitly qualify them as benchmark references.</label
+				>
+			{/if}
 			<div class="mt-3 grid gap-3 sm:grid-cols-3">
 				<label class="text-sm"
 					>Category<input
@@ -215,7 +338,7 @@
 					><button
 						class="rounded-lg bg-error px-4 py-2 text-on-error"
 						disabled={creating}
-						onclick={create}>Create benchmark</button
+						onclick={create}>Confirm and start</button
 					>
 				</div>
 			</div>

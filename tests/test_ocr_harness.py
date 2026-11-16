@@ -158,3 +158,93 @@ def test_scores_for_different_expected_receipts_do_not_collide(tmp_path):
     first.write_text('{"total":"1.00"}')
     second.write_text('{"total":"2.00"}')
     assert score_path(tmp_path, first) != score_path(tmp_path, second)
+
+
+def test_changed_raw_or_normalized_artifact_is_not_reused(tmp_path):
+    image = tmp_path / 'source.png'
+    image.write_text('TOTAL 1.00')
+    out, e = tmp_path / 'out', engine(tmp_path)
+    row = run_matrix([e], [image], out, timeout=5)[0]
+    from pathlib import Path
+    artifact = Path(row['artifact'])
+    artifact.write_text(json.dumps({'text': 'changed', 'blocks': []}))
+    assert not run_matrix([e], [image], out, timeout=5)[0]['cached']
+    raw = artifact.with_name('raw.json')
+    raw.write_text(raw.read_text() + '\n')
+    assert not run_matrix([e], [image], out, timeout=5)[0]['cached']
+
+
+def test_http_native_adapter_uses_v2_identity_and_keeps_typed_raw_page(monkeypatch,tmp_path):
+    import hashlib
+    from test_ocr_provider import wire_page
+    from scripts.ocr_harness import worker
+    from PIL import Image
+    image = tmp_path/'source.png'; Image.new('RGB',(3,4)).save(image)
+    requests=[]
+    class Response:
+        def __init__(self,data): self.data=json.dumps(data).encode()
+        def read(self,*args): return self.data
+        def __enter__(self): return self
+        def __exit__(self,*args): pass
+        def close(self): pass
+    class Client:
+        def open(self,request,**kwargs):
+            requests.append(request)
+            if isinstance(request,str):
+                return Response({'ready':True,'profile_id':'fixed-profile','runtime_fingerprint':'runtime'})
+            body=request.data.decode('latin1')
+            import re
+            rid = re.search('name="request_id"\r\n\r\n([^\r]+)',body).group(1)
+            return Response(wire_page(0,hashlib.sha256(image.read_bytes()).hexdigest(),rid))
+    monkeypatch.setattr(worker.urllib.request,'build_opener',lambda *args:Client())
+    page=worker.http({'url':'http://127.0.0.1:8082','timeout':600},image)
+    assert page['contract_version']==2
+    body=requests[-1].data
+    assert b'name="photo_index"' in body and b'name="timeout_ms"' in body
+    assert b'name="source_sha256"' in body and image.read_bytes() in body
+
+
+def test_native_http_cache_identity_tracks_actual_ready_profile_and_runtime(monkeypatch):
+    from scripts.ocr_harness import runner, worker
+    state={'ready':True,'profile_id':'p1','runtime_fingerprint':'r1'}
+    class Response:
+        def read(self,*args): return json.dumps(state).encode()
+        def __enter__(self): return self
+        def __exit__(self,*args): pass
+    class Client:
+        def open(self,*args,**kwargs): return Response()
+    monkeypatch.setattr(worker.urllib.request,'build_opener',lambda *args:Client())
+    engine={'family':'http','options':{'url':'http://127.0.0.1:8082'}}
+    first=runner.image_identity(engine)
+    state['profile_id']='p2'
+    assert runner.image_identity(engine)!=first
+    state['profile_id']='p1'; state['runtime_fingerprint']='r2'
+    assert runner.image_identity(engine)!=first
+
+
+def test_native_normalization_preserves_reading_order_block_identity_without_png():
+    from test_ocr_provider import wire_page
+    page=wire_page(text='Bottom\nTop')
+    page['blocks']=[{'id':'bottom','label':'text','text':'Bottom','bbox':[[0,10],[3,10],[3,12]]},
+                    {'id':'top','label':'text','text':'Top','bbox':[[0,0],[3,0],[3,2]]}]
+    result=normalize_result(page)
+    assert result['row_text']=='Bottom\nTop'
+    assert result['blocks'][0]['id']=='bottom'
+    assert result['page_metadata']['working_image']['view_id']==page['working_image']['view_id']
+    assert 'png_base64' not in json.dumps(result)
+
+
+async def test_optional_extraction_stage_uses_typed_replay_not_legacy_text(tmp_path):
+    from test_extraction_pipeline import formatter
+    from test_ocr_provider import wire_page
+    from scripts.ocr_harness.extraction import service_extract
+    from PIL import Image
+    from scripts.ocr_harness.runner import digest
+    image=tmp_path/'source.png'; Image.new('RGB',(3,4)).save(image)
+    raw=tmp_path/'raw.json';raw.write_text(json.dumps(wire_page(digest=digest(image.read_bytes()),text='ONLY OBSERVED')))
+    row={'input':str(image),'engine':'native','status':'ok','artifact':str(raw),'identity':{'input_sha256':digest(image.read_bytes())}}
+    llm=formatter(False)
+    receipt,metadata=await service_extract(llm,'fixture',row,'REFERENCE_SENTINEL',tmp_path)
+    prompt=llm._client.chat.call_args.kwargs['messages'][0]['content']
+    assert receipt is not None and metadata['ocr_replayed']
+    assert 'ONLY OBSERVED' in prompt and 'REFERENCE_SENTINEL' not in prompt

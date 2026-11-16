@@ -196,7 +196,7 @@ def complete(*, total="90071992547.91"):
 async def test_bootstrap_and_empty_downgrade(db):
     migrate(db)
     conn = await asyncpg.connect(db.pg_dsn)
-    assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0015"
+    assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0016"
     await conn.close()
     migrate(db, "0010", "downgrade")
     migrate(db)
@@ -321,7 +321,7 @@ async def test_finish_atomic_decimal_and_immutable_history(workflow_db, db):
         )
     assert migrate(db, "0010", "downgrade", check=False).returncode != 0
     async with w.pool.acquire() as conn:
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0015"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0016"
         assert await conn.fetchval("SELECT count(*) FROM receipt_review_revisions") == 1
 
 

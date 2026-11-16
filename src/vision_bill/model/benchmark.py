@@ -24,7 +24,7 @@ class BenchmarkCreate(BaseModel):
     category: str | None = None
     max_source_confidence: int | None = Field(default=None, ge=0, le=100)
     limit: int | None = Field(default=None, ge=1)
-    request_timeout_seconds: int = Field(default=300, ge=1)
+    request_timeout_seconds: int = Field(default=600, ge=1, le=600)
     council_policy: CouncilPolicy = CouncilPolicy.ALL
     council_absolute_threshold: Decimal | None = Field(default=None, ge=0)
     council_relative_threshold: Decimal | None = Field(default=None, ge=0)
@@ -53,6 +53,8 @@ class BenchmarkSummary(BaseModel):
     succeeded: int = 0
     failed: int = 0
     average_score: float | None = None
+    all_case_average_score: float | None = None
+    full_receipt_correct_rate: float | None = None
     average_confidence: float | None = None
     average_attempts: float | None = None
     average_latency_ms: float | None = None
@@ -68,3 +70,32 @@ class BenchmarkStatus(BaseModel):
     retrying: int
     terminal: int
     summaries: list[BenchmarkSummary]
+
+
+class ReferenceConfirmation(BaseModel):
+    expected_review_revision: int = Field(ge=1)
+    expected_document_sha256: str = Field(pattern=r'^[0-9a-f]{64}$')
+
+
+class ReferencePreview(BaseModel):
+    receipt_identity: UUID
+    owner_id: UUID | None
+    review_revision: int
+    document_sha256: str
+    expected_sha256: str
+    expected: dict[str, Any]
+    scored_fields: list[str]
+    sources: list[dict[str, Any]]
+    schema_version: str
+    scoring_version: str
+    findings: list[dict[str, Any]]
+    acknowledgements: list[dict[str, Any]]
+
+
+class GoldSnapshot(ReferencePreview):
+    id: UUID
+    receipt_id: UUID | None
+    qualified_by: UUID | None
+    qualified_at: datetime
+    owner_identity: UUID | None
+    actor_identity: UUID

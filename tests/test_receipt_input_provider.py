@@ -556,3 +556,43 @@ async def test_ocr_repeated_text_span_cannot_point_to_another_block():
         "requested", inp, tags=[], deadline=time.monotonic() + 2
     )
     assert output.receipt is None
+
+
+async def test_final_rows_project_distinct_blocks_after_accepted_boundary_overlap():
+    from test_multi_image_extraction import extraction, item
+    from vision_bill.model.experiment import ExperimentOptions
+    from vision_bill.model.ocr import OcrBlock
+
+    pages = [OcrResponse.model_validate(wire_page(i, str(i + 1) * 64)) for i in range(2)]
+    refs = [SourceRef(part_id=uuid4(), photo_index=i, source_sha256=page.source_sha256,
+                      view_id=page.working_image.view_id, coordinate_space='working')
+            for i, page in enumerate(pages)]
+    sources = {}
+    for i, names in enumerate((('A', 'B'), ('B', 'C'))):
+        for j, name in enumerate(names):
+            block = OcrBlock(id=f'{i}-{j}', label='text', text=name,
+                             bbox=[[j, 0], [j + 1, 0], [j + 1, 1]])
+            pages[i].blocks.append(block)
+            source = refs[i].model_copy(update={'block_id': block.id, 'bbox': block.bbox})
+            sources[f'line_items.{i * 2 + j}.description'] = [source.model_dump(mode='json')]
+    inp = ReceiptInput(mode='ocr', image_paths=['a', 'b'], ocr_pages=pages, source_refs=refs)
+    payload = extraction([item('A'), item('B'), item('B', source=1), item('C', source=1)], [(1, 2)])
+    payload['field_sources'] = sources
+    provider = OllamaProvider('http://local').for_experiment(ExperimentOptions(include_classification=False))
+    provider.send_message = AsyncMock(return_value=json.dumps(payload))
+    result = await provider.extract_receipt_input('requested', inp, tags=[], deadline=time.monotonic() + 2)
+    assert [row.description for row in result.receipt.line_items] == ['A', 'B', 'C']
+    assert [result.field_sources[f'line_items.{i}.description'][0].block_id for i in range(3)] == ['0-0', '0-1', '1-1']
+    assert 'line_items.3.description' not in result.field_sources
+    assert [row.description for row in result.draft.line_items] == ['A', 'B', 'B', 'C']
+    assert result.raw_field_sources['line_items.2.description'][0].block_id == '1-0'
+    assert result.source_projection_version == '2'
+    assert result.overlap_decisions[-1]['removed_index'] == 2
+
+
+def test_historical_envelope_without_projection_identity_remains_legacy():
+    from vision_bill.model.extraction import InferenceEnvelope
+    envelope=InferenceEnvelope.model_validate({'provenance':{'requested_pipeline':'ocr','used_pipeline':'ocr',
+        'source_image_count':1,'ordered_source_sha256':['a'*64],'model_id':'old'},
+        'telemetry':{'elapsed_ms':1,'max_output_tokens':8192}})
+    assert envelope.source_projection_version=='1'

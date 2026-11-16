@@ -50,29 +50,14 @@ def test_case_manifest_preserves_order_and_rejects_duplicate_ids(tmp_path):
 
 def test_cached_ocr_requires_every_unchanged_photo(tmp_path):
     case = case_files(tmp_path)
-    rows = []
-    for i, image in enumerate(case["images"]):
-        artifact = tmp_path / f"ocr-{i}.json"
-        artifact.write_text(
-            json.dumps({"text": f"photo {i}", "row_text": f"ordered {i}", "blocks": []})
-        )
-        rows.append(
-            {
-                "engine": "pp-medium",
-                "input": str(image),
-                "status": "ok",
-                "identity": {"input_sha256": digest(image.read_bytes())},
-                "artifact": str(artifact),
-                "elapsed_ms": 10,
-            }
-        )
-    text, elapsed = cached_ocr(case, rows, "pp-medium")
-    assert text.index("ordered 0") < text.index("ordered 1") and elapsed == 20
+    rows = typed_rows(case, tmp_path)
+    pages, elapsed = cached_ocr(case, rows, "native")
+    assert [page["text"] for page in pages] == ["OBSERVED 0", "OBSERVED 1"] and elapsed == 20
     case["images"][1].write_bytes(b"changed")
     with pytest.raises(ValueError, match="changed"):
-        cached_ocr(case, rows, "pp-medium")
+        cached_ocr(case, rows, "native")
     with pytest.raises(ValueError, match="Missing"):
-        cached_ocr(case, [], "pp-medium")
+        cached_ocr(case, [], "native")
 
 
 async def test_direct_service_gets_all_photos_and_ocr_gets_replayed_text(settings, tmp_path):
@@ -98,9 +83,10 @@ async def test_direct_service_gets_all_photos_and_ocr_gets_replayed_text(setting
     transported = provider._client.chat.call_args.kwargs["messages"][0]["images"]
     assert len(transported) == len(case["images"])
     assert "2 ordered photos" in provider._client.chat.call_args.kwargs["messages"][0]["content"]
-    result = await compare_case(provider, "model", case, "ocr", "both photos OCR", tmp_path, 5)
+    pages, _ = cached_ocr(case, typed_rows(case, tmp_path), "native")
+    result = await compare_case(provider, "model", case, "ocr", pages, tmp_path, 5)
     request = provider._client.chat.call_args.kwargs["messages"][0]
-    assert "both photos OCR" in request["content"] and not request.get("images")
+    assert "OBSERVED 0" in request["content"] and "OBSERVED 1" in request["content"] and not request.get("images")
     assert result.metadata["ocr_replayed"] and result.metadata["source_image_count"] == 2
     assert result.metadata["fallback_used"] is False
     with pytest.raises(ValueError, match="OCR text"):
@@ -193,19 +179,9 @@ async def test_runner_records_missing_ocr_and_continues_then_reuses_successes(
     case = case_files(tmp_path)
     second = {**case, "id": "missing-ocr", "images": [tmp_path / "missing.png"]}
     second["images"][0].write_bytes(b"missing")
-    cache = []
-    for i, image in enumerate(case["images"]):
-        artifact = tmp_path / f"cached-{i}.json"
-        artifact.write_text(json.dumps({"text": str(i), "blocks": []}))
-        cache.append(
-            {
-                "engine": "pp",
-                "input": str(image),
-                "identity": {"input_sha256": digest(image.read_bytes())},
-                "artifact": str(artifact),
-                "status": "ok",
-            }
-        )
+    cache = typed_rows(case, tmp_path)
+    for row in cache:
+        row["engine"] = "pp"
     client = SimpleNamespace(
         chat=AsyncMock(),
         list=AsyncMock(
@@ -234,6 +210,10 @@ async def test_runner_records_missing_ocr_and_continues_then_reuses_successes(
     )
     assert execute.await_count == 3
     assert sum(r.get("llm_cached", False) for r in second_run) == 3
+    Path(second_run[0]["trace_artifact"]).write_text("tampered raw response")
+    third_run = await comparison.run_comparison([case, second], targets, cache, "pp", tmp_path / "results")
+    assert execute.await_count == 4
+    assert sum(r.get("llm_cached", False) for r in third_run) == 2
 
 
 def test_report_labels_vision_path_and_ocr_replay(tmp_path):
@@ -347,3 +327,97 @@ def test_bootstrap_settings_works_without_live_env_or_dotenv(tmp_path):
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def typed_rows(case, tmp_path):
+    from test_ocr_provider import wire_page
+    rows = []
+    for i, path in enumerate(case['images']):
+        artifact = tmp_path / f'typed-{i}.json'
+        artifact.write_text(json.dumps(wire_page(i, digest(path.read_bytes()), text=f'OBSERVED {i}')))
+        rows.append({'engine': 'native', 'input': str(path), 'status': 'ok',
+                     'identity': {'input_sha256': digest(path.read_bytes())},
+                     'artifact': str(artifact), 'elapsed_ms': 10})
+    return rows
+
+
+async def test_typed_replay_routes_every_photo_without_reference_or_geometry_loss(tmp_path):
+    from test_extraction_pipeline import formatter
+    case = case_files(tmp_path)
+    case['expected'].write_text('REFERENCE_SENTINEL')
+    pages, elapsed = cached_ocr(case, typed_rows(case, tmp_path), 'native')
+    assert isinstance(pages, list) and len(pages) == 2
+    llm = formatter(False)
+    result = await compare_case(llm, 'fixture', case, 'ocr', pages, tmp_path, 5)
+    prompt = llm._client.chat.call_args.kwargs['messages'][0]['content']
+    assert prompt.index('OBSERVED 0') < prompt.index('OBSERVED 1')
+    assert 'REFERENCE_SENTINEL' not in prompt and 'png_base64' not in prompt
+    assert result.metadata['source_image_count'] == 2
+    assert len(result.metadata['ocr_pages']) == 2
+    assert result.metadata['ocr_replayed'] and elapsed == 20
+
+
+def test_replay_cache_binds_raw_profile_runtime_and_order(tmp_path):
+    case = case_files(tmp_path)
+    rows = typed_rows(case, tmp_path)
+    pages, _ = cached_ocr(case, rows, 'native')
+    key = job_identity({'model': 'a'}, case, 'ocr', pages, 600, 8192)
+    for field in ('profile_id', 'runtime_fingerprint'):
+        changed = json.loads(json.dumps(pages))
+        changed[0][field] = 'different'
+        assert job_identity({'model': 'a'}, case, 'ocr', changed, 600, 8192) != key
+    reordered = {**case, 'images': list(reversed(case['images']))}
+    assert job_identity({'model': 'a'}, reordered, 'ocr', pages, 600, 8192) != key
+    raw = Path(rows[0]['artifact'])
+    raw.write_text(raw.read_text() + '\n')
+    changed, _ = cached_ocr(case, rows, 'native')
+    assert job_identity({'model': 'a'}, case, 'ocr', changed, 600, 8192) != key
+
+
+async def test_second_replay_page_failure_never_returns_successful_prefix(tmp_path):
+    from test_extraction_pipeline import formatter
+    from vision_bill.service.experiment_execution import ExperimentFailure
+    case = case_files(tmp_path)
+    pages, _ = cached_ocr(case, typed_rows(case, tmp_path), 'native')
+    pages[1]['text'] = ' '
+    llm = formatter(False)
+    with pytest.raises(ExperimentFailure) as failure:
+        await compare_case(llm, 'fixture', case, 'ocr', pages, tmp_path, 5)
+    assert failure.value.metadata['source_image_count'] == 2
+    assert len(failure.value.metadata['ocr_pages']) == 1
+    llm._client.chat.assert_not_awaited()
+
+
+def test_summary_keeps_scoring_errors_and_reports_exact_failure_denominators(tmp_path):
+    result = summary([{'engine':'m','llm_status':'ok','score_artifact':str(tmp_path/'missing')},
+                      {'engine':'m','llm_status':'error'}])[0]
+    assert result['cases']==2 and result['extracted']==1 and result['scoring_failed']==1
+    assert result['score_excluding_payment']==0
+    assert result['full_receipt_correct_rate']==0
+
+
+def test_complete_report_escapes_metadata_and_displays_fallback_repair_and_cache_modes(tmp_path):
+    from scripts.ocr_harness.runner import write_reports
+    path=tmp_path/'original.png';path.write_bytes(b'not-decoded-by-report')
+    write_reports(tmp_path,[{'engine':'<script>alert(1)</script>','input':str(path),'status':'ok','cached':False,
+        'cache_mode':'ocr_replay','warm_state':'unknown','metadata':{'used_pipeline':'direct_vision','fallback_used':True,
+        'fallback_reason':'ocr_page_failed','telemetry':{'stage_ms':{'repair':123},'finish_reason':'length'},
+        'field_sources':{'merchant_name':'<img onerror=evil>'}}}])
+    html=(tmp_path/'report.html').read_text()
+    assert '<script>' not in html and '<img onerror' not in html
+    assert '&lt;script&gt;' in html and '&lt;img onerror=evil&gt;' in html
+    assert all(value in html for value in ['ocr_replay','ocr_page_failed','repair','length','unknown','direct_vision'])
+
+
+async def test_failed_dataset_scoring_still_records_both_extractions(tmp_path,monkeypatch):
+    from scripts.ocr_harness import comparison
+    case=case_files(tmp_path)
+    case['expected'].write_text('{invalid reference')
+    client=SimpleNamespace(chat=AsyncMock(),list=AsyncMock(return_value=SimpleNamespace(models=[SimpleNamespace(model='m',digest='d')])),_client=SimpleNamespace(aclose=AsyncMock()))
+    monkeypatch.setattr(comparison,'make_target_provider',lambda *args:SimpleNamespace(_client=client))
+    execute=AsyncMock(return_value=SimpleNamespace(receipt=receipt(),metadata={}))
+    monkeypatch.setattr(comparison,'compare_case',execute)
+    rows=await comparison.run_comparison([case],[{'id':'m','provider':'ollama','host':'http://localhost','model':'m'}],typed_rows(case,tmp_path),'native',tmp_path/'output')
+    assert len(rows)==2 and execute.await_count==2
+    assert all(row['llm_status']=='ok' and row['score_status']=='error' for row in rows)
+    assert all(s['cases']==1 and s['scoring_failed']==1 and s['score_excluding_payment']==0 for s in summary(rows))

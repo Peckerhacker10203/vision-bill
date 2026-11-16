@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Standalone benchmark runner that calls vision-bill code directly.
 
 This script runs a benchmark without requiring the Vision Bill API to be running.
@@ -37,9 +36,8 @@ import json
 import logging
 import os
 import sys
-import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -48,9 +46,9 @@ import asyncpg
 # Add src to path so we can import vision_bill modules
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from vision_bill.config import LLMSettings, OcrSettings, PGSettings
-from vision_bill.provider.factory import get_llm_provider, get_ocr_provider
+from vision_bill.config import ImageSettings, LLMSettings, OcrSettings, PGSettings
 from vision_bill.model.receipt import LineItem, Receipt, TaxLine
+from vision_bill.provider.factory import get_llm_provider, get_ocr_provider
 from vision_bill.service.benchmark_scoring import score_receipts
 
 logger = logging.getLogger(__name__)
@@ -140,6 +138,7 @@ def get_pg_settings(args: argparse.Namespace) -> PGSettings:
 def get_ocr_settings(args: argparse.Namespace) -> OcrSettings:
     """Build OcrSettings from environment or command-line args."""
     return OcrSettings(
+        enabled=True,
         service_url=args.ocr_url or os.getenv("OCR__SERVICE_URL", "http://localhost:8082"),
         timeout_seconds=int(os.getenv("OCR__TIMEOUT_SECONDS", "300")),
     )
@@ -176,7 +175,7 @@ async def fetch_verified_receipts(
                r.merchant_address, r.receipt_number, r.time,
                r.discount_total, r.tip,
                i.image_path,
-               i.original_filename
+               i.original_filename, i.additional_images
         FROM receipts r
         JOIN images i ON r.id = i.receipt_id
         WHERE r.verified = true
@@ -219,17 +218,17 @@ async def fetch_receipt_details(
         SELECT description, quantity, unit_price, total_price, tags, spending_category
         FROM line_items
         WHERE receipt_id = $1
-        ORDER BY id
+        ORDER BY position, id
     """,
         receipt_id,
     )
 
     taxes = await pool.fetch(
         """
-        SELECT name, amount
+        SELECT name, rate, amount
         FROM taxes
         WHERE receipt_id = $1
-        ORDER BY id
+        ORDER BY position, id
     """,
         receipt_id,
     )
@@ -251,7 +250,7 @@ async def fetch_receipt_details(
 
     tax_lines = []
     for t in taxes:
-        tax_lines.append(TaxLine(name=t["name"], amount=t["amount"]))
+        tax_lines.append(TaxLine(name=t["name"], rate=t["rate"], amount=t["amount"]))
 
     return Receipt(
         confidence=receipt_row["confidence"],
@@ -271,6 +270,18 @@ async def fetch_receipt_details(
         total=receipt_row["total"],
         payment_method=receipt_row["payment_method"],
     )
+
+
+async def execute_photos(provider, ocr, model, paths, pg_settings):
+    from tempfile import TemporaryDirectory
+
+    from vision_bill.model.experiment import ExperimentOptions
+    from vision_bill.service.receipt_service import ReceiptService
+    with TemporaryDirectory(prefix="vision-bill-benchmark-") as directory:
+        service = ReceiptService(ImageSettings(save_dir=directory, tmp_dir=directory), pg_settings,
+                                 provider, ocr_provider=ocr)
+        return await service.analyse_submission_with_metadata(
+            model, paths, ExperimentOptions(pipeline="ocr", include_classification=False), [])
 
 
 async def run_benchmark(args: argparse.Namespace) -> BenchmarkSummary:
@@ -339,22 +350,24 @@ async def run_benchmark(args: argparse.Namespace) -> BenchmarkSummary:
             model=llm_settings.model_name,
             provider=str(llm_settings.provider),
             total_receipts=len(receipts),
-            started_at=datetime.now().isoformat(),
+            started_at=datetime.now(UTC).isoformat(),
         )
 
         for i, receipt in enumerate(receipts, 1):
             receipt_id = str(receipt["id"])
             image_path = receipt["image_path"]
+            additional = receipt.get("additional_images") or []
+            additional = json.loads(additional) if isinstance(additional, str) else additional
+            paths = [Path(image_path), *[Path(part["image_path"]) for part in additional]]
             logger.info(
-                "[%d/%d] Processing receipt %s (%s)",
+                "[%d/%d] Processing receipt %s",
                 i,
                 len(receipts),
                 receipt_id,
-                receipt.get("merchant_name", "unknown"),
             )
 
             # Check if image exists
-            if not Path(image_path).exists():
+            if any(not path.is_file() for path in paths):
                 logger.warning("Image not found: %s", image_path)
                 summary.results.append(
                     BenchmarkResult(
@@ -386,21 +399,12 @@ async def run_benchmark(args: argparse.Namespace) -> BenchmarkSummary:
 
             # Run OCR + LLM pipeline
             try:
-                start_time = time.time()
 
-                # Stage 1: OCR
-                ocr_start = time.time()
-                ocr_result = await ocr_provider.extract_text(Path(image_path))
-                ocr_time = (time.time() - ocr_start) * 1000
-
-                # Stage 2: LLM
-                llm_start = time.time()
-                actual = await llm_provider.analyse_receipt_from_ocr_text(
-                    llm_settings.model_name, ocr_result
-                )
-                llm_time = (time.time() - llm_start) * 1000
-
-                total_time = (time.time() - start_time) * 1000
+                result = await execute_photos(llm_provider, ocr_provider, llm_settings.model_name, paths, pg_settings)
+                actual = result.receipt
+                ocr_time = result.metadata.get("telemetry", {}).get("stage_ms", {}).get("ocr", 0)
+                llm_time = result.metadata.get("llm_ms", 0)
+                total_time = result.elapsed_ms
 
                 # Score
                 scores = score_receipts(expected, actual)
@@ -433,8 +437,8 @@ async def run_benchmark(args: argparse.Namespace) -> BenchmarkSummary:
                 )
                 summary.successful += 1
 
-            except Exception as e:
-                logger.error("  Error processing receipt: %s", e, exc_info=args.verbose)
+            except Exception as e:  # noqa: BLE001 - preserve every failed dataset case
+                logger.error("Receipt processing failed: %s", type(e).__name__)
                 summary.results.append(
                     BenchmarkResult(
                         receipt_id=receipt_id,
@@ -446,7 +450,7 @@ async def run_benchmark(args: argparse.Namespace) -> BenchmarkSummary:
                 )
                 summary.failed += 1
 
-        summary.finished_at = datetime.now().isoformat()
+        summary.finished_at = datetime.now(UTC).isoformat()
 
         # Calculate averages
         successful_results = [r for r in summary.results if r.success]
@@ -517,8 +521,7 @@ async def run_benchmark(args: argparse.Namespace) -> BenchmarkSummary:
                     for r in summary.results
                 ],
             }
-            with open(args.output, "w") as f:
-                json.dump(output_data, f, indent=2)
+            await asyncio.to_thread(Path(args.output).write_text, json.dumps(output_data, indent=2))
             print(f"Results written to {args.output}")
 
     finally:

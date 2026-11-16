@@ -683,7 +683,10 @@ async def test_quantity_rate_widening_preserves_historical_values(db):
         taxes=[{"name": "VAT", "rate": 0.1234, "amount": "1.23"}],
     )
     conn = await asyncpg.connect(db.pg_dsn)
-    saved = await ReceiptDB(db).insert_receipt(conn, receipt, image_id=None, user_id=None)
+    # Seed the historical schema using its actual tax columns; the current writer
+    # deliberately requires migration0016's ordered-tax position column.
+    saved = await ReceiptDB(db).insert_receipt(conn, receipt.model_copy(update={"taxes": []}), image_id=None, user_id=None)
+    await conn.execute("INSERT INTO taxes(receipt_id,name,rate,amount) VALUES($1,'VAT',0.1234,1.23)", saved.id)
     query = "SELECT r.total,l.quantity,l.unit_price,l.total_price,t.rate,t.amount FROM receipts r JOIN line_items l ON l.receipt_id=r.id JOIN taxes t ON t.receipt_id=r.id WHERE r.id=$1"
     before = await conn.fetchrow(query, saved.id)
     await conn.close()

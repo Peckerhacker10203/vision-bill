@@ -132,8 +132,8 @@ DELETE_CATEGORY_ALIAS_SQL = """
 
 INSERT_TAX_SQL = """
     INSERT INTO taxes
-        (receipt_id, name, rate, amount)
-    VALUES ($1, $2, $3, $4)
+        (receipt_id, name, rate, amount, position)
+    VALUES ($1, $2, $3, $4, $5)
 """
 
 GET_RECEIPT_SQL = "SELECT * FROM receipts WHERE id = $1"
@@ -223,8 +223,8 @@ STATS_WEEKLY_SQL = """
     GROUP BY week_start, currency
     ORDER BY week_start, currency
 """
-LIST_LINE_ITEMS_SQL = "SELECT * FROM line_items WHERE receipt_id = $1 ORDER BY position"
-LIST_TAXES_SQL = "SELECT * FROM taxes WHERE receipt_id = $1 ORDER BY id"
+LIST_LINE_ITEMS_SQL = "SELECT * FROM line_items WHERE receipt_id = $1 ORDER BY position, id"
+LIST_TAXES_SQL = "SELECT * FROM taxes WHERE receipt_id = $1 ORDER BY position, id"
 LIST_COLLECTION_IDS_FOR_RECEIPT_SQL = (
     "SELECT collection_id FROM receipt_collections WHERE receipt_id = $1"
 )
@@ -384,13 +384,14 @@ class ReceiptDB:
                 )
 
         if receipt.taxes:
-            for tax in receipt.taxes:
+            for position, tax in enumerate(receipt.taxes):
                 await conn.execute(
                     INSERT_TAX_SQL,
                     receipt_id,
                     tax.name,
                     Decimal(str(tax.rate)) if tax.rate is not None else None,
                     tax.amount,
+                    position,
                 )
 
     async def get_category_suggestion(

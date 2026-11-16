@@ -2,6 +2,15 @@ import math
 
 
 def normalize_result(data):
+    if isinstance(data, dict) and data.get("contract_version") == 2:
+        from vision_bill.model.ocr import OcrPageMetadata, OcrResponse
+        page = OcrResponse.model_validate(data)
+        if not page.text.strip():
+            raise ValueError("OCR returned no recognized text")
+        return {"text": page.text, "row_text": page.text,
+                "blocks": [block.model_dump(mode="json") for block in page.blocks],
+                "versions": page.telemetry.get("client_versions", {}), "warnings": [],
+                "page_metadata": OcrPageMetadata.model_validate(page.model_dump()).model_dump(mode="json")}
     if (
         not isinstance(data, dict)
         or not isinstance(data.get("text"), str)

@@ -13,6 +13,7 @@ from .receipt import Category, Currency, LineItem, Receipt, ReceiptTime
 from .review import AmountPolicy, ReviewFinding, SourceView
 
 EXTRACTION_SCHEMA_VERSION = "1"
+SOURCE_PROJECTION_VERSION = "2"
 PaymentMethod = Literal[
     "cash", "credit_card", "debit_card", "mobile_payment", "check", "other", "unknown"
 ]
@@ -117,6 +118,8 @@ class DerivedInputView(BaseModel):
 
 
 class InferenceEnvelope(BaseModel):
+    source_projection_version: str = "1"  # Missing identity in historical envelopes stays legacy.
+    raw_field_sources: dict[str, list[SourceRef]] = Field(default_factory=dict)
     draft: ExtractionDraft | None = None
     receipt: Receipt | None = None
     amount_policy: AmountPolicy = Field(default_factory=AmountPolicy)

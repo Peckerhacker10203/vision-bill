@@ -49,13 +49,10 @@
 	<label class="mt-3 flex items-center gap-2 text-sm"
 		><input type="checkbox" bind:checked={settings.includeClassification} /> Include categories and tags</label
 	>
-	<label class="mt-3 flex items-center gap-2 text-sm"
-		><input type="checkbox" bind:checked={settings.allowFallback} /> Allow direct vision fallback if OCR
-		fails</label
-	>
 	<p class="mt-2 text-xs text-on-surface-variant">
-		These settings apply only to this run. Extraction and classification are scored separately. OCR
-		failures stop the experiment unless fallback is selected.
+		These settings apply only to this run. Extraction and classification are scored separately.
+		Normal upload inherits the server OCR and fallback policy. Direct vision skips OCR. OCR followed
+		by model requires OCR and stops on OCR failure.
 	</p>
 	{#if !ocrAvailable}<p class="mt-2 text-xs text-on-surface-variant">
 			The OCR extension is not configured. Normal upload currently uses direct vision.
