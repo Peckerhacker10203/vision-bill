@@ -87,7 +87,7 @@ async def test_hung_attempt_includes_binding_in_original_budget(settings, tmp_pa
     service.worker = settings.worker.model_copy(update={"attempt_timeout_seconds": 0.2})
     entered = asyncio.Event()
 
-    async def hang(*args):
+    async def hang(*args, **kwargs):
         entered.set()
         await asyncio.Event().wait()
 
@@ -131,7 +131,7 @@ async def test_stale_checkpoint_cleans_only_unreferenced_new_artifact(settings, 
 
     service, receipt, db, claim, part = context(settings, tmp_path)
     db.save_ocr_checkpoint.return_value = False
-    db.unreferenced_views = AsyncMock(side_effect=lambda image_id, views: views)
+    db.unreferenced_views = AsyncMock(side_effect=lambda image_id, views, **kwargs: views)
 
     async def extract(*args, **kwargs):
         await kwargs["checkpoint"](OcrResponse.model_validate(wire_page(0, part.source_sha256)))
@@ -149,7 +149,7 @@ async def test_hung_outcome_commit_cannot_extend_complete_attempt_budget(setting
     service.worker = settings.worker.model_copy(update={"attempt_timeout_seconds": 0.02})
     receipt.extract_receipt.side_effect = TimeoutError()
 
-    async def hang(*args):
+    async def hang(*args, **kwargs):
         await asyncio.Event().wait()
 
     db.finish_attempt.side_effect = hang

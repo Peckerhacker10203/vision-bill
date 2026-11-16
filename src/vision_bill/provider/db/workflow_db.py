@@ -2,7 +2,8 @@
 
 Files are saved by the application before supplying PersistedWorkingView. This
 provider validates their identities and stores metadata only; it never decodes
-or opens images. A failed transaction may leave an unreferenced file for the
+or opens images. Optional deadlines use the asyncio loop clock and bound the
+whole connection/transaction lifecycle. A failed transaction may leave an unreferenced file for the
 application's artifact cleanup, but never a partially committed receipt.
 """
 
@@ -38,6 +39,7 @@ from ...model.workflow import (
     assert_metadata_only,
 )
 from ...service.receipt_review import evaluate_receipt, persistent_findings, receipt_from_draft
+from .deadline import connection
 from .receipt_db import OriginalChecker, ReceiptDB
 
 
@@ -153,13 +155,15 @@ class WorkflowDB:
         self,
         claim: AnalysisClaim,
         bindings: list[SourcePartBinding],
+        *,
+        deadline: float | None = None,
     ) -> list[PersistedSourcePart] | None:
         """Initialize unknown legacy source identities inside the live claim fence.
 
         The caller hashes originals under its attempt deadline. Paths must equal
         the stored ordered originals; established identities cannot be changed.
         """
-        async with self.pool.acquire() as conn, conn.transaction():
+        async with connection(self.pool, deadline=deadline, transaction=True) as conn:
             row = await self._lock_claim(conn, claim)
             if row is None:
                 return None
@@ -459,13 +463,13 @@ class WorkflowDB:
             ):
                 raise ValueError("source reference view does not match saved artifact")
 
-    async def get_ocr_checkpoint(self, claim: AnalysisClaim) -> OcrCheckpoint | None:
+    async def get_ocr_checkpoint(self, claim: AnalysisClaim, *, deadline: float | None = None) -> OcrCheckpoint | None:
         """Read internal metadata under a live fence, including saved-view paths.
 
         The application checks the actual OCR profile/runtime before reuse and
         loads saved artifacts through FileProvider. This never reconstructs PNGs.
         """
-        async with self.pool.acquire() as conn, conn.transaction():
+        async with connection(self.pool, deadline=deadline, transaction=True) as conn:
             row = await self._lock_claim(conn, claim)
             if row is None or row["ocr_checkpoint"] is None:
                 return None
@@ -479,9 +483,9 @@ class WorkflowDB:
                 )
                 return None
 
-    async def clear_ocr_checkpoint(self, claim: AnalysisClaim) -> bool:
+    async def clear_ocr_checkpoint(self, claim: AnalysisClaim, *, deadline: float | None = None) -> bool:
         """Invalidate only the cache pointer, retaining immutable views and history."""
-        async with self.pool.acquire() as conn, conn.transaction():
+        async with connection(self.pool, deadline=deadline, transaction=True) as conn:
             if await self._lock_claim(conn, claim) is None:
                 return False
             await conn.execute("UPDATE images SET ocr_checkpoint=NULL WHERE id=$1", claim.image.id)
@@ -493,9 +497,10 @@ class WorkflowDB:
         *,
         model_id: str,
         effective_options: dict[str, Any],
+        deadline: float | None = None,
     ) -> ImageRow | None:
         """Resolve an uninitialized legacy job once, under the original claim fence."""
-        async with self.pool.acquire() as conn, conn.transaction():
+        async with connection(self.pool, deadline=deadline, transaction=True) as conn:
             row = await self._lock_claim(conn, claim)
             if row is None:
                 return None
@@ -541,8 +546,8 @@ class WorkflowDB:
             )
         return min(maximum, max(0.0, float(delay))) if delay is not None else maximum
 
-    async def save_ocr_checkpoint(self, claim: AnalysisClaim, checkpoint: OcrCheckpoint) -> bool:
-        async with self.pool.acquire() as conn, conn.transaction():
+    async def save_ocr_checkpoint(self, claim: AnalysisClaim, checkpoint: OcrCheckpoint, *, deadline: float | None = None) -> bool:
+        async with connection(self.pool, deadline=deadline, transaction=True) as conn:
             row = await self._lock_claim(conn, claim)
             if row is None:
                 return False
@@ -576,9 +581,9 @@ class WorkflowDB:
             )
             return True
 
-    async def finish_attempt(self, claim: AnalysisClaim, outcome: AttemptOutcome) -> CommitResult:
+    async def finish_attempt(self, claim: AnalysisClaim, outcome: AttemptOutcome, *, deadline: float | None = None) -> CommitResult:
         try:
-            return await self._finish_attempt_transaction(claim, outcome)
+            return await self._finish_attempt_transaction(claim, outcome, deadline=deadline)
         except _ExpiredClaim:
             return CommitResult(stale=True)
 
@@ -586,8 +591,10 @@ class WorkflowDB:
         self,
         claim: AnalysisClaim,
         outcome: AttemptOutcome,
+        *,
+        deadline: float | None = None,
     ) -> CommitResult:
-        async with self.pool.acquire() as conn, conn.transaction():
+        async with connection(self.pool, deadline=deadline, transaction=True) as conn:
             row = await self._lock_claim(conn, claim)
             if row is None:
                 return CommitResult(stale=True)
@@ -1100,9 +1107,11 @@ class WorkflowDB:
         self,
         image_id: UUID,
         views: list[PersistedWorkingView],
+        *,
+        deadline: float | None = None,
     ) -> list[PersistedWorkingView]:
         """Wait for any in-flight commit before authorizing caller-owned orphan cleanup."""
-        async with self.pool.acquire() as conn, conn.transaction():
+        async with connection(self.pool, deadline=deadline, transaction=True) as conn:
             await conn.fetchrow("SELECT id FROM images WHERE id=$1 FOR UPDATE", image_id)
             saved = await conn.fetch(
                 "SELECT view_id FROM extraction_working_views WHERE view_id=ANY($1::uuid[])",

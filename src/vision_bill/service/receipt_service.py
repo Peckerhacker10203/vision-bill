@@ -136,9 +136,11 @@ class ReceiptService:
         """The users-table provider, exposed for auth and ownership backfill."""
         return self._user_db
 
-    async def list_tags(self) -> list[str]:
+    async def list_tags(self, *, deadline: float | None = None) -> list[str]:
         """Return the allowed line-item tag vocabulary from the database."""
-        return await self._db.list_tags()
+        if deadline is None:
+            return await self._db.list_tags()
+        return await self._db.list_tags(deadline=deadline)
 
     async def get_category_suggestion(
         self, user_id: UUID, merchant_name: str, description: str

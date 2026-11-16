@@ -1273,9 +1273,9 @@ class ReceiptDB:
             collection_ids=collection_ids,
         )
 
-    async def list_tags(self) -> list[str]:
+    async def list_tags(self, *, deadline: float | None = None) -> list[str]:
         """Return the allowed line-item tag vocabulary, ordered by name."""
-        async with self.pool.acquire() as conn:
+        async with connection(self.pool, deadline=deadline) as conn:
             rows = await conn.fetch(LIST_TAGS_SQL)
         return [row["name"] for row in rows]
 

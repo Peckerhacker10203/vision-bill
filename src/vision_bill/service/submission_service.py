@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+from functools import partial
 from pathlib import Path
 from time import monotonic
 from typing import Any
@@ -108,25 +109,39 @@ class SubmissionService:
 
     async def process_claim(self, claim: AnalysisClaim) -> CommitResult:
         deadline = monotonic() + self.worker.attempt_timeout_seconds
+        # Convert once: asyncio loop time need not share monotonic()'s epoch.
+        loop = asyncio.get_running_loop()
+        db_deadline = loop.time() + max(0.0, deadline - monotonic())
         owned: list[PersistedWorkingView] = []
         try:
-            async with asyncio.timeout(max(0, deadline - monotonic())):
-                return await self._process_claim(claim, deadline, owned)
+            async with asyncio.timeout_at(db_deadline):
+                return await self._process_claim(claim, deadline, owned, db_deadline=db_deadline)
         except TimeoutError:
             # A hung DB cannot extend the complete attempt. Lease recovery owns
             # any still-uncommitted outcome; stale fencing prevents a late write.
             return CommitResult(stale=True)
         finally:
-            if owned and monotonic() < deadline:
+            if owned and monotonic() < deadline and loop.time() < db_deadline:
                 # The DB locks the submission before checking references, including
                 # transactions whose commit acknowledgement was lost. Uncertain
                 # outcomes retain artifacts; never delete a referenced file.
                 try:
-                    async with asyncio.timeout(min(5.0, max(0, deadline - monotonic()))):
-                        unused = await self.db.unreferenced_views(claim.image.id, owned)
+                    cleanup_deadline = min(deadline, monotonic() + 5.0)
+                    cleanup_db_deadline = min(db_deadline, loop.time() + 5.0)
+                    async with asyncio.timeout_at(cleanup_db_deadline):
+                        unused = await self.db.unreferenced_views(
+                            claim.image.id, owned, deadline=cleanup_db_deadline
+                        )
                         for view in unused:
-                            await asyncio.to_thread(
-                                self.images.remove_unreferenced_working_image,
+                            check_deadline(cleanup_deadline)
+                            if loop.time() >= cleanup_db_deadline:
+                                raise TimeoutError("database_attempt_deadline")
+                            await run_sync_before(
+                                cleanup_deadline,
+                                partial(
+                                    self.images.remove_unreferenced_working_image,
+                                    deadline=cleanup_deadline,
+                                ),
                                 claim.image.id,
                                 view.artifact_path,
                                 view.metadata,
@@ -135,16 +150,19 @@ class SubmissionService:
                     logger.warning("Working artifact cleanup deferred")
 
     async def _process_claim(
-        self, claim: AnalysisClaim, deadline: float, owned: list[PersistedWorkingView]
+        self, claim: AnalysisClaim, deadline: float, owned: list[PersistedWorkingView],
+        *, db_deadline: float,
     ) -> CommitResult:
         try:
             # Reserve a small part of the same absolute budget for durable error
             # bookkeeping. Providers, callbacks and threads retain the original deadline.
             reserve = min(5.0, self.worker.attempt_timeout_seconds * 0.05)
-            async with asyncio.timeout(max(0, deadline - monotonic() - reserve)):
-                outcome = await self._attempt(claim, deadline, owned)
+            async with asyncio.timeout_at(db_deadline - reserve):
+                outcome = await self._attempt(claim, deadline, owned, db_deadline=db_deadline)
                 check_deadline(deadline)
-                return await self.db.finish_attempt(claim, outcome)
+                if asyncio.get_running_loop().time() >= db_deadline:
+                    raise TimeoutError("database_attempt_deadline")
+                return await self.db.finish_attempt(claim, outcome, deadline=db_deadline)
         except StaleClaimError:
             return CommitResult(stale=True)
         except (SourceIntegrityError, OriginalSourceChangedError):
@@ -160,8 +178,10 @@ class SubmissionService:
         except Exception:  # noqa: BLE001 - no receipt content in error responses or logs
             outcome = AttemptOutcome(kind="retry", result_code="analysis_unavailable")
         check_deadline(deadline)
-        async with asyncio.timeout(max(0, deadline - monotonic())):
-            return await self.db.finish_attempt(claim, outcome)
+        if asyncio.get_running_loop().time() >= db_deadline:
+            raise TimeoutError("database_attempt_deadline")
+        async with asyncio.timeout_at(db_deadline):
+            return await self.db.finish_attempt(claim, outcome, deadline=db_deadline)
 
     @staticmethod
     def _bindings(image: ImageRow) -> list[SourcePartBinding]:
@@ -178,7 +198,8 @@ class SubmissionService:
             raise SourceIntegrityError from exc
 
     async def _attempt(
-        self, claim: AnalysisClaim, deadline: float, owned: list[PersistedWorkingView]
+        self, claim: AnalysisClaim, deadline: float, owned: list[PersistedWorkingView],
+        *, db_deadline: float,
     ) -> AttemptOutcome:
         image = claim.image
         if not image.effective_options:
@@ -195,7 +216,7 @@ class SubmissionService:
             if selected is None:
                 raise RuntimeError("model_unavailable")
             saved = await self.db.ensure_execution_snapshot(
-                claim, model_id=selected, effective_options=self.legacy_snapshot()
+                claim, model_id=selected, effective_options=self.legacy_snapshot(), deadline=db_deadline
             )
             if saved is None:
                 raise StaleClaimError
@@ -213,7 +234,7 @@ class SubmissionService:
             raise ValueError("execution_snapshot_invalid")
         bindings = await run_sync_before(deadline, self._bindings, image)
         try:
-            parts = await self.db.bind_source_parts(claim, bindings)
+            parts = await self.db.bind_source_parts(claim, bindings, deadline=db_deadline)
         except ValueError as exc:
             raise SourceIntegrityError from exc
         if parts is None:
@@ -228,7 +249,7 @@ class SubmissionService:
             )
             for p in parts
         ]
-        pages, manifests = await self._resume(claim, parts, ocr, deadline)
+        pages, manifests = await self._resume(claim, parts, ocr, deadline, db_deadline=db_deadline)
 
         async def save_page(page: OcrResponse) -> None:
             manifest = await self._save_view(
@@ -244,10 +265,10 @@ class SubmissionService:
                 pages=[p.model_dump() for p in pages],
                 persisted_views=list(manifests),
             )
-            if not await self.db.save_ocr_checkpoint(claim, checkpoint):
+            if not await self.db.save_ocr_checkpoint(claim, checkpoint, deadline=db_deadline):
                 raise StaleClaimError
 
-        tags = await self.receipts.list_tags()
+        tags = await self.receipts.list_tags(deadline=db_deadline)
         for retry in range(2):
             try:
                 envelope = await self.receipts.extract_receipt(
@@ -264,7 +285,7 @@ class SubmissionService:
                 )
                 break
             except OcrRuntimeChangedError:
-                if not await self.db.clear_ocr_checkpoint(claim):
+                if not await self.db.clear_ocr_checkpoint(claim, deadline=db_deadline):
                     raise StaleClaimError from None
                 pages.clear()
                 manifests.clear()
@@ -323,8 +344,10 @@ class SubmissionService:
         parts: list[PersistedSourcePart],
         ocr: OcrSettings,
         deadline: float,
+        *,
+        db_deadline: float,
     ) -> tuple[list[OcrResponse], list[PersistedWorkingView]]:
-        checkpoint = await self.db.get_ocr_checkpoint(claim)
+        checkpoint = await self.db.get_ocr_checkpoint(claim, deadline=db_deadline)
         if checkpoint is None:
             return [], []
         if checkpoint.ordered_source_sha256 != [p.source_sha256 for p in parts]:
@@ -376,7 +399,7 @@ class SubmissionService:
         except TimeoutError:
             raise
         except (ValueError, OSError):
-            if not await self.db.clear_ocr_checkpoint(claim):
+            if not await self.db.clear_ocr_checkpoint(claim, deadline=db_deadline):
                 raise StaleClaimError from None
             return [], []
 

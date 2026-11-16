@@ -360,9 +360,13 @@ class ImageService:
         image_id: UUID,
         artifact_path: str,
         metadata: WorkingImageMetadata,
+        *,
+        deadline: float | None = None,
     ) -> None:
         """Caller must hold DB evidence that its own newly created file is unreferenced."""
         expected = self._working_path(image_id, metadata.view_id)
         if Path(artifact_path).absolute() != expected or expected.is_symlink():
             raise ValueError("invalid_working_artifact_path")
+        if deadline is not None:
+            check_deadline(deadline)
         expected.unlink(missing_ok=True)

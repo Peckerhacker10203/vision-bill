@@ -130,8 +130,8 @@ async def test_checkpoint_reload_reuses_only_exact_prefix(workflow_db, settings,
                 == payload
             )
 
-        async def load(claim):
-            result = await original_load(claim)
+        async def load(claim, *, deadline=None):
+            result = await original_load(claim, deadline=deadline)
             assert result is None
             async with w.pool.acquire() as conn:
                 assert (
@@ -155,9 +155,9 @@ async def test_checkpoint_reload_reuses_only_exact_prefix(workflow_db, settings,
     original_attempt = service._attempt
     deadlines = []
 
-    async def attempt(claim, deadline, owned):
+    async def attempt(claim, deadline, owned, *, db_deadline):
         deadlines.append(deadline)
-        return await original_attempt(claim, deadline, owned)
+        return await original_attempt(claim, deadline, owned, db_deadline=db_deadline)
 
     service._attempt = attempt
     second = await service.process_claim(claim)
