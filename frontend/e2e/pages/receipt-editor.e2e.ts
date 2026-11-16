@@ -281,7 +281,7 @@ test.describe('receipt editor', () => {
 		);
 		await page.getByRole('button', { name: 'Tags' }).click();
 		await page.getByRole('option', { name: 'beverage', exact: true }).click();
-		await page.keyboard.press('Escape');
+		await page.getByRole('heading', { name: 'Billa Test', exact: true }).click();
 		await expect(page.getByRole('listbox')).toBeHidden();
 		await expect(
 			page.getByRole('button', { name: 'Remove “beverage”', exact: true })
