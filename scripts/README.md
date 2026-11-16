@@ -17,7 +17,8 @@ Build/install targets and ordinary startup do not run these tools, historical
 colleague/Gemma comparisons, or real model benchmarks. Invoke only the desired
 diagnostic explicitly; you can build first and test your own receipts through the UI.
 For native shared-GPU work, all supported clients must use the application's same
-Ollama endpoint spelling, OCR settings and underlying `OCR__COORDINATION_PATH` file.
+configured provider, lifecycle mode, endpoint spelling, OCR settings and underlying
+`OCR__COORDINATION_PATH` file. See [OpenAI/llama.cpp setup](../OPENAI_COMPATIBLE.md).
 A host-side path must refer to the same file mounted at `/app/config` in Compose.
 Managed standalone/forced OCR also requires production `OCR__ENABLED=true` and
 `OCR__MANAGE_MODEL_LIFECYCLE=true`; it is rejected before load when ordinary app
@@ -32,6 +33,9 @@ make script-context-budget ARGS="--model installed-local-model --image /private/
 make script-context-budget ARGS="--model installed-local-model --db-sample 24"
 ```
 
+This diagnostic is Ollama-only; selecting an OpenAI-compatible application backend
+does not change its protocol. With managed OCR, its endpoint spelling must also
+match the application's shared ownership identity.
 `--host`/`OLLAMA_HOST` selects local Ollama; `--app-url` reads tag vocabulary,
 `--tags-file` supplies a JSON tag list, and `--db-sample` reads existing image paths.
 The command sends selected images to that endpoint. It requests a prompt count

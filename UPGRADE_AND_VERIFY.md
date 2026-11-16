@@ -1,9 +1,10 @@
 # Unreleased package: upgrade and verification
 
-This guide describes source `7d8284765f3c3f27e01e54f2df0121596a75de03` plus the
-subsequent documentation alignment (including a docstring-only standalone CLI help
-correction; its executable AST is unchanged). It is an operator procedure, not an executed
-deployment. The original PR14 optional OCR integration has been stabilized here;
+This guide covers the stabilized package and its subsequent lazy OCR/LLM handoff
+and optional OpenAI-compatible llama.cpp router lifecycle. The verification table
+below identifies its historical checkpoints; it does not attest later runtime
+changes. See [backend setup, ownership and changes](OPENAI_COMPATIBLE.md). This is
+an operator procedure, not an executed deployment. The original PR14 optional OCR integration has been stabilized here;
 PR15's splitting experiments and historical results remain separate evidence.
 Those source imports are not described as remotely merged PRs. The colleague
 attachment supplied settings only; no colleague project logic was imported. The
@@ -20,6 +21,8 @@ maximum to 2,000,000 pixels.
 3. Normalize document pixels and extract all photos, using direct vision when OCR
    is off or the explicitly enabled native sidecar when OCR is selected. Persist
    exact working views and a complete all-photo checkpoint only when valid.
+   Managed OCR first confirms release of owned LLMs and later confirms native OCR
+   worker exit before any LLM formatting request.
 4. Format nullable printed observations with the configured LLM. Reconcile only
    verified adjacent boundary overlaps; apply classification as enrichment after
    extraction. Preserve missing data, repeated purchases and original descriptions.
@@ -255,7 +258,10 @@ attested all 100 backend source identities and 83 frontend assets; unchanged bas
 dependency/backend layers justified backend carry. Owned cleanup finished with no
 remaining resources. A previous 96-pass/1-fail browser run remains failed history;
 it is not combined with the final pass. Nonblocking npm/Vite timing notices remain.
-These counts are accepted existing evidence, not suites rerun for documentation.
+These counts are historical package evidence, not suites rerun for documentation
+or evidence for the later lifecycle extensions. Follow the
+[current branch CI](https://github.com/Peckerhacker10203/vision-bill/actions?query=branch%3Acodex%2Fvision-bill-update-package)
+for subsequent GPU-handoff/OpenAI changes and read each job's actual conclusion.
 
 Actual official CUDA wheel-lock resolution, CUDA/ROCm native compilation, physical
 GPU inference/qualification, current historical CPU image installation/inference,

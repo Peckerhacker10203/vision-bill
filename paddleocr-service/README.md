@@ -125,9 +125,11 @@ startup path, or explicitly change `OCR_QUALIFICATION_IMAGE_PATH`.
 Use `make ocr-qualify-cuda` or `make ocr-qualify-rocm`. This is an explicit offline
 hardware gate, never a build prerequisite or automatic comparative benchmark.
 First stop/drain the application's analysis, benchmark and standalone workers and
-stop its OCR sidecar. Release only Vision Bill's model IDs on its dedicated Ollama
-endpoint and verify their absence with `/api/ps` before starting the gate; stopping
-the app alone does not unload Ollama. Leave unrelated GPU applications alone.
+stop its OCR sidecar. Release only Vision Bill's model IDs on its dedicated LLM
+endpoint before starting the gate. Verify absence with Ollama's `/api/ps`, or
+confirm each canonical llama.cpp router ID has `status.value=unloaded` in
+`GET /models`; see [backend control](../OPENAI_COMPATIBLE.md). Stopping the app
+alone does not unload its LLM. Leave unrelated GPU applications alone.
 These commands run only the
 sidecar, with the runtime input/output volume writable for this gate. For Radeon,
 set `OCR_RENDER_NODE`, `OCR_RENDER_GID` and `OCR_VIDEO_GID` to the actual host node
@@ -223,21 +225,24 @@ advisory lock and durable journal. `OCR__COORDINATION_PATH` defaults to
 even when host/container paths differ, and the same spelling of the LLM endpoint.
 Keep the directory private to Vision Bill and use local storage supporting flock.
 
-One owner releases and verifies its exact Ollama model IDs, loads OCR, processes
+One owner releases and verifies its exact owned LLM model IDs, loads OCR, processes
 every receipt photo, then parks OCR and confirms native child death. Only then can
 formatting, repairs and classification run; the owner unloads and verifies its LLM
 before releasing ownership. `/lifecycle/claim`, `/load` and `/park` (all under the
 `/lifecycle` prefix) and `/ocr` use generation-fenced owner tokens; stale requests
 cannot park/reload a successor. These internal routes must stay on the private
 application network. No device-exclusive mode, foreign process termination, or
-unloading of every model returned by Ollama discovery is used.
+unloading of every model returned by provider discovery is used.
 
-Use a **dedicated Vision Bill Ollama endpoint** when other clients might use the
-same model ID: Ollama cannot identify which client owns a shared resident model.
-Unrelated GPU programs and unrelated model IDs remain allowed; their memory use can
-still cause capacity failures. OpenAI-compatible inference has no standard unload
-contract and is rejected for managed sharing. Direct OpenAI deployments without
-OCR remain supported. `OCR__MANAGE_MODEL_LIFECYCLE=false` is an explicit CPU-only or
+Use a **dedicated Vision Bill LLM endpoint** for managed sharing; the backend cannot
+identify which client owns a shared resident model. Unrelated GPU programs and
+unrelated model IDs remain allowed; their memory use can still cause capacity
+failures. OpenAI-compatible inference has no standard unload contract. Its default
+`LLM__MODEL_LIFECYCLE=none` is rejected for managed sharing; explicit `llamacpp`
+enables the dedicated router protocol and waits for exact-ID `unloaded` confirmation.
+A successful unload POST, sleeping state or missing model is insufficient. See
+[OpenAI-compatible backend setup](../OPENAI_COMPATIBLE.md). Pure LLM OpenAI operation
+remains supported. `OCR__MANAGE_MODEL_LIFECYCLE=false` is an explicit CPU-only or
 separate-resource policy, used by software E2E stubs; it makes no GPU handoff claim
 and cannot activate the shipped parked native sidecar without ownership.
 
@@ -256,16 +261,17 @@ but includes the actual qualified profile/runtime, checked again against executi
 Recreate old benchmark manifests after changing this lifecycle contract.
 
 Failed teardown or unconfirmed unload blocks the next phase. A crashed/cancelled
-or failed Ollama request whose completion is unknown leaves `unsettled=true` in
-the journal, even if a momentary `/api/ps` looks empty. The attempt deadline remains
+or failed model request whose completion is unknown leaves `unsettled=true` in
+the journal, even if a momentary residence probe looks idle. The attempt deadline remains
 600 seconds including cleanup. Cleanup uses at most 30 seconds of the remaining
 absolute attempt budget; when none remains, pending/unsettled state stays durable
 for the next owner's confirmed claim/release barrier. Expiry never becomes a
 successful result. A late response cannot clear a successor's journal.
 For manual recovery, stop/drain all Vision Bill app/standalone workers and its
-sidecar, then establish that the dedicated Ollama endpoint has no outstanding
+sidecar, then establish that the dedicated LLM endpoint has no outstanding
 requests (restart only that dedicated endpoint if necessary). Unload/verify only
-the journal's owned model IDs. Only after those checks, with all owners stopped,
+the journal's owned model IDs using `/api/ps` for Ollama or exact-ID
+`GET /models` status `unloaded` for llama.cpp. Only after those checks, with all owners stopped,
 archive/remove the lock and adjacent `.json` journal and restart parked services.
 Never reset ownership while workers are active or restart a shared foreign runtime.
 

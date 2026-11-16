@@ -11,7 +11,8 @@ in general logs. Preserve original bytes, human corrections, exact money and own
 Public operator contracts are in [UPGRADE_AND_VERIFY.md](UPGRADE_AND_VERIFY.md),
 [MULTI_IMAGE_RECEIPTS.md](MULTI_IMAGE_RECEIPTS.md),
 [paddleocr-service/README.md](paddleocr-service/README.md) and
-[scripts/README.md](scripts/README.md). These describe current behavior; historical
+[scripts/README.md](scripts/README.md) and
+[OPENAI_COMPATIBLE.md](OPENAI_COMPATIBLE.md). These describe current behavior; historical
 experiment reports do not certify production hardware or accuracy.
 
 ## Layout and stack
@@ -141,7 +142,13 @@ loader contract; they do not become native OCR v2 by rerunning a CPU adapter.
 
 `config.py` precedence: process environment > `.env`/`.env.local` > persistent YAML.
 Nested names use `__`. `VISION_BILL_CONFIG_PATH` defaults `/app/config/config.yaml`;
-admin writes are atomic/0600. Editable settings expose source/restart flags without
+admin writes are atomic/0600. OpenAI inference can opt into `LLM__MODEL_LIFECYCLE=llamacpp`
+for a dedicated router with exact canonical IDs, autoload on and eager loads off.
+The default `none` cannot release models for shared managed OCR; Ollama ignores this
+OpenAI-only option. In llama.cpp mode, inference/control refuse redirects; release requires
+exact router status `unloaded`, never just a successful POST. Preserve shared journal
+ownership and recovery before endpoint/lifecycle changes. See the backend guide.
+Editable settings expose source/restart flags without
 credentials. Provider/host need restart; model/temperature/registration apply live.
 `AUTH__SECRET_KEY` is required, optional pepper otherwise falls back to it. Empty
 users table permits bootstrap admin and legacy ownership backfill. Registration

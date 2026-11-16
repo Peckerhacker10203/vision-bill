@@ -2,7 +2,8 @@
 
 vision-bill extracts receipts with local models and provides a bundled web UI for
 review, collections, search, spending statistics and model comparisons. Ollama is
-the default; a user-configured OpenAI-compatible endpoint is also supported. Keep
+the default; [OpenAI-compatible backends](OPENAI_COMPATIBLE.md), including llama.cpp,
+are also supported. Keep
 that endpoint local to retain local processing. Argon2 passwords, session cookies,
 owner-scoped data and an optional admin-wide view support multiple users.
 
@@ -47,7 +48,10 @@ Environment > dotenv > persistent YAML (`/app/config/config.yaml`, mounted from
 model/temperature/registration changes apply immediately, provider/host changes
 need restart. Credentials and database settings are not exposed there. Formatter
 output defaults to 8192 tokens; OCR's 4096-token cap and model context capacity
-are separate limits. Unknown context remains unknown.
+are separate limits. Unknown context remains unknown. Managed OCR sharing with
+llama.cpp requires its dedicated router and explicit `LLM__MODEL_LIFECYCLE=llamacpp`;
+standard OpenAI inference alone has no model-unload API. See the
+[backend setup and handoff guide](OPENAI_COMPATIBLE.md).
 
 Benchmark Gold requires ordinary human verification plus explicit qualification of
 the **current** document and sources. Bypass or legacy `verified` alone is
