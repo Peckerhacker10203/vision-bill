@@ -6,11 +6,30 @@
 	import { queryClient } from '$lib/query/client';
 	import { queryKeys } from '$lib/query/keys';
 	import { t } from '$lib/i18n';
+	import type { SubmissionStatus } from '$lib/types';
 
 	let { id }: { id: string } = $props();
 	let retrying = $state(false);
 	let retryError = $state('');
 	let retryRequest: { id: string; expected_generation: number; request_key: string } | null = null;
+	let activeView: { id: string } | null = null;
+	let activeRetry: { id: string; generation: number; view: object } | null = null;
+
+	$effect(() => {
+		const view = { id };
+		activeView = view;
+		activeRetry = null;
+		retryRequest = null;
+		retrying = false;
+		retryError = '';
+		// Also runs on unmount: an old request no longer owns cache or UI effects.
+		return () => {
+			if (activeView === view) {
+				activeView = null;
+				activeRetry = null;
+			}
+		};
+	});
 	const job = createQuery(
 		() => ({
 			queryKey: queryKeys.image(id),
@@ -23,27 +42,66 @@
 	);
 
 	async function retry() {
-		if (retrying || !job.data?.terminal || job.data.status === 'analyzed') return;
+		if (
+			!activeView ||
+			activeView.id !== id ||
+			retrying ||
+			!job.data?.terminal ||
+			job.data.status === 'analyzed'
+		)
+			return;
+		const request = { id, generation: job.data.generation, view: activeView };
+		const key = queryKeys.image(request.id);
+		const isCurrent = () =>
+			activeView === request.view && activeRetry === request && id === request.id;
+		activeRetry = request;
 		retrying = true;
 		retryError = '';
 		try {
-			if (retryRequest?.id !== id || retryRequest.expected_generation !== job.data.generation) {
-				retryRequest = { id, expected_generation: job.data.generation, request_key: requestKey() };
+			if (
+				retryRequest?.id !== request.id ||
+				retryRequest.expected_generation !== request.generation
+			) {
+				retryRequest = {
+					id: request.id,
+					expected_generation: request.generation,
+					request_key: requestKey()
+				};
 			}
-			const result = await api.retrySubmission(id, {
+			const result = await api.retrySubmission(request.id, {
 				expected_generation: retryRequest.expected_generation,
 				request_key: retryRequest.request_key
 			});
-			await queryClient.cancelQueries({ queryKey: queryKeys.image(id) });
-			queryClient.setQueryData(queryKeys.image(id), result);
+			if (!isCurrent()) return;
+			const cached = queryClient.getQueryData<SubmissionStatus>(key);
+			// A GET may already know a later generation or later state within this generation.
+			// A delayed retry response must never replace either one.
+			if (!cached || cached.generation < result.generation) {
+				await queryClient.cancelQueries({ queryKey: key, exact: true });
+				if (!isCurrent()) return;
+				queryClient.setQueryData<SubmissionStatus>(key, (latest) =>
+					latest && latest.generation >= result.generation ? latest : result
+				);
+			}
+			if (!isCurrent()) return;
 			retryRequest = null;
-			void queryClient.invalidateQueries({ queryKey: ['images'] });
+			void queryClient.invalidateQueries({ queryKey: key, exact: true }, { cancelRefetch: false });
+			// Refresh list/count observers without cancelling a different job's GET.
+			void queryClient.invalidateQueries({
+				queryKey: ['images'],
+				predicate: (query) => typeof query.queryKey[1] !== 'string'
+			});
 		} catch (error) {
+			if (!isCurrent()) return;
 			retryError = error instanceof ApiError ? `${error.status}: ${error.detail}` : String(error);
-			// A conflict needs fresh generation state, while its detail remains visible.
-			if (error instanceof ApiError && error.status === 409) void job.refetch();
+			if (error instanceof ApiError && error.status === 409) {
+				void queryClient.refetchQueries({ queryKey: key, exact: true });
+			}
 		} finally {
-			retrying = false;
+			if (isCurrent()) {
+				activeRetry = null;
+				retrying = false;
+			}
 		}
 	}
 </script>
