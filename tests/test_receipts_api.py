@@ -948,6 +948,9 @@ def test_delete_receipt(api_context: ApiContext, settings: Settings) -> None:
     tmp_file.write_bytes(b"receipt-image-bytes")
     ctx.conn.fetchrow = AsyncMock(
         side_effect=[
+            {"image_id": IMAGE_ID},
+            {"id": IMAGE_ID},
+            _receipt_row(id=RECEIPT_ID, image_id=IMAGE_ID, merchant_name="Doomed Store"),
             _receipt_row(id=RECEIPT_ID, image_id=IMAGE_ID, merchant_name="Doomed Store"),
             _image_row(
                 id=IMAGE_ID,

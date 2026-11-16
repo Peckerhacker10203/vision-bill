@@ -571,3 +571,306 @@ async def test_legacy_unknown_identity_is_readable_but_known_mismatch_blocks(
         with pytest.raises(ValueError, match="integrity"):
             await w._receipts.verify_receipt(row.id, ReviewRequest(), scope=scope)
     assert path.read_bytes() == b"original receipt bytes"
+
+
+@pytest.mark.parametrize("write_path", ["put", "automatic_bypass"])
+async def test_review_quantity_and_rate_are_exact_after_storage(workflow_db, tmp_path, write_path):
+    from hashlib import sha256
+
+    from vision_bill.model.extraction import ExtractionDraft
+    from vision_bill.model.receipt import Receipt, TaxLine
+    from vision_bill.model.review import OriginalAvailability
+    from vision_bill.service.receipt_review import evaluate_receipt
+
+    w, scope = workflow_db
+    row, body, path = await seed(w, scope, tmp_path, verified=True)
+    digest = sha256(path.read_bytes()).hexdigest()
+    body.line_items[0].quantity = 1.00001
+    body.line_items[0].unit_price = Decimal(10000)
+    body.line_items[0].total_price = body.total = body.subtotal = Decimal("10000.1")
+    body.taxes = [TaxLine(name="VAT", rate=0.123456, amount=Decimal(0))]
+    document = Receipt.model_validate(body.model_dump())
+    if write_path == "put":
+        async with w.pool.acquire() as conn:
+            part_id = await conn.fetchval(
+                "INSERT INTO image_source_parts(image_id,photo_index,source_sha256,image_path,metadata) VALUES($1,0,$2,$3,'{}') RETURNING part_id",
+                row.image_id,
+                digest,
+                str(path),
+            )
+        saved = await w._receipts.update_receipt(row.id, body, user_id=scope.user_id)
+    else:
+        request = workflow_tests.submission()
+        request.parts[0].image_path = str(path)
+        request.source_manifest[0]["source_sha256"] = digest
+        request.bypass_review = True
+        image = (await w.enqueue_submission(request, scope=scope, idempotency_key=None)).submission
+        outcome = workflow_tests.complete()
+        outcome.envelope.receipt = document
+        outcome.envelope.amount_policy = POLICY
+        outcome.envelope.provenance.ordered_source_sha256 = [digest]
+        outcome.review.can_auto_verify = True
+        saved = (await w.finish_attempt(await w.claim_next(), outcome)).receipt
+        part_id = (await w.get_source_parts(image.id, scope=scope))[0].part_id
+    assert saved.verified
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT quantity FROM line_items WHERE receipt_id=$1", saved.id
+        ) == Decimal("1.00001")
+        assert await conn.fetchval(
+            "SELECT rate FROM taxes WHERE receipt_id=$1", saved.id
+        ) == Decimal("0.123456")
+    details = await w._receipts.get_receipt_with_details(saved.id)
+    reread = ExtractionDraft.model_validate(
+        {
+            **details.receipt.model_dump(),
+            "line_items": [item.model_dump() for item in details.line_items],
+            "taxes": [tax.model_dump() for tax in details.taxes],
+        }
+    )
+    originals = [
+        OriginalAvailability(part_id=part_id, photo_index=0, available=True, sha256_matches=True)
+    ]
+    assert evaluate_receipt(reread, POLICY, {}, [], originals).can_auto_verify
+    # A real warning's identity must also survive the DB round trip unchanged.
+    document.total = reread.total = Decimal("10001.1")
+    expected = evaluate_receipt(document, POLICY, {}, [], originals)
+    actual = evaluate_receipt(reread, POLICY, {}, [], originals)
+    assert [f.code for f in actual.findings] == ["amount_discrepancy"]
+    assert [f.id for f in actual.findings] == [f.id for f in expected.findings]
+
+
+@pytest.mark.parametrize(
+    "table,column,value",
+    [
+        ("line_items", "quantity", "1.00001"),
+        ("taxes", "rate", "0.123456"),
+        ("line_items", "quantity", "1000000"),
+        ("taxes", "rate", "100"),
+    ],
+)
+async def test_quantity_rate_downgrade_refuses_loss(workflow_db, tmp_path, table, column, value):
+    w, scope = workflow_db
+    row, _, _ = await seed(w, scope, tmp_path)
+    async with w.pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO taxes(receipt_id,name,rate,amount) VALUES($1,'VAT',0.1,0)", row.id
+        )
+        await conn.execute(
+            f"UPDATE {table} SET {column}=$1 WHERE receipt_id=$2", Decimal(value), row.id
+        )
+    refusal = migrate(w._settings, "0013", "downgrade", check=False)
+    assert refusal.returncode != 0
+    assert "precision losing" in refusal.stderr
+
+
+async def test_quantity_rate_widening_preserves_historical_values(db):
+    import asyncpg
+
+    from vision_bill.model.receipt import Receipt
+    from vision_bill.provider.db.receipt_db import ReceiptDB
+
+    migrate(db, "0013")
+    receipt = Receipt(
+        confidence=90,
+        merchant_name="Historical",
+        date="2025-01-01",
+        subtotal="12.34",
+        total="12.34",
+        line_items=[
+            {"description": "item", "quantity": 1.2345, "unit_price": "10", "total_price": "12.34"}
+        ],
+        taxes=[{"name": "VAT", "rate": 0.1234, "amount": "1.23"}],
+    )
+    conn = await asyncpg.connect(db.pg_dsn)
+    saved = await ReceiptDB(db).insert_receipt(conn, receipt, image_id=None, user_id=None)
+    query = "SELECT r.total,l.quantity,l.unit_price,l.total_price,t.rate,t.amount FROM receipts r JOIN line_items l ON l.receipt_id=r.id JOIN taxes t ON t.receipt_id=r.id WHERE r.id=$1"
+    before = await conn.fetchrow(query, saved.id)
+    await conn.close()
+    migrate(db)
+    conn = await asyncpg.connect(db.pg_dsn)
+    assert await conn.fetchrow(query, saved.id) == before
+    await conn.close()
+    migrate(db, "0013", "downgrade")
+    conn = await asyncpg.connect(db.pg_dsn)
+    assert await conn.fetchrow(query, saved.id) == before
+    await conn.close()
+
+
+@pytest.mark.parametrize("missing", ["new_all", "snapshot_all", "processed_all", "additional"])
+async def test_durable_originals_cannot_fall_back_to_legacy(workflow_db, tmp_path, missing):
+    from hashlib import sha256
+
+    from vision_bill.model.db.image import ImagePart
+
+    w, scope = workflow_db
+    request = workflow_tests.submission()
+    paths = [tmp_path / "first.png"]
+    if missing == "additional":
+        paths.append(tmp_path / "second.png")
+    for index, path in enumerate(paths):
+        path.write_bytes(f"original {index}".encode())
+    hashes = [sha256(path.read_bytes()).hexdigest() for path in paths]
+    request.parts = [ImagePart(image_path=str(path)) for path in paths]
+    request.source_manifest = [
+        {"photo_index": i, "source_sha256": digest} for i, digest in enumerate(hashes)
+    ]
+    request.effective_options = {"ocr": {"enabled": False}}
+    image = (await w.enqueue_submission(request, scope=scope, idempotency_key=None)).submission
+    outcome = workflow_tests.complete(total="10")
+    outcome.envelope.receipt.taxes = []
+    outcome.envelope.amount_policy = POLICY
+    outcome.envelope.provenance.ordered_source_sha256 = hashes
+    outcome.envelope.provenance.source_image_count = len(paths)
+    row = (await w.finish_attempt(await w.claim_next(), outcome)).receipt
+    w._receipts._pool = w.pool
+    async with w.pool.acquire() as conn:
+        if missing == "additional":
+            await conn.execute(
+                "DELETE FROM image_source_parts WHERE image_id=$1 AND photo_index=1", image.id
+            )
+        else:
+            await conn.execute("DELETE FROM image_source_parts WHERE image_id=$1", image.id)
+            if missing in {"snapshot_all", "processed_all"}:
+                await conn.execute(
+                    "UPDATE images SET request_fingerprint=NULL,source_manifest='[]',attempt_count=0 WHERE id=$1",
+                    image.id,
+                )
+            if missing == "processed_all":
+                await conn.execute(
+                    "UPDATE images SET effective_options='{}',requested_options='{}' WHERE id=$1",
+                    image.id,
+                )
+    paths[-1].write_bytes(b"readable replacement with missing original identity")
+    with pytest.raises(ValueError, match="original_integrity"):
+        await w._receipts.verify_receipt(row.id, ReviewRequest(), scope=scope)
+    assert not (await w._receipts.get_receipt_with_details(row.id)).receipt.verified
+
+
+@pytest.mark.parametrize("operation", ["put", "verify"])
+async def test_delete_obeys_image_before_receipt_lock_order(
+    workflow_db, tmp_path, monkeypatch, operation
+):
+    import asyncpg
+
+    w, scope = workflow_db
+    row, body, _ = await seed(w, scope, tmp_path)
+    async with w.pool.acquire() as conn:
+        # Real linked-image FK is the second half of the old deadlock cycle.
+        await conn.execute("UPDATE images SET receipt_id=$2 WHERE id=$1", row.image_id, row.id)
+    image_locked = asyncio.Event()
+    release_gate = asyncio.Event()
+    delete_started = asyncio.Event()
+    delete_pid = None
+    original_fetchrow = asyncpg.Connection.fetchrow
+
+    async def barrier_fetchrow(connection, query, *args, **kwargs):
+        nonlocal delete_pid
+        task = asyncio.current_task()
+        if task.get_name() == "review-delete":
+            delete_pid = connection.get_server_pid()
+            delete_started.set()
+        result = await original_fetchrow(connection, query, *args, **kwargs)
+        if (
+            task.get_name() == "review-gate"
+            and query == "SELECT id FROM images WHERE id=$1 FOR UPDATE"
+        ):
+            image_locked.set()
+            await release_gate.wait()
+        return result
+
+    monkeypatch.setattr(asyncpg.Connection, "fetchrow", barrier_fetchrow)
+    action = (
+        w._receipts.update_receipt(row.id, body, user_id=scope.user_id)
+        if operation == "put"
+        else w._receipts.verify_receipt(row.id, ReviewRequest(), scope=scope)
+    )
+    gate = asyncio.create_task(action, name="review-gate")
+    deletion = None
+    receipt_locked = False
+    try:
+        async with asyncio.timeout(10):
+            await image_locked.wait()
+            deletion = asyncio.create_task(
+                w._receipts.delete_receipt(row.id, user_id=scope.user_id), name="review-delete"
+            )
+            await delete_started.wait()
+            async with w.pool.acquire() as observer:
+                # Wait for the observed DB lock, not an assumed scheduling delay.
+                while (
+                    await observer.fetchval(
+                        "SELECT wait_event_type FROM pg_stat_activity WHERE pid=$1", delete_pid
+                    )
+                    != "Lock"
+                ):
+                    pass
+                try:
+                    async with observer.transaction():
+                        await observer.fetchrow(
+                            "SELECT id FROM receipts WHERE id=$1 FOR UPDATE NOWAIT", row.id
+                        )
+                except asyncpg.LockNotAvailableError:
+                    receipt_locked = True
+                if receipt_locked:
+                    # Remove the bad waiter before releasing the gate: prove the
+                    # inversion without relying on PG's deadlock timeout.
+                    deletion.cancel()
+                    await asyncio.gather(deletion, return_exceptions=True)
+                release_gate.set()
+                assert await gate is not None
+                if not receipt_locked:
+                    assert (await deletion).id == row.id
+                    assert (
+                        await observer.fetchval(
+                            "SELECT receipt_id FROM images WHERE id=$1", row.image_id
+                        )
+                        is None
+                    )
+                    for table in ("receipts", "line_items", "receipt_review_revisions"):
+                        key = "id" if table == "receipts" else "receipt_id"
+                        assert (
+                            await observer.fetchval(
+                                f"SELECT count(*) FROM {table} WHERE {key}=$1", row.id
+                            )
+                            == 0
+                        )
+    finally:
+        release_gate.set()
+        for task in (gate, deletion):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (gate, deletion) if task is not None), return_exceptions=True
+        )
+    assert not receipt_locked, "DELETE acquired receipt before its linked image"
+
+
+async def test_delete_preserves_owner_scope_and_benchmark_foreign_key(workflow_db, tmp_path):
+    import asyncpg
+
+    w, scope = workflow_db
+    row, _, _ = await seed(w, scope, tmp_path)
+    assert await w._receipts.delete_receipt(row.id, user_id=uuid4()) is None
+    async with w.pool.acquire() as conn:
+        await conn.execute("UPDATE images SET receipt_id=$2 WHERE id=$1", row.image_id, row.id)
+        run_id = await conn.fetchval(
+            "INSERT INTO benchmark_runs(model_ids,receipt_ids,dataset_fingerprint,prompt_version,scoring_version) VALUES('[]','[]','test','test','test') RETURNING id"
+        )
+        await conn.execute(
+            "INSERT INTO benchmark_tasks(run_id,model_id,receipt_id) VALUES($1,'test',$2)",
+            run_id,
+            row.id,
+        )
+    with pytest.raises(asyncpg.ForeignKeyViolationError):
+        await w._receipts.delete_receipt(row.id, user_id=scope.user_id)
+    async with w.pool.acquire() as conn:
+        assert (
+            await conn.fetchval("SELECT receipt_id FROM images WHERE id=$1", row.image_id) == row.id
+        )
+        assert (
+            await conn.fetchval("SELECT count(*) FROM line_items WHERE receipt_id=$1", row.id) == 1
+        )
+        await conn.execute("DELETE FROM benchmark_runs WHERE id=$1", run_id)
+    assert (
+        await w._receipts.delete_receipt(row.id, user_id=uuid4(), can_see_all=True)
+    ).id == row.id

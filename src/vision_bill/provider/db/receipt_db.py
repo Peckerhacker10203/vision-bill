@@ -653,6 +653,26 @@ class ReceiptDB:
         )
         by_index = {part["photo_index"]: part for part in durable}
         parts = image.parts()
+        # Only pre-workflow images without any durable identity evidence may
+        # retain unknown legacy identities. A missing manifest is corruption,
+        # not permission to replace a known original with any readable file.
+        snapshots = [row[name] for name in ("source_manifest", "requested_options", "effective_options")]
+        has_snapshot = any(
+            json.loads(value) if isinstance(value, str) else value for value in snapshots
+        )
+        requires_manifest = bool(
+            durable or has_snapshot or row["request_fingerprint"] is not None
+            or row["idempotency_key"] is not None or row["ocr_checkpoint"] is not None
+            or row["attempt_count"] > 0 or row["generation"] > 1
+        )
+        if not requires_manifest:
+            requires_manifest = await conn.fetchval(
+                """SELECT EXISTS(SELECT 1 FROM receipt_extractions WHERE image_id=$1)
+                OR EXISTS(SELECT 1 FROM image_retry_requests WHERE image_id=$1)""",
+                image_id,
+            )
+        if requires_manifest and [part["photo_index"] for part in durable] != list(range(len(parts))):
+            raise ValueError("original_integrity_failed")
         for index, part in enumerate(parts):
             saved = by_index.get(index)
             part.part_id = saved["part_id"] if saved else None
@@ -665,10 +685,6 @@ class ReceiptDB:
                         part_id=part.part_id, photo_index=index, available=False, sha256_matches=False
                     )
                 ]
-        extra = [part for index, part in by_index.items() if index >= len(parts)]
-        if extra:
-            return [OriginalAvailability(part_id=part["part_id"], photo_index=part["photo_index"],
-                                         available=False, sha256_matches=False) for part in extra]
         if self._original_checker is None:
             raise ValueError("original_checker_required")
         result = await self._original_checker(parts)
@@ -995,7 +1011,11 @@ class ReceiptDB:
             args.append(user_id)
             sql = sql.replace("RETURNING *", f"AND user_id = ${len(args)} RETURNING *", 1)
 
-        async with self.pool.acquire() as conn:
+        async with self.pool.acquire() as conn, conn.transaction():
+            # DELETE also locks the image via its receipt_id SET NULL action.
+            # Acquire it first, as PUT/verify do, before touching the receipt.
+            if await self._lock_review_receipt(conn, receipt_id, user_id, can_see_all) is None:
+                return None
             row = await conn.fetchrow(sql, *args)
         if row is None:
             return None

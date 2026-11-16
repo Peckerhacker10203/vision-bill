@@ -26,8 +26,8 @@ from fastapi.testclient import TestClient
 
 import vision_bill.main as main_module
 from vision_bill.api import images as images_api_module
-from vision_bill.api.system import main as system_api_module
 from vision_bill.api.receipts import ReceiptUpdate
+from vision_bill.api.system import main as system_api_module
 from vision_bill.config import Settings
 from vision_bill.model.receipt import LineItem, Receipt
 from vision_bill.provider.db import image_db as image_db_module
@@ -38,7 +38,6 @@ from vision_bill.provider.db.image_db import (
     ImageDB,
 )
 from vision_bill.provider.db.receipt_db import (
-    DELETE_RECEIPT_SQL,
     GET_RECEIPT_SQL,
     GET_RECEIPT_WITH_IMAGE_SQL,
     LIST_RECEIPTS_BASE_SQL,
@@ -321,9 +320,11 @@ async def test_delete_receipt_scoped_to_owner(receipt_db: ReceiptDB) -> None:
     await receipt_db.delete_receipt(RESOURCE_ID, user_id=USER_A, can_see_all=False)
 
     call = conn.fetchrow.call_args
-    assert call.args[0] == DELETE_RECEIPT_SQL.replace("RETURNING *", "AND user_id = $2 RETURNING *")
+    assert "user_id=$2" in call.args[0]
     assert call.args[1] == RESOURCE_ID
     assert call.args[2] == USER_A
+    assert call.args[3] is False
+    assert conn.fetchrow.await_count == 1  # Invisible rows are not locked or deleted.
 
 
 # ── ImageDB scoping ──────────────────────────────────────────────────

@@ -1,4 +1,4 @@
-"""Lossless monetary storage and current review decisions."""
+"""Lossless review-number storage and current review decisions."""
 
 from alembic import op
 
@@ -12,12 +12,15 @@ MONEY = {
     "line_items": ("unit_price", "total_price"),
     "taxes": ("amount",),
 }
+# Quantity and rate are material review inputs too; retain their former bounds
+# only as downgrade guards, never as implicit rounding on new writes.
+NUMERIC_COLUMNS = [(table, column, 14, 2) for table, columns in MONEY.items() for column in columns]
+NUMERIC_COLUMNS += [("line_items", "quantity", 10, 4), ("taxes", "rate", 6, 4)]
 
 
 def upgrade() -> None:
-    for table, columns in MONEY.items():
-        for column in columns:
-            op.execute(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE NUMERIC")
+    for table, column, _precision, _scale in NUMERIC_COLUMNS:
+        op.execute(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE NUMERIC")
     op.execute("ALTER TABLE receipts ADD COLUMN overlap_decisions JSONB NOT NULL DEFAULT '[]'")
     op.execute("ALTER TABLE receipts ADD COLUMN acknowledgements JSONB NOT NULL DEFAULT '[]'")
 
@@ -27,13 +30,12 @@ def downgrade() -> None:
     op.execute("""DO $$ BEGIN IF EXISTS (SELECT 1 FROM receipts WHERE
         overlap_decisions<>'[]'::jsonb OR acknowledgements<>'[]'::jsonb) THEN
         RAISE EXCEPTION 'review decision downgrade refused'; END IF; END $$""")
-    for table, columns in MONEY.items():
-        for column in columns:
-            op.execute(f"""DO $$ BEGIN IF EXISTS (SELECT 1 FROM {table} WHERE
-                {column}<>round({column},2) OR abs({column})>=1000000000000) THEN
-                RAISE EXCEPTION 'precision losing monetary downgrade refused';
-                END IF; END $$""")
-    for table, columns in MONEY.items():
-        for column in columns:
-            op.execute(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE NUMERIC(14,2)")
+    for table, column, precision, scale in NUMERIC_COLUMNS:
+        limit = 10 ** (precision - scale)
+        op.execute(f"""DO $$ BEGIN IF EXISTS (SELECT 1 FROM {table} WHERE
+            {column}<>round({column},{scale}) OR abs({column})>={limit}) THEN
+            RAISE EXCEPTION 'precision losing numeric downgrade refused';
+            END IF; END $$""")
+    for table, column, precision, scale in NUMERIC_COLUMNS:
+        op.execute(f"ALTER TABLE {table} ALTER COLUMN {column} TYPE NUMERIC({precision},{scale})")
     op.execute("ALTER TABLE receipts DROP COLUMN acknowledgements, DROP COLUMN overlap_decisions")
