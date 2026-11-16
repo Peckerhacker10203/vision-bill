@@ -12,6 +12,8 @@
 # keeps this safe when orchestrated.
 set -e
 
-uv run alembic upgrade head
+# Dependencies are installed during the image build. Startup must not resolve
+# or rebuild packages before running the migrations from that locked environment.
+alembic upgrade head
 
 exec "$@"
