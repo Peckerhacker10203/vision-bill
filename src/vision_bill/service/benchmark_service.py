@@ -25,6 +25,7 @@ from ..model.experiment import ExperimentOptions, ExtractionPipeline
 from ..model.receipt import LineItem, Receipt, TaxLine
 from ..model.workflow import AccessScope
 from ..provider.db.benchmark_db import BenchmarkDB
+from ..provider.db.deadline import connection
 from ..provider.llm.base import LLMProvider
 from ..provider.llm.errors import UnreadableReceiptError
 from ..provider.llm.experiment import endpoint_fingerprint
@@ -181,8 +182,9 @@ class BenchmarkService:
                 break
         return selected
 
-    async def _expected_receipt_and_path(self, receipt_id: UUID) -> tuple[Receipt, str | None]:
-        details = await self._receipts.get_receipt_with_details(receipt_id)
+    async def _expected_receipt_and_path(self, receipt_id: UUID, *, deadline: float | None = None) -> tuple[Receipt, str | None]:
+        details = (await self._receipts.get_receipt_with_details(receipt_id, deadline=deadline)
+                   if deadline is not None else await self._receipts.get_receipt_with_details(receipt_id))
         if details is None or not details.receipt.verified:
             raise ValueError("Benchmark data must be a verified receipt")
         r = details.receipt
@@ -211,12 +213,12 @@ class BenchmarkService:
         # This outer budget also covers loading the run and its saved timeout.
         try:
             async with asyncio.timeout_at(deadline):
-                run = await self._db.run(task["run_id"])
+                run = await self._db.run(task["run_id"], deadline=deadline)
                 if run is None:
                     return
-                deadline = min(deadline, started + await self._timeout(run))
+                deadline = min(deadline, started + await self._timeout(run, deadline=deadline))
                 async with asyncio.timeout_at(deadline):
-                    manifest = await self._db.manifest(task["run_id"])
+                    manifest = await self._db.manifest(task["run_id"], deadline=deadline)
                     await self._execute_reserved(task, run, manifest, started, deadline)
         except TimeoutError:
             # Persistence/connection cleanup cannot extend the total budget.
@@ -227,7 +229,7 @@ class BenchmarkService:
                                 manifest: dict[str, Any] | None, started: float, deadline: float) -> None:
         if task["inference_attempt_count"] >= self._settings.max_attempts:
             # Expired final attempts terminalize independently of model readiness.
-            await self._finish_failure(task, manifest, ValueError("inference_attempts_exhausted"), started)
+            await self._finish_failure(task, manifest, ValueError("inference_attempts_exhausted"), started, deadline)
             return
         reserve = min(5.0, (deadline - started) * 0.05)
         try:
@@ -237,33 +239,35 @@ class BenchmarkService:
                 except Exception as exc:
                     raise _ReadinessWait("model_discovery_unavailable") from exc
                 model = models.get(task["model_id"])
-                expected_digest = (await self._run_digests(run)).get(task["model_id"])
+                expected_digest = (await self._run_digests(run, deadline=deadline)).get(task["model_id"])
                 if model is None or (expected_digest and expected_digest != model.digest):
                     raise _ReadinessWait("model_unavailable_or_changed")
                 if manifest:
-                    await self._execute_experiment(task, manifest)
+                    await self._execute_experiment(task, manifest, deadline)
                 else:
-                    expected, image_path = await self._expected_receipt_and_path(task["receipt_id"])
+                    expected, image_path = await self._expected_receipt_and_path(task["receipt_id"], deadline=deadline)
                     if not image_path or not Path(image_path).is_file():
                         raise FileNotFoundError("Image missing")
-                    await self._begin(task)
+                    await self._begin(task, deadline)
                     result = await self._provider.analyse_receipt_with_metadata(task["model_id"], Path(image_path))
                     await self._db.finish_task(task, success=True, score=score_receipts(expected, result.receipt)["overall"],
-                        confidence=result.receipt.confidence, attempts=result.attempts, latency_ms=result.elapsed_ms)
+                        confidence=result.receipt.confidence, attempts=result.attempts, latency_ms=result.elapsed_ms, deadline=deadline)
         except _StaleClaim:
             return
-        except Exception as exc:  # noqa: BLE001 - classify once, never log receipt/provider content
+        except Exception as exc:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError("benchmark_attempt_deadline") from exc
             before_inference = not task["inference_started"]
             retryable = self._retryable(exc)
             if before_inference and (isinstance(exc, _ReadinessWait) or retryable):
-                await self._db.retry_task(task, waiting=True)
+                await self._db.retry_task(task, waiting=True, deadline=deadline)
             elif retryable and task["inference_attempt_count"] < self._settings.max_attempts:
-                await self._db.retry_task(task)
+                await self._db.retry_task(task, deadline=deadline)
             else:
-                await self._finish_failure(task, manifest, exc, started)
+                await self._finish_failure(task, manifest, exc, started, deadline)
 
-    async def _begin(self, task: dict[str, Any]) -> None:
-        updated = await self._db.begin_attempt(task)
+    async def _begin(self, task: dict[str, Any], deadline: float) -> None:
+        updated = await self._db.begin_attempt(task, deadline=deadline)
         if updated is None:
             raise _StaleClaim
         task.update(updated)
@@ -297,9 +301,9 @@ class BenchmarkService:
                 "historical_inference_attempt_count": None if task["attempts"] else 0}
 
     async def _finish_failure(self, task: dict[str, Any], manifest: dict[str, Any] | None,
-                              exc: Exception, started: float) -> None:
+                              exc: Exception, started: float, deadline: float) -> None:
         if not manifest:
-            await self._db.finish_task(task, success=False)
+            await self._db.finish_task(task, success=False, deadline=deadline)
             return
         metadata = dict(exc.metadata) if isinstance(exc, ExperimentFailure) else {"options": manifest["options"]}
         elapsed = (asyncio.get_running_loop().time() - started) * 1000
@@ -309,18 +313,18 @@ class BenchmarkService:
         failure_score = self._score(manifest, task["receipt_id"], Receipt.model_validate(item["expected"]), None) if "reference" in item else {}
         await self._db.finish_task(task, success=False, latency_ms=elapsed,
             attempts=len(metadata.get("calls", [])) or 1,
-            result={**failure_score, "error": str(exc) or type(exc).__name__, "metadata": metadata})
+            result={**failure_score, "error": str(exc) or type(exc).__name__, "metadata": metadata}, deadline=deadline)
 
-    async def _run_digests(self, run: BenchmarkRun) -> dict[str, str | None]:
-        async with self._receipts.pool.acquire() as conn:
+    async def _run_digests(self, run: BenchmarkRun, *, deadline: float | None = None) -> dict[str, str | None]:
+        async with connection(self._receipts.pool, deadline=deadline) as conn:
             row = await conn.fetchrow("SELECT model_digests FROM benchmark_runs WHERE id=$1", run.id)
         if not row:
             return {}
         value = row["model_digests"]
         return dict(json.loads(value) if isinstance(value, str) else value)
 
-    async def _timeout(self, run: BenchmarkRun) -> int:
-        async with self._receipts.pool.acquire() as conn:
+    async def _timeout(self, run: BenchmarkRun, *, deadline: float | None = None) -> int:
+        async with connection(self._receipts.pool, deadline=deadline) as conn:
             return int(await conn.fetchval("SELECT request_timeout_seconds FROM benchmark_runs WHERE id=$1", run.id))
 
     def capabilities(self) -> dict[str, bool]:
@@ -427,9 +431,9 @@ class BenchmarkService:
         return detailed_score(item["expected"], actual, classification=manifest["options"]["include_classification"],
                               scored_fields=item.get("scored_fields"))
 
-    async def _execute_experiment(self, task: dict[str, Any], manifest: dict[str, Any]) -> None:
+    async def _execute_experiment(self, task: dict[str, Any], manifest: dict[str, Any], deadline: float) -> None:
         async def begin() -> None:
-            await self._begin(task)
+            await self._begin(task, deadline)
         expected, result = await self._run_experiment(
             manifest, task["receipt_id"], task["model_id"], before_inference=begin)
         detail = self._score(manifest, task["receipt_id"], expected, result.receipt)
@@ -439,4 +443,4 @@ class BenchmarkService:
                    "legacy_scores": score_receipts(expected, result.receipt)}
         await self._db.finish_task(task, success=True, score=detail["scores"]["normalized"],
                                    confidence=result.receipt.confidence, attempts=result.attempts,
-                                   latency_ms=result.elapsed_ms, result=payload)
+                                   latency_ms=result.elapsed_ms, result=payload, deadline=deadline)

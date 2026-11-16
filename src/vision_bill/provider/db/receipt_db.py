@@ -38,6 +38,7 @@ from ...service.receipt_review import (
     persistent_findings,
     validate_acknowledgements,
 )
+from .deadline import connection
 
 # ── SQL (DML; DDL lives in alembic/versions/0001_initial_schema.py) ──
 
@@ -1237,7 +1238,8 @@ class ReceiptDB:
         )
 
     async def get_receipt_with_details(
-        self, receipt_id: UUID, user_id: UUID | None = None, can_see_all: bool = False
+        self, receipt_id: UUID, user_id: UUID | None = None, can_see_all: bool = False,
+        *, deadline: float | None = None,
     ) -> ReceiptWithDetails | None:
         """Fetch a receipt together with its line items, taxes and image path.
 
@@ -1250,7 +1252,7 @@ class ReceiptDB:
         if not can_see_all and user_id is not None:
             args.append(user_id)
             sql += f" AND r.user_id = ${len(args)}"
-        async with self.pool.acquire() as conn:
+        async with connection(self.pool, deadline=deadline) as conn:
             row = await conn.fetchrow(sql, *args)
             if row is None:
                 return None

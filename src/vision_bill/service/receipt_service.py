@@ -272,8 +272,13 @@ class ReceiptService:
         )
 
     async def get_receipt_with_details(
-        self, receipt_id: UUID, user_id: UUID | None = None, can_see_all: bool = False
+        self, receipt_id: UUID, user_id: UUID | None = None, can_see_all: bool = False,
+        *, deadline: float | None = None,
     ) -> ReceiptWithDetails | None:
+        if deadline is not None:
+            return await self._db.get_receipt_with_details(
+                receipt_id, user_id=user_id, can_see_all=can_see_all, deadline=deadline
+            )
         return await self._db.get_receipt_with_details(
             receipt_id, user_id=user_id, can_see_all=can_see_all
         )

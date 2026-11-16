@@ -21,6 +21,7 @@ from ...model.benchmark import (
     ReferencePreview,
 )
 from ...model.workflow import AccessScope
+from .deadline import connection
 from .receipt_db import ReceiptDB
 
 
@@ -66,8 +67,8 @@ class BenchmarkDB:
             await conn.executemany("INSERT INTO benchmark_summaries (run_id, model_id, model_digest) VALUES ($1,$2,$3)", [(row["id"], m, model_digests.get(m)) for m in model_ids])
         return self._run(row)
 
-    async def run(self, run_id: UUID, *, scope: AccessScope | None = None) -> BenchmarkRun | None:
-        async with self._pool.acquire() as conn:
+    async def run(self, run_id: UUID, *, scope: AccessScope | None = None, deadline: float | None = None) -> BenchmarkRun | None:
+        async with connection(self._pool, deadline=deadline) as conn:
             row = await conn.fetchrow("SELECT * FROM benchmark_runs WHERE id=$1 AND ($2 OR owner_id=$3)", run_id, scope is None or scope.can_see_all, scope.user_id if scope else None)
         return self._run(row) if row else None
 
@@ -119,8 +120,8 @@ class BenchmarkDB:
         await conn.fetchrow("SELECT 1 FROM benchmark_tasks WHERE run_id=$1 AND model_id=$2 AND receipt_id=$3 FOR UPDATE",
                             task["run_id"], task["model_id"], task["receipt_id"])
 
-    async def begin_attempt(self, task: Mapping[str, Any]) -> dict[str, Any] | None:
-        async with self._pool.acquire() as conn, conn.transaction():
+    async def begin_attempt(self, task: Mapping[str, Any], *, deadline: float | None = None) -> dict[str, Any] | None:
+        async with connection(self._pool, deadline=deadline, transaction=True) as conn:
             await self._lock_task(conn, task)
             row = await conn.fetchrow("""UPDATE benchmark_tasks
                 SET inference_started=TRUE, inference_attempt_count=inference_attempt_count+1
@@ -130,8 +131,8 @@ class BenchmarkDB:
                 task["run_id"], task["model_id"], task["receipt_id"], task.get("claim_token"), self._worker.max_attempts)
             return dict(row) if row else None
 
-    async def retry_task(self, task: Mapping[str, Any], waiting: bool = False) -> bool:
-        async with self._pool.acquire() as conn, conn.transaction():
+    async def retry_task(self, task: Mapping[str, Any], waiting: bool = False, *, deadline: float | None = None) -> bool:
+        async with connection(self._pool, deadline=deadline, transaction=True) as conn:
             await self._lock_task(conn, task)
             # Use the stored count, never the caller's potentially pre-begin snapshot.
             row = await conn.fetchrow("""SELECT inference_attempt_count FROM benchmark_tasks
@@ -151,8 +152,8 @@ class BenchmarkDB:
                 "waiting_for_model" if waiting else "retrying", delay)
             return bool(changed == "UPDATE 1")
 
-    async def finish_task(self, task: Mapping[str, Any], *, success: bool, score: float = 0, confidence: int = 0, attempts: int = 1, latency_ms: float = 0, result: dict[str, Any] | None = None) -> bool:
-        async with self._pool.acquire() as conn, conn.transaction():
+    async def finish_task(self, task: Mapping[str, Any], *, success: bool, score: float = 0, confidence: int = 0, attempts: int = 1, latency_ms: float = 0, result: dict[str, Any] | None = None, deadline: float | None = None) -> bool:
+        async with connection(self._pool, deadline=deadline, transaction=True) as conn:
             # All finishers take run -> task. Lease/begin/retry lock only tasks, never
             # runs, so there is no opposite task -> run lock order. Different-model
             # last tasks must serialize here to see each other's committed removal.
@@ -187,8 +188,8 @@ class BenchmarkDB:
         experiment = {k: v for k, v in manifest.items() if k not in {"inputs", "tags"}} if manifest else None
         return BenchmarkRun(experiment=experiment, id=row["id"], status=row["status"], model_ids=list(model_ids), receipt_ids=list(receipt_ids), dataset_fingerprint=row["dataset_fingerprint"], prompt_version=row["prompt_version"], scoring_version=row["scoring_version"], council_policy=row["council_policy"], apply_council_flags=row["apply_council_flags"], created_at=row["created_at"], completed_at=row["completed_at"])
 
-    async def manifest(self, run_id: UUID) -> dict[str, Any] | None:
-        async with self._pool.acquire() as conn:
+    async def manifest(self, run_id: UUID, *, deadline: float | None = None) -> dict[str, Any] | None:
+        async with connection(self._pool, deadline=deadline) as conn:
             value = await conn.fetchval("SELECT experiment_manifest FROM benchmark_runs WHERE id=$1", run_id)
         if isinstance(value, str):
             value = json.loads(value)
