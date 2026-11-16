@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { api, ApiError } from '$lib/api/client';
+import { setLocale } from '$lib/i18n';
 import { queryClient } from '$lib/query/client';
 import { queryKeys } from '$lib/query/keys';
 import SubmissionStatus from './SubmissionStatus.svelte';
@@ -29,6 +30,56 @@ afterEach(() => {
 });
 
 describe('SubmissionStatus', () => {
+	it.each(['en', 'de'] as const)(
+		'explains model unreadability despite a valid working image in %s',
+		async (language) => {
+			// A decoded working image does not imply the model can read the receipt.
+			// This is the terminal API shape observed in the unreadable-model browser flow.
+			const persisted = status({
+				status: 'unreadable',
+				terminal: true,
+				retry_at: null,
+				wait_reason: null,
+				result_code: 'unreadable',
+				error: 'unreadable',
+				source_views: [
+					{
+						view_id: 'working',
+						photo_index: 0,
+						coordinate_space: 'working',
+						width: 320,
+						height: 480,
+						sha256: 'df40cf0ccfd9dc1dca83eed23414fe64f6969d3e2a8fd02ee2b8c9be4cd0b43b',
+						url: '/api/v1/images/job/views/working',
+						transforms: [{ operation: 'test_fixture_unwarp' }],
+						inverse_mapping: null
+					}
+				]
+			});
+			const before = structuredClone(persisted);
+			vi.spyOn(api, 'getImage').mockResolvedValue(persisted as never);
+			setLocale(language);
+			try {
+				render(SubmissionStatus, { id: 'job' });
+				await screen.findByText(language === 'en' ? 'Attempt 1 of 3' : 'Versuch 1 von 3');
+				expect(
+					screen.getByText(
+						language === 'en'
+							? 'Analysis result: The receipt could not be read reliably. Check the file or try clearer photos. (unreadable)'
+							: 'Analyseergebnis: Der Beleg konnte nicht zuverlässig gelesen werden. Prüfe die Datei oder versuche es mit deutlicheren Fotos. (unreadable)'
+					)
+				).not.toBeNull();
+				expect(screen.getByRole('link', { name: /1.*working/ }).getAttribute('href')).toBe(
+					'/api/v1/images/job/views/working'
+				);
+				expect(screen.queryByText('Photo is too blurry', { exact: true })).toBeNull();
+				expect(queryClient.getQueryData(queryKeys.image('job'))).toEqual(before);
+				expect(persisted).toEqual(before);
+			} finally {
+				setLocale('en');
+			}
+		}
+	);
 	it.each([
 		['failed', 'retry_backoff'],
 		['pending', 'ocr_unavailable']

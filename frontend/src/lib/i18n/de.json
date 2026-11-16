@@ -542,7 +542,7 @@
 			"retry_backoff": "Warten auf den geplanten erneuten Versuch nach einem Fehlschlag.",
 			"source_integrity_failed": "Die Originalquelle konnte nicht verifiziert werden. Die Verarbeitung ist gesperrt.",
 			"timed_out": "Die Verarbeitungsfrist wurde erreicht.",
-			"unreadable": "Die Quelle konnte nicht als lesbares Bild dekodiert werden.",
+			"unreadable": "Der Beleg konnte nicht zuverlässig gelesen werden. Prüfe die Datei oder versuche es mit deutlicheren Fotos.",
 			"analysis_contract_failed": "Die Extraktion erfüllt den erforderlichen Datenvertrag nicht.",
 			"analysis_unavailable": "Der Extraktionsdienst ist vorübergehend nicht verfügbar.",
 			"analysis_incomplete": "Die Extraktion hat keinen vollständigen Beleg erzeugt. Prüfung oder Wiederholung ist nötig.",

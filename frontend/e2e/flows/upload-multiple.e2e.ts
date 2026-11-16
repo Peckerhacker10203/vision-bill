@@ -61,7 +61,12 @@ test.describe('multiple photos of one receipt', () => {
 		await expect(
 			page.getByText('The receipt could not be read reliably', { exact: true })
 		).toBeVisible();
-		await expect(page.getByText('Analysis result: unreadable', { exact: true })).toBeVisible();
+		await expect(
+			page.getByText(
+				'Analysis result: The receipt could not be read reliably. Check the file or try clearer photos. (unreadable)',
+				{ exact: true }
+			)
+		).toBeVisible();
 		const id = new URL(page.url()).searchParams.get('job');
 		const persisted = await (await context.request.get(`/api/v1/images/${id}`)).json();
 		expect(persisted).toMatchObject({

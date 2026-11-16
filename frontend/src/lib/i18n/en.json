@@ -542,7 +542,7 @@
 			"retry_backoff": "Waiting for the scheduled retry after a failed attempt.",
 			"source_integrity_failed": "The original source could not be verified. Processing is blocked.",
 			"timed_out": "The processing deadline was reached.",
-			"unreadable": "The source could not be decoded as a readable image.",
+			"unreadable": "The receipt could not be read reliably. Check the file or try clearer photos.",
 			"analysis_contract_failed": "The extraction did not satisfy the required data contract.",
 			"analysis_unavailable": "The extraction service is temporarily unavailable.",
 			"analysis_incomplete": "The extraction did not produce a complete receipt. Review or retry is needed.",
