@@ -163,11 +163,14 @@ async def list_images(
 async def analyze_pending(
     receipt_service: ReceiptService = Depends(get_receipt_service),  # noqa: B008
     analysis_scheduler: AnalysisScheduler = Depends(get_analysis_scheduler),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
 ) -> dict[str, object]:
     """Manually trigger one analysis cycle over the pending queue."""
     if not receipt_service.db_ready:
         raise HTTPException(status_code=503, detail="Database not available")
-    results = await analysis_scheduler.process_pending()
+    results = await analysis_scheduler.process_pending(
+        scope=AccessScope(user_id=current_user.id, can_see_all=current_user.can_see_all)
+    )
     return {"results": results}
 
 

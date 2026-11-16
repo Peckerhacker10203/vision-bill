@@ -1117,3 +1117,97 @@ async def test_draft_finalization_rolls_back_after_receipt_insert(workflow_db, m
         assert (
             await conn.fetchval("SELECT status FROM images WHERE id=$1", image.id) == "needs_review"
         )
+
+
+@pytest.mark.parametrize("due_kind", ["retry", "lease"])
+async def test_next_wake_includes_overdue_retry_and_defers_unavailable_candidate(
+    workflow_db, due_kind
+):
+    w, scope = workflow_db
+    first, second = await enqueue(w, scope), await enqueue(w, scope)
+    async with w.pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE images SET retry_at=clock_timestamp()-interval '30 seconds' WHERE id=$1",
+            first.id,
+        )
+        await conn.execute(
+            "UPDATE images SET retry_at=clock_timestamp()+interval '60 seconds' WHERE id=$1",
+            second.id,
+        )
+    if due_kind == "lease":
+        claim = await w.claim_next(image_id=first.id)
+        assert claim is not None
+        async with w.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE images SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1",
+                first.id,
+            )
+    assert await w.next_wake_delay(300) == 0
+    delay = await w.next_wake_delay(300, deferred_image_ids=[first.id])
+    assert 55 < delay <= 60
+    assert await w.next_wake_delay(300, deferred_image_ids=[first.id, second.id]) == 300
+
+
+async def test_long_cycle_rescans_overdue_retry_using_real_wake_query(
+    workflow_db, settings, monkeypatch
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    import vision_bill.service.analysis_scheduler as module
+
+    w, scope = workflow_db
+    first, second = await enqueue(w, scope), await enqueue(w, scope)
+    clock = [0.0]
+    runs, waits = [], []
+    provider_ready = [True]
+
+    async def overdue():
+        async with w.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE images SET retry_at=clock_timestamp()-interval '1 second' WHERE id=$1",
+                first.id,
+            )
+
+    async def process(claim):
+        runs.append((claim.image.id, clock[0]))
+        if claim.image.id == second.id:
+            clock[0] += 60
+            await overdue()
+            return await w.finish_attempt(
+                claim, AttemptOutcome(kind="terminal", result_code="unreadable")
+            )
+        result = await w.finish_attempt(
+            claim, AttemptOutcome(kind="retry", result_code="timed_out")
+        )
+        if claim.attempt_number == 2:
+            provider_ready[0] = False
+            await overdue()
+        return result
+
+    async def wait_for(awaitable, *, timeout):
+        awaitable.close()
+        waits.append(timeout)
+        if len(waits) == 4:
+            raise asyncio.CancelledError
+        if len(waits) > 1:
+            clock[0] += timeout
+        raise TimeoutError
+
+    service = SimpleNamespace(
+        ready_for=AsyncMock(side_effect=lambda image: provider_ready[0]),
+        process_claim=process,
+    )
+    scheduler = module.AnalysisScheduler(
+        settings, None, SimpleNamespace(workflow_db=w), None, submission_service=service
+    )
+    monkeypatch.setattr(
+        module, "asyncio", SimpleNamespace(wait_for=wait_for, timeout=asyncio.timeout)
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await scheduler._run_forever()
+    assert runs == [(first.id, 0), (second.id, 0), (first.id, 60)]
+    assert waits == [300, 0, 0, 300]
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval("SELECT attempt_count FROM images WHERE id=$1", first.id) == 2
+        assert await conn.fetchval("SELECT status FROM images WHERE id=$1", first.id) == "pending"

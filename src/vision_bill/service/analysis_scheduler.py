@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from ..config import Settings
+from ..model.workflow import AccessScope
 from ..provider.db.image_db import ImageDB
 from ..provider.llm.base import LLMProvider
 from .image_service import ImageService
@@ -42,6 +43,7 @@ class AnalysisScheduler:
         self._interval = settings.worker.check_interval_seconds
         self._lock = asyncio.Lock()
         self._wake = asyncio.Event()
+        self._deferred_image_ids: set[UUID] = set()
         self._task: asyncio.Task[None] | None = None
 
     @property
@@ -76,7 +78,9 @@ class AnalysisScheduler:
             try:
                 await self.process_pending()
                 delay = (
-                    await self._db.next_wake_delay(self._interval)
+                    await self._db.next_wake_delay(
+                        self._interval, deferred_image_ids=tuple(self._deferred_image_ids)
+                    )
                     if self._db.is_ready
                     else float(self._interval)
                 )
@@ -84,8 +88,11 @@ class AnalysisScheduler:
                 logger.warning("Analysis cycle unavailable")
                 delay = float(self._interval)
 
-    async def process_pending(self) -> list[PendingImageResult]:
+    async def process_pending(
+        self, *, scope: AccessScope | None = None
+    ) -> list[PendingImageResult]:
         async with self._lock:
+            self._deferred_image_ids.clear()
             if not self._db.is_ready:
                 return []
             results = []
@@ -96,14 +103,19 @@ class AnalysisScheduler:
                 except Exception:  # noqa: BLE001 - preclaim failure spends no attempt
                     ready = False
                 if not ready:
+                    self._deferred_image_ids.add(image.id)
                     continue
                 claim = await self._db.claim_next(
                     lease_seconds=self._settings.worker.claim_lease_seconds, image_id=image.id
                 )
                 if claim is None:
+                    # A competing claim/row lock must not create a zero-delay loop.
+                    self._deferred_image_ids.add(image.id)
                     continue
                 result = await self._submissions.process_claim(claim)
-                if result.submission is not None:
+                if result.submission is not None and (
+                    scope is None or scope.can_see_all or claim.image.user_id == scope.user_id
+                ):
                     status = result.submission
                     results.append(
                         PendingImageResult(

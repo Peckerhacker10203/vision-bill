@@ -7,11 +7,12 @@ application's artifact cleanup, but never a partially committed receipt.
 """
 
 import json
+from collections.abc import Sequence
 from typing import Any
 from uuid import UUID, uuid4
 
 import asyncpg
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from ...config import PGSettings, WorkerSettings
 from ...model.db.image import ImageRow
@@ -468,7 +469,15 @@ class WorkflowDB:
             row = await self._lock_claim(conn, claim)
             if row is None or row["ocr_checkpoint"] is None:
                 return None
-            return OcrCheckpoint.model_validate(_decoded(row["ocr_checkpoint"]))
+            try:
+                return OcrCheckpoint.model_validate(_decoded(row["ocr_checkpoint"]))
+            except (json.JSONDecodeError, ValidationError):
+                # Invalid cache metadata is recoverable. Keep database/transport errors
+                # outside this catch and retain all immutable views and extractions.
+                await conn.execute(
+                    "UPDATE images SET ocr_checkpoint=NULL WHERE id=$1", claim.image.id
+                )
+                return None
 
     async def clear_ocr_checkpoint(self, claim: AnalysisClaim) -> bool:
         """Invalidate only the cache pointer, retaining immutable views and history."""
@@ -513,12 +522,23 @@ class WorkflowDB:
                 ORDER BY created_at,id""")
         return [ImageRow.model_validate(dict(row)) for row in rows]
 
-    async def next_wake_delay(self, maximum: float) -> float:
+    async def next_wake_delay(
+        self,
+        maximum: float,
+        *,
+        deferred_image_ids: Sequence[UUID] = (),
+    ) -> float:
+        """Include jobs that became due during work, but defer failed readiness probes."""
         async with self.pool.acquire() as conn:
-            delay = await conn.fetchval("""SELECT EXTRACT(EPOCH FROM min(due)-clock_timestamp())
-                FROM (SELECT retry_at AS due FROM images WHERE status='pending' AND retry_at>clock_timestamp()
-                UNION ALL SELECT lease_expires_at FROM images WHERE status='processing'
-                AND lease_expires_at>clock_timestamp()) candidates""")
+            delay = await conn.fetchval(
+                """SELECT EXTRACT(EPOCH FROM min(CASE WHEN status='pending'
+                    THEN COALESCE(retry_at,clock_timestamp()) ELSE lease_expires_at END)
+                    -clock_timestamp()) FROM images
+                WHERE status IN ('pending','processing') AND receipt_id IS NULL
+                AND id<>ALL($1::uuid[])
+                AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id)""",
+                list(deferred_image_ids),
+            )
         return min(maximum, max(0.0, float(delay))) if delay is not None else maximum
 
     async def save_ocr_checkpoint(self, claim: AnalysisClaim, checkpoint: OcrCheckpoint) -> bool:

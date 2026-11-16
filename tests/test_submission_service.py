@@ -245,3 +245,15 @@ async def test_controlled_clock_exhausts_original_600_seconds_before_commit(
     result = await service.process_claim(claim)
     assert result.stale
     db.finish_attempt.assert_not_awaited()
+
+
+async def test_checkpoint_transport_failure_does_not_clear_cache_or_run_ocr(settings, tmp_path):
+    import asyncpg
+
+    service, receipts, db, claim, _part = context(settings, tmp_path)
+    db.get_ocr_checkpoint.side_effect = asyncpg.ConnectionDoesNotExistError("connection lost")
+    await service.process_claim(claim)
+    db.clear_ocr_checkpoint.assert_not_awaited()
+    receipts.extract_receipt.assert_not_awaited()
+    outcome = db.finish_attempt.call_args.args[1]
+    assert outcome.kind == "retry" and outcome.result_code == "analysis_unavailable"

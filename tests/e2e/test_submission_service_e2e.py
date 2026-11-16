@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -73,7 +74,10 @@ async def setup(w, scope, settings, tmp_path, *, ocr=True):
     return image, paths, llm, native, service
 
 
-@pytest.mark.parametrize("change", ["none", "runtime", "corrupt", "source", "race"])
+@pytest.mark.parametrize(
+    "change",
+    ["none", "runtime", "corrupt", "source", "race", "malformed_page", "malformed_manifest"],
+)
 async def test_checkpoint_reload_reuses_only_exact_prefix(workflow_db, settings, tmp_path, change):
     w, scope = workflow_db
     image, paths, _llm, native, service = await setup(w, scope, settings, tmp_path)
@@ -103,6 +107,43 @@ async def test_checkpoint_reload_reuses_only_exact_prefix(workflow_db, settings,
         Path(saved.persisted_views[0].artifact_path).write_bytes(b"corrupt")
     if change == "source":
         paths[0].write_bytes(b"changed original")
+    if change in {"malformed_page", "malformed_manifest"}:
+        payload = json.loads(checkpoint)
+        if change == "malformed_page":
+            payload["pages"][0]["working_image"]["width"] = "invalid"
+        else:
+            payload["persisted_views"][0]["part_id"] = "invalid"
+        async with w.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE images SET ocr_checkpoint=$2::jsonb WHERE id=$1",
+                image.id,
+                json.dumps(payload),
+            )
+        original_load = w.get_ocr_checkpoint
+        stale = claim.model_copy(update={"claim_token": uuid4()})
+        assert await original_load(stale) is None
+        async with w.pool.acquire() as conn:
+            assert (
+                json.loads(
+                    await conn.fetchval("SELECT ocr_checkpoint FROM images WHERE id=$1", image.id)
+                )
+                == payload
+            )
+
+        async def load(claim):
+            result = await original_load(claim)
+            assert result is None
+            async with w.pool.acquire() as conn:
+                assert (
+                    await conn.fetchval("SELECT ocr_checkpoint FROM images WHERE id=$1", image.id)
+                    is None
+                )
+                assert await conn.fetchval("SELECT count(*) FROM receipt_extractions") == 1
+                assert await conn.fetchval("SELECT count(*) FROM extraction_working_views") == 1
+            assert Path(saved.persisted_views[0].artifact_path).exists()
+            return result
+
+        w.get_ocr_checkpoint = load
 
     async def page(*args, **kwargs):
         result = await original_extract(*args, **kwargs)
@@ -111,7 +152,18 @@ async def test_checkpoint_reload_reuses_only_exact_prefix(workflow_db, settings,
         return result
 
     native.extract_page = AsyncMock(side_effect=page)
+    original_attempt = service._attempt
+    deadlines = []
+
+    async def attempt(claim, deadline, owned):
+        deadlines.append(deadline)
+        return await original_attempt(claim, deadline, owned)
+
+    service._attempt = attempt
     second = await service.process_claim(claim)
+    assert len(deadlines) == 1
+    for call in native.extract_page.await_args_list:
+        assert call.kwargs["deadline"] == deadlines[0]
     if change == "source":
         assert second.submission.status == "failed"
         assert second.submission.result_code == "source_integrity_failed"

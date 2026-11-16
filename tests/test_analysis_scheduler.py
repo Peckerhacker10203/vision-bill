@@ -92,3 +92,80 @@ async def test_database_unavailable_never_claims(settings):
     db.is_ready = False
     assert await scheduler.process_pending() == []
     db.due_candidates.assert_not_awaited()
+
+
+async def test_retry_due_during_long_second_job_rescans_without_provider_down_hot_loop(
+    settings, monkeypatch
+):
+    from datetime import UTC, datetime, timedelta
+
+    import vision_bill.service.analysis_scheduler as module
+
+    scheduler, db, service, first = context(settings)
+    second = ImageRow(id=uuid4())
+    clock = [0.0]
+    due = {first.id: 0.0, second.id: 0.0}
+    runs = []
+    waits = []
+    done = asyncio.Event()
+    ready = {first.id: True, second.id: True}
+
+    async def candidates():
+        return [image for image in [first, second] if due.get(image.id, 999) <= clock[0]]
+
+    async def claim_next(*, image_id, lease_seconds):
+        return SimpleNamespace(image=first if image_id == first.id else second)
+
+    async def process(claim):
+        runs.append((claim.image.id, clock[0]))
+        if claim.image.id == first.id and len(runs) == 1:
+            due[first.id] = clock[0] + 30
+            return CommitResult(
+                stale=False,
+                submission=SubmissionStatus(
+                    id=first.id,
+                    status="pending",
+                    retry_at=datetime.now(UTC) + timedelta(seconds=30),
+                ),
+            )
+        if claim.image.id == second.id:
+            clock[0] += 60
+            del due[second.id]
+        else:
+            ready[first.id] = False
+            due[first.id] = clock[0]  # another overdue retry, but provider then goes down
+        return CommitResult(
+            stale=False, submission=SubmissionStatus(id=claim.image.id, status="pending")
+        )
+
+    async def wake_delay(maximum, *, deferred_image_ids=()):
+        eligible = [
+            when - clock[0] for image_id, when in due.items() if image_id not in deferred_image_ids
+        ]
+        return min(maximum, max(0, min(eligible))) if eligible else maximum
+
+    async def wait_for(awaitable, *, timeout):
+        waits.append(timeout)
+        awaitable.close()
+        if len(waits) >= 4:
+            done.set()
+            raise asyncio.CancelledError()
+        if timeout:
+            clock[0] += timeout if len(waits) > 1 else 0
+        raise TimeoutError()
+
+    db.due_candidates.side_effect = candidates
+    db.claim_next.side_effect = claim_next
+    db.next_wake_delay.side_effect = wake_delay
+    service.ready_for.side_effect = lambda image: ready[image.id]
+    service.process_claim.side_effect = process
+    monkeypatch.setattr(module.asyncio, "wait_for", wait_for)
+    task = asyncio.create_task(scheduler._run_forever())
+    await done.wait()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert runs == [(first.id, 0), (second.id, 0), (first.id, 60)]
+    assert db.claim_next.await_count == 3
+    assert waits == [300, 0, 0, 300]

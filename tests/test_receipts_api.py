@@ -551,7 +551,7 @@ def test_analyze_images_success(api_context: ApiContext, tmp_path: Path) -> None
     ctx = api_context
     queued_file = tmp_path / "queued.png"
     queued_file.write_bytes(b"queued-image-bytes")
-    image = ImageRow(id=IMAGE_ID, image_path=str(queued_file))
+    image = ImageRow(id=IMAGE_ID, image_path=str(queued_file), user_id=USER_ID)
     claim = SimpleNamespace(image=image)
     service = ctx.client.app.state.submission_service
     service.db.due_candidates = AsyncMock(return_value=[image])
@@ -1083,3 +1083,57 @@ def test_update_receipt_omitted_collection_ids_noop(api_context: ApiContext) -> 
     r = ctx.client.put(f"{RECEIPTS_URL}/{RECEIPT_ID}", json=body)
     assert r.status_code == 200
     coll_svc.set_receipt_collections.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "viewer,admin,see_all,expected",
+    [
+        ("first", False, False, ["first"]),
+        ("second", False, False, ["second"]),
+        ("admin", True, False, []),
+        ("admin", True, True, ["first", "second"]),
+    ],
+)
+def test_manual_analysis_results_follow_owner_and_admin_scope(
+    api_context, viewer, admin, see_all, expected
+):
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from vision_bill.model.db.image import ImageRow
+    from vision_bill.model.workflow import CommitResult, SubmissionStatus
+
+    owners = {name: uuid4() for name in ["first", "second", "admin"]}
+    images = {name: ImageRow(id=uuid4(), user_id=owners[name]) for name in ["first", "second"]}
+    receipts = {name: uuid4() for name in images}
+    service = api_context.client.app.state.submission_service
+    service.db.due_candidates = AsyncMock(return_value=list(images.values()))
+    service.ready_for = AsyncMock(return_value=True)
+
+    async def claim(*, image_id, lease_seconds):
+        return SimpleNamespace(image=next(i for i in images.values() if i.id == image_id))
+
+    async def process(claim):
+        name = next(name for name, image in images.items() if image.id == claim.image.id)
+        return CommitResult(
+            stale=False,
+            submission=SubmissionStatus(
+                id=claim.image.id,
+                user_id=claim.image.user_id,
+                status="analyzed",
+                receipt_id=receipts[name],
+                result_code=f"{name}_code",
+            ),
+        )
+
+    service.db.claim_next = AsyncMock(side_effect=claim)
+    service.process_claim = AsyncMock(side_effect=process)
+    user = User(id=owners[viewer], username=viewer, is_admin=admin, can_see_all=see_all)
+    api_context.client.app.dependency_overrides[get_current_user] = lambda: user
+    response = api_context.client.post(f"{IMAGES_URL}/analyze")
+    assert response.status_code == 200
+    results = response.json()["results"]
+    assert {r["image_id"] for r in results} == {str(images[name].id) for name in expected}
+    for name in set(images) - set(expected):
+        assert str(receipts[name]) not in response.text
+        assert f"{name}_code" not in response.text
