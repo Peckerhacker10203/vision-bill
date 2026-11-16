@@ -51,7 +51,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute("""DO $$ BEGIN IF EXISTS (SELECT 1 FROM images WHERE request_fingerprint IS NOT NULL
-        OR generation<>1 OR attempt_count<>0 OR status IN ('needs_review','timed_out','unreadable')
+        OR generation<>1 OR attempt_count<>0 OR status='needs_review'
         OR ocr_checkpoint IS NOT NULL OR source_manifest<>'[]'::jsonb
         OR legacy_events<>'[]'::jsonb)
         OR EXISTS (SELECT 1 FROM image_retry_requests) THEN
@@ -61,7 +61,7 @@ def downgrade() -> None:
     op.execute("DROP INDEX ux_images_owner_upload_key")
     op.execute("ALTER TABLE images DROP CONSTRAINT images_status_check")
     # Existing timed_out/unreadable meanings cannot be destroyed by a downgrade.
-    op.execute("ALTER TABLE images ADD CONSTRAINT images_status_check CHECK (status IN ('pending','processing','analyzed','failed'))")
+    op.execute("ALTER TABLE images ADD CONSTRAINT images_status_check CHECK (status IN ('pending','processing','analyzed','failed','timed_out','unreadable'))")
     for column in ("generation", "attempt_count", "max_attempts", "retry_at", "claim_token",
                    "lease_expires_at", "source_manifest", "requested_options", "effective_options",
                    "request_fingerprint", "idempotency_key", "result_code", "wait_reason",

@@ -24,8 +24,17 @@ def upgrade() -> None:
         event_kind TEXT NOT NULL, actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
         snapshot JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         UNIQUE(receipt_id,operation_revision))""")
+    op.execute("""CREATE FUNCTION vision_bill_immutable_review() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+        -- Only the actor FK's referential action may null its deleted parent.
+        -- Every other column, including the original snapshot, remains immutable.
+        IF pg_trigger_depth()>1 AND OLD.actor_user_id IS NOT NULL AND NEW.actor_user_id IS NULL
+           AND to_jsonb(NEW)-'actor_user_id'=to_jsonb(OLD)-'actor_user_id'
+           AND NOT EXISTS (SELECT 1 FROM users WHERE id=OLD.actor_user_id) THEN RETURN NEW;
+        END IF;
+        RAISE EXCEPTION 'immutable review history'; END $$""")
     op.execute("""CREATE TRIGGER immutable_artifact BEFORE UPDATE ON receipt_review_revisions
-        FOR EACH ROW EXECUTE FUNCTION vision_bill_immutable_artifact()""")
+        FOR EACH ROW EXECUTE FUNCTION vision_bill_immutable_review()""")
     # Direct deletion is forbidden; cascading deletion with the receipt remains supported.
     op.execute("""CREATE FUNCTION vision_bill_review_no_delete() RETURNS trigger LANGUAGE plpgsql AS $$
         BEGIN IF pg_trigger_depth()=1 THEN RAISE EXCEPTION 'append-only review history';
@@ -42,6 +51,7 @@ def downgrade() -> None:
         OR checks_version IS NOT NULL) THEN
         RAISE EXCEPTION 'destructive review downgrade refused'; END IF; END $$""")
     op.execute("DROP TABLE receipt_review_revisions")
+    op.execute("DROP FUNCTION vision_bill_immutable_review()")
     op.execute("DROP FUNCTION vision_bill_review_no_delete()")
     for column in ("extraction_id", "operation_revision", "review_revision", "amount_policy",
                    "findings", "field_sources", "checks_version", "verification_source"):

@@ -672,6 +672,62 @@ async def test_sealed_extraction_cannot_be_deleted_directly(workflow_db):
         assert await conn.fetchval("SELECT count(*) FROM receipt_review_revisions") == 0
 
 
+@pytest.mark.parametrize("path", ["terminal_review", "checkpoint_page", "finish_page"])
+@pytest.mark.parametrize("forged", ["part", "view"])
+async def test_every_persisted_review_and_page_reference_is_validated(workflow_db, path, forged):
+    from vision_bill.model.review import ReviewFinding
+    from vision_bill.model.workflow import OcrCheckpoint
+
+    w, scope = workflow_db
+    image = await enqueue(w, scope)
+    claim = await w.claim_next()
+    page = wire_page()
+    view = await saved_view(w, scope, image, page)
+    reference = {
+        "part_id": str(uuid4()) if forged == "part" else str(view.part_id),
+        "photo_index": 0,
+        "source_sha256": "a" * 64,
+        "view_id": str(uuid4()) if forged == "view" else str(view.metadata.view_id),
+    }
+    if path == "terminal_review":
+        finding = ReviewFinding(
+            id="forged",
+            code="source",
+            severity="integrity",
+            field_path="total",
+            source_refs=[reference],
+        )
+        review = ReviewEvaluation(findings=[finding], can_finalize=False, can_auto_verify=False)
+        with pytest.raises(ValueError, match="source reference"):
+            await w.finish_attempt(
+                claim, AttemptOutcome(kind="terminal", review=review, persisted_views=[view])
+            )
+    else:
+        page.telemetry = {"elapsed_ms": 1, "nested": {"source_refs": [reference]}}
+        if path == "checkpoint_page":
+            checkpoint = OcrCheckpoint(
+                ordered_source_sha256=["a" * 64],
+                profile_id="profile",
+                runtime_fingerprint="runtime",
+                pages=[page],
+                persisted_views=[view],
+            )
+            with pytest.raises(ValueError, match="source reference"):
+                await w.save_ocr_checkpoint(claim, checkpoint)
+        else:
+            outcome = complete()
+            outcome.envelope.ocr_pages = [page]
+            outcome.persisted_views = [view]
+            with pytest.raises(ValueError, match="source reference"):
+                await w.finish_attempt(claim, outcome)
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM receipt_extractions") == 0
+        assert await conn.fetchval("SELECT count(*) FROM extraction_working_views") == 0
+        assert (
+            await conn.fetchval("SELECT ocr_checkpoint FROM images WHERE id=$1", image.id) is None
+        )
+
+
 async def test_checkpoint_read_is_fenced_and_preserves_saved_metadata(workflow_db):
     from vision_bill.model.workflow import OcrCheckpoint
 
@@ -767,3 +823,159 @@ async def test_upload_replay_ignores_new_storage_paths_and_changed_resolved_defa
     )
     with pytest.raises(ValueError, match="conflict"):
         await w.enqueue_submission(explicit_changed, scope=scope, idempotency_key="stable-request")
+
+
+async def test_untouched_partial_drafts_allow_repeated_generations_with_monotonic_revision(
+    workflow_db,
+):
+    from vision_bill.model.extraction import ExtractionDraft
+
+    w, scope = workflow_db
+    image = await enqueue(w, scope)
+    for generation in range(1, 4):
+        envelope = complete().envelope
+        envelope.receipt = None
+        envelope.draft = ExtractionDraft(merchant_name=f"generation {generation}")
+        result = await w.finish_attempt(
+            await w.claim_next(), AttemptOutcome(kind="partial", envelope=envelope)
+        )
+        assert result.submission.generation == generation
+        async with w.pool.acquire() as conn:
+            draft = await conn.fetchrow("SELECT * FROM receipt_drafts WHERE image_id=$1", image.id)
+            assert draft["revision"] == generation and not draft["human_edited"]
+        retried = await w.retry_submission(
+            image.id,
+            RetryRequest(expected_generation=generation, request_key=f"generation-{generation}"),
+            scope=scope,
+        )
+        assert retried.generation == generation + 1
+
+
+@pytest.mark.parametrize("legacy_rows", [False, True])
+async def test_downgrade_preserves_exact_0010_terminal_status_contract(db, legacy_rows):
+    migrate(db, "0010")
+    conn = await asyncpg.connect(db.pg_dsn)
+    if legacy_rows:
+        await conn.execute(
+            "INSERT INTO images(status,image_path) VALUES('timed_out','/legacy/timeout'),('unreadable','/legacy/unreadable')"
+        )
+    await conn.close()
+    migrate(db)
+    migrate(db, "0010", "downgrade")
+    conn = await asyncpg.connect(db.pg_dsn)
+    assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0010"
+    for state in ("pending", "processing", "analyzed", "failed", "timed_out", "unreadable"):
+        row_id = await conn.fetchval("INSERT INTO images(status) VALUES($1) RETURNING id", state)
+        await conn.execute("UPDATE images SET status=$2 WHERE id=$1", row_id, state)
+    if legacy_rows:
+        assert (
+            await conn.fetchval("SELECT status FROM images WHERE image_path='/legacy/timeout'")
+            == "timed_out"
+        )
+        assert (
+            await conn.fetchval("SELECT status FROM images WHERE image_path='/legacy/unreadable'")
+            == "unreadable"
+        )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await conn.execute("INSERT INTO images(status) VALUES('needs_review')")
+    await conn.close()
+
+
+async def test_review_actor_deletion_nulls_only_actor_preserves_history_and_owner(workflow_db):
+    w, scope = workflow_db
+    await enqueue(w, scope)
+    result = await w.finish_attempt(await w.claim_next(), complete())
+    async with w.pool.acquire() as conn:
+        actor = await conn.fetchval(
+            "INSERT INTO users(username,hashed_password,is_admin) VALUES('reviewer','test',TRUE) RETURNING id"
+        )
+        revision = await conn.fetchval(
+            """INSERT INTO receipt_review_revisions(receipt_id,operation_revision,
+            review_revision,event_kind,actor_user_id,snapshot) VALUES($1,2,1,'verified',$2,'{"content":"immutable"}') RETURNING id""",
+            result.receipt.id,
+            actor,
+        )
+        for statement in (
+            "actor_user_id=NULL",
+            "event_kind='tampered'",
+            "snapshot='{}'::jsonb",
+            "operation_revision=99",
+        ):
+            with pytest.raises(asyncpg.RaiseError, match="immutable"):
+                await conn.execute(
+                    f"UPDATE receipt_review_revisions SET {statement} WHERE id=$1", revision
+                )
+        await conn.execute("DELETE FROM users WHERE id=$1", actor)
+        history = await conn.fetchrow(
+            "SELECT * FROM receipt_review_revisions WHERE id=$1", revision
+        )
+        assert (
+            history["actor_user_id"] is None and history["snapshot"] == '{"content": "immutable"}'
+        )
+        assert history["operation_revision"] == 2 and history["event_kind"] == "verified"
+        assert (
+            await conn.fetchval("SELECT user_id FROM receipts WHERE id=$1", result.receipt.id)
+            == scope.user_id
+        )
+        with pytest.raises(asyncpg.RaiseError, match="immutable"):
+            await conn.execute(
+                "UPDATE receipt_review_revisions SET snapshot='{}'::jsonb WHERE id=$1", revision
+            )
+        await conn.execute("DELETE FROM receipts WHERE id=$1", result.receipt.id)
+        assert await conn.fetchval("SELECT count(*) FROM receipt_review_revisions") == 0
+
+
+@pytest.mark.parametrize("terminal_review", [False, True])
+async def test_reference_validation_preserves_real_references_and_ordinary_telemetry(
+    workflow_db, terminal_review
+):
+    from vision_bill.model.review import ReviewFinding
+    from vision_bill.model.workflow import OcrCheckpoint
+
+    w, scope = workflow_db
+    image = await enqueue(w, scope)
+    claim = await w.claim_next()
+    page = wire_page()
+    view = await saved_view(w, scope, image, page)
+    reference = {
+        "part_id": str(view.part_id),
+        "photo_index": 0,
+        "source_sha256": "a" * 64,
+        "view_id": str(view.metadata.view_id),
+    }
+    review = ReviewEvaluation(
+        findings=[
+            ReviewFinding(
+                id="real",
+                code="review",
+                severity="review",
+                field_path="total",
+                source_refs=[reference],
+            )
+        ],
+        can_finalize=False,
+        can_auto_verify=False,
+    )
+    if terminal_review:
+        result = await w.finish_attempt(
+            claim, AttemptOutcome(kind="terminal", review=review, persisted_views=[view])
+        )
+        assert not result.stale
+    else:
+        page.telemetry = {
+            "elapsed_ms": 12,
+            "provider": {"profile": "native"},
+            "reference": reference,
+        }
+        checkpoint = OcrCheckpoint(
+            ordered_source_sha256=["a" * 64],
+            profile_id="profile",
+            runtime_fingerprint="runtime",
+            pages=[page],
+            persisted_views=[view],
+        )
+        assert await w.save_ocr_checkpoint(claim, checkpoint)
+        outcome = complete()
+        outcome.envelope.ocr_pages = [page]
+        outcome.persisted_views = [view]
+        assert not (await w.finish_attempt(claim, outcome)).stale

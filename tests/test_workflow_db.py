@@ -45,3 +45,27 @@ def test_raw_png_in_generic_submission_metadata_is_rejected():
             effective_options={},
             request_fingerprint="fingerprint",
         )
+
+
+def test_reference_collection_does_not_skip_nested_reference_objects():
+    from vision_bill.provider.db.workflow_db import _nested_source_refs
+
+    first, nested = uuid4(), uuid4()
+    value = {
+        "part_id": str(first),
+        "photo_index": 0,
+        "source_sha256": "a" * 64,
+        "nested": {
+            "source_refs": [{"part_id": str(nested), "photo_index": 1, "source_sha256": "b" * 64}]
+        },
+    }
+    assert {ref.part_id for ref in _nested_source_refs(value)} == {first, nested}
+    assert _nested_source_refs({"elapsed_ms": 1, "stages": ["ocr", "format"]}) == []
+
+
+def test_standalone_saved_view_references_are_collected_recursively():
+    from vision_bill.provider.db import workflow_db
+
+    assert hasattr(workflow_db, "_nested_view_ids")
+    view = uuid4()
+    assert workflow_db._nested_view_ids({"telemetry": {"view_id": str(view)}}) == [view]

@@ -57,13 +57,26 @@ def _nested_source_refs(value: Any) -> list[SourceRef]:
     if isinstance(value, dict):
         if "part_id" in value:
             refs.append(SourceRef.model_validate(value))
-        else:
-            for item in value.values():
-                refs.extend(_nested_source_refs(item))
+        for item in value.values():
+            refs.extend(_nested_source_refs(item))
     elif isinstance(value, list):
         for item in value:
             refs.extend(_nested_source_refs(item))
     return refs
+
+
+def _nested_view_ids(value: Any) -> list[UUID]:
+    """View identities in flexible metadata must belong to this submission too."""
+    ids: list[UUID] = []
+    if isinstance(value, dict):
+        if value.get("view_id") is not None:
+            ids.append(UUID(str(value["view_id"])))
+        for item in value.values():
+            ids.extend(_nested_view_ids(item))
+    elif isinstance(value, list):
+        for item in value:
+            ids.extend(_nested_view_ids(item))
+    return ids
 
 
 class WorkflowDB:
@@ -409,6 +422,23 @@ class WorkflowDB:
             if ref.coordinate_space == "working" and ref.view_id is None:
                 raise ValueError("working source reference requires saved view")
 
+    async def _validate_metadata_refs(
+        self,
+        conn: asyncpg.Connection,
+        image_id: UUID,
+        parts: list[PersistedSourcePart],
+        value: Any,
+    ) -> None:
+        await self._validate_refs(conn, image_id, parts, _nested_source_refs(value))
+        for view_id in set(_nested_view_ids(value)):
+            if not await conn.fetchval(
+                """SELECT EXISTS(SELECT 1 FROM extraction_working_views
+                WHERE view_id=$1 AND image_id=$2)""",
+                view_id,
+                image_id,
+            ):
+                raise ValueError("source reference view does not match saved artifact")
+
     async def get_ocr_checkpoint(self, claim: AnalysisClaim) -> OcrCheckpoint | None:
         """Read internal metadata under a live fence, including saved-view paths.
 
@@ -442,6 +472,7 @@ class WorkflowDB:
                     parts, views, page.photo_index, page.source_sha256, page.working_image
                 )
             payload = checkpoint.model_dump(mode="json")
+            await self._validate_metadata_refs(conn, row["id"], parts, payload)
             old = _decoded(row["ocr_checkpoint"])
             if old is not None and (
                 old["ordered_source_sha256"] != payload["ordered_source_sha256"]
@@ -480,9 +511,7 @@ class WorkflowDB:
             if row["receipt_id"] is not None or existing is not None:
                 raise ValueError("a linked receipt must never be overwritten")
             if draft is not None and (
-                draft["human_edited"]
-                or draft["revision"] > 1
-                or draft["finalized_receipt_id"] is not None
+                draft["human_edited"] or draft["finalized_receipt_id"] is not None
             ):
                 raise ValueError("an edited or finalized draft must never be overwritten")
             parts = await self._parts(conn, row["id"])
@@ -502,15 +531,6 @@ class WorkflowDB:
                     self._require_view(
                         parts, views, view.photo_index, view.source_sha256, view.working_image
                     )
-                refs = [ref for group in envelope.field_sources.values() for ref in group]
-                refs += [ref for finding in envelope.findings for ref in finding.source_refs]
-                refs += _nested_source_refs(envelope.overlap_decisions)
-                refs += _nested_source_refs(envelope.telemetry.model_dump(mode="json"))
-                if outcome.review:
-                    refs += [
-                        ref for finding in outcome.review.findings for ref in finding.source_refs
-                    ]
-                await self._validate_refs(conn, row["id"], parts, refs)
                 payload = envelope.model_dump(mode="json", exclude={"ocr_pages", "input_views"})
                 payload["ocr_pages"] = [
                     OcrPageMetadata.model_validate(page.model_dump()).model_dump(mode="json")
@@ -519,6 +539,14 @@ class WorkflowDB:
                 payload["input_views"] = [
                     view.model_dump(mode="json") for view in outcome.persisted_views
                 ]
+            review_payload = outcome.review.model_dump(mode="json") if outcome.review else None
+            saved_views = [view.model_dump(mode="json") for view in outcome.persisted_views]
+            await self._validate_metadata_refs(
+                conn,
+                row["id"],
+                parts,
+                {"envelope": payload, "review": review_payload, "saved_views": saved_views},
+            )
             extraction_id = await conn.fetchval(
                 """INSERT INTO receipt_extractions(image_id,generation,
                 attempt_number,outcome_kind,result_code,envelope,review,source_views)
@@ -529,8 +557,8 @@ class WorkflowDB:
                 outcome.kind,
                 outcome.result_code,
                 _json(payload) if payload is not None else None,
-                _json(outcome.review.model_dump(mode="json")) if outcome.review else None,
-                _json([view.model_dump(mode="json") for view in outcome.persisted_views]),
+                _json(review_payload) if review_payload is not None else None,
+                _json(saved_views),
             )
             receipt = None
             status = "failed"
@@ -668,11 +696,7 @@ class WorkflowDB:
             draft = await conn.fetchrow(
                 "SELECT * FROM receipt_drafts WHERE image_id=$1 FOR UPDATE", image_id
             )
-            if draft and (
-                draft["human_edited"]
-                or draft["revision"] > 1
-                or draft["finalized_receipt_id"] is not None
-            ):
+            if draft and (draft["human_edited"] or draft["finalized_receipt_id"] is not None):
                 raise ValueError("an edited draft cannot be retried")
             if row["status"] not in {"failed", "timed_out", "unreadable", "needs_review"}:
                 raise ValueError("submission is not terminal/retryable")
