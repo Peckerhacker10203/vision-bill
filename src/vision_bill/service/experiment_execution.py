@@ -60,21 +60,31 @@ def image_digest(path: Path) -> str:
 
 
 def effective_policy(
-    service: "ReceiptService", options: ExperimentOptions,
+    service: "ReceiptService",
+    options: ExperimentOptions,
 ) -> tuple[Any, OcrSettings, ExperimentOptions]:
     """Keep upload policy, explicit direct vision and strict OCR distinct."""
     settings = service._ocr_settings
     ocr = service._ocr_provider
     if options.pipeline == ExtractionPipeline.OCR:
-        settings = settings.model_copy(update={
-            "enabled": True, "required": True, "allow_vision_fallback": False,
-        })
+        settings = settings.model_copy(
+            update={
+                "enabled": True,
+                "required": True,
+                "allow_vision_fallback": False,
+            }
+        )
         if ocr is None:
             from ..provider.factory import get_ocr_provider
+
             ocr = get_ocr_provider(settings)
         options = options.model_copy(update={"allow_ocr_fallback": False})
     elif options.pipeline == ExtractionPipeline.UPLOAD:
-        options = options.model_copy(update={"allow_ocr_fallback": settings.allow_vision_fallback})
+        options = options.model_copy(
+            update={
+                "allow_ocr_fallback": settings.allow_vision_fallback and options.allow_ocr_fallback
+            }
+        )
     else:
         ocr = None
     return ocr, settings, options
@@ -108,8 +118,11 @@ async def execute_submission(
     try:
         async with asyncio.timeout(provider.analysis_timeout_seconds):
             envelope = await probe.extract_receipt(
-                model_id, paths, options=effective_options,
-                deadline=monotonic() + provider.analysis_timeout_seconds, tags=tags,
+                model_id,
+                paths,
+                options=effective_options,
+                deadline=monotonic() + provider.analysis_timeout_seconds,
+                tags=tags,
             )
             metadata.update(envelope.provenance.model_dump(mode="json"))
             metadata["calls"] = envelope.telemetry.calls
@@ -127,6 +140,7 @@ async def execute_submission(
             metadata["overlap_decisions"] = envelope.overlap_decisions
             metadata["findings"] = [f.model_dump(mode="json") for f in envelope.findings]
             from ..model.ocr import OcrPageMetadata
+
             metadata["ocr_pages"] = [
                 OcrPageMetadata.model_validate(page.model_dump()).model_dump(mode="json")
                 for page in envelope.ocr_pages
@@ -146,7 +160,9 @@ async def execute_submission(
     return ExperimentResult(receipt, len(metadata["calls"]) or 1, elapsed, metadata)
 
 
-async def pipeline_identity(service: 'ReceiptService', options: ExperimentOptions) -> dict[str, Any]:
+async def pipeline_identity(
+    service: "ReceiptService", options: ExperimentOptions
+) -> dict[str, Any]:
     """Freeze effective local execution contracts without receipt/reference observations."""
     import inspect
 
@@ -156,22 +172,34 @@ async def pipeline_identity(service: 'ReceiptService', options: ExperimentOption
         ReceiptInput,
     )
     from ..provider.llm.experiment import source_extraction_prompt
+
     ocr, settings, effective_options = effective_policy(service, options)
     provider = service._provider.for_experiment(effective_options)
     capabilities = None
     if ocr is not None and options.pipeline != ExtractionPipeline.DIRECT:
-        capabilities = (await ocr.get_capabilities()).model_dump(mode='json')
+        capabilities = (await ocr.get_capabilities()).model_dump(mode="json")
     return {
-        'version': 1, 'schema_version': EXTRACTION_SCHEMA_VERSION,
-        'source_projection_version': SOURCE_PROJECTION_VERSION,
-        'source_prompt_sha256': hashlib.sha256(inspect.getsource(source_extraction_prompt).encode()).hexdigest(),
-        'input_schema_sha256': hashlib.sha256(json.dumps(ReceiptInput.model_json_schema(), sort_keys=True).encode()).hexdigest(),
-        'preprocessing_sha256': hashlib.sha256(inspect.getsource(provider._prepare_receipt_input).encode()).hexdigest(),
-        'ocr_client': ocr_fingerprint(ocr), 'ocr_runtime': capabilities,
-        'ocr_settings': settings.model_dump(mode='json', exclude={'service_url'}),
-        'requested_options': options.model_dump(mode='json'),
-        'options': (provider.experiment_options or effective_options).model_dump(mode='json'),
-        'formatter_output_tokens': provider.max_output_tokens,
-        'context_window_tokens': getattr(provider, 'context_window_tokens', None),
-        'analysis_timeout_seconds': provider.analysis_timeout_seconds,
+        "version": 1,
+        "schema_version": EXTRACTION_SCHEMA_VERSION,
+        "source_projection_version": SOURCE_PROJECTION_VERSION,
+        "source_prompt_sha256": hashlib.sha256(
+            inspect.getsource(source_extraction_prompt).encode()
+        ).hexdigest(),
+        "input_schema_sha256": hashlib.sha256(
+            json.dumps(ReceiptInput.model_json_schema(), sort_keys=True).encode()
+        ).hexdigest(),
+        "preprocessing_sha256": hashlib.sha256(
+            (
+                inspect.getsource(provider._prepare_receipt_input)
+                + inspect.getsource(provider._authorized_source_refs)
+            ).encode()
+        ).hexdigest(),
+        "ocr_client": ocr_fingerprint(ocr),
+        "ocr_runtime": capabilities,
+        "ocr_settings": settings.model_dump(mode="json", exclude={"service_url"}),
+        "requested_options": options.model_dump(mode="json"),
+        "options": (provider.experiment_options or effective_options).model_dump(mode="json"),
+        "formatter_output_tokens": provider.max_output_tokens,
+        "context_window_tokens": getattr(provider, "context_window_tokens", None),
+        "analysis_timeout_seconds": provider.analysis_timeout_seconds,
     }

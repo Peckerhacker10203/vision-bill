@@ -2,12 +2,13 @@ import { expect, test, type BrowserContext, type Page } from '@playwright/test';
 import { registerUser } from '../helpers/auth';
 import { loadFixture } from '../helpers/fixtures';
 import { setStubMode, stubGuard } from '../helpers/stub';
+import { awaitSubmission } from '../helpers/api';
 import { confirmDialog } from '../helpers/ui';
 
 /** Upload one image while the stub is in `mode`; land on the queue page. */
 async function queueAnImage(
 	page: Page,
-	_context: BrowserContext,
+	context: BrowserContext,
 	mode: 'down' | 'broken'
 ): Promise<void> {
 	const fixture = await loadFixture('a');
@@ -19,11 +20,18 @@ async function queueAnImage(
 		buffer: fixture.bytes
 	});
 	await page.getByRole('button', { name: 'Upload' }).click();
+	await expect(page).toHaveURL(/\/upload\?job=[a-f0-9-]+/);
+	const id = new URL(page.url()).searchParams.get('job')!;
 	if (mode === 'down') {
-		await expect(page.locator('p:has-text("Added to the analysis queue")')).toBeVisible();
+		const job = await (await context.request.get(`/api/v1/images/${id}`)).json();
+		expect(job.status).toBe('pending');
+		expect(job.attempt_count).toBe(0);
 	} else {
-		await expect(page.getByText('Upload failed')).toBeVisible({ timeout: 30_000 });
+		const job = await awaitSubmission(context, id, 120_000);
+		expect(job.status).toBe('failed');
+		expect(job.attempt_count).toBe(3);
 	}
+
 	await page.goto('/queue');
 }
 

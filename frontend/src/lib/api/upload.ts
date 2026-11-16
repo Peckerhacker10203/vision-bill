@@ -22,9 +22,15 @@ export function readPendingUpload(owner: string): PendingUpload | null {
 			return null;
 		const options = value.options;
 		if (!options || typeof options !== 'object' || Array.isArray(options)) return null;
-		if (Object.keys(options).some((key) => key !== 'bypass_review' && key !== 'model_id'))
+		if (
+			Object.keys(options).some(
+				(key) => key !== 'bypass_review' && key !== 'model_id' && key !== 'allow_ocr_fallback'
+			)
+		)
 			return null;
 		if ('bypass_review' in options && typeof options.bypass_review !== 'boolean') return null;
+		if ('allow_ocr_fallback' in options && typeof options.allow_ocr_fallback !== 'boolean')
+			return null;
 		if ('model_id' in options && typeof options.model_id !== 'string') return null;
 		return { key: value.key, identity: value.identity, options };
 	} catch {
@@ -54,6 +60,8 @@ export async function prepareUpload(
 	const options: UploadOptions = {};
 	if (selected.model_id !== undefined) options.model_id = selected.model_id;
 	if (selected.bypass_review !== undefined) options.bypass_review = selected.bypass_review;
+	if (selected.allow_ocr_fallback !== undefined)
+		options.allow_ocr_fallback = selected.allow_ocr_fallback;
 	const hashes: string[] = [];
 	for (const file of files) hashes.push(bytesToHex(sha256(new Uint8Array(await fileBytes(file)))));
 	const identity = bytesToHex(sha256(utf8ToBytes(JSON.stringify({ owner, hashes, options }))));

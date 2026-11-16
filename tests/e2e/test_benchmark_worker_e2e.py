@@ -22,7 +22,7 @@ postgres, db, workflow_db = claims.postgres, claims.db, claims.workflow_db
 pytestmark = pytest.mark.e2e
 
 
-async def prepare(w, scope, tmp_path, *, kind="legacy", pipeline="direct_vision", worker=None, ocr_settings=None):
+async def prepare(w, scope, tmp_path, *, kind="legacy", pipeline="direct_vision", worker=None, ocr_settings=None, permission=False):
     row, _body, path = await claims.references.human(w, scope, tmp_path)
     provider, ocr = formatter(), sidecar()
     receipts = ReceiptService(ImageSettings(save_dir=str(tmp_path), tmp_dir=str(tmp_path)), w._settings,
@@ -37,7 +37,7 @@ async def prepare(w, scope, tmp_path, *, kind="legacy", pipeline="direct_vision"
         preview = await service.reference_preview(row.id, scope=scope)
         await service.qualify_reference(row.id, 1, preview.document_sha256, scope=scope)
         run = await service.create_run(BenchmarkCreate(model_ids=["fixture"], receipt_ids=[row.id],
-            experiment=ExperimentOptions(pipeline=pipeline, include_classification=False)), scope=scope)
+            experiment=ExperimentOptions(pipeline=pipeline, include_classification=False, allow_ocr_fallback=permission)), scope=scope)
         if kind == "old_manifest":
             manifest = await service._db.manifest(run.id)
             manifest["inputs"][0].pop("reference")
@@ -198,7 +198,7 @@ async def test_unreadable_output_is_permanent_after_one_attempt(workflow_db, tmp
 async def test_readiness_obeys_effective_policy(workflow_db, tmp_path, pipeline, enabled, fallback, want_wait):
     w, scope = workflow_db
     service, run, _, _, inference, ocr = await prepare(w, scope, tmp_path, kind="manifest",
-        pipeline=pipeline, ocr_settings=OcrSettings(enabled=enabled, allow_vision_fallback=fallback))
+        pipeline=pipeline, permission=fallback, ocr_settings=OcrSettings(enabled=enabled, allow_vision_fallback=fallback))
     ocr.get_capabilities.return_value.ready = False
     ocr.get_capabilities.return_value.reachable = False
     ocr.get_capabilities.return_value.profile_id = None
@@ -272,7 +272,7 @@ async def test_stale_worker_stops_before_inference_after_preflight_barrier(workf
 
 async def test_permitted_fallback_waits_when_no_vision_model_is_available(workflow_db, tmp_path):
     w, scope = workflow_db
-    service, run, _, _, inference, ocr = await prepare(w, scope, tmp_path, kind="manifest", pipeline="upload",
+    service, run, _, _, inference, ocr = await prepare(w, scope, tmp_path, kind="manifest", pipeline="upload", permission=True,
         ocr_settings=OcrSettings(enabled=True, allow_vision_fallback=True))
     service._provider.get_available_models.return_value[0].capabilities = ["completion"]
     ocr.get_capabilities.return_value.ready = False
@@ -285,7 +285,7 @@ async def test_permitted_fallback_waits_when_no_vision_model_is_available(workfl
 @pytest.mark.parametrize("change", ["formatter_budget", "ocr_recovery_race"])
 async def test_permitted_fallback_preserves_frozen_contract_and_executed_runtime(workflow_db, tmp_path, change):
     w, scope = workflow_db
-    service, run, _, _, inference, ocr = await prepare(w, scope, tmp_path, kind="manifest", pipeline="upload",
+    service, run, _, _, inference, ocr = await prepare(w, scope, tmp_path, kind="manifest", pipeline="upload", permission=True,
         ocr_settings=OcrSettings(enabled=True, allow_vision_fallback=True))
     ocr.get_capabilities.return_value.ready = False
     if change == "formatter_budget":
@@ -368,3 +368,16 @@ async def test_complete_worker_deadline_includes_preflight_and_persistence(workf
         await service._execute(dict(await service._db.lease_task()))
         assert (await service._db.summaries(run.id))[0].completed == 1
         assert (await service._db.results(run.id))[0]["metadata"]["inference_attempt_count"] == 2
+
+
+async def test_upload_without_permission_waits_despite_global_fallback(workflow_db, tmp_path):
+    w, scope = workflow_db
+    service, run, _, _, inference, ocr = await prepare(
+        w, scope, tmp_path, kind="manifest", pipeline="upload",
+        ocr_settings=OcrSettings(enabled=True, allow_vision_fallback=True),
+    )
+    ocr.get_capabilities.return_value.ready = False
+    await service._execute(dict(await service._db.lease_task()))
+    task = await claims.saved(w, run.id)
+    assert task["status"] == "waiting_for_model"
+    assert task["inference_attempt_count"] == 0 and inference.await_count == 0

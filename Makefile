@@ -39,24 +39,17 @@ docker-logs: ## Follow vision_bill container logs
 test: ## Run unit tests (e2e excluded; see test-e2e)
 	uv run --extra dev pytest tests/ -m "not e2e"
 
-e2e-up: ## Build and start the e2e stack (manual; the test targets manage it)
-	$(E2E_COMPOSE) up -d --build
+e2e-up: ## Start a private stack (requires E2E_STATE=/private/directory/state.json)
+	uv run python e2e/run.py up --state "$(E2E_STATE)"
 
-e2e-down: ## Stop the e2e stack and delete its volumes (manual)
-	$(E2E_COMPOSE) down -v
+e2e-down: ## Remove only the explicitly owned stack
+	uv run python e2e/run.py down --state "$(E2E_STATE)"
 
-# The e2e test targets own the stack lifecycle: start it for the run and
-# always tear it down on exit (the EXIT trap covers failures and Ctrl-C).
-E2E_COMPOSE := docker compose -f docker-compose.e2e.yml
-test-e2e: ## Run backend e2e tests (starts the e2e stack, always tears it down)
-	@bash -c 'trap "$(E2E_COMPOSE) down -v" EXIT; \
-		$(E2E_COMPOSE) up -d --build && uv run python e2e/wait_ready.py && \
-		uv run --extra dev pytest tests/e2e/'
+test-e2e: ## Run backend E2E in a unique owned stack
+	uv run --extra dev python e2e/run.py run -- uv run --extra dev pytest tests/e2e/
 
-fe-test-e2e: ## Playwright e2e (starts the e2e stack, always tears it down)
-	@bash -c 'trap "$(E2E_COMPOSE) down -v" EXIT; \
-		$(E2E_COMPOSE) up -d --build && uv run python e2e/wait_ready.py && \
-		$(NODE) (cd $(FE) && npm run test:e2e)'
+fe-test-e2e: ## Run Playwright in a unique owned stack
+	$(NODE) uv run python e2e/run.py run --policy fallback -- npm --prefix frontend run test:e2e
 
 lint: ## Lint (ruff) and type-check (mypy)
 	uv run --extra dev ruff check src

@@ -64,24 +64,45 @@ export async function uploadViaApi(
 	context: BrowserContext,
 	name: string,
 	bytes: Uint8Array,
-	mimeType = 'image/png'
+	mimeType = 'image/png',
+	options: {
+		key?: string;
+		wait?: boolean;
+		photos?: { name: string; bytes: Uint8Array; mimeType: string }[];
+		allow_ocr_fallback?: boolean;
+	} = {}
 ): Promise<{ status: number; body: Record<string, unknown> }> {
 	const form = new FormData();
-	form.append('receipt', new File([new Uint8Array(bytes)], name, { type: mimeType }));
-	const response = await context.request.post('/api/v1/images', {
-		headers: { 'Idempotency-Key': crypto.randomUUID() },
-		multipart: form
-	});
+	for (const photo of options.photos ?? [{ name, bytes, mimeType }]) {
+		form.append(
+			'receipt',
+			new File([new Uint8Array(photo.bytes)], photo.name, { type: photo.mimeType })
+		);
+	}
+	const response = await context.request.post(
+		'/api/v1/images' +
+			(options.allow_ocr_fallback === undefined
+				? ''
+				: `?allow_ocr_fallback=${options.allow_ocr_fallback}`),
+		{
+			headers: { 'Idempotency-Key': options.key ?? crypto.randomUUID() },
+			multipart: form
+		}
+	);
 	const body = (await response.json()) as Record<string, unknown>;
 	if (response.status() !== 202) return { status: response.status(), body };
 	expect(typeof body.id).toBe('string');
-	return { status: response.status(), body: await awaitSubmission(context, body.id as string) };
+	return {
+		status: response.status(),
+		body: options.wait === false ? body : await awaitSubmission(context, body.id as string)
+	};
 }
 
 /** Await the durable outcome, never treat acceptance as a usable receipt. */
 export async function awaitSubmission(
 	context: BrowserContext,
-	id: string
+	id: string,
+	budget = 120_000
 ): Promise<Record<string, unknown>> {
 	let outcome: Record<string, unknown> = {};
 	await expect
@@ -92,7 +113,7 @@ export async function awaitSubmission(
 				outcome = await response.json();
 				return outcome.terminal;
 			},
-			{ timeout: 90_000, intervals: [200, 500, 1000] }
+			{ timeout: budget, intervals: [200, 500, 1000] }
 		)
 		.toBe(true);
 	return outcome;
@@ -133,4 +154,17 @@ export async function verifyReceiptViaApi(
 	});
 	expect(verified.status()).toBe(200);
 	expect((await verified.json()).verified).toBe(true);
+}
+
+export async function qualifyGold(context: BrowserContext, id: string): Promise<void> {
+	const response = await context.request.get(`/api/v1/benchmarks/references/${id}`);
+	expect(response.status()).toBe(200);
+	const preview = await response.json();
+	const qualified = await context.request.post(`/api/v1/benchmarks/references/${id}`, {
+		data: {
+			expected_review_revision: preview.review_revision,
+			expected_document_sha256: preview.document_sha256
+		}
+	});
+	expect(qualified.status()).toBe(200);
 }

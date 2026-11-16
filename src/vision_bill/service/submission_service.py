@@ -65,10 +65,21 @@ class SubmissionService:
             "max_output_tokens": self.settings.llm.max_output_tokens,
         }
 
+    @staticmethod
+    def _fallback_permission(snapshot: dict[str, Any]) -> bool:
+        old = {"ocr", "temperature", "max_output_tokens"}
+        if set(snapshot) not in (old, old | {"allow_ocr_fallback"}):
+            raise ValueError("execution_snapshot_invalid")
+        permission = snapshot.get("allow_ocr_fallback", False)
+        if type(permission) is not bool:
+            raise ValueError("execution_snapshot_invalid")
+        return permission
+
     async def ready_for(self, image: ImageRow) -> bool:
         """Readiness precedes claim, and therefore never spends the attempt budget."""
         snapshot = image.effective_options or self.legacy_snapshot()
         try:
+            permission = self._fallback_permission(snapshot)
             ocr = OcrSettings.model_validate(snapshot["ocr"])
         except (ValueError, KeyError):
             # Claim malformed saved options to record a terminal safe diagnostic.
@@ -80,7 +91,9 @@ class SubmissionService:
             selected = image.model_id or self.settings.llm.model_name
             if ocr.enabled:
                 capabilities = await self.receipts.ocr_capabilities(ocr)
-                if not capabilities.ready and (ocr.required or not ocr.allow_vision_fallback):
+                if not capabilities.ready and (
+                    ocr.required or not ocr.allow_vision_fallback or not permission
+                ):
                     return False
                 if capabilities.ready:
                     capability = "text"
@@ -188,11 +201,12 @@ class SubmissionService:
                 raise StaleClaimError
             image = saved
         snapshot = image.effective_options
-        if set(snapshot) != {"ocr", "temperature", "max_output_tokens"} or not image.model_id:
+        permission = self._fallback_permission(snapshot)
+        if not image.model_id:
             raise ValueError("execution_snapshot_invalid")
         ocr = OcrSettings.model_validate(snapshot["ocr"])
         options = ExperimentOptions(
-            temperature=snapshot["temperature"], allow_ocr_fallback=ocr.allow_vision_fallback
+            temperature=snapshot["temperature"], allow_ocr_fallback=permission
         )
         limit = snapshot["max_output_tokens"]
         if type(limit) is not int or limit <= 0:
@@ -269,7 +283,19 @@ class SubmissionService:
         # Check originals again before accepting any receipt; preserve bytes and paths.
         if await run_sync_before(deadline, self._bindings, image) != bindings:
             raise SourceIntegrityError
-        return self._outcome(envelope, manifests, [OriginalAvailability(part_id=p.part_id, photo_index=p.photo_index, available=True, sha256_matches=True) for p in parts])
+        return self._outcome(
+            envelope,
+            manifests,
+            [
+                OriginalAvailability(
+                    part_id=p.part_id,
+                    photo_index=p.photo_index,
+                    available=True,
+                    sha256_matches=True,
+                )
+                for p in parts
+            ],
+        )
 
     async def _save_view(
         self,
@@ -440,7 +466,10 @@ class SubmissionService:
                     except OSError:
                         result.append(
                             OriginalAvailability(
-                                part_id=part.part_id, photo_index=part.photo_index, available=False, sha256_matches=False
+                                part_id=part.part_id,
+                                photo_index=part.photo_index,
+                                available=False,
+                                sha256_matches=False,
                             )
                         )
                 return result

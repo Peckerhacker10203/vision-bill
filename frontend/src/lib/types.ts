@@ -137,9 +137,11 @@ export interface SubmissionStatus {
 	processing_at: string | null;
 }
 
-export type ImageRow = SubmissionStatus;
+/** List rows omit artifact detail; terminal state is determined from status. */
+export type ImageRow = Omit<SubmissionStatus, 'terminal' | 'source_views' | 'latest_extraction_id'>;
 
 export interface UploadOptions {
+	allow_ocr_fallback?: boolean;
 	model_id?: string;
 	bypass_review?: boolean;
 }

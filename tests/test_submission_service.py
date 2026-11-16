@@ -257,3 +257,37 @@ async def test_checkpoint_transport_failure_does_not_clear_cache_or_run_ocr(sett
     receipts.extract_receipt.assert_not_awaited()
     outcome = db.finish_attempt.call_args.args[1]
     assert outcome.kind == "retry" and outcome.result_code == "analysis_unavailable"
+
+
+@pytest.mark.parametrize("permission", [None, False, True, "true"])
+async def test_saved_fallback_permission_used_in_readiness_and_execution(
+    settings, tmp_path, permission
+):
+    from vision_bill.model.ocr import OcrCapabilities
+    from vision_bill.provider.llm.base import ModelInfo
+
+    service, receipts, db, claim, _ = context(settings, tmp_path)
+    claim.image.effective_options["ocr"] = OcrSettings(
+        enabled=True, allow_vision_fallback=True
+    ).model_dump(mode="json")
+    if permission is not None:
+        claim.image.effective_options["allow_ocr_fallback"] = permission
+    snapshot = dict(claim.image.effective_options)
+    receipts.check_connection = AsyncMock(return_value=True)
+    receipts.ocr_capabilities = AsyncMock(
+        return_value=OcrCapabilities(enabled=True, configured=True, reachable=True, ready=False)
+    )
+    receipts.get_available_models = AsyncMock(return_value=[ModelInfo("saved-model")])
+    assert await service.ready_for(claim.image) is (
+        permission is True or isinstance(permission, str)
+    )
+    receipts.extract_receipt.side_effect = TimeoutError()
+    await service.process_claim(claim)
+    if isinstance(permission, str):
+        receipts.extract_receipt.assert_not_awaited()
+        assert db.finish_attempt.call_args.args[1].result_code == "analysis_contract_failed"
+    else:
+        assert receipts.extract_receipt.call_args.kwargs["options"].allow_ocr_fallback is (
+            permission is True
+        )
+    assert claim.image.effective_options == snapshot

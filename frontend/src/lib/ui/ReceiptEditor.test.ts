@@ -407,3 +407,34 @@ it.each([1, 2])(
 		});
 	}
 );
+
+it('normalizes a read DTO time with seconds to the minute write contract', async () => {
+	const onSave = vi.fn();
+	render(ReceiptEditor, {
+		receipt: { ...receipt, time: '14:30:00' },
+		lineItems: [line()],
+		taxes: [],
+		onSave
+	});
+	await fireEvent.input(screen.getByLabelText('Merchant'), {
+		target: { value: 'Time round trip' }
+	});
+	await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+	expect(onSave).toHaveBeenCalledOnce();
+	expect(onSave.mock.calls[0][0].time).toBe('14:30');
+});
+
+it('preserves legacy nonzero seconds for explicit validation rather than truncating them', async () => {
+	const onSave = vi.fn();
+	render(ReceiptEditor, {
+		receipt: { ...receipt, time: '14:30:15' },
+		lineItems: [line()],
+		taxes: [],
+		onSave
+	});
+	await fireEvent.input(screen.getByLabelText('Merchant'), {
+		target: { value: 'Preserve seconds' }
+	});
+	await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+	expect(onSave.mock.calls[0][0].time).toBe('14:30:15');
+});

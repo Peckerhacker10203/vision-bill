@@ -109,7 +109,7 @@
 			merchant_address: receipt.merchant_address ?? '',
 			receipt_number: receipt.receipt_number ?? '',
 			date: receipt.date,
-			time: receipt.time ?? '',
+			time: receipt.time?.replace(/^(\d{2}:\d{2}):00(?:\.0+)?$/, '$1') ?? '',
 			currency: receipt.currency || 'USD',
 			category: receipt.category,
 			payment_method: receipt.payment_method,

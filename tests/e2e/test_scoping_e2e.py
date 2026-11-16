@@ -3,7 +3,11 @@
 import pytest
 
 from e2e.discovery import first_case
-from e2e.helpers import API, register_user, wait_until
+from e2e.helpers import (
+    API,
+    register_user,
+    wait_until,
+)
 
 pytestmark = pytest.mark.e2e
 
@@ -15,11 +19,10 @@ def _receipt_id_for(client) -> str:
         response = client.post(
             f"{API}/images", files={"receipt": (case.image_path.name, fh, "image/png")}
         )
-    assert response.status_code in (201, 202)
-    image_id = response.json()["image_id"]
+    assert response.status_code == 202
+    image_id = response.json()["id"]
 
     def check():
-        client.post(f"{API}/images/analyze")
         row = client.get(f"{API}/images/{image_id}").json()
         return row["receipt_id"] if row["status"] == "analyzed" else None
 

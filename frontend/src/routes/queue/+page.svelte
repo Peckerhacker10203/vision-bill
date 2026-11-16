@@ -162,14 +162,14 @@
 								values: { count: image.attempt_count, max: image.max_attempts }
 							})}
 						</p>
-						{#if !image.terminal && image.retry_at}
+						{#if (image.status === 'pending' || image.status === 'processing') && image.retry_at}
 							<p class="mt-1 text-xs text-on-surface-variant">
 								{$t('submission.retryAt', {
 									values: { time: new Date(image.retry_at).toLocaleString() }
 								})}
 							</p>
 						{/if}
-						{#if !image.terminal && image.wait_reason}<p
+						{#if (image.status === 'pending' || image.status === 'processing') && image.wait_reason}<p
 								class="mt-1 text-xs text-on-surface-variant"
 							>
 								{$t('submission.waitReason')}: {image.wait_reason}

@@ -3,7 +3,12 @@
 import pytest
 
 from e2e.discovery import first_case
-from e2e.helpers import API, register_user, wait_until
+from e2e.helpers import (
+    API,
+    receipt_write,
+    register_user,
+    wait_until,
+)
 
 pytestmark = pytest.mark.e2e
 
@@ -15,11 +20,10 @@ def _make_receipt(client) -> str:
         response = client.post(
             f"{API}/images", files={"receipt": (case.image_path.name, fh, "image/png")}
         )
-    assert response.status_code in (201, 202)
-    image_id = response.json()["image_id"]
+    assert response.status_code == 202
+    image_id = response.json()["id"]
 
     def check():
-        client.post(f"{API}/images/analyze")
         row = client.get(f"{API}/images/{image_id}").json()
         return row["receipt_id"] if row["status"] == "analyzed" else None
 
@@ -36,36 +40,7 @@ def test_receipt_crud(http_factory) -> None:
 
     # PUT update (change merchant_name, keep required fields valid)
     current = detail.json()
-    update = {
-        "confidence": current["receipt"]["confidence"],
-        "merchant_name": "Renamed Merchant",
-        "merchant_address": current["receipt"]["merchant_address"],
-        "receipt_number": current["receipt"]["receipt_number"],
-        "date": current["receipt"]["date"],
-        "time": current["receipt"]["time"],
-        "currency": current["receipt"]["currency"],
-        "category": current["receipt"]["category"],
-        "line_items": [
-            {
-                "description": i["description"],
-                "quantity": i["quantity"],
-                "unit_price": i["unit_price"],
-                "total_price": i["total_price"],
-                "tags": i.get("tags", []),
-            }
-            for i in current["line_items"]
-        ],
-        "taxes": [
-            {"name": t["name"], "rate": t.get("rate"), "amount": t["amount"]}
-            for t in current["taxes"]
-        ],
-        "subtotal": current["receipt"]["subtotal"],
-        "discount_total": current["receipt"]["discount_total"],
-        "tax_total": current["receipt"]["tax_total"],
-        "tip": current["receipt"]["tip"],
-        "total": current["receipt"]["total"],
-        "payment_method": current["receipt"]["payment_method"],
-    }
+    update = receipt_write(current, merchant_name="Renamed Merchant")
     put = client.put(f"{API}/receipts/{receipt_id}", json=update)
     assert put.status_code == 200
     assert put.json()["merchant_name"] == "Renamed Merchant"

@@ -164,11 +164,17 @@ test.describe('receipt editor', () => {
 		test.setTimeout(120_000);
 		await uploadFixture(page, context, await loadFixture('a'), { verify: false });
 		// Explicit server amount policy determines reconciliation after save.
-		await page.getByLabel('Tax basis', { exact: true }).selectOption('net');
-		await page.getByLabel('Discount treatment', { exact: true }).selectOption('included_in_lines');
-		await page.getByLabel('Tip treatment', { exact: true }).selectOption('none');
-		await page.getByLabel('Subtotal origin', { exact: true }).selectOption('printed');
-		await page.getByLabel('Tax information', { exact: true }).selectOption('present');
+		await page.getByRole('combobox', { name: 'Tax basis', exact: true }).selectOption('net');
+		await page
+			.getByRole('combobox', { name: 'Discount treatment', exact: true })
+			.selectOption('included_in_lines');
+		await page.getByRole('combobox', { name: 'Tip treatment', exact: true }).selectOption('none');
+		await page
+			.getByRole('combobox', { name: 'Subtotal origin', exact: true })
+			.selectOption('printed');
+		await page
+			.getByRole('combobox', { name: 'Tax information', exact: true })
+			.selectOption('present');
 		await page.locator('#re-total').fill('9.00');
 		await expect(page.getByText(/Does not match the entered total by/)).toHaveCount(0);
 		await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();

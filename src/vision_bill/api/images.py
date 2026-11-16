@@ -41,6 +41,7 @@ async def upload_image(
     receipt: list[UploadFile] = File(...),  # noqa: B008
     model_id: str | None = None,
     bypass_review: bool | None = Query(None),
+    allow_ocr_fallback: bool | None = Query(None),
     idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
     receipt_service: ReceiptService = Depends(get_receipt_service),  # noqa: B008
     image_service: ImageService = Depends(get_image_service),  # noqa: B008
@@ -81,6 +82,8 @@ async def upload_image(
         requested["model_id"] = model_id
     if bypass_review is not None:
         requested["bypass_review"] = bypass_review
+    if allow_ocr_fallback is not None:
+        requested["allow_ocr_fallback"] = allow_ocr_fallback
     manifest = [
         {"photo_index": index, "source_sha256": part.source_sha256}
         for index, part in enumerate(parts)
@@ -100,6 +103,7 @@ async def upload_image(
         requested_options=requested,
         request_fingerprint=fingerprint,
         effective_options={
+            "allow_ocr_fallback": allow_ocr_fallback is True,
             "ocr": settings.ocr.model_dump(mode="json"),
             "temperature": settings.llm.temperature,
             "max_output_tokens": settings.llm.max_output_tokens,

@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { qualifyGold } from '../helpers/api';
 import { loginAdmin } from '../helpers/auth';
 import { loadFixture } from '../helpers/fixtures';
 import { stubGuard } from '../helpers/stub';
@@ -14,11 +15,19 @@ test.describe('admin: benchmarks', () => {
 
 		await page.goto('/benchmarks');
 		await expect(page.getByRole('checkbox', { name: 'e2e-vision' })).toBeChecked();
+		const textOnlyModel = page.getByRole('checkbox', { name: 'e2e-text', exact: true });
+		if (await textOnlyModel.count()) await textOnlyModel.uncheck();
 		await page.getByPlaceholder('Comma-separated receipt UUIDs').fill(receiptId);
+		await page.getByRole('button', { name: 'Preview human references' }).click();
+		await page.locator('summary').filter({ hasText: receiptId }).click();
+		await expect(page.locator('pre')).toContainText('Aldi Test');
+		await page
+			.getByRole('checkbox', {
+				name: 'I checked these current receipts and originals and explicitly qualify them as benchmark references.'
+			})
+			.check();
 		await page.getByRole('button', { name: 'Create benchmark' }).first().click();
-		// The confirmation dialog is rendered inline (not role="dialog"),
-		// so click the second "Create benchmark" button directly.
-		await page.getByRole('button', { name: 'Create benchmark' }).nth(1).click();
+		await page.getByRole('button', { name: 'Confirm and start', exact: true }).click();
 		await expect(page).toHaveURL(/\/benchmarks\/results$/);
 
 		// The run is picked up by the benchmark worker and finishes fast
@@ -41,6 +50,7 @@ test.describe('admin: benchmarks', () => {
 		await loginAdmin(context);
 		const receiptId = await uploadFixture(page, context, await loadFixture('b'));
 
+		await qualifyGold(context, receiptId);
 		const run = await context.request.post('/api/v1/benchmarks', {
 			data: { model_ids: ['e2e-vision'], receipt_ids: [receiptId] }
 		});

@@ -239,3 +239,30 @@ async def test_explicit_model_presence_is_identity_and_contents_are_not_logged(
         assert blank.status_code == 422
     assert len(queue.creates) == 1
     assert marker.decode() not in caplog.text
+
+
+@pytest.mark.parametrize("permission", [None, False, True])
+async def test_fallback_permission_is_separate_frozen_intent(upload_context, settings, permission):
+    app, queue, *_ = upload_context
+    settings.ocr.enabled = True
+    settings.ocr.allow_vision_fallback = True
+    query = "" if permission is None else "?allow_ocr_fallback=" + str(permission).lower()
+    async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/images" + query, files=photos(), headers={"Idempotency-Key": "fallback"}
+        )
+        assert response.status_code == 202
+        saved = queue.creates[0]
+        assert saved.effective_options["allow_ocr_fallback"] is (permission is True)
+        assert ("allow_ocr_fallback" in saved.requested_options) is (permission is not None)
+        settings.ocr.allow_vision_fallback = False
+        replay = await client.post(
+            "/api/v1/images" + query, files=photos(), headers={"Idempotency-Key": "fallback"}
+        )
+        assert replay.json()["id"] == response.json()["id"]
+        changed = "?allow_ocr_fallback=" + str(permission is not True).lower()
+        conflict = await client.post(
+            "/api/v1/images" + changed, files=photos(), headers={"Idempotency-Key": "fallback"}
+        )
+        assert conflict.status_code == 409
+        assert saved.effective_options["ocr"]["allow_vision_fallback"] is True

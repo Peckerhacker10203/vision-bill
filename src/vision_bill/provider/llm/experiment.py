@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from ...model.extraction import ReceiptInput
+from ...model.ocr import SourceRef
 from ...model.receipt import Receipt
 from ...model.receipt_extraction import MultiImageReceipt
 
@@ -86,7 +87,9 @@ def endpoint_fingerprint(provider: Any) -> str | None:
     return hashlib.sha256(str(url).encode()).hexdigest() if url is not None else None
 
 
-def source_extraction_prompt(input: ReceiptInput) -> str:
+def source_extraction_prompt(
+    input: ReceiptInput, *, source_refs: Sequence[SourceRef] | None = None
+) -> str:
     """Classification-free observations with explicit photo/source boundaries, never PNG data."""
     from ...model.extraction import ExtractionDraft
 
@@ -119,7 +122,12 @@ def source_extraction_prompt(input: ReceiptInput) -> str:
         "Optional field_sources map field paths to supplied SourceRef objects; use only supplied "
         "identities and block coordinates in the indicated coordinate_space. "
         "Source refs: "
-        + json.dumps([ref.model_dump(mode="json") for ref in input.source_refs])
+        + json.dumps(
+            [
+                ref.model_dump(mode="json")
+                for ref in (input.source_refs if source_refs is None else source_refs)
+            ]
+        )
         + "\nNullable schema: "
         + json.dumps(schema)
         + "\nObservations:\n"

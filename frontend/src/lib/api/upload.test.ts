@@ -62,3 +62,28 @@ it('hashes actual bytes and generates keys on local HTTP without subtle or rando
 	expect(one.identity).toMatch(/^[0-9a-f]{64}$/);
 	expect((await prepareUpload('a', files(), {})).key).toBe(one.key);
 });
+it('binds fallback consent presence and keeps every untouched recovery option', async () => {
+	const input = files();
+	const absent = await prepareUpload('owner', input, {});
+	const denied = await prepareUpload('owner', input, { allow_ocr_fallback: false });
+	expect(denied.key).not.toBe(absent.key);
+	const allowed = await prepareUpload('owner', input, {
+		model_id: 'chosen',
+		allow_ocr_fallback: true
+	});
+	expect(allowed.key).not.toBe(denied.key);
+	expect(readPendingUpload('owner')).toEqual(allowed);
+	expect(await prepareUpload('owner', input)).toEqual(allowed);
+	const edited = await prepareUpload('owner', input, { ...allowed.options, bypass_review: true });
+	expect(edited.options).toEqual({
+		model_id: 'chosen',
+		allow_ocr_fallback: true,
+		bypass_review: true
+	});
+	vi.stubGlobal(
+		'fetch',
+		vi.fn().mockResolvedValue({ ok: true, json: async () => ({ id: 'job' }) })
+	);
+	await api.uploadImages(input, edited.options, edited.key);
+	expect(String(vi.mocked(fetch).mock.calls[0][0])).toContain('allow_ocr_fallback=true');
+});

@@ -26,7 +26,8 @@
 		"retry": "Retry analysis",
 		"openDraft": "Open receipt draft",
 		"recovery": "An earlier upload has an unknown outcome. Check Queue first. To recover it, select the same photos in the same order and click Upload. Its original options and request key will be reused. No upload is sent automatically.",
-		"ownerChanged": "Your account changed. Select the photos again before uploading."
+		"ownerChanged": "Your account changed. Select the photos again before uploading.",
+		"allowFallback": "Allow vision analysis if OCR fails"
 	},
 	"app": {
 		"name": "Vision Bill"

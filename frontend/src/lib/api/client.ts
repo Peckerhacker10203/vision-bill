@@ -137,6 +137,10 @@ export const api = {
 			`/images${toQueryString(
 				{
 					model_id: options.model_id,
+					allow_ocr_fallback:
+						options.allow_ocr_fallback === undefined
+							? undefined
+							: String(options.allow_ocr_fallback),
 					bypass_review:
 						options.bypass_review === undefined ? undefined : String(options.bypass_review)
 				},
@@ -231,8 +235,8 @@ export const api = {
 		);
 	},
 
-	getImage(id: string): Promise<ImageRow> {
-		return request<ImageRow>(`/images/${id}`);
+	getImage(id: string): Promise<SubmissionStatus> {
+		return request<SubmissionStatus>(`/images/${id}`);
 	},
 
 	deleteImage(id: string): Promise<void> {

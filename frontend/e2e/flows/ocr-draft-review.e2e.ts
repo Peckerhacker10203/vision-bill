@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test';
 import { loadFixture } from '../helpers/fixtures';
-import { stubGuard } from '../helpers/stub';
+import { stubGuard, setStubScenario } from '../helpers/stub';
 import { ensureSession, confirmDialog } from '../helpers/ui';
 import { awaitSubmission, uploadViaApi } from '../helpers/api';
 import type { ReceiptWithDetails } from '../../src/lib/types';
@@ -15,6 +15,7 @@ test.describe('draft review and versioned receipt editing', () => {
 	}) => {
 		test.setTimeout(120_000);
 		await ensureSession(context);
+		await setStubScenario('partial');
 		const fixture = await loadFixture('a');
 		const uploaded = await uploadViaApi(context, fixture.name, fixture.bytes, fixture.mimeType);
 		expect(uploaded.status).toBe(202);
@@ -45,8 +46,10 @@ test.describe('draft review and versioned receipt editing', () => {
 		await page.getByRole('button', { name: 'Finalize draft' }).click();
 		await expect(page.getByRole('alert')).toContainText('discount_total');
 		await page.getByLabel('Discount', { exact: true }).fill('0');
-		for (const button of await page.getByRole('button', { name: 'Add tags', exact: true }).all())
-			await button.click();
+		const addTags = page.getByRole('button', { name: 'Add tags', exact: true });
+		const missingTags = await addTags.count();
+		for (let i = 0; i < missingTags; i++) await addTags.first().click();
+		await expect(addTags).toHaveCount(0);
 		await page.getByRole('button', { name: 'Save draft' }).click();
 		await expect(page.getByRole('button', { name: 'Save draft' })).toBeDisabled();
 		const finalize = page.waitForResponse(
@@ -65,12 +68,13 @@ test.describe('draft review and versioned receipt editing', () => {
 		const finalized = await context.request.get(`/api/v1/images/${id}/draft`);
 		expect((await finalized.json()).finalized_receipt_id).toBe(receiptId);
 	});
-	test('two stale concurrent PUTs cannot overwrite, and a material edit revokes verification', async ({
+	test('two stale concurrent PUTs cannot overwrite, and a financial mismatch revokes verification', async ({
 		page,
 		context
 	}) => {
 		test.setTimeout(120_000);
 		await ensureSession(context);
+		await setStubScenario('partial');
 		const fixture = await loadFixture('a');
 		const uploaded = await uploadViaApi(context, fixture.name, fixture.bytes, fixture.mimeType);
 		const id = uploaded.body.id as string;
@@ -119,11 +123,13 @@ test.describe('draft review and versioned receipt editing', () => {
 		).json()) as ReceiptWithDetails;
 		const write = {
 			...verified.receipt,
+			time: verified.receipt.time?.slice(0, 5) ?? null,
 			line_items: verified.line_items,
 			taxes: verified.taxes,
 			collection_ids: verified.collection_ids,
 			expected_operation_revision: verified.receipt.operation_revision,
-			merchant_name: 'Concurrent edit'
+			merchant_name: 'Concurrent edit',
+			total: '999.00'
 		};
 		const results = await Promise.all([
 			context.request.put(`/api/v1/receipts/${receiptId}`, { data: write }),
@@ -133,6 +139,10 @@ test.describe('draft review and versioned receipt editing', () => {
 		const current = (await (
 			await context.request.get(`/api/v1/receipts/${receiptId}`)
 		).json()) as ReceiptWithDetails;
+		expect(current.receipt.total).toBe('999.00');
+		expect(
+			current.receipt.findings.filter((f) => f.severity === 'review').map((f) => f.code)
+		).toEqual(['amount_discrepancy']);
 		expect(current.receipt.verified).toBe(false);
 		expect(current.line_items.map((line) => line.id)).toEqual(
 			verified.line_items.map((line) => line.id)

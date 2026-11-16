@@ -67,7 +67,8 @@ async def test_partial_null_draft_retains_actual_model_finish_and_bounded_attemp
     assert output.telemetry.calls[-1]["actual_model"] == "actual"
     assert output.telemetry.finish_reason == "length"
     assert output.telemetry.output_tokens is None
-    assert len(output.telemetry.calls) == 3
+    assert len(output.telemetry.calls) == 1
+    assert output.findings == []
     assert "Private Shop" not in caplog.text
     call = (
         provider._client.chat.call_args
@@ -149,6 +150,7 @@ async def test_source_aware_overlap_keeps_original_draft_and_verified_decisions(
         source_refs=[*inp.source_refs, ref],
     )
     payload = extraction([item(), item(), item(source=1), item("Bread", source=1)], [(1, 2)])
+    payload.update(currency="EUR", discount_total="0", tax_total="0")
     payload["overlap_decisions"] = [{"reason": "printed suffix and prefix"}]
     provider = OllamaProvider("http://local").for_experiment(
         ExperimentOptions(include_classification=False)
@@ -560,39 +562,244 @@ async def test_ocr_repeated_text_span_cannot_point_to_another_block():
 
 async def test_final_rows_project_distinct_blocks_after_accepted_boundary_overlap():
     from test_multi_image_extraction import extraction, item
+
     from vision_bill.model.experiment import ExperimentOptions
     from vision_bill.model.ocr import OcrBlock
 
     pages = [OcrResponse.model_validate(wire_page(i, str(i + 1) * 64)) for i in range(2)]
-    refs = [SourceRef(part_id=uuid4(), photo_index=i, source_sha256=page.source_sha256,
-                      view_id=page.working_image.view_id, coordinate_space='working')
-            for i, page in enumerate(pages)]
+    refs = [
+        SourceRef(
+            part_id=uuid4(),
+            photo_index=i,
+            source_sha256=page.source_sha256,
+            view_id=page.working_image.view_id,
+            coordinate_space="working",
+        )
+        for i, page in enumerate(pages)
+    ]
     sources = {}
-    for i, names in enumerate((('A', 'B'), ('B', 'C'))):
+    for i, names in enumerate((("A", "B"), ("B", "C"))):
         for j, name in enumerate(names):
-            block = OcrBlock(id=f'{i}-{j}', label='text', text=name,
-                             bbox=[[j, 0], [j + 1, 0], [j + 1, 1]])
+            block = OcrBlock(
+                id=f"{i}-{j}", label="text", text=name, bbox=[[j, 0], [j + 1, 0], [j + 1, 1]]
+            )
             pages[i].blocks.append(block)
-            source = refs[i].model_copy(update={'block_id': block.id, 'bbox': block.bbox})
-            sources[f'line_items.{i * 2 + j}.description'] = [source.model_dump(mode='json')]
-    inp = ReceiptInput(mode='ocr', image_paths=['a', 'b'], ocr_pages=pages, source_refs=refs)
-    payload = extraction([item('A'), item('B'), item('B', source=1), item('C', source=1)], [(1, 2)])
-    payload['field_sources'] = sources
-    provider = OllamaProvider('http://local').for_experiment(ExperimentOptions(include_classification=False))
+            source = refs[i].model_copy(update={"block_id": block.id, "bbox": block.bbox})
+            sources[f"line_items.{i * 2 + j}.description"] = [source.model_dump(mode="json")]
+    inp = ReceiptInput(mode="ocr", image_paths=["a", "b"], ocr_pages=pages, source_refs=refs)
+    payload = extraction([item("A"), item("B"), item("B", source=1), item("C", source=1)], [(1, 2)])
+    payload.update(currency="EUR", discount_total="0", tax_total="0")
+    payload["field_sources"] = sources
+    provider = OllamaProvider("http://local").for_experiment(
+        ExperimentOptions(include_classification=False)
+    )
     provider.send_message = AsyncMock(return_value=json.dumps(payload))
-    result = await provider.extract_receipt_input('requested', inp, tags=[], deadline=time.monotonic() + 2)
-    assert [row.description for row in result.receipt.line_items] == ['A', 'B', 'C']
-    assert [result.field_sources[f'line_items.{i}.description'][0].block_id for i in range(3)] == ['0-0', '0-1', '1-1']
-    assert 'line_items.3.description' not in result.field_sources
-    assert [row.description for row in result.draft.line_items] == ['A', 'B', 'B', 'C']
-    assert result.raw_field_sources['line_items.2.description'][0].block_id == '1-0'
-    assert result.source_projection_version == '2'
-    assert result.overlap_decisions[-1]['removed_index'] == 2
+    result = await provider.extract_receipt_input(
+        "requested", inp, tags=[], deadline=time.monotonic() + 2
+    )
+    assert [row.description for row in result.receipt.line_items] == ["A", "B", "C"]
+    assert [result.field_sources[f"line_items.{i}.description"][0].block_id for i in range(3)] == [
+        "0-0",
+        "0-1",
+        "1-1",
+    ]
+    assert "line_items.3.description" not in result.field_sources
+    assert [row.description for row in result.draft.line_items] == ["A", "B", "B", "C"]
+    assert result.raw_field_sources["line_items.2.description"][0].block_id == "1-0"
+    assert result.source_projection_version == "2"
+    assert result.overlap_decisions[-1]["removed_index"] == 2
 
 
 def test_historical_envelope_without_projection_identity_remains_legacy():
     from vision_bill.model.extraction import InferenceEnvelope
-    envelope=InferenceEnvelope.model_validate({'provenance':{'requested_pipeline':'ocr','used_pipeline':'ocr',
-        'source_image_count':1,'ordered_source_sha256':['a'*64],'model_id':'old'},
-        'telemetry':{'elapsed_ms':1,'max_output_tokens':8192}})
-    assert envelope.source_projection_version=='1'
+
+    envelope = InferenceEnvelope.model_validate(
+        {
+            "provenance": {
+                "requested_pipeline": "ocr",
+                "used_pipeline": "ocr",
+                "source_image_count": 1,
+                "ordered_source_sha256": ["a" * 64],
+                "model_id": "old",
+            },
+            "telemetry": {"elapsed_ms": 1, "max_output_tokens": 8192},
+        }
+    )
+    assert envelope.source_projection_version == "1"
+
+
+def test_direct_view_identity_is_fresh_per_preparation_without_changing_pixels(tmp_path):
+    from hashlib import sha256
+
+    from PIL import Image
+
+    from vision_bill.provider.llm.openai import OpenAIProvider
+
+    path = tmp_path / "same.png"
+    Image.new("RGB", (8, 8), "white").save(path)
+    digest = sha256(path.read_bytes()).hexdigest()
+    provider = OpenAIProvider("http://unused/v1", "test")
+    first_ref = SourceRef(
+        part_id=uuid4(), photo_index=0, source_sha256=digest, coordinate_space="original"
+    )
+    second_ref = first_ref.model_copy(update={"part_id": uuid4()})
+
+    def prepare(ref):
+        return provider._prepare_receipt_input(
+            ReceiptInput(mode="direct_vision", image_paths=[str(path)], source_refs=[ref])
+        )[2][0]
+
+    first, second = prepare(first_ref), prepare(second_ref)
+    assert first.working_image.sha256 == second.working_image.sha256
+    assert first.working_image.view_id != second.working_image.view_id
+    assert prepare(first_ref).working_image.view_id != first.working_image.view_id
+
+
+@pytest.mark.parametrize("missing", ["null", "omitted"])
+@pytest.mark.parametrize("count", [1, 2])
+async def test_nullable_observations_stop_without_invalid_repair_or_financial_defaults(
+    missing, count
+):
+    from vision_bill.model.experiment import ExperimentOptions
+
+    provider = OllamaProvider("http://local").for_experiment(
+        ExperimentOptions(include_classification=False)
+    )
+    payload = {
+        "confidence": 95,
+        "merchant_name": "Observed",
+        "date": "2026-01-01",
+        "line_items": [
+            {
+                "description": "A",
+                "quantity": 1,
+                "unit_price": "1",
+                "total_price": "1",
+                "source_image": 0,
+            }
+        ],
+        "subtotal": "1",
+        "total": "1",
+        "payment_method": "cash",
+    }
+    if missing == "null":
+        payload.update(currency=None, discount_total=None, tax_total=None)
+    if count == 2:
+        payload["duplicate_candidates"] = []
+    provider.send_message = AsyncMock(return_value=json.dumps(payload))
+    input = ocr_input()
+    if count == 2:
+        second = input.ocr_pages[0].model_copy(deep=True)
+        second.photo_index = 1
+        input.ocr_pages.append(second)
+        input.image_paths.append("second.gif")
+    result = await provider.extract_receipt_input(
+        "m", input, tags=[], deadline=time.monotonic() + 2
+    )
+    assert result.receipt is None
+    assert (
+        result.draft.currency is None
+        and result.draft.discount_total is None
+        and result.draft.tax_total is None
+    )
+    assert result.findings == []
+    assert len(result.telemetry.calls) == 1
+    assert provider.send_message.await_count == 1
+
+
+async def test_incomplete_observations_do_not_bypass_invalid_overlap_structure():
+    from test_multi_image_extraction import extraction, item
+
+    from vision_bill.model.experiment import ExperimentOptions
+
+    provider = OllamaProvider("http://local").for_experiment(
+        ExperimentOptions(include_classification=False)
+    )
+    payload = extraction([item("A"), item("B"), item("B", source=1), item("C", source=1)], [(0, 3)])
+    payload.update(currency=None, discount_total=None, tax_total=None)
+    provider.send_message = AsyncMock(return_value=json.dumps(payload))
+    inp = ocr_input()
+    page = inp.ocr_pages[0].model_copy(deep=True)
+    page.photo_index = 1
+    inp.ocr_pages.append(page)
+    inp.image_paths.append("second")
+    result = await provider.extract_receipt_input("m", inp, tags=[], deadline=time.monotonic() + 2)
+    assert result.receipt is None and result.draft is None
+    assert [f.code for f in result.findings] == ["formatter_invalid_response"]
+    assert len(result.telemetry.calls) == 3
+
+
+def test_real_original_bindings_supply_exact_working_refs_to_ocr_formatter():
+    provider = OllamaProvider("http://local")
+    inp = ocr_input()
+    original = inp.source_refs[0].model_copy(
+        update={"coordinate_space": "original", "view_id": None}
+    )
+    inp.source_refs = [original]
+    prepared, messages, views = provider._prepare_receipt_input(inp)
+    working = [
+        ref
+        for ref in provider._authorized_source_refs(prepared)
+        if ref.coordinate_space == "working"
+    ]
+    assert len(working) == 1
+    assert working[0].part_id == original.part_id
+    assert working[0].source_sha256 == original.source_sha256
+    assert working[0].view_id == inp.ocr_pages[0].working_image.view_id
+    assert prepared.source_refs == [original]
+    assert inp.source_refs == [original] and views == []
+    assert str(working[0].view_id) in messages[0]["content"]
+    wrong = original.model_copy(update={"source_sha256": "f" * 64})
+    inp.source_refs = [wrong]
+    with pytest.raises(ValueError, match="ocr_source_reference_mismatch"):
+        provider._prepare_receipt_input(inp)
+
+
+@pytest.mark.parametrize(
+    "changed", [None, "part_id", "photo_index", "source_sha256", "view_id", "bbox"]
+)
+async def test_original_to_working_binding_accepts_only_exact_saved_page_geometry(changed):
+    from test_experiment_scoring import receipt
+
+    from vision_bill.model.experiment import ExperimentOptions
+
+    provider = OllamaProvider("http://local").for_experiment(
+        ExperimentOptions(include_classification=False)
+    )
+    inp = ocr_input()
+    original = inp.source_refs[0].model_copy(
+        update={"coordinate_space": "original", "view_id": None}
+    )
+    inp.source_refs = [original]
+    from vision_bill.model.ocr import OcrBlock
+
+    block = OcrBlock(id="merchant", label="text", text="Shop", bbox=[[0, 0], [2, 0], [2, 2]])
+    inp.ocr_pages[0].blocks = [block]
+    ref = original.model_copy(
+        update={
+            "coordinate_space": "working",
+            "view_id": inp.ocr_pages[0].working_image.view_id,
+            "block_id": block.id,
+            "bbox": block.bbox,
+        }
+    ).model_dump(mode="json")
+    if changed:
+        ref[changed] = {
+            "part_id": str(uuid4()),
+            "photo_index": 1,
+            "source_sha256": "e" * 64,
+            "view_id": str(uuid4()),
+            "bbox": [[0, 0], [1, 0], [1, 1]],
+        }[changed]
+    payload = receipt().model_dump(mode="json")
+    payload["field_sources"] = {"merchant_name": [ref]}
+    provider.send_message = AsyncMock(return_value=json.dumps(payload))
+    result = await provider.extract_receipt_input("m", inp, tags=[], deadline=time.monotonic() + 2)
+    if changed:
+        assert result.receipt is None and result.draft is None
+        assert len(result.telemetry.calls) == 3
+    else:
+        assert result.receipt is not None
+        assert result.field_sources["merchant_name"][0].model_dump(mode="json") == ref
+        assert result.field_sources["input"] == [original]
+        assert result.provenance.ordered_source_sha256 == [original.source_sha256]

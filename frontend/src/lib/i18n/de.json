@@ -26,7 +26,8 @@
 		"retry": "Analyse wiederholen",
 		"openDraft": "Belegentwurf öffnen",
 		"recovery": "Der Ausgang eines vorherigen Uploads ist unbekannt. Prüfe zuerst die Warteschlange. Wähle zur Wiederherstellung dieselben Fotos in derselben Reihenfolge und klicke auf Hochladen. Die ursprünglichen Optionen und die Anfragekennung werden wiederverwendet. Es wird kein Upload automatisch gesendet.",
-		"ownerChanged": "Dein Konto hat sich geändert. Wähle die Fotos vor dem Hochladen erneut aus."
+		"ownerChanged": "Dein Konto hat sich geändert. Wähle die Fotos vor dem Hochladen erneut aus.",
+		"allowFallback": "Bildanalyse erlauben, wenn OCR fehlschlägt"
 	},
 	"app": {
 		"name": "Vision Bill"

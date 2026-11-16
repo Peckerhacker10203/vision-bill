@@ -3,13 +3,19 @@
 import httpx
 import pytest
 
-from e2e.helpers import API, STUB_BASE, register_user, wait_until
+from e2e.helpers import (
+    API,
+    STUB_BASE,
+    register_user,
+    wait_until,
+)
 
 pytestmark = pytest.mark.e2e
 
 
 @pytest.mark.parametrize("bypass", [False, True])
 def test_multi_photo_immediate_processing_review_and_cleanup(http_factory, stub, bypass):
+    stub.set_scenario("policy_unknown")
     client, _ = register_user(http_factory, "multi")
     other, _ = register_user(http_factory, "other-multi")
     photo = httpx.get(f"{STUB_BASE}/__fixtures/a").content
@@ -23,7 +29,7 @@ def test_multi_photo_immediate_processing_review_and_cleanup(http_factory, stub,
         ],
     )
     assert response.status_code == 202, response.text
-    image_url = f"{API}/images/{response.json()['image_id']}"
+    image_url = f"{API}/images/{response.json()['id']}"
 
     def completed():
         row = client.get(image_url).json()
@@ -41,16 +47,26 @@ def test_multi_photo_immediate_processing_review_and_cleanup(http_factory, stub,
     row = receipt["receipt"]
     # This fixture supplies no amount policy: bypass cannot approve these unknowns.
     assert {f["code"] for f in row["findings"]} == {
-        "unknown_tax_basis", "unknown_subtotal_origin", "missing_tax_information",
+        "unknown_tax_basis",
+        "unknown_subtotal_origin",
+        "missing_tax_information",
     }
     assert all(f["severity"] == "review" for f in row["findings"])
     assert row["status"] == "unverified" and row["verified"] is False
-    verified = client.post(f"{receipt_url}/verify", json={
-        "expected_operation_revision": row["operation_revision"],
-        "expected_review_revision": row["review_revision"],
-        "acknowledgements": [{"finding_id": f["id"], "comment": "Fixture policy unknowns reviewed against originals"}
-                             for f in row["findings"]],
-    })
+    verified = client.post(
+        f"{receipt_url}/verify",
+        json={
+            "expected_operation_revision": row["operation_revision"],
+            "expected_review_revision": row["review_revision"],
+            "acknowledgements": [
+                {
+                    "finding_id": f["id"],
+                    "comment": "Fixture policy unknowns reviewed against originals",
+                }
+                for f in row["findings"]
+            ],
+        },
+    )
     assert verified.status_code == 200, verified.text
     assert client.get(f"{image_url}/file?part=1").content == photo
     assert client.delete(receipt_url).status_code == 200
@@ -66,8 +82,8 @@ def test_unreadable_is_terminal_and_survives_reload(http_factory, stub, count):
         f"{API}/images",
         files=[("receipt", (f"part-{i}.png", photo, "image/png")) for i in range(count)],
     )
-    assert response.status_code == (422 if count == 1 else 202), response.text
-    image_url = f"{API}/images/{response.json()['image_id']}"
+    assert response.status_code == 202, response.text
+    image_url = f"{API}/images/{response.json()['id']}"
 
     def unreadable():
         row = client.get(image_url).json()

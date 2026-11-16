@@ -14,7 +14,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic, perf_counter
 from typing import Any, TypeVar
-from uuid import NAMESPACE_URL, uuid5
+from uuid import uuid4
 
 from PIL import Image, ImageOps
 from pydantic import ValidationError
@@ -34,7 +34,7 @@ from ...model.extraction import (
 from ...model.item_category import CATEGORY_CODES, CATEGORY_DEFINITIONS
 from ...model.ocr import SourceRef, WorkingImage
 from ...model.receipt import Receipt
-from ...model.receipt_extraction import MultiImageReceipt
+from ...model.receipt_extraction import DuplicateCandidate, MultiImageReceipt, validate_overlap
 from ...model.review import AmountPolicy, ReviewFinding
 from .errors import UnreadableReceiptError
 from .experiment import extraction_prompt, source_extraction_prompt
@@ -66,9 +66,10 @@ class AnalysisResult:
 
 
 class _PartialDraftError(ValueError):
-    def __init__(self, envelope: InferenceEnvelope):
+    def __init__(self, envelope: InferenceEnvelope, *, incomplete: bool = False):
         super().__init__("receipt_incomplete")
         self.envelope = envelope
+        self.incomplete = incomplete
 
 
 class LLMProvider(ABC):
@@ -180,6 +181,8 @@ class LLMProvider(ABC):
                 if isinstance(exc, _PartialDraftError):
                     partial_error = exc
                     self._record_supplied_fields(call, exc.envelope)
+                    if exc.incomplete:
+                        return exc.envelope  # type: ignore[return-value]
                 last_error = exc
                 messages = [
                     *messages,
@@ -313,7 +316,10 @@ class LLMProvider(ABC):
                 range(count)
             ):
                 raise ValueError("incomplete_ocr_input")
-            return input, [{"role": "user", "content": source_extraction_prompt(input)}], []
+            prompt = source_extraction_prompt(
+                input, source_refs=self._authorized_source_refs(input)
+            )
+            return input, [{"role": "user", "content": prompt}], []
         from pillow_heif.as_plugin import register_heif_opener
 
         register_heif_opener()
@@ -339,12 +345,14 @@ class LLMProvider(ABC):
                     working.save(target, format="PNG")
                 png = target.read_bytes()
                 digest = hashlib.sha256(png).hexdigest()
+                # Each persisted preparation owns a new immutable artifact path, including retries.
+                view_id = uuid4()
                 views.append(
                     DerivedInputView(
                         photo_index=index,
                         source_sha256=source_hash,
                         working_image=WorkingImage(
-                            view_id=uuid5(NAMESPACE_URL, f"vision:{index}:{source_hash}:{digest}"),
+                            view_id=view_id,
                             sha256=digest,
                             width=working.width,
                             height=working.height,
@@ -365,6 +373,37 @@ class LLMProvider(ABC):
             else:
                 messages[0]["content"][0]["text"] = prompt
             return input, messages, views
+
+    @staticmethod
+    def _authorized_source_refs(input: ReceiptInput) -> list[SourceRef]:
+        """Alternate OCR views do not change ordered input/provenance cardinality."""
+        authorized = list(input.source_refs)
+        if input.mode != "ocr":
+            return authorized
+        for ref in input.source_refs:
+            if ref.coordinate_space != "original":
+                continue
+            page = next(
+                (
+                    page
+                    for page in input.ocr_pages
+                    if page.photo_index == ref.photo_index
+                    and page.source_sha256 == ref.source_sha256
+                ),
+                None,
+            )
+            if page is None:
+                raise ValueError("ocr_source_reference_mismatch")
+            working_ref = SourceRef(
+                part_id=ref.part_id,
+                photo_index=ref.photo_index,
+                source_sha256=ref.source_sha256,
+                coordinate_space="working",
+                view_id=page.working_image.view_id,
+            )
+            if working_ref not in authorized:
+                authorized.append(working_ref)
+        return authorized
 
     def _parse_receipt_input(
         self, content: str, *, input: ReceiptInput, prototype: InferenceEnvelope
@@ -393,7 +432,7 @@ class LLMProvider(ABC):
             for ref in validated:
                 known_refs = [
                     known
-                    for known in input.source_refs
+                    for known in self._authorized_source_refs(input)
                     if ref.part_id == known.part_id
                     and ref.photo_index == known.photo_index
                     and ref.source_sha256 == known.source_sha256
@@ -455,6 +494,9 @@ class LLMProvider(ABC):
                     type(i) is not int or not 0 <= i < count for i in sources
                 ) or sources != sorted(sources):
                     raise ValueError("invalid_row_source_order")
+                validate_overlap(
+                    sources, [DuplicateCandidate.model_validate(pair) for pair in candidates]
+                )
                 for index, source in enumerate(sources):
                     if source < len(input.source_refs):
                         field_sources.setdefault(f"line_items.{index}", [input.source_refs[source]])
@@ -468,10 +510,14 @@ class LLMProvider(ABC):
             for pair in candidates
             if isinstance(pair, dict)
         ]
-        # Receipt validation uses observed values only; the draft keeps absent/null fields.
+        # These financial observations cannot inherit final-business EUR/zero defaults.
+        observed_values = {
+            **values,
+            **{key: getattr(draft, key) for key in ("currency", "discount_total", "tax_total")},
+        }
         try:
             if count > 1:
-                multi = MultiImageReceipt.model_validate(values)
+                multi = MultiImageReceipt.model_validate(observed_values)
                 receipt = multi.reconciled(count)
                 verified_groups: dict[int, bool] = {}
                 for pair in multi.duplicate_candidates:
@@ -491,11 +537,13 @@ class LLMProvider(ABC):
                     for pair in multi.duplicate_candidates
                 ]
                 removed = {
-                    pair.second_index for pair in multi.duplicate_candidates
+                    pair.second_index
+                    for pair in multi.duplicate_candidates
                     if verified_groups[multi.line_items[pair.first_index].source_image]
                 }
                 positions = {
-                    old: new for new, old in enumerate(
+                    old: new
+                    for new, old in enumerate(
                         index for index in range(len(multi.line_items)) if index not in removed
                     )
                 }
@@ -511,7 +559,12 @@ class LLMProvider(ABC):
                     projected[key] = refs
                 result.field_sources = projected
             else:
-                receipt = Receipt.model_validate(values)
+                receipt = Receipt.model_validate(observed_values)
+        except ValidationError as exc:
+            incomplete = all(
+                error["type"] == "missing" or error.get("input") is None for error in exc.errors()
+            )
+            raise _PartialDraftError(result, incomplete=incomplete) from exc
         except ValueError as exc:
             raise _PartialDraftError(result) from exc
         result.receipt = receipt
