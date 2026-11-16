@@ -354,9 +354,9 @@ class ReceiptDB:
                     INSERT_LINE_ITEM_SQL,
                     receipt_id,
                     item.description,
-                    float(item.quantity),
-                    float(item.unit_price),
-                    float(item.total_price),
+                    Decimal(str(item.quantity)),
+                    item.unit_price,
+                    item.total_price,
                     list(item.tags),
                     index,
                     decision.id,
@@ -371,8 +371,8 @@ class ReceiptDB:
                     INSERT_TAX_SQL,
                     receipt_id,
                     tax.name,
-                    tax.rate,
-                    float(tax.amount),
+                    Decimal(str(tax.rate)) if tax.rate is not None else None,
+                    tax.amount,
                 )
 
     async def get_category_suggestion(
@@ -410,6 +410,31 @@ class ReceiptDB:
 
     # ── Persist extracted data ───────────────────────────────────────
 
+    async def insert_receipt(
+        self, conn: asyncpg.Connection, receipt: Receipt, *, image_id: UUID,
+        user_id: UUID | None, status: str = "unverified", verified: bool = False,
+    ) -> ReceiptRow:
+        """Insert only on the caller's transaction; never overwrite a linked receipt."""
+        row = await conn.fetchrow(
+            INSERT_RECEIPT_SQL, receipt.confidence, receipt.merchant_name,
+            receipt.merchant_address, receipt.receipt_number, receipt.date,
+            self._receipt_time_value(receipt), receipt.currency, receipt.category,
+            receipt.subtotal, receipt.discount_total, receipt.tax_total, receipt.tip,
+            receipt.total, receipt.payment_method, status, image_id, verified, user_id,
+        )
+        history = await self._history_for_items(
+            conn, user_id, receipt.merchant_name, [i.description for i in receipt.line_items]
+        )
+        decisions = [ItemCategoryDecision(
+            id=None, original_description=item.description,
+            category=history.get(normalize_history_key(item.description), item.spending_category),
+            source="history" if normalize_history_key(item.description) in history else (
+                "llm" if item.spending_category != "unknown" else "unknown"
+            ),
+        ) for item in receipt.line_items]
+        await self._insert_children(conn, row["id"], receipt, decisions)
+        return self._receipt_row_from_record(row)
+
     async def persist_receipt(
         self,
         receipt: Receipt,
@@ -439,11 +464,11 @@ class ReceiptDB:
             self._receipt_time_value(receipt),
             receipt.currency,
             receipt.category,
-            float(receipt.subtotal),
-            float(receipt.discount_total),
-            float(receipt.tax_total),
-            float(receipt.tip) if receipt.tip is not None else None,
-            float(receipt.total),
+            receipt.subtotal,
+            receipt.discount_total,
+            receipt.tax_total,
+            receipt.tip,
+            receipt.total,
             receipt.payment_method,
         )
 
@@ -509,11 +534,11 @@ class ReceiptDB:
             self._receipt_time_value(receipt),
             receipt.currency,
             receipt.category,
-            float(receipt.subtotal),
-            float(receipt.discount_total),
-            float(receipt.tax_total),
-            float(receipt.tip) if receipt.tip is not None else None,
-            float(receipt.total),
+            receipt.subtotal,
+            receipt.discount_total,
+            receipt.tax_total,
+            receipt.tip,
+            receipt.total,
             receipt.payment_method,
             receipt_id,
         ]

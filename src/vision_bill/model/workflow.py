@@ -4,15 +4,63 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, computed_field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 from .db.image import ImagePart, ImageRow
 from .db.receipt import ReceiptRow
 from .extraction import InferenceEnvelope
-from .ocr import OcrPageMetadata, OcrResponse, Sha256
+from .ocr import OcrPageMetadata, OcrResponse, Sha256, WorkingImageMetadata
 from .review import FindingAcknowledgement, ReviewEvaluation
 
 TERMINAL_STATES = frozenset({"analyzed", "needs_review", "failed", "timed_out", "unreadable"})
+
+
+def assert_metadata_only(value: Any) -> None:
+    """Reject transport image payloads from arbitrary persisted metadata."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raise ValueError("image bytes belong in saved artifacts")  # noqa: TRY004
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if str(key).lower() in {"png_base64", "image_base64", "image_bytes"}:
+                raise ValueError("raw image payload belongs in saved artifacts")
+            assert_metadata_only(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            assert_metadata_only(item)
+
+
+class SourcePartBinding(BaseModel):
+    """Original-file hash attested by the application, in exact capture order."""
+
+    photo_index: int = Field(ge=0)
+    source_sha256: Sha256
+    image_path: str = Field(min_length=1)
+
+
+class PersistedSourcePart(SourcePartBinding):
+    part_id: UUID
+
+
+class PersistedWorkingView(BaseModel):
+    """Caller attests that the exact validated PNG was saved before DB commit.
+
+    DB owns identity/metadata checks, never file or codec I/O. Artifact creation
+    and cleanup of unreferenced files belong to the caller/FileProvider.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    part_id: UUID
+    photo_index: int = Field(ge=0)
+    source_sha256: Sha256
+    artifact_path: str = Field(min_length=1)
+    metadata: WorkingImageMetadata
+
+    @model_validator(mode="before")
+    @classmethod
+    def no_payload(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            assert_metadata_only(value)
+        return value
 
 
 class AccessScope(BaseModel):
@@ -83,6 +131,15 @@ class ReviewRequest(BaseModel):
 
 
 class SubmissionCreate(BaseModel):
+    """Upload identity and the first resolved execution snapshot.
+
+    The caller fingerprints ordered ORIGINAL hashes plus analysis-relevant
+    explicitly supplied options/model selection. requested_options contains
+    those explicit values (including an explicit bypass flag); effective_options,
+    model_id and bypass_review preserve the first resolution of server defaults.
+    Generated paths, thumbnails and database IDs are never request identity.
+    """
+
     id: UUID
     parts: list[ImagePart] = Field(min_length=1)
     source_manifest: list[dict[str, Any]]
@@ -91,6 +148,11 @@ class SubmissionCreate(BaseModel):
     request_fingerprint: str
     model_id: str | None = None
     bypass_review: bool = False
+
+    @model_validator(mode="after")
+    def metadata_only(self) -> "SubmissionCreate":
+        assert_metadata_only(self.model_dump())
+        return self
 
 
 class EnqueueResult(BaseModel):
@@ -103,6 +165,7 @@ class OcrCheckpoint(BaseModel):
     profile_id: str
     runtime_fingerprint: str
     pages: list[dict[str, Any]]
+    persisted_views: list[PersistedWorkingView] = Field(default_factory=list)
 
     @field_validator("pages", mode="before")
     @classmethod
@@ -123,6 +186,20 @@ class AttemptOutcome(BaseModel):
     result_code: str | None = None
     retry_delay_seconds: int | None = Field(default=None, ge=0)
     review: ReviewEvaluation | None = None
+    persisted_views: list[PersistedWorkingView] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def required_result(self) -> "AttemptOutcome":
+        if self.kind == "complete" and (
+            self.envelope is None
+            or self.envelope.receipt is None
+            or self.review is None
+            or not self.review.can_finalize
+        ):
+            raise ValueError("complete requires a receipt and finalizable review")
+        if self.kind == "partial" and (self.envelope is None or self.envelope.draft is None):
+            raise ValueError("partial requires an extraction draft")
+        return self
 
 
 class CommitResult(BaseModel):

@@ -32,6 +32,7 @@ class ReceiptRow(BaseModel):
     thumbnail_path: str | None = None
     verified: bool = False
     user_id: UUID | None = None
+    extraction_id: UUID | None = None
     operation_revision: int = Field(default=1, ge=1)
     review_revision: int = Field(default=1, ge=1)
     amount_policy: AmountPolicy = Field(default_factory=AmountPolicy)

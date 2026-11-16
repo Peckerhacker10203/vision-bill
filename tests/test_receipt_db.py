@@ -309,11 +309,11 @@ async def test_persist_receipt_binds_negative_line_item_prices(db: ReceiptDB) ->
     ]
     assert len(insert_calls) == 2
     pfand_call = insert_calls[1]
-    # $4 = unit_price and $5 = total_price arrive as negative floats, not clamped.
+    # Monetary binds preserve exact Decimal values, including negative prices.
     assert pfand_call.args[4] == -0.25
     assert pfand_call.args[5] == -0.75
-    assert isinstance(pfand_call.args[4], float)
-    assert isinstance(pfand_call.args[5], float)
+    assert isinstance(pfand_call.args[4], Decimal)
+    assert isinstance(pfand_call.args[5], Decimal)
 
 
 @pytest.mark.asyncio
