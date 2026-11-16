@@ -71,7 +71,7 @@ class BenchmarkService:
             raise ValueError(f"Selected model(s) unavailable: {', '.join(sorted(unknown))}")
         selected_ids = await self._select_receipts(request, scope=scope)
         if not selected_ids:
-            raise ValueError("No verified receipts match the selection")
+            raise ValueError("No current qualified references match the selection")
         if request.experiment.think is not None and not self._provider.supports_thinking_control:
             raise ValueError("Thinking override is supported only by the Ollama provider")
         if request.experiment.pipeline == ExtractionPipeline.OCR and not self.capabilities()["ocr_available"]:
@@ -144,11 +144,23 @@ class BenchmarkService:
             result = []
             for receipt_id in request.receipt_ids:
                 row = await self._receipts.get_receipt_by_id(receipt_id, user_id=scope.user_id, can_see_all=scope.can_see_all)
-                if row is not None and row.verified:
-                    result.append(receipt_id)
+                if row is None or not row.verified:
+                    raise ValueError("Explicit receipt is unavailable or not verified")
+                result.append(receipt_id)
             return result
-        rows = await self._receipts.list_receipts(limit=request.limit or 10_000, status=["verified"], user_id=scope.user_id, can_see_all=scope.can_see_all)
-        return [r.id for r in rows if (request.category is None or r.category == request.category) and (request.max_source_confidence is None or r.confidence <= request.max_source_confidence)]
+        candidates = await self._db.reference_candidates(
+            scope=scope, category=request.category, max_source_confidence=request.max_source_confidence,
+        )
+        selected = []
+        for receipt_id in candidates:
+            try:
+                await self._db.current_reference(receipt_id, scope=scope)
+            except (ValueError, OSError):
+                continue  # Filtered selection excludes stale/ineligible references.
+            selected.append(receipt_id)
+            if request.limit is not None and len(selected) >= request.limit:
+                break
+        return selected
 
     async def _expected_receipt_and_path(self, receipt_id: UUID) -> tuple[Receipt, str | None]:
         details = await self._receipts.get_receipt_with_details(receipt_id)

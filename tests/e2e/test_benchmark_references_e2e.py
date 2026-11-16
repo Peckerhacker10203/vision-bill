@@ -313,3 +313,117 @@ async def test_new_summary_counts_extraction_failures_without_redefining_success
     assert summary.all_case_average_score==.5
     assert summary.full_receipt_correct_rate==.5
     assert summary.completed==2 and summary.failed==1
+
+
+@pytest.mark.parametrize('evidence', ['sources', 'raw_draft', 'tax_policy'])
+async def test_observed_defaults_are_frozen_scored_and_stale_masks_rejected(workflow_db, tmp_path, evidence):
+    import hashlib
+    from vision_bill.model.receipt import Receipt
+    from vision_bill.service.experiment_scoring import detailed_score
+    w, scope = workflow_db
+    row, _, path = await human(w, scope, tmp_path)
+    b = bench(w)
+    async def acknowledge_current_findings():
+        from vision_bill.service.receipt_review import evaluate_receipt, persistent_findings
+        async with w.pool.acquire() as conn:
+            record = await conn.fetchrow('SELECT * FROM receipts WHERE id=$1', row.id)
+            current = w._receipts._receipt_row_from_record(record)
+            document = await w._receipts._review_document(conn, record)
+            originals = await w._receipts._review_originals(conn, row.image_id)
+            evaluation = evaluate_receipt(document, current.amount_policy, current.field_sources,
+                current.overlap_decisions, originals, retained_findings=persistent_findings(current.findings))
+            acknowledgements = [{'finding_id':f.id,'comment':'Human checked the original'} for f in evaluation.findings if f.severity == 'review']
+            await conn.execute('UPDATE receipts SET acknowledgements=$2::jsonb WHERE id=$1', row.id,json.dumps(acknowledgements))
+    # Unknown legacy defaults are not declarations that these values were printed.
+    async with w.pool.acquire() as conn:
+        await conn.execute("UPDATE receipts SET amount_policy=jsonb_set(amount_policy,'{tax_information}','\"missing\"') WHERE id=$1", row.id)
+        if evidence in {'sources', 'raw_draft'}:
+            part = uuid4()
+            sha = hashlib.sha256(path.read_bytes()).hexdigest()
+            await conn.execute("INSERT INTO image_source_parts(part_id,image_id,photo_index,source_sha256,image_path,metadata) VALUES($1,$2,0,$3,$4,'{}')",part,row.image_id,sha,str(path))
+    await acknowledge_current_findings()
+    before = await b.reference_preview(row.id, scope=scope)
+    assert not {'currency', 'discount_total', 'tax_total'} & set(before.scored_fields)
+    legacy = await b.qualify_reference(row.id, before.review_revision, before.document_sha256, scope=scope)
+    async with w.pool.acquire() as conn:
+        if evidence == 'sources':
+            refs = {key: [{'part_id':str(part),'photo_index':0,'source_sha256':sha,'block_id':key}] for key in ('currency','discount_total','tax_total')}
+            await conn.execute('UPDATE receipts SET field_sources=$2::jsonb WHERE id=$1',row.id,json.dumps(refs))
+        elif evidence == 'raw_draft':
+            extraction = await conn.fetchval("INSERT INTO receipt_extractions(image_id,generation,attempt_number,outcome_kind,envelope) VALUES($1,1,1,'complete',$2::jsonb) RETURNING id", row.image_id,json.dumps({'draft':{'currency':'EUR','discount_total':'0','tax_total':'0'}}))
+            await conn.execute('UPDATE receipts SET extraction_id=$2 WHERE id=$1',row.id,extraction)
+        else:
+            await conn.execute("UPDATE receipts SET amount_policy=jsonb_set(amount_policy,'{tax_information}','\"explicit_zero\"') WHERE id=$1", row.id)
+    await acknowledge_current_findings()
+    preview = await b.reference_preview(row.id, scope=scope)
+    observed = {'tax_total'} if evidence == 'tax_policy' else {'currency','discount_total','tax_total'}
+    assert observed <= set(preview.scored_fields)
+    assert preview.sources == before.sources and preview.expected == before.expected
+    assert preview.document_sha256 != before.document_sha256
+    with pytest.raises(ValueError, match='confirmation'):
+        await b.qualify_reference(row.id,before.review_revision,before.document_sha256,scope=scope)
+    with pytest.raises(ValueError, match='qualified'):
+        await b.current_reference(row.id, scope=scope)
+    gold = await b.qualify_reference(row.id,preview.review_revision,preview.document_sha256,scope=scope)
+    assert (await b.current_reference(row.id,scope=scope)).model_dump() == gold.model_dump()
+    assert legacy.scored_fields == before.scored_fields
+    expected = Receipt.model_validate(gold.expected)
+    assert detailed_score(gold.expected,expected,scored_fields=gold.scored_fields)['full_receipt_correct']
+    for field in observed:
+        wrong = expected.model_copy(update={field: 'USD' if field == 'currency' else __import__('decimal').Decimal('1')})
+        assert not detailed_score(gold.expected,wrong,scored_fields=gold.scored_fields)['full_receipt_correct']
+        assert detailed_score(legacy.expected,wrong,scored_fields=legacy.scored_fields)['full_receipt_correct']
+
+
+async def test_filtered_creation_qualifies_before_limit_and_explicit_ids_are_strict(workflow_db, tmp_path):
+    from datetime import date
+    from unittest.mock import AsyncMock
+    from vision_bill.config import ImageSettings, OcrSettings
+    from vision_bill.model.benchmark import BenchmarkCreate
+    from vision_bill.provider.llm.ollama import OllamaProvider
+    from vision_bill.provider.llm.base import ModelInfo
+    from vision_bill.service.receipt_service import ReceiptService
+    from vision_bill.service.benchmark_service import BenchmarkService
+    w, scope = workflow_db
+    foreign_scope = AccessScope(user_id=uuid4())
+    async with w.pool.acquire() as conn:
+        await conn.execute("INSERT INTO users(id,username,hashed_password,is_admin) VALUES($1,$2,'test',true)",foreign_scope.user_id,str(foreign_scope.user_id))
+    b = bench(w)
+    rows = {}
+    for index, name in enumerate(('valid', 'missing_source', 'stale', 'unqualified', 'foreign', 'wrong_category', 'high_confidence', 'unverified'), 1):
+        owner = foreign_scope if name == 'foreign' else scope
+        row, _, path = await human(w,owner,tmp_path)
+        async with w.pool.acquire() as conn:
+            await conn.execute('UPDATE receipts SET date=$2,category=$3,confidence=$4 WHERE id=$1', row.id,date(2026,1,index),'grocery' if name != 'wrong_category' else 'other',99 if name == 'high_confidence' else 50)
+        if name not in {'unqualified','unverified'}:
+            preview = await b.reference_preview(row.id,scope=owner)
+            await b.qualify_reference(row.id,preview.review_revision,preview.document_sha256,scope=owner)
+        rows[name] = row.id
+        if name == 'missing_source': path.unlink()
+        if name in {'stale','unverified'}:
+            async with w.pool.acquire() as conn:
+                if name == 'stale': await conn.execute("UPDATE receipts SET merchant_name='edited' WHERE id=$1",row.id)
+                else: await conn.execute("UPDATE receipts SET verified=false,status='unverified' WHERE id=$1",row.id)
+    provider = OllamaProvider('http://local')
+    model = ModelInfo('fixture'); model.capabilities=['completion','vision']
+    provider.get_available_models = AsyncMock(return_value=[model])
+    provider._client.chat = AsyncMock(side_effect=AssertionError('selection must not infer'))
+    receipts = ReceiptService(ImageSettings(save_dir=str(tmp_path),tmp_dir=str(tmp_path)),w._settings,provider,ocr_settings=OcrSettings(enabled=False))
+    receipts._db = w._receipts
+    service = BenchmarkService(provider,receipts)
+    request = BenchmarkCreate(model_ids=['fixture'],category='grocery',max_source_confidence=75,limit=1)
+    run = await service.create_run(request,scope=scope)
+    assert run.receipt_ids == [rows['valid']]
+    manifest = await b.manifest(run.id)
+    assert manifest['inputs'][0]['receipt_id'] == str(rows['valid'])
+    # A restricted admin cannot include a foreign reference; configured see-all can.
+    admin_run = await service.create_run(request,scope=AccessScope(user_id=scope.user_id,can_see_all=True))
+    assert admin_run.receipt_ids == [rows['foreign']]
+    async with w.pool.acquire() as conn:
+        before = await conn.fetchval('SELECT count(*) FROM benchmark_runs')
+    for invalid in [uuid4(), *[rows[name] for name in ('foreign','unqualified','stale','missing_source','unverified')]]:
+        with pytest.raises((ValueError,FileNotFoundError)):
+            await service.create_run(BenchmarkCreate(model_ids=['fixture'],receipt_ids=[rows['valid'],invalid],limit=1),scope=scope)
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval('SELECT count(*) FROM benchmark_runs') == before
+    provider._client.chat.assert_not_awaited()

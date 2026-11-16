@@ -34,3 +34,18 @@ async def test_every_benchmark_read_write_receives_real_admin_scope(method, suff
     assert call.await_count == 1
     scope = call.call_args.kwargs['scope']
     assert scope.user_id == user.id and scope.can_see_all is False
+
+
+@pytest.mark.parametrize('message', ['Explicit receipt is unavailable or not verified', 'No current qualified references match the selection'])
+async def test_create_rejects_ineligible_selection_as_unprocessable(message):
+    user = User(id=uuid4(), username='restricted-admin', is_admin=True, can_see_all=False)
+    app = FastAPI()
+    app.include_router(router, prefix='/benchmarks')
+    app.dependency_overrides[get_current_user] = lambda: user
+    service = SimpleNamespace(create_run=AsyncMock(side_effect=ValueError(message)))
+    app.dependency_overrides[get_benchmark_service] = lambda: service
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+        response = await client.post('/benchmarks', json={'receipt_ids':[str(uuid4()),str(uuid4())]})
+    assert response.status_code == 422 and response.json()['detail'] == message
+    assert len(service.create_run.call_args.args[0].receipt_ids) == 2
+    assert service.create_run.call_args.kwargs['scope'].user_id == user.id

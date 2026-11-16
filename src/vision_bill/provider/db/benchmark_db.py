@@ -219,11 +219,24 @@ class BenchmarkDB:
         material['line_items'] = [{k: item[k] for k in ('description','quantity','unit_price','total_price')}
                                   for item in expected['line_items']]
         material['taxes'] = expected['taxes']
-        # Legacy defaults cannot prove a printed observation. Be conservative, and freeze
-        # this declared mask so future schema defaults never change historical scoring.
+        # A default value is ambiguous only without retained observation evidence.
+        # Nullable raw drafts distinguish explicit zero/EUR from schema-filled defaults.
+        observed = {path.split('.')[0] for path, refs in current.field_sources.items() if refs}
+        raw_draft = await conn.fetchval(
+            "SELECT envelope->'draft' FROM receipt_extractions WHERE id=$1 AND image_id=$2",
+            current.extraction_id, current.image_id,
+        )
+        if isinstance(raw_draft, str):
+            raw_draft = json.loads(raw_draft)
+        if isinstance(raw_draft, dict):
+            observed.update(key for key, value in raw_draft.items() if value is not None)
+        if current.amount_policy.tax_information == 'explicit_zero':
+            observed.add('tax_total')
+        # Unknown legacy defaults remain excluded. The final union is server-derived;
+        # confirmation cannot remove known observations, and its hash binds the mask.
         mandatory = {'merchant_name', 'date', 'line_items', 'subtotal', 'total'}
         defaults = {'currency': 'EUR', 'payment_method': 'unknown', 'discount_total': '0', 'tax_total': '0', 'taxes': []}
-        scored = [key for key in OBSERVABLE_FIELDS if key in mandatory or
+        scored = [key for key in OBSERVABLE_FIELDS if key in mandatory or key in observed or
                   (material.get(key) is not None and key not in defaults) or
                   (key in defaults and material.get(key) != defaults[key])]
         def digest(value: Any) -> str:
@@ -282,3 +295,18 @@ class BenchmarkDB:
             if row is None:
                 raise ValueError('Receipt has no current explicitly qualified reference')
             return self._reference(row)
+
+    async def reference_candidates(
+        self, *, scope: AccessScope, category: str | None, max_source_confidence: int | None,
+    ) -> list[UUID]:
+        """Scoped qualified candidates; current eligibility is checked before limiting."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch('''SELECT r.id FROM receipts r
+                WHERE ($1 OR r.user_id=$2) AND r.verified AND r.status='verified'
+                AND ($3::text IS NULL OR r.category=$3)
+                AND ($4::integer IS NULL OR r.confidence<=$4)
+                AND EXISTS(SELECT 1 FROM benchmark_references b WHERE b.receipt_id=r.id
+                    AND ($1 OR b.owner_id=$2))
+                ORDER BY r.date DESC,r.id DESC''', scope.can_see_all, scope.user_id,
+                category, max_source_confidence)
+        return [row['id'] for row in rows]
