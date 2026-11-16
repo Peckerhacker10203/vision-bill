@@ -1,0 +1,266 @@
+"""Wire contracts for OpenAI inference and opt-in llama.cpp router handoff."""
+
+import json
+from contextlib import asynccontextmanager
+from time import monotonic
+
+import httpx
+import pytest
+from openai import AsyncOpenAI
+
+from vision_bill.config import LLMSettings
+from vision_bill.provider.factory import get_llm_provider
+from vision_bill.provider.llm.openai import OpenAIProvider
+from vision_bill.service.gpu_handoff import ModelHandoff
+
+REAL_CLIENT = httpx.AsyncClient
+
+
+def model_status(value):
+    return {
+        "object": "list",
+        "data": [
+            {"id": "own", "aliases": [], "status": {"value": value}},
+            {"id": "foreign", "aliases": [], "status": {"value": "loaded"}},
+        ],
+    }
+
+
+@asynccontextmanager
+async def configured(monkeypatch, handler, host="http://llama.local/llama/v1"):
+    config = LLMSettings(
+        provider="openai",
+        host=host,
+        api_key="test-key",
+        model_name="own",
+        temperature=0.0,
+        model_lifecycle="llamacpp",
+    )
+    provider = get_llm_provider(config)
+    try:
+        assert provider.supports_model_release, "explicit llama.cpp lifecycle was ignored"
+        await provider._client.close()
+        transport = httpx.MockTransport(handler)
+        provider._client = AsyncOpenAI(
+            base_url=host,
+            api_key="test-key",
+            max_retries=0,
+            http_client=REAL_CLIENT(transport=transport, trust_env=False),
+        )
+
+        def control_client(**kwargs):
+            assert kwargs.get("trust_env") is False
+            assert kwargs.get("follow_redirects") is False
+            return REAL_CLIENT(transport=transport, **kwargs)
+
+        monkeypatch.setattr(httpx, "AsyncClient", control_client)
+        yield provider
+    finally:
+        await provider._client.close()
+
+
+@pytest.mark.asyncio
+async def test_openai_wire_does_not_force_optional_reasoning_extension():
+    def handler(request):
+        body = json.loads(request.content)
+        assert request.url.path == "/v1/chat/completions"
+        assert body["model"] == "own"
+        assert "reasoning_effort" not in body
+        return httpx.Response(200, json={
+            "id": "chat", "object": "chat.completion", "created": 0,
+            "model": "own",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                         "finish_reason": "stop"}],
+        })
+
+    provider = OpenAIProvider("http://llama.local/v1", "test-key")
+    await provider._client.close()
+    provider._client = AsyncOpenAI(
+        base_url="http://llama.local/v1", api_key="test-key", max_retries=0,
+        http_client=REAL_CLIENT(transport=httpx.MockTransport(handler), trust_env=False),
+    )
+    try:
+        assert await provider.send_message("own", [{"role": "user", "content": "hi"}]) == "ok"
+    finally:
+        await provider._client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial", ["loaded", "loading", "sleeping"])
+async def test_router_release_waits_for_exact_owned_model_exit(monkeypatch, initial):
+    requests = []
+    statuses = iter([initial, "loading", "unloaded"])
+
+    def handler(request):
+        assert request.headers["authorization"] == "Bearer test-key"
+        requests.append((request.method, request.url.path))
+        if request.method == "POST":
+            assert request.url.path == "/llama/models/unload"
+            assert json.loads(request.content) == {"model": "own"}
+            return httpx.Response(200, json={"success": True})
+        assert request.url.path == "/llama/models"
+        return httpx.Response(200, json=model_status(next(statuses)))
+
+    async with configured(monkeypatch, handler) as provider:
+        await provider.release_model("own")
+    assert requests == [
+        ("GET", "/llama/models"), ("POST", "/llama/models/unload"),
+        ("GET", "/llama/models"), ("GET", "/llama/models"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host,path", [
+    ("http://llama.local", "/models"),
+    ("http://llama.local/v1/", "/models"),
+    ("http://llama.local/proxy/v1", "/proxy/models"),
+])
+async def test_already_unloaded_router_model_never_posts(monkeypatch, host, path):
+    def handler(request):
+        assert request.method == "GET"
+        assert request.url.path == path
+        return httpx.Response(200, json=model_status("unloaded"))
+
+    async with configured(monkeypatch, handler, host) as provider:
+        await provider.release_model("own")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [
+    {"object": "list", "data": []},
+    {"object": "list", "data": [{"id": "alias", "aliases": ["own"],
+                                "status": {"value": "unloaded"}}]},
+    {"object": "list", "data": [{"id": "own"}]},
+    model_status("unknown"),
+    {"object": "list", "data": [
+        {"id": "own", "status": {"value": "unloaded"}},
+        {"id": "own", "status": {"value": "loaded"}},
+    ]},
+])
+async def test_unknown_router_state_blocks_ocr_and_keeps_owned_journal(
+    monkeypatch, tmp_path, body
+):
+    events = []
+
+    def handler(request):
+        assert request.method == "GET"
+        return httpx.Response(200, json=body)
+
+    async with configured(monkeypatch, handler) as provider:
+        handoff = ModelHandoff(tmp_path / "handoff", provider, Ocr(events))
+        with pytest.raises(RuntimeError, match="model_"):
+            async with handoff.session(monotonic() + 2) as owner:
+                owner.track("own")
+                await owner.ocr_phase()
+        state = json.loads((tmp_path / "handoff.json").read_text())
+        assert state["models"] == ["own"]
+        assert "load_ocr" not in events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code,body", [
+    (401, {"error": "unauthorized"}),
+    (302, {}),
+    (200, {"success": False}),
+])
+async def test_failed_unload_is_not_accepted(monkeypatch, code, body):
+    def handler(request):
+        if request.method == "GET":
+            return httpx.Response(200, json=model_status("loaded"))
+        return httpx.Response(
+            code, json=body, headers={"location": "http://other.local/unload"}
+        )
+
+    async with configured(monkeypatch, handler) as provider:
+        with pytest.raises((httpx.HTTPError, RuntimeError)):
+            await provider.release_model("own")
+
+
+class Ocr:
+    def __init__(self, events):
+        self.events = events
+        self.active = False
+
+    async def claim(self, token, deadline):
+        self.active = False
+        self.events.append("claim_park")
+
+    async def load(self, token, deadline):
+        self.active = True
+        self.events.append("load_ocr")
+
+    async def park(self, token, deadline):
+        self.active = False
+        self.events.append("park_ocr")
+
+
+@pytest.mark.asyncio
+async def test_openai_direct_and_ocr_calls_use_same_handoff(monkeypatch, tmp_path):
+    events = []
+    ocr = Ocr(events)
+    state = "unloaded"
+
+    def handler(request):
+        nonlocal state
+        if request.url.path == "/llama/models":
+            return httpx.Response(200, json=model_status(state))
+        if request.url.path == "/llama/models/unload":
+            assert json.loads(request.content) == {"model": "own"}
+            events.append("unload_llm")
+            state = "unloaded"
+            return httpx.Response(200, json={"success": True})
+        assert request.url.path == "/llama/v1/chat/completions"
+        assert not ocr.active, "LLM request overlapped native OCR"
+        assert json.loads(request.content)["model"] == "own"
+        events.append("chat")
+        state = "loaded"
+        return httpx.Response(200, json={
+            "id": "chat", "object": "chat.completion", "created": 0,
+            "model": "own",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                         "finish_reason": "stop"}],
+        })
+
+    async with configured(monkeypatch, handler) as provider:
+        provider.handoff = ModelHandoff(tmp_path / "handoff", provider, ocr)
+        messages = [{"role": "user", "content": "hi"}]
+        assert await provider.send_message("own", messages) == "ok"
+        assert state == "unloaded"
+        async with provider.handoff.session(monotonic() + 2) as owner:
+            owner.track("own")
+            await owner.ocr_phase()
+            assert await provider.send_message("own", messages) == "ok"
+        assert events == [
+            "claim_park", "chat", "park_ocr", "unload_llm",
+            "claim_park", "load_ocr", "park_ocr", "chat", "park_ocr", "unload_llm",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_router_never_unloads_blocks_successor_ocr(monkeypatch, tmp_path):
+    events = []
+
+    def handler(request):
+        if request.method == "POST":
+            return httpx.Response(200, json={"success": True})
+        return httpx.Response(200, json=model_status("loaded"))
+
+    async with configured(monkeypatch, handler) as provider:
+        handoff = ModelHandoff(tmp_path / "handoff", provider, Ocr(events))
+        with pytest.raises(TimeoutError):
+            async with handoff.session(monotonic() + 0.03) as owner:
+                owner.track("own")
+                await owner.ocr_phase()
+        with pytest.raises(RuntimeError, match="model_request_unsettled"):
+            async with handoff.session(monotonic() + 1):
+                pytest.fail("unconfirmed release admitted a successor")
+        assert "load_ocr" not in events
+        assert json.loads((tmp_path / "handoff.json").read_text())["models"] == ["own"]
+
+
+def test_lifecycle_setting_rejects_non_openai_provider():
+    with pytest.raises(ValueError, match="openai"):
+        LLMSettings(
+            provider="ollama", host="http://local", api_key="none",
+            model_name="own", temperature=0.0, model_lifecycle="llamacpp",
+        )

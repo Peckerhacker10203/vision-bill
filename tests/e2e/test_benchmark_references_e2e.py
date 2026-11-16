@@ -206,7 +206,7 @@ async def test_run_uses_explicit_frozen_reference_and_never_feeds_expected_to_mo
     async def page(path,*,photo_index,source_sha256,**kwargs):
         return OcrResponse.model_validate(wire_page(photo_index,source_sha256,text=f'Only observed photo {photo_index}'))
     ocr = SimpleNamespace(get_capabilities=AsyncMock(return_value=OcrCapabilities(enabled=True,configured=True,reachable=True,ready=True,profile_id='fixed-profile',runtime_fingerprint='runtime')),extract_page=page)
-    receipts = ReceiptService(ImageSettings(save_dir=str(tmp_path),tmp_dir=str(tmp_path)),w._settings,provider,ocr_provider=ocr,ocr_settings=OcrSettings(enabled=True))
+    receipts = ReceiptService(ImageSettings(save_dir=str(tmp_path),tmp_dir=str(tmp_path)),w._settings,provider,ocr_provider=ocr,ocr_settings=OcrSettings(enabled=True, manage_model_lifecycle=False))
     receipts._db = w._receipts
     service = BenchmarkService(provider,receipts)
     request = BenchmarkCreate(model_ids=['fixture'],receipt_ids=[row.id],experiment=ExperimentOptions(pipeline='ocr',include_classification=False))

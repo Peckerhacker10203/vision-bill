@@ -25,8 +25,12 @@ pytestmark = pytest.mark.e2e
 async def prepare(w, scope, tmp_path, *, kind="legacy", pipeline="direct_vision", worker=None, ocr_settings=None, permission=False):
     row, _body, path = await claims.references.human(w, scope, tmp_path)
     provider, ocr = formatter(), sidecar()
+    # This helper controls CPU inference; it never loads managed native models.
+    ocr_settings = (ocr_settings or OcrSettings(enabled=False)).model_copy(
+        update={"manage_model_lifecycle": False}
+    )
     receipts = ReceiptService(ImageSettings(save_dir=str(tmp_path), tmp_dir=str(tmp_path)), w._settings,
-        provider, ocr_provider=ocr, ocr_settings=ocr_settings or OcrSettings(enabled=False))
+        provider, ocr_provider=ocr, ocr_settings=ocr_settings)
     receipts._db = w._receipts
     service = BenchmarkService(provider, receipts, worker=worker) if worker else BenchmarkService(provider, receipts)
     if kind == "legacy":

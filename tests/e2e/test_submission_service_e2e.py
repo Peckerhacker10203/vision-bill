@@ -40,7 +40,7 @@ async def setup(w, scope, settings, tmp_path, *, ocr=True):
     for i, path in enumerate(paths):
         Image.new("RGB", (4, 5), (i, 0, 0)).save(path)
     hashes = [hashlib.sha256(p.read_bytes()).hexdigest() for p in paths]
-    config = OcrSettings(enabled=ocr, required=ocr)
+    config = OcrSettings(enabled=ocr, required=ocr, manage_model_lifecycle=False)
     upload = SubmissionCreate(
         id=uuid4(),
         parts=[ImagePart(image_path=str(p)) for p in paths],

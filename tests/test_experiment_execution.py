@@ -320,7 +320,7 @@ async def test_ocr_benchmark_discovers_text_only_formatter_models(settings):
     service._receipts = SimpleNamespace(
         _provider=service._provider,
         _ocr_provider=sidecar(),
-        _ocr_settings=OcrSettings(enabled=True),
+        _ocr_settings=OcrSettings(enabled=True, manage_model_lifecycle=False),
         list_tags=AsyncMock(return_value=[]),
     )
     rid = uuid4()
