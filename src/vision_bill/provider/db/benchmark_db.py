@@ -200,7 +200,12 @@ class BenchmarkDB:
         for part, original in zip(image.parts(), originals, strict=True):
             if not original.available or not original.sha256_matches:
                 raise ValueError('original_integrity_failed')
-            actual_hash = await asyncio.to_thread(image_digest, Path(part.image_path))
+            try:
+                actual_hash = await asyncio.to_thread(image_digest, Path(part.image_path))
+            except OSError as exc:
+                # Only source-file I/O becomes an ineligible reference. Database
+                # acquisition/query failures must abort dataset selection.
+                raise ValueError('original_integrity_failed') from exc
             if original.photo_index in durable and durable[original.photo_index] != actual_hash:
                 raise ValueError('original_integrity_failed')
             sources.append({'part_id': str(original.part_id) if original.part_id else None,
@@ -230,6 +235,19 @@ class BenchmarkDB:
             raw_draft = json.loads(raw_draft)
         if isinstance(raw_draft, dict):
             observed.update(key for key, value in raw_draft.items() if value is not None)
+        # Finalization validates the nullable draft without substituting defaults.
+        # Its immutable human event preserves completed observations even when raw
+        # extraction values were null and the reviewer supplied no coordinate refs.
+        finalized = await conn.fetchval(
+            """SELECT snapshot->'document' FROM receipt_review_revisions
+            WHERE receipt_id=$1 AND event_kind='draft_finalized'
+            AND snapshot->'receipt'->>'extraction_id'=$2""",
+            receipt_id, str(current.extraction_id) if current.extraction_id else None,
+        )
+        if isinstance(finalized, str):
+            finalized = json.loads(finalized)
+        if isinstance(finalized, dict):
+            observed.update(key for key, value in finalized.items() if value is not None)
         if current.amount_policy.tax_information == 'explicit_zero':
             observed.add('tax_total')
         # Unknown legacy defaults remain excluded. The final union is server-derived;

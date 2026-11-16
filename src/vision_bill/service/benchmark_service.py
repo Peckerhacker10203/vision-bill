@@ -155,7 +155,7 @@ class BenchmarkService:
         for receipt_id in candidates:
             try:
                 await self._db.current_reference(receipt_id, scope=scope)
-            except (ValueError, OSError):
+            except ValueError:
                 continue  # Filtered selection excludes stale/ineligible references.
             selected.append(receipt_id)
             if request.limit is not None and len(selected) >= request.limit:

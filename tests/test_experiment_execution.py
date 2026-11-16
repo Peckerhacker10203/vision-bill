@@ -298,3 +298,17 @@ async def test_serialized_experiment_intent_preserves_effective_ocr_policy(setti
         assert identity['ocr_settings']['enabled'] and identity['ocr_settings']['required']
         assert not identity['ocr_settings']['allow_vision_fallback']
     assert service._ocr_settings.enabled is enabled and not service._ocr_settings.required
+
+
+@pytest.mark.parametrize('failure', [ConnectionRefusedError('database reconnect failed'), TimeoutError('database acquisition timed out')])
+async def test_reference_selection_propagates_infrastructure_errors(failure):
+    from types import SimpleNamespace
+    from vision_bill.model.benchmark import BenchmarkCreate
+    from vision_bill.service.benchmark_service import BenchmarkService
+    candidates = [uuid4(),uuid4()]
+    service = object.__new__(BenchmarkService)
+    service._db = SimpleNamespace(reference_candidates=AsyncMock(return_value=candidates),
+        current_reference=AsyncMock(side_effect=[failure,object()]))
+    with pytest.raises(type(failure),match=str(failure)):
+        await service._select_receipts(BenchmarkCreate(limit=1),scope=AccessScope(user_id=uuid4()))
+    assert service._db.current_reference.await_count == 1

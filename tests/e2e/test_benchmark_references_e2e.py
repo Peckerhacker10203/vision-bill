@@ -427,3 +427,121 @@ async def test_filtered_creation_qualifies_before_limit_and_explicit_ids_are_str
     async with w.pool.acquire() as conn:
         assert await conn.fetchval('SELECT count(*) FROM benchmark_runs') == before
     provider._client.chat.assert_not_awaited()
+
+
+async def test_public_human_null_completion_remains_observed_in_gold(workflow_db, tmp_path):
+    from decimal import Decimal
+    from uuid import UUID
+    import httpx
+    from fastapi import FastAPI
+    from vision_bill.api.drafts import router as drafts_router
+    from vision_bill.api.receipts import router as receipts_router
+    from vision_bill.api.benchmarks import router as benchmarks_router
+    from vision_bill.api.helper.helper import get_receipt_service, get_benchmark_service
+    from vision_bill.config import ImageSettings
+    from vision_bill.model.receipt import Receipt
+    from vision_bill.provider.llm.ollama import OllamaProvider
+    from vision_bill.security.dependencies import get_current_user
+    from vision_bill.security.models import User
+    from vision_bill.service.receipt_service import ReceiptService
+    from vision_bill.service.submission_service import SubmissionService
+    from vision_bill.service.benchmark_service import BenchmarkService
+    from vision_bill.service.experiment_scoring import detailed_score
+    from tests.e2e import test_workflow_db_e2e as workflow
+    w, scope = workflow_db
+    w._receipts._pool = w.pool
+    image = await workflow.partial_draft(w, scope, tmp_path/'human-original')
+    async with w.pool.acquire() as conn:
+        raw_before = await conn.fetchval('SELECT envelope FROM receipt_extractions WHERE image_id=$1',image.id)
+    raw_draft = json.loads(raw_before)['draft']
+    assert raw_draft['currency'] is None and raw_draft['discount_total'] is None
+    provider = OllamaProvider('http://local')
+    receipts = ReceiptService(ImageSettings(save_dir=str(tmp_path),tmp_dir=str(tmp_path)),w._settings,provider)
+    receipts._db = w._receipts
+    submissions = object.__new__(SubmissionService)
+    submissions.db = w
+    benchmarks = BenchmarkService(provider, receipts)
+    app = FastAPI()
+    app.include_router(drafts_router,prefix='/images')
+    app.include_router(receipts_router,prefix='/receipts')
+    app.include_router(benchmarks_router,prefix='/benchmarks')
+    app.state.submission_service = submissions
+    app.dependency_overrides[get_current_user] = lambda: User(id=scope.user_id,username='owner',is_admin=True,can_see_all=False)
+    app.dependency_overrides[get_receipt_service] = lambda: receipts
+    app.dependency_overrides[get_benchmark_service] = lambda: benchmarks
+    changes = workflow.complete(total='10').envelope.receipt.model_dump(mode='json')
+    changes.update(currency='EUR',discount_total='0',taxes=[],tax_total='0',amount_policy=reviews.POLICY.model_dump())
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test') as client:
+        patched = await client.patch(f'/images/{image.id}/draft',json={'expected_revision':1,'changes':changes})
+        assert patched.status_code == 200, patched.text
+        assert patched.json()['field_sources'] == {}
+        finalized = await client.post(f'/images/{image.id}/draft/finalize',json={'expected_revision':2,'request_key':'human-final'})
+        assert finalized.status_code == 200, finalized.text
+        receipt_id = UUID(finalized.json()['id'])
+        acknowledgements = [{'finding_id':f['id'],'comment':'Checked against original'} for f in finalized.json()['findings'] if f['severity']=='review']
+        verified = await client.post(f'/receipts/{receipt_id}/verify',json={'acknowledgements':acknowledgements})
+        assert verified.status_code == 200, verified.text
+        preview = await client.get(f'/benchmarks/references/{receipt_id}')
+        assert preview.status_code == 200, preview.text
+        current = preview.json()
+        assert {'currency','discount_total'} <= set(current['scored_fields'])
+        assert (await client.get(f'/benchmarks/references/{receipt_id}')).json()['document_sha256'] == current['document_sha256']
+        qualified = await client.post(f'/benchmarks/references/{receipt_id}',json={'expected_review_revision':current['review_revision'],'expected_document_sha256':current['document_sha256']})
+        assert qualified.status_code == 200, qualified.text
+    gold = await benchmarks._db.current_reference(receipt_id,scope=scope)
+    assert str(gold.id) == qualified.json()['id'] and gold.scored_fields == current['scored_fields']
+    expected = Receipt.model_validate(gold.expected)
+    for field, wrong in [('currency','USD'),('discount_total',Decimal('1'))]:
+        assert not detailed_score(gold.expected,expected.model_copy(update={field:wrong}),scored_fields=gold.scored_fields)['full_receipt_correct']
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval('SELECT envelope FROM receipt_extractions WHERE image_id=$1',image.id) == raw_before
+    legacy,_,_ = await human(w,scope,tmp_path)
+    legacy_preview = await benchmarks.reference_preview(legacy.id,scope=scope)
+    assert not {'currency','discount_total'} & set(legacy_preview.scored_fields)
+
+
+async def test_reference_pool_failure_aborts_before_partial_run(workflow_db,tmp_path):
+    from unittest.mock import AsyncMock
+    from vision_bill.config import ImageSettings, OcrSettings
+    from vision_bill.model.benchmark import BenchmarkCreate
+    from vision_bill.provider.llm.ollama import OllamaProvider
+    from vision_bill.provider.llm.base import ModelInfo
+    from vision_bill.service.receipt_service import ReceiptService
+    from vision_bill.service.benchmark_service import BenchmarkService
+    w,scope = workflow_db
+    b = bench(w)
+    for _ in range(2):
+        row,_,_ = await human(w,scope,tmp_path)
+        preview = await b.reference_preview(row.id,scope=scope)
+        await b.qualify_reference(row.id,preview.review_revision,preview.document_sha256,scope=scope)
+    provider = OllamaProvider('http://local')
+    model = ModelInfo('fixture'); model.capabilities=['vision','completion']
+    provider.get_available_models = AsyncMock(return_value=[model])
+    receipts = ReceiptService(ImageSettings(save_dir=str(tmp_path),tmp_dir=str(tmp_path)),w._settings,provider,ocr_settings=OcrSettings(enabled=False))
+    receipts._db = w._receipts
+    service = BenchmarkService(provider,receipts)
+    class ReconnectingPool:
+        calls = 0
+        def acquire(self):
+            self.calls += 1
+            if self.calls == 2:  # Candidate enumeration succeeds; first reference acquisition fails.
+                raise ConnectionRefusedError('private pool reconnect failed')
+            return w.pool.acquire()
+    service._db._pool = ReconnectingPool()
+    with pytest.raises(ConnectionRefusedError,match='private pool reconnect failed'):
+        await service.create_run(BenchmarkCreate(model_ids=['fixture'],limit=1),scope=scope)
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval('SELECT count(*) FROM benchmark_runs') == 0
+        assert await conn.fetchval('SELECT count(*) FROM benchmark_tasks') == 0
+
+
+async def test_reference_hash_read_unavailability_is_a_domain_failure(workflow_db,tmp_path,monkeypatch):
+    from vision_bill.service import experiment_execution
+    w,scope = workflow_db
+    row,_,path = await human(w,scope,tmp_path)
+    assert path.is_file()  # Initial integrity check succeeds; the later hash open fails.
+    def vanished(_path):
+        raise FileNotFoundError('original vanished during hash read')
+    monkeypatch.setattr(experiment_execution,'image_digest',vanished)
+    with pytest.raises(ValueError,match='original_integrity_failed'):
+        await bench(w).reference_preview(row.id,scope=scope)
