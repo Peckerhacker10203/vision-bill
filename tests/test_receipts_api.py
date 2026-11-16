@@ -687,6 +687,7 @@ def test_update_receipt_accepts_suggested_tags(api_context: ApiContext) -> None:
         "subtotal": "10.00",
         "total": "10.00",
     }
+    body["expected_operation_revision"] = 1
     body["line_items"][0]["tags"] = ["brunch", "  Brunch  ", ""]
 
     response = ctx.client.put(
@@ -1000,7 +1001,10 @@ def test_update_receipt_sets_collections(api_context: ApiContext) -> None:
     ctx = api_context
     ctx.conn.fetchrow = AsyncMock(return_value=_receipt_row(id=RECEIPT_ID))
 
+    ctx.conn.fetch = AsyncMock(side_effect=lambda sql, *args: [{"id": UUID("00000000-0000-4000-8000-0000000000c1")}] if "SELECT id FROM collections" in sql else [])
+
     body = {
+        "expected_operation_revision": 1,
         "confidence": 90,
         "merchant_name": "M",
         "date": "2026-06-05",
@@ -1017,10 +1021,9 @@ def test_update_receipt_sets_collections(api_context: ApiContext) -> None:
     }
     r = ctx.client.put(f"{RECEIPTS_URL}/{RECEIPT_ID}", json=body)
     assert r.status_code == 200
-    coll_svc.set_receipt_collections.assert_awaited_once()
-    args = coll_svc.set_receipt_collections.call_args.args
-    assert args[0] == RECEIPT_ID
-    assert list(args[1]) == [UUID("00000000-0000-4000-8000-0000000000c1")]
+    calls = [c for c in ctx.conn.execute.call_args_list if "INSERT INTO receipt_collections" in c.args[0]]
+    assert len(calls) == 1 and calls[0].args[1:] == (RECEIPT_ID, UUID("00000000-0000-4000-8000-0000000000c1"))
+    coll_svc.set_receipt_collections.assert_not_awaited()
 
 
 def test_update_receipt_empty_collection_ids_clears_all(api_context: ApiContext) -> None:
@@ -1034,6 +1037,7 @@ def test_update_receipt_empty_collection_ids_clears_all(api_context: ApiContext)
     ctx.conn.fetchrow = AsyncMock(return_value=_receipt_row(id=RECEIPT_ID))
 
     body = {
+        "expected_operation_revision": 1,
         "confidence": 90,
         "merchant_name": "M",
         "date": "2026-06-05",
@@ -1050,10 +1054,9 @@ def test_update_receipt_empty_collection_ids_clears_all(api_context: ApiContext)
     }
     r = ctx.client.put(f"{RECEIPTS_URL}/{RECEIPT_ID}", json=body)
     assert r.status_code == 200
-    coll_svc.set_receipt_collections.assert_awaited_once()
-    args = coll_svc.set_receipt_collections.call_args.args
-    assert args[0] == RECEIPT_ID
-    assert list(args[1]) == []
+    assert any("DELETE FROM receipt_collections" in c.args[0] for c in ctx.conn.execute.call_args_list)
+    assert not any("INSERT INTO receipt_collections" in c.args[0] for c in ctx.conn.execute.call_args_list)
+    coll_svc.set_receipt_collections.assert_not_awaited()
 
 
 def test_update_receipt_omitted_collection_ids_noop(api_context: ApiContext) -> None:
@@ -1067,6 +1070,7 @@ def test_update_receipt_omitted_collection_ids_noop(api_context: ApiContext) -> 
     ctx.conn.fetchrow = AsyncMock(return_value=_receipt_row(id=RECEIPT_ID))
 
     body = {
+        "expected_operation_revision": 1,
         "confidence": 90,
         "merchant_name": "M",
         "date": "2026-06-05",
@@ -1137,3 +1141,13 @@ def test_manual_analysis_results_follow_owner_and_admin_scope(
     for name in set(images) - set(expected):
         assert str(receipts[name]) not in response.text
         assert f"{name}_code" not in response.text
+
+
+@pytest.mark.parametrize("error,status", [("operation_revision_conflict",409), ("review_acknowledgements_invalid",422), ("receipt_integrity_failed",422)])
+def test_locked_review_gate_errors_are_http_responses(api_context, error, status):
+    service = api_context.client.app.state.receipt_service
+    service.get_receipt_by_id = AsyncMock(return_value=__import__("types").SimpleNamespace(status="unverified"))
+    service.verify_receipt = AsyncMock(side_effect=ValueError(error))
+    response = api_context.client.post(f"{RECEIPTS_URL}/{RECEIPT_ID}/verify", json={"expected_operation_revision":2,"expected_review_revision":2,"acknowledgements":[]})
+    assert response.status_code == status
+    assert response.json()["detail"] == error

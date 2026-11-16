@@ -21,7 +21,13 @@ from ..model.ocr import OcrCapabilities, OcrResponse, SourceRef
 from ..model.receipt import Receipt
 from ..model.search import ProductSearchResponse
 from ..model.statistics import ReceiptStatistics
-from ..model.workflow import AccessScope, EnqueueResult, SubmissionCreate, SubmissionStatus
+from ..model.workflow import (
+    AccessScope,
+    EnqueueResult,
+    ReviewRequest,
+    SubmissionCreate,
+    SubmissionStatus,
+)
 from ..provider.db.collection_db import CollectionDB
 from ..provider.db.image_db import ImageDB
 from ..provider.db.receipt_db import ReceiptDB
@@ -71,10 +77,10 @@ class ReceiptService:
         self._ocr_provider: OcrProvider | None = ocr_provider
         self._ocr_settings = ocr_settings or OcrSettings(enabled=ocr_provider is not None)
         self._image_service = ImageService(image_settings)
-        self._db = ReceiptDB(pg_settings)
+        self._db = ReceiptDB(pg_settings, original_checker=self._image_service.check_originals)
         self._image_db = ImageDB(pg_settings)
         self._user_db = UserDB(pg_settings)
-        self._workflow_db = WorkflowDB(pg_settings, worker_settings=worker_settings)
+        self._workflow_db = WorkflowDB(pg_settings, worker_settings=worker_settings, original_checker=self._image_service.check_originals)
         self._collection_db: CollectionDB | None = None
 
     # ── Database delegation ──────────────────────────────────────────
@@ -184,7 +190,7 @@ class ReceiptService:
         try:
             active = await self._collection_db.active_collection(user_id, can_see_all=False)
             if active is not None:
-                await self._collection_db.assign(active.id, receipt_id)
+                await self._collection_db.assign(active.id, receipt_id, user_id=user_id)
         except Exception:  # noqa: BLE001 - optional capture must not fail extraction
             logger.warning("collection_capture_failed")
 
@@ -284,9 +290,10 @@ class ReceiptService:
         )
 
     async def verify_receipt(
-        self, receipt_id: UUID, user_id: UUID | None = None, can_see_all: bool = False
+        self, receipt_id: UUID, request: ReviewRequest | None = None, *,
+        scope: AccessScope | None = None, user_id: UUID | None = None, can_see_all: bool = False,
     ) -> ReceiptRow | None:
-        return await self._db.verify_receipt(receipt_id, user_id=user_id, can_see_all=can_see_all)
+        return await self._db.verify_receipt(receipt_id, request, scope=scope, user_id=user_id, can_see_all=can_see_all)
 
     async def delete_receipt(
         self, receipt_id: UUID, user_id: UUID | None = None, can_see_all: bool = False

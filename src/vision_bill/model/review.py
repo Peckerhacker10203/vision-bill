@@ -4,7 +4,7 @@ from decimal import Decimal
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .ocr import Sha256, SourceRef
 
@@ -55,9 +55,17 @@ class SourceView(BaseModel):
 
 
 class OriginalAvailability(BaseModel):
-    part_id: UUID
+    # None is an honest legacy path observation, never a fabricated persisted UUID.
+    part_id: UUID | None
+    photo_index: int | None = Field(default=None, ge=0)
     available: bool
     sha256_matches: bool
+
+    @model_validator(mode="after")
+    def legacy_index(self) -> "OriginalAvailability":
+        if self.part_id is None and self.photo_index is None:
+            raise ValueError("legacy original availability requires photo_index")
+        return self
 
 
 class ReviewEvaluation(BaseModel):

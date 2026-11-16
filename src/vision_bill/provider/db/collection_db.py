@@ -10,6 +10,7 @@ import asyncpg
 
 from ...model.collection import Collection, CollectionDetail, CollectionSummary, CurrencyTotal
 from ...model.db.receipt import ReceiptRow
+from .receipt_db import MEMBERSHIP_LOCK_SQL, ReceiptDB
 
 CREATE_COLLECTION_SQL = (
     "INSERT INTO collections (user_id, name, color, start_date, end_date, active) "
@@ -188,9 +189,28 @@ class CollectionDB:
     async def delete(self, collection_id: UUID, user_id: UUID | None, can_see_all: bool) -> bool:
         args: list[Any] = [collection_id]
         sql = self._scoped_returning(DELETE_COLLECTION_SQL, args, user_id, can_see_all)
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(sql, *args)
-        return row is not None
+        async with self.pool.acquire() as conn, conn.transaction():
+            await conn.execute(MEMBERSHIP_LOCK_SQL)
+            visible = await conn.fetchrow(
+                EXISTS_COLLECTION_SQL + self._owner_scope([collection_id], user_id, can_see_all),
+                *args,
+            )
+            if visible is None:
+                return False
+            linked = await conn.fetch(
+                "SELECT receipt_id FROM receipt_collections WHERE collection_id=$1 ORDER BY receipt_id",
+                collection_id,
+            )
+            locked = []
+            for link in linked:
+                row = await ReceiptDB._lock_review_receipt(conn, link["receipt_id"], None, True)
+                if row is not None:
+                    locked.append(row["id"])
+            deleted = await conn.fetchrow(sql, *args)
+            if deleted is not None:
+                for receipt_id in locked:
+                    await self._membership_event(conn, receipt_id, user_id)
+            return deleted is not None
 
     async def exists(self, collection_id: UUID, user_id: UUID | None, can_see_all: bool) -> bool:
         args: list[Any] = [collection_id]
@@ -235,25 +255,93 @@ class CollectionDB:
             row = await conn.fetchrow(set_sql, *args)
         return self._collection_from_row(row) if row is not None else None
 
-    async def assign(self, collection_id: UUID, receipt_id: UUID) -> None:
-        async with self.pool.acquire() as conn:
-            await conn.execute(ASSIGN_SQL, receipt_id, collection_id)
+    @staticmethod
+    async def _membership_event(
+        conn: asyncpg.Connection, receipt_id: UUID, actor: UUID | None
+    ) -> None:
+        row = await conn.fetchrow(
+            "UPDATE receipts SET operation_revision=operation_revision+1 WHERE id=$1 RETURNING *",
+            receipt_id,
+        )
+        if row is not None:
+            await ReceiptDB._append_review_history(conn, row, "collections_changed", actor)
 
-    async def unassign(self, collection_id: UUID, receipt_id: UUID) -> bool:
-        async with self.pool.acquire() as conn:
+    @staticmethod
+    async def _lock_membership(
+        conn: asyncpg.Connection,
+        collection_id: UUID,
+        receipt_id: UUID,
+        user_id: UUID | None,
+        can_see_all: bool,
+    ) -> None:
+        await conn.execute(MEMBERSHIP_LOCK_SQL)
+        if await ReceiptDB._lock_review_receipt(conn, receipt_id, user_id, can_see_all) is None:
+            raise ValueError("receipt_not_found")
+        visible = await conn.fetchrow(
+            "SELECT id FROM collections WHERE id=$1 AND ($3 OR $2::uuid IS NULL OR user_id=$2) FOR SHARE",
+            collection_id,
+            user_id,
+            can_see_all,
+        )
+        if visible is None:
+            raise ValueError("collection_not_found")
+
+    async def assign(
+        self,
+        collection_id: UUID,
+        receipt_id: UUID,
+        *,
+        user_id: UUID | None = None,
+        can_see_all: bool = False,
+    ) -> None:
+        async with self.pool.acquire() as conn, conn.transaction():
+            await self._lock_membership(conn, collection_id, receipt_id, user_id, can_see_all)
+            changed = await conn.fetchrow(
+                ASSIGN_SQL + " RETURNING receipt_id", receipt_id, collection_id
+            )
+            if changed is not None:
+                await self._membership_event(conn, receipt_id, user_id)
+
+    async def unassign(
+        self,
+        collection_id: UUID,
+        receipt_id: UUID,
+        *,
+        user_id: UUID | None = None,
+        can_see_all: bool = False,
+    ) -> bool:
+        async with self.pool.acquire() as conn, conn.transaction():
+            await self._lock_membership(conn, collection_id, receipt_id, user_id, can_see_all)
             row = await conn.fetchrow(UNASSIGN_SQL, receipt_id, collection_id)
-        return row is not None
+            if row is not None:
+                await self._membership_event(conn, receipt_id, user_id)
+            return row is not None
 
     async def collection_ids_for_receipt(self, receipt_id: UUID) -> list[UUID]:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(LIST_COLLECTION_IDS_FOR_RECEIPT_SQL, receipt_id)
         return [row["collection_id"] for row in rows]
 
-    async def set_receipt_collections(self, receipt_id: UUID, collection_ids: list[UUID]) -> None:
-        async with self.pool.acquire() as conn:
-            await conn.execute(DELETE_RECEIPT_COLLECTIONS_SQL, receipt_id)
-            for cid in collection_ids:
-                await conn.execute(ASSIGN_SQL, receipt_id, cid)
+    async def set_receipt_collections(
+        self,
+        receipt_id: UUID,
+        collection_ids: list[UUID],
+        *,
+        user_id: UUID | None = None,
+        can_see_all: bool = False,
+    ) -> None:
+        async with self.pool.acquire() as conn, conn.transaction():
+            await conn.execute(MEMBERSHIP_LOCK_SQL)
+            if await ReceiptDB._lock_review_receipt(conn, receipt_id, user_id, can_see_all) is None:
+                raise ValueError("receipt_not_found")
+            current = {
+                row["collection_id"]
+                for row in await conn.fetch(LIST_COLLECTION_IDS_FOR_RECEIPT_SQL, receipt_id)
+            }
+            if current == set(collection_ids):
+                return
+            await ReceiptDB._set_collections(conn, receipt_id, collection_ids, user_id, can_see_all)
+            await self._membership_event(conn, receipt_id, user_id)
 
     async def receipts_in_collection(
         self, collection_id: UUID, user_id: UUID | None, can_see_all: bool

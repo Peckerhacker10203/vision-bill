@@ -38,9 +38,20 @@ def test_multi_photo_immediate_processing_review_and_cleanup(http_factory, stub,
     receipt_url = f"{API}/receipts/{job['receipt_id']}"
     receipt = client.get(receipt_url).json()
     assert len(receipt["line_items"]) == len(truth["line_items"])
-    assert receipt["receipt"]["status"] == ("verified" if bypass else "unverified")
-    if not bypass:
-        assert client.post(f"{receipt_url}/verify").status_code == 200
+    row = receipt["receipt"]
+    # This fixture supplies no amount policy: bypass cannot approve these unknowns.
+    assert {f["code"] for f in row["findings"]} == {
+        "unknown_tax_basis", "unknown_subtotal_origin", "missing_tax_information",
+    }
+    assert all(f["severity"] == "review" for f in row["findings"])
+    assert row["status"] == "unverified" and row["verified"] is False
+    verified = client.post(f"{receipt_url}/verify", json={
+        "expected_operation_revision": row["operation_revision"],
+        "expected_review_revision": row["review_revision"],
+        "acknowledgements": [{"finding_id": f["id"], "comment": "Fixture policy unknowns reviewed against originals"}
+                             for f in row["findings"]],
+    })
+    assert verified.status_code == 200, verified.text
     assert client.get(f"{image_url}/file?part=1").content == photo
     assert client.delete(receipt_url).status_code == 200
     assert client.get(image_url).status_code == 404

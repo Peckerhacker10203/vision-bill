@@ -665,7 +665,7 @@ async def test_verify_receipt_delegates(delegation_context: DelegationContext) -
 
     result = await service.verify_receipt(RECEIPT_ID)
 
-    mock_db.verify_receipt.assert_awaited_once_with(RECEIPT_ID, user_id=None, can_see_all=False)
+    mock_db.verify_receipt.assert_awaited_once_with(RECEIPT_ID, None, scope=None, user_id=None, can_see_all=False)
     assert result is row
 
 
@@ -889,7 +889,7 @@ async def test_persist_receipt_captures_to_active_collection(delegation_context)
 
     assert result is not None
     coll_db.active_collection.assert_awaited_once_with(OWNER_ID, can_see_all=False)
-    coll_db.assign.assert_awaited_once_with(ACTIVE_COLLECTION_ID, RECEIPT_ID)
+    coll_db.assign.assert_awaited_once_with(ACTIVE_COLLECTION_ID, RECEIPT_ID, user_id=OWNER_ID)
 
 
 @pytest.mark.asyncio

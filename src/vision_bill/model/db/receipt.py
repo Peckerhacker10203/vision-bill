@@ -5,7 +5,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
-from ..review import AmountPolicy, ReviewFinding
+from ..ocr import SourceRef
+from ..review import AmountPolicy, FindingAcknowledgement, ReviewFinding
 
 
 class ReceiptRow(BaseModel):
@@ -38,8 +39,19 @@ class ReceiptRow(BaseModel):
     amount_policy: AmountPolicy = Field(default_factory=AmountPolicy)
     findings: list[ReviewFinding] = Field(default_factory=list)
     verification_source: str | None = None
+    checks_version: str | None = None
+    field_sources: dict[str, list[SourceRef]] = Field(default_factory=dict)
+    overlap_decisions: list[dict[str, object]] = Field(default_factory=list)
+    acknowledgements: list[FindingAcknowledgement] = Field(default_factory=list)
 
-    @field_validator("amount_policy", "findings", mode="before")
+    @field_validator(
+        "amount_policy",
+        "findings",
+        "field_sources",
+        "overlap_decisions",
+        "acknowledgements",
+        mode="before",
+    )
     @classmethod
     def decode_review_json(cls, value: object) -> object:
         return json.loads(value) if isinstance(value, str) else value

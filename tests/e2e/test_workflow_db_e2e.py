@@ -132,7 +132,8 @@ async def db(postgres):
 async def workflow_db(db):
     migrate(db)
     module = importlib.import_module("vision_bill.provider.db.workflow_db")
-    provider = module.WorkflowDB(db)
+    from vision_bill.service.image_service import ImageService
+    provider = module.WorkflowDB(db, original_checker=ImageService.check_originals)
     await provider.init_db()
     owner = uuid4()
     async with provider.pool.acquire() as conn:
@@ -195,7 +196,7 @@ def complete(*, total="90071992547.91"):
 async def test_bootstrap_and_empty_downgrade(db):
     migrate(db)
     conn = await asyncpg.connect(db.pg_dsn)
-    assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0013"
+    assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0014"
     await conn.close()
     migrate(db, "0010", "downgrade")
     migrate(db)
@@ -320,7 +321,7 @@ async def test_finish_atomic_decimal_and_immutable_history(workflow_db, db):
         )
     assert migrate(db, "0010", "downgrade", check=False).returncode != 0
     async with w.pool.acquire() as conn:
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0013"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0014"
         assert await conn.fetchval("SELECT count(*) FROM receipt_review_revisions") == 1
 
 
@@ -755,17 +756,17 @@ async def test_checkpoint_read_is_fenced_and_preserves_saved_metadata(workflow_d
 
 
 async def test_numeric_update_and_owner_admin_scope(workflow_db):
+    from vision_bill.api.receipts import ReceiptUpdate
     from vision_bill.provider.db.receipt_db import ReceiptDB
+    from vision_bill.service.image_service import ImageService
 
     w, scope = workflow_db
     image = await enqueue(w, scope)
     outcome = complete()
     result = await w.finish_attempt(await w.claim_next(), outcome)
-    receipts = ReceiptDB(w._settings)
+    receipts = ReceiptDB(w._settings, original_checker=ImageService.check_originals)
     receipts._pool = w.pool
-    updated = outcome.envelope.receipt.model_copy(
-        update={"total": Decimal("90071992547.93"), "subtotal": Decimal("90071992547.93")}
-    )
+    updated = ReceiptUpdate.model_validate(dict(outcome.envelope.receipt.model_dump(), total="90071992547.93", subtotal="90071992547.93", expected_operation_revision=1))
     saved = await receipts.update_receipt(result.receipt.id, updated, user_id=scope.user_id)
     assert saved.total == Decimal("90071992547.93")
     other = AccessScope(user_id=uuid4())
@@ -981,11 +982,18 @@ async def test_reference_validation_preserves_real_references_and_ordinary_telem
         assert not (await w.finish_attempt(claim, outcome)).stale
 
 
-async def partial_draft(w, scope):
+async def partial_draft(w, scope, original_path=None):
     from vision_bill.model.extraction import ExtractionDraft
 
-    image = await enqueue(w, scope)
+    request = submission()
+    if original_path is not None:
+        from hashlib import sha256
+        original_path.write_bytes(b"original fixture")
+        request.parts[0].image_path = str(original_path)
+        request.source_manifest[0]["source_sha256"] = sha256(original_path.read_bytes()).hexdigest()
+    image = (await w.enqueue_submission(request, scope=scope, idempotency_key=None)).submission
     outcome = complete()
+    outcome.envelope.provenance.ordered_source_sha256 = [request.source_manifest[0]["source_sha256"]]
     outcome.envelope.draft = ExtractionDraft(merchant_name="observed", total=None)
     outcome.envelope.receipt = None
     await w.finish_attempt(
@@ -1047,12 +1055,12 @@ async def test_clear_checkpoint_is_fenced_and_retains_immutable_views(workflow_d
         assert await conn.fetchval("SELECT count(*) FROM extraction_working_views") == 1
 
 
-async def test_draft_finalize_missing_then_once_unverified_and_rollback(workflow_db):
+async def test_draft_finalize_missing_then_once_unverified_and_rollback(workflow_db, tmp_path):
     from vision_bill.model.review import OriginalAvailability
     from vision_bill.model.workflow import DraftFinalize, DraftPatch
 
     w, scope = workflow_db
-    image = await partial_draft(w, scope)
+    image = await partial_draft(w, scope, tmp_path / "original.png")
     parts = await w.get_source_parts(image.id, scope=scope)
     originals = [
         OriginalAvailability(part_id=p.part_id, available=True, sha256_matches=True) for p in parts
@@ -1079,12 +1087,12 @@ async def test_draft_finalize_missing_then_once_unverified_and_rollback(workflow
         )
 
 
-async def test_draft_finalization_rolls_back_after_receipt_insert(workflow_db, monkeypatch):
+async def test_draft_finalization_rolls_back_after_receipt_insert(workflow_db, monkeypatch, tmp_path):
     from vision_bill.model.review import OriginalAvailability
     from vision_bill.model.workflow import DraftFinalize, DraftPatch
 
     w, scope = workflow_db
-    image = await partial_draft(w, scope)
+    image = await partial_draft(w, scope, tmp_path / "original.png")
     document = complete().envelope.receipt.model_dump(mode="json")
     await w.patch_draft(image.id, DraftPatch(expected_revision=1, changes=document), scope=scope)
     originals = [

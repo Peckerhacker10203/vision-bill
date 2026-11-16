@@ -20,6 +20,7 @@ from ..helper.deadline import check_deadline
 from ..model.db.image import ImagePart
 from ..model.image import ImageInfo
 from ..model.ocr import WorkingImage, WorkingImageMetadata
+from ..model.review import OriginalAvailability
 
 pillow_heif.register_heif_opener()  # type: ignore[attr-defined]
 
@@ -58,6 +59,32 @@ magic_service = MagicService()
 
 class ImageService:
     """Handles image inspection and validation."""
+
+    @staticmethod
+    async def check_originals(parts: list[ImagePart]) -> list[OriginalAvailability]:
+        """Read every original, including legacy paths, without moving or modifying it."""
+
+        def inspect() -> list[OriginalAvailability]:
+            result = []
+            for part in parts:
+                available = matches = False
+                try:
+                    digest = sha256()
+                    with Path(part.image_path).open("rb") as stream:
+                        while chunk := stream.read(1024 * 1024):
+                            digest.update(chunk)
+                    available = True
+                    matches = part.source_sha256 is None or digest.hexdigest() == part.source_sha256
+                except OSError:
+                    pass
+                result.append(
+                    OriginalAvailability(
+                        part_id=part.part_id, photo_index=part.photo_index, available=available, sha256_matches=matches
+                    )
+                )
+            return result
+
+        return await asyncio.to_thread(inspect)
 
     def __init__(self, settings: ImageSettings, sniff_chunk_size: int = 4096):
         self._sniff_chunk_size = sniff_chunk_size

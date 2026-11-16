@@ -18,6 +18,7 @@ from ..model.db.receipt import ReceiptRow
 from ..model.experiment import ExperimentOptions
 from ..model.extraction import DraftView, ExtractionDraft, InferenceEnvelope
 from ..model.ocr import OcrPageMetadata, OcrResponse, SourceRef, WorkingImage, WorkingImageMetadata
+from ..model.receipt import Receipt
 from ..model.review import OriginalAvailability
 from ..model.workflow import (
     AccessScope,
@@ -35,7 +36,7 @@ from ..provider.llm.errors import AnalysisTimeoutError, UnreadableReceiptError
 from ..provider.ocr.base import compact_ocr_text
 from .extraction_pipeline import OcrRuntimeChangedError, OriginalSourceChangedError
 from .image_service import ImageService
-from .receipt_review import admission_review
+from .receipt_review import evaluate_receipt, receipt_from_draft
 from .receipt_service import ReceiptService
 
 logger = logging.getLogger(__name__)
@@ -268,7 +269,7 @@ class SubmissionService:
         # Check originals again before accepting any receipt; preserve bytes and paths.
         if await run_sync_before(deadline, self._bindings, image) != bindings:
             raise SourceIntegrityError
-        return self._outcome(envelope, manifests)
+        return self._outcome(envelope, manifests, [OriginalAvailability(part_id=p.part_id, photo_index=p.photo_index, available=True, sha256_matches=True) for p in parts])
 
     async def _save_view(
         self,
@@ -354,7 +355,11 @@ class SubmissionService:
             return [], []
 
     @staticmethod
-    def _outcome(envelope: InferenceEnvelope, views: list[PersistedWorkingView]) -> AttemptOutcome:
+    def _outcome(
+        envelope: InferenceEnvelope,
+        views: list[PersistedWorkingView],
+        originals: list[OriginalAvailability],
+    ) -> AttemptOutcome:
         document = envelope.draft
         if document is None and envelope.receipt is not None:
             document = ExtractionDraft.model_validate(envelope.receipt.model_dump())
@@ -372,7 +377,22 @@ class SubmissionService:
             return AttemptOutcome(
                 kind="retry", result_code=code, envelope=envelope, persisted_views=views
             )
-        review = admission_review(document, originals_valid=True, findings=envelope.findings)
+        reviewed: Receipt | ExtractionDraft = document
+        if envelope.receipt is not None:
+            try:
+                receipt_from_draft(document)
+            except ValueError:
+                pass  # Missing observations must not acquire final Receipt defaults.
+            else:
+                reviewed = envelope.receipt  # Already reconciled by the explicit overlap producer.
+        review = evaluate_receipt(
+            reviewed,
+            envelope.amount_policy,
+            envelope.field_sources,
+            envelope.overlap_decisions,
+            originals,
+            retained_findings=envelope.findings,
+        )
         if envelope.receipt is not None and review.can_finalize:
             return AttemptOutcome(
                 kind="complete", envelope=envelope, review=review, persisted_views=views
@@ -412,6 +432,7 @@ class SubmissionService:
                         result.append(
                             OriginalAvailability(
                                 part_id=part.part_id,
+                                photo_index=part.photo_index,
                                 available=True,
                                 sha256_matches=digest == part.source_sha256,
                             )
@@ -419,7 +440,7 @@ class SubmissionService:
                     except OSError:
                         result.append(
                             OriginalAvailability(
-                                part_id=part.part_id, available=False, sha256_matches=False
+                                part_id=part.part_id, photo_index=part.photo_index, available=False, sha256_matches=False
                             )
                         )
                 return result

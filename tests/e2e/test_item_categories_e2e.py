@@ -29,7 +29,7 @@ def upload(client):
 
 
 def save(client, details, lines, **updates):
-    body = {**details["receipt"], "line_items": lines, "taxes": details["taxes"], **updates}
+    body = {**details["receipt"], "expected_operation_revision": details["receipt"]["operation_revision"], "line_items": lines, "taxes": details["taxes"], **updates}
     response = client.put(f"{API}/receipts/{details['receipt']['id']}", json=body)
     assert response.status_code == 200, response.text
     return client.get(f"{API}/receipts/{details['receipt']['id']}").json()
@@ -114,7 +114,18 @@ def test_item_statistics_scoping_dates_deposits_and_collections(http_factory):
     )
     receipt_id = details["receipt"]["id"]
     assert alice.get(f"{API}/statistics/items").json()["categories"] == []
-    assert alice.post(f"{API}/receipts/{receipt_id}/verify").status_code == 200
+    row = details["receipt"]
+    assert {f["code"] for f in row["findings"]} == {
+        "unknown_tax_basis", "unknown_subtotal_origin", "missing_tax_information", "unknown_discount_treatment",
+    }
+    assert all(f["severity"] == "review" for f in row["findings"])
+    verified = alice.post(f"{API}/receipts/{receipt_id}/verify", json={
+        "expected_operation_revision": row["operation_revision"],
+        "expected_review_revision": row["review_revision"],
+        "acknowledgements": [{"finding_id": f["id"], "comment": "Test fixture printed values confirmed"}
+                             for f in row["findings"] if f["severity"] == "review"],
+    })
+    assert verified.status_code == 200, verified.text
     report = alice.get(f"{API}/statistics/items", params={"months": 3})
     assert report.status_code == 200, report.text
     report = report.json()

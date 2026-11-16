@@ -38,3 +38,14 @@ def test_line_items_fetched_in_original_order(http_factory) -> None:
     # Fixture 'a' is (Milk, Bread); the DB must return them in that order.
     assert descriptions == ["Milk", "Bread"], f"line items reshuffled: {descriptions}"
     assert positions == [0, 1], f"positions not sequential: {positions}"
+
+    reordered = list(reversed(receipt["line_items"]))
+    reordered[0]["description"] = reordered[1]["description"] = "Repeated item"
+    body = {**receipt["receipt"], "expected_operation_revision": receipt["receipt"]["operation_revision"],
+            "line_items": reordered, "taxes": receipt["taxes"]}
+    saved = client.put(f"{API}/receipts/{row['receipt_id']}", json=body)
+    assert saved.status_code == 200, saved.text
+    fetched = client.get(f"{API}/receipts/{row['receipt_id']}").json()["line_items"]
+    assert [item["id"] for item in fetched] == [item["id"] for item in reordered]
+    assert [item["position"] for item in fetched] == [0, 1]
+    assert [item["description"] for item in fetched] == ["Repeated item", "Repeated item"]

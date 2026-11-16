@@ -37,8 +37,8 @@ from ...model.workflow import (
     SubmissionStatus,
     assert_metadata_only,
 )
-from ...service.receipt_review import admission_review, receipt_from_draft
-from .receipt_db import ReceiptDB
+from ...service.receipt_review import evaluate_receipt, persistent_findings, receipt_from_draft
+from .receipt_db import OriginalChecker, ReceiptDB
 
 
 def _json(value: Any) -> str:
@@ -87,11 +87,11 @@ def _nested_view_ids(value: Any) -> list[UUID]:
 
 
 class WorkflowDB:
-    def __init__(self, settings: PGSettings, *, worker_settings: WorkerSettings | None = None):
+    def __init__(self, settings: PGSettings, *, worker_settings: WorkerSettings | None = None, original_checker: OriginalChecker | None = None):
         self._settings = settings
         self._worker = worker_settings or WorkerSettings()
         self._pool: asyncpg.Pool | None = None
-        self._receipts = ReceiptDB(settings)
+        self._receipts = ReceiptDB(settings, original_checker=original_checker)
 
     @property
     def pool(self) -> asyncpg.Pool:
@@ -661,7 +661,12 @@ class WorkflowDB:
                     and outcome.review is not None
                 )
                 assert payload is not None
-                verified = row["bypass_review"] and outcome.review.can_auto_verify
+                availability = [OriginalAvailability(part_id=p.part_id, photo_index=p.photo_index, available=True, sha256_matches=True) for p in parts]
+                if row["bypass_review"]:
+                    availability = await self._receipts._review_originals(conn, row["id"])
+                financial = evaluate_receipt(envelope.receipt, envelope.amount_policy, envelope.field_sources,
+                                             envelope.overlap_decisions, availability, retained_findings=envelope.findings)
+                verified = row["bypass_review"] and outcome.review.can_auto_verify and financial.can_auto_verify
                 receipt = await self._receipts.insert_receipt(
                     conn,
                     envelope.receipt,
@@ -672,15 +677,16 @@ class WorkflowDB:
                 )
                 record = await conn.fetchrow(
                     """UPDATE receipts SET extraction_id=$2,amount_policy=$3::jsonb,
-                    findings=$4::jsonb,field_sources=$5::jsonb,checks_version=$6,verification_source=$7
+                    findings=$4::jsonb,field_sources=$5::jsonb,checks_version=$6,verification_source=$7,overlap_decisions=$8::jsonb
                     WHERE id=$1 RETURNING *""",
                     receipt.id,
                     extraction_id,
                     envelope.amount_policy.model_dump_json(),
-                    _json([f.model_dump(mode="json") for f in outcome.review.findings]),
+                    _json([f.model_dump(mode="json") for f in financial.findings]),
                     _json(payload["field_sources"]),
                     outcome.review.checks_version,
-                    "automatic" if verified else None,
+                    "automatic_bypass" if verified else None,
+                    _json(envelope.overlap_decisions),
                 )
                 receipt = self._receipts._receipt_row_from_record(record)
                 await conn.execute(
@@ -691,6 +697,7 @@ class WorkflowDB:
                         {
                             "receipt": receipt.model_dump(mode="json"),
                             "extraction_id": str(extraction_id),
+                            "document": envelope.receipt.model_dump(mode="json"),
                             "field_sources": payload["field_sources"],
                         }
                     ),
@@ -1004,7 +1011,14 @@ class WorkflowDB:
                 or not all(o.available and o.sha256_matches for o in originals)
             ):
                 raise ValueError("original_integrity_failed")
-            review = admission_review(view.document, originals_valid=True, findings=view.findings)
+            originals = await self._receipts._review_originals(conn, image_id)
+            if not originals or not all(o.available and o.sha256_matches for o in originals):
+                raise ValueError("original_integrity_failed")
+            sources = TypeAdapter(dict[str, list[SourceRef]]).validate_python(_decoded(row["field_sources"]))
+            extraction = await conn.fetchrow("SELECT envelope FROM receipt_extractions WHERE id=$1", row["extraction_id"])
+            overlaps = _decoded(extraction["envelope"]).get("overlap_decisions", []) if extraction else []
+            review = evaluate_receipt(view.document, view.amount_policy, sources, overlaps, originals,
+                                      retained_findings=persistent_findings(view.findings))
             if not review.can_finalize:
                 raise ValueError("draft_integrity_failed")
             saved_receipt = await self._receipts.insert_receipt(
@@ -1017,13 +1031,14 @@ class WorkflowDB:
             )
             saved = await conn.fetchrow(
                 """UPDATE receipts SET extraction_id=$2,amount_policy=$3::jsonb,
-                findings=$4::jsonb,field_sources=$5::jsonb,checks_version=$6 WHERE id=$1 RETURNING *""",
+                findings=$4::jsonb,field_sources=$5::jsonb,checks_version=$6,overlap_decisions=$7::jsonb WHERE id=$1 RETURNING *""",
                 saved_receipt.id,
                 row["extraction_id"],
                 row["amount_policy"],
-                row["findings"],
+                _json([finding.model_dump(mode="json") for finding in review.findings]),
                 row["field_sources"],
                 review.checks_version,
+                _json(overlaps),
             )
             result = self._receipts._receipt_row_from_record(saved)
             await conn.execute(
@@ -1035,6 +1050,7 @@ class WorkflowDB:
                     {
                         "receipt": result.model_dump(mode="json"),
                         "draft_revision": row["revision"],
+                        "document": receipt.model_dump(mode="json"),
                         "request_key": request.request_key,
                     }
                 ),

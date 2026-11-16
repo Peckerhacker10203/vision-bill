@@ -18,6 +18,7 @@ UID = UUID("00000000-0000-4000-8000-0000000000a1")
 
 
 def _make_pool(conn: AsyncMock) -> MagicMock:
+    conn.transaction = MagicMock(return_value=AsyncMock(__aenter__=AsyncMock(return_value=None), __aexit__=AsyncMock(return_value=None)))
     pool = MagicMock()
     pool.acquire = MagicMock(
         return_value=AsyncMock(
@@ -117,17 +118,18 @@ async def test_list_with_totals_builds_summaries(db: CollectionDB) -> None:
 @pytest.mark.asyncio
 async def test_assign_is_idempotent_insert(db: CollectionDB) -> None:
     conn = AsyncMock()
+    conn.fetchrow = AsyncMock(side_effect=lambda sql, *args: None if "INSERT INTO receipt_collections" in sql else _receipt_row())
     db._pool = _make_pool(conn)
     await db.assign(CID, RID)
-    sql = conn.execute.call_args.args[0]
-    assert "INSERT INTO receipt_collections" in sql
-    assert "ON CONFLICT" in sql
+    sql = conn.fetchrow.call_args.args[0]
+    assert "INSERT INTO receipt_collections" in sql and "ON CONFLICT" in sql
+    assert not any("operation_revision" in c.args[0] for c in conn.fetchrow.call_args_list)
 
 
 @pytest.mark.asyncio
 async def test_unassign_reports_missing(db: CollectionDB) -> None:
     conn = AsyncMock()
-    conn.fetchrow = AsyncMock(return_value=None)
+    conn.fetchrow = AsyncMock(side_effect=lambda sql, *args: None if "DELETE FROM receipt_collections" in sql else _receipt_row())
     db._pool = _make_pool(conn)
     assert await db.unassign(CID, RID) is False
 
@@ -135,7 +137,9 @@ async def test_unassign_reports_missing(db: CollectionDB) -> None:
 @pytest.mark.asyncio
 async def test_set_receipt_collections_replaces_links(db: CollectionDB) -> None:
     conn = AsyncMock()
-    conn.fetch = AsyncMock(return_value=[{"collection_id": CID}])
+    conn.fetchrow = AsyncMock(return_value=_receipt_row())
+    other = UUID("00000000-0000-4000-8000-0000000000c2")
+    conn.fetch = AsyncMock(side_effect=lambda sql, *args: [{"id": CID}, {"id": other}] if "SELECT id FROM collections" in sql else [{"collection_id": CID}] if "SELECT collection_id FROM receipt_collections" in sql else [])
     db._pool = _make_pool(conn)
     other = UUID("00000000-0000-4000-8000-0000000000c2")
     await db.set_receipt_collections(RID, [CID, other])

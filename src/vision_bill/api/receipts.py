@@ -4,17 +4,19 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import model_validator
+from pydantic import Field, model_validator
 
 from ..model.db.receipt import ReceiptRow, ReceiptWithDetails
 from ..model.item_category import CATEGORY_CODE_SET
+from ..model.ocr import SourceRef
 from ..model.receipt import LineItem, Receipt
+from ..model.review import AmountPolicy
+from ..model.workflow import AccessScope, ReviewRequest
 from ..security.dependencies import get_current_user
 from ..security.models import User
-from ..service.collection_service import CollectionService, NotFoundError
 from ..service.image_service import ImageService
 from ..service.receipt_service import ReceiptReferencedError, ReceiptService
-from .helper.helper import get_collection_service, get_image_service, get_receipt_service
+from .helper.helper import get_image_service, get_receipt_service
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,10 @@ class ReceiptUpdate(Receipt):
     untouched) from an explicit empty list (clear all memberships).
     """
 
+    expected_operation_revision: int | None = Field(default=None, ge=1)
+    amount_policy: AmountPolicy | None = None
+    field_sources: dict[str, list[SourceRef]] | None = None
+    overlap_decisions: list[dict[str, object]] | None = None
     collection_ids: list[UUID] | None = None
     line_items: list[LineItemUpdate]  # type: ignore[assignment]  # Pydantic parses PUT-only fields
 
@@ -112,7 +118,6 @@ async def update_receipt(
     receipt_id: UUID,
     receipt: ReceiptUpdate,
     receipt_service: ReceiptService = Depends(get_receipt_service),  # noqa: B008
-    collection_service: CollectionService = Depends(get_collection_service),  # noqa: B008
     current_user: User = Depends(get_current_user),  # noqa: B008
 ) -> ReceiptRow:
     if not receipt_service.db_ready:
@@ -122,41 +127,35 @@ async def update_receipt(
             receipt_id, receipt, user_id=current_user.id, can_see_all=current_user.can_see_all
         )
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+        code = str(exc)
+        status = 404 if code == "collection_not_found" else 409 if "revision" in code else 422
+        raise HTTPException(status_code=status, detail=code) from exc
     if row is None:
         raise HTTPException(status_code=404, detail="Receipt not found")
-    if receipt.collection_ids is not None:
-        try:
-            await collection_service.set_receipt_collections(
-                receipt_id, receipt.collection_ids, current_user.id, current_user.can_see_all
-            )
-        except NotFoundError:
-            raise HTTPException(status_code=404, detail="Collection not found") from None
     return row
 
 
 @router.post("/{receipt_id}/verify")
 async def verify_receipt(
     receipt_id: UUID,
+    request: ReviewRequest | None = None,
     receipt_service: ReceiptService = Depends(get_receipt_service),  # noqa: B008
     current_user: User = Depends(get_current_user),  # noqa: B008
 ) -> ReceiptRow:
-    """Verify receipt metadata while preserving original and legacy file paths."""
+    """Verify against locked current observations and preserve original file paths."""
     if not receipt_service.db_ready:
         raise HTTPException(status_code=503, detail="Database not available")
-
-    row = await receipt_service.get_receipt_by_id(
-        receipt_id, user_id=current_user.id, can_see_all=current_user.can_see_all
-    )
-    if row is None:
-        raise HTTPException(status_code=404, detail="Receipt not found")
-
-    if row.status == "verified":
-        raise HTTPException(status_code=409, detail="Receipt already verified")
-
-    verified = await receipt_service.verify_receipt(
-        receipt_id, user_id=current_user.id, can_see_all=current_user.can_see_all
-    )
+    try:
+        verified = await receipt_service.verify_receipt(
+            receipt_id,
+            request or ReviewRequest(),
+            scope=AccessScope(user_id=current_user.id, can_see_all=current_user.can_see_all),
+        )
+    except ValueError as exc:
+        code = str(exc)
+        status = 409 if "revision" in code or code == "receipt_already_verified" else 422
+        detail = "Receipt already verified" if code == "receipt_already_verified" else code
+        raise HTTPException(status_code=status, detail=detail) from exc
     if verified is None:
         raise HTTPException(status_code=404, detail="Receipt not found")
     return verified
