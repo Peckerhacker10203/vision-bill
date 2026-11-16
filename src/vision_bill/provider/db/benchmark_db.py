@@ -6,13 +6,13 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Mapping
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import asyncpg
 
+from ...config import WorkerSettings
 from ...model.benchmark import (
     BenchmarkRun,
     BenchmarkSummary,
@@ -25,9 +25,11 @@ from .receipt_db import ReceiptDB
 
 
 class BenchmarkDB:
-    def __init__(self, pool: asyncpg.Pool, receipts: ReceiptDB | None = None):
+    def __init__(self, pool: asyncpg.Pool, receipts: ReceiptDB | None = None,
+                 *, worker: WorkerSettings | None = None):
         self._pool = pool
         self._receipts = receipts
+        self._worker = worker or WorkerSettings()
 
     async def create_run(self, *, model_ids: list[str], receipt_ids: list[UUID], fingerprint: str,
                          model_digests: dict[str, str | None], timeout: int, policy: CouncilPolicy,
@@ -94,27 +96,73 @@ class BenchmarkDB:
             model_id=r["model_id"], model_digest=r["model_digest"], completed=r["completed"], succeeded=r["succeeded"], failed=r["failed"], average_score=(r["total_score"] / r["succeeded"] if r["succeeded"] else None), average_confidence=(r["total_confidence"] / r["succeeded"] if r["succeeded"] else None), average_attempts=(r["total_attempts"] / r["completed"] if r["completed"] else None), average_latency_ms=(r["total_latency_ms"] / r["completed"] if r["completed"] else None), council_candidates=r["council_candidates"], council_findings=r["council_findings"]) for r in rows]
 
     async def lease_task(self) -> Mapping[str, Any] | None:
-        now = datetime.now(UTC)
         async with self._pool.acquire() as conn, conn.transaction():
             row = await conn.fetchrow("""SELECT * FROM benchmark_tasks WHERE
-                (status IN ('queued','retrying','waiting_for_model') AND (retry_at IS NULL OR retry_at <= $1))
-                OR (status='running' AND leased_until < $1)
-                ORDER BY run_id, receipt_id FOR UPDATE SKIP LOCKED LIMIT 1""", now)
+                (status IN ('queued','retrying','waiting_for_model') AND (retry_at IS NULL OR retry_at <= clock_timestamp()))
+                OR (status='running' AND leased_until < clock_timestamp())
+                ORDER BY run_id, receipt_id, model_id FOR UPDATE SKIP LOCKED LIMIT 1""")
             if not row:
                 return None
-            await conn.execute("UPDATE benchmark_tasks SET status='running', attempts=attempts+1, started_at=$2, leased_until=$3 WHERE run_id=$1 AND model_id=$4 AND receipt_id=$5", row["run_id"], now, now + timedelta(seconds=900), row["model_id"], row["receipt_id"])
-            return dict(row)
+            # Reservation is not inference. Legacy attempts remains historical poll evidence.
+            updated = await conn.fetchrow("""UPDATE benchmark_tasks SET status='running',
+                claim_token=gen_random_uuid(), inference_started=FALSE,
+                started_at=COALESCE(started_at,clock_timestamp()), retry_at=NULL,
+                leased_until=clock_timestamp()+make_interval(secs => $4)
+                WHERE run_id=$1 AND model_id=$2 AND receipt_id=$3 RETURNING *""",
+                row["run_id"], row["model_id"], row["receipt_id"], self._worker.claim_lease_seconds)
+            return dict(updated)
 
-    async def retry_task(self, task: Mapping[str, Any], waiting: bool = False) -> None:
-        delay = min(5 * 2 ** max(0, int(task["attempts"])), 300)
-        async with self._pool.acquire() as conn:
-            await conn.execute("UPDATE benchmark_tasks SET status=$1, leased_until=NULL, retry_at=$2 WHERE run_id=$3 AND model_id=$4 AND receipt_id=$5", "waiting_for_model" if waiting else "retrying", datetime.now(UTC) + timedelta(seconds=delay), task["run_id"], task["model_id"], task["receipt_id"])
+    @staticmethod
+    async def _lock_task(conn: asyncpg.Connection, task: Mapping[str, Any]) -> None:
+        # Check the fence in a NEW statement after acquiring the lock. A timestamp
+        # evaluated before waiting (including transaction now()) is not a live lease.
+        await conn.fetchrow("SELECT 1 FROM benchmark_tasks WHERE run_id=$1 AND model_id=$2 AND receipt_id=$3 FOR UPDATE",
+                            task["run_id"], task["model_id"], task["receipt_id"])
 
-    async def finish_task(self, task: Mapping[str, Any], *, success: bool, score: float = 0, confidence: int = 0, attempts: int = 1, latency_ms: float = 0, result: dict[str, Any] | None = None) -> None:
+    async def begin_attempt(self, task: Mapping[str, Any]) -> dict[str, Any] | None:
         async with self._pool.acquire() as conn, conn.transaction():
-            deleted = await conn.execute("DELETE FROM benchmark_tasks WHERE run_id=$1 AND model_id=$2 AND receipt_id=$3", task["run_id"], task["model_id"], task["receipt_id"])
+            await self._lock_task(conn, task)
+            row = await conn.fetchrow("""UPDATE benchmark_tasks
+                SET inference_started=TRUE, inference_attempt_count=inference_attempt_count+1
+                WHERE run_id=$1 AND model_id=$2 AND receipt_id=$3 AND claim_token=$4
+                AND status='running' AND leased_until>clock_timestamp()
+                AND NOT inference_started AND inference_attempt_count<$5 RETURNING *""",
+                task["run_id"], task["model_id"], task["receipt_id"], task.get("claim_token"), self._worker.max_attempts)
+            return dict(row) if row else None
+
+    async def retry_task(self, task: Mapping[str, Any], waiting: bool = False) -> bool:
+        async with self._pool.acquire() as conn, conn.transaction():
+            await self._lock_task(conn, task)
+            # Use the stored count, never the caller's potentially pre-begin snapshot.
+            row = await conn.fetchrow("""SELECT inference_attempt_count FROM benchmark_tasks
+                WHERE run_id=$1 AND model_id=$2 AND receipt_id=$3 AND claim_token=$4
+                AND status='running' AND leased_until>clock_timestamp() AND inference_attempt_count<$5""",
+                task["run_id"], task["model_id"], task["receipt_id"], task.get("claim_token"), self._worker.max_attempts)
+            if row is None:
+                return False
+            count = row["inference_attempt_count"]
+            delay = min(30 if waiting or count == 0 else self._worker.retry_backoff_seconds[count-1],
+                        self._worker.retry_backoff_cap_seconds)
+            changed = await conn.execute("""UPDATE benchmark_tasks SET status=$5, claim_token=NULL,
+                leased_until=NULL, retry_at=clock_timestamp()+make_interval(secs => $6)
+                WHERE run_id=$1 AND model_id=$2 AND receipt_id=$3 AND claim_token=$4
+                AND status='running' AND leased_until>clock_timestamp()""",
+                task["run_id"], task["model_id"], task["receipt_id"], task.get("claim_token"),
+                "waiting_for_model" if waiting else "retrying", delay)
+            return bool(changed == "UPDATE 1")
+
+    async def finish_task(self, task: Mapping[str, Any], *, success: bool, score: float = 0, confidence: int = 0, attempts: int = 1, latency_ms: float = 0, result: dict[str, Any] | None = None) -> bool:
+        async with self._pool.acquire() as conn, conn.transaction():
+            # All finishers take run -> task. Lease/begin/retry lock only tasks, never
+            # runs, so there is no opposite task -> run lock order. Different-model
+            # last tasks must serialize here to see each other's committed removal.
+            await conn.fetchrow("SELECT id FROM benchmark_runs WHERE id=$1 FOR UPDATE", task["run_id"])
+            await self._lock_task(conn, task)
+            deleted = await conn.execute("""DELETE FROM benchmark_tasks WHERE run_id=$1 AND model_id=$2 AND receipt_id=$3
+                AND claim_token=$4 AND status='running' AND leased_until>clock_timestamp()""",
+                task["run_id"], task["model_id"], task["receipt_id"], task.get("claim_token"))
             if deleted == "DELETE 0":
-                return  # A recovered lease must not count the same task twice.
+                return False
             if result is not None:
                 await conn.execute(
                     "INSERT INTO benchmark_results (run_id, model_id, receipt_id, success, payload) "
@@ -123,6 +171,7 @@ class BenchmarkDB:
             await conn.execute("""UPDATE benchmark_summaries SET completed=completed+1, succeeded=succeeded+$1, failed=failed+$2, total_score=total_score+$3, total_confidence=total_confidence+$4, total_attempts=total_attempts+$5, total_latency_ms=total_latency_ms+$6 WHERE run_id=$7 AND model_id=$8""", int(success), int(not success), score, confidence, attempts, latency_ms, task["run_id"], task["model_id"])
             await conn.execute("""UPDATE benchmark_runs SET status='completed', completed_at=now()
                 WHERE id=$1 AND NOT EXISTS (SELECT 1 FROM benchmark_tasks WHERE run_id=$1)""", task["run_id"])
+            return True
 
     @staticmethod
     def _run(row: Mapping[str, Any]) -> BenchmarkRun:

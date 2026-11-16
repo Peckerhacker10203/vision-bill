@@ -9,6 +9,7 @@ import importlib
 import os
 import secrets
 import subprocess
+import sys
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -106,7 +107,7 @@ def migrate(settings, revision="head", direction="upgrade", check=True):
         "VISION_BILL_CONFIG_PATH": "/tmp/vb-task7-no-config",
     }
     return subprocess.run(
-        [str(ROOT / ".venv/bin/python"), "-m", "alembic", direction, revision],
+        [sys.executable, "-m", "alembic", direction, revision],
         cwd=ROOT,
         env=env,
         capture_output=True,
@@ -196,7 +197,7 @@ def complete(*, total="90071992547.91"):
 async def test_bootstrap_and_empty_downgrade(db):
     migrate(db)
     conn = await asyncpg.connect(db.pg_dsn)
-    assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0016"
+    assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0017"
     await conn.close()
     migrate(db, "0010", "downgrade")
     migrate(db)
@@ -321,7 +322,7 @@ async def test_finish_atomic_decimal_and_immutable_history(workflow_db, db):
         )
     assert migrate(db, "0010", "downgrade", check=False).returncode != 0
     async with w.pool.acquire() as conn:
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0016"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0017"
         assert await conn.fetchval("SELECT count(*) FROM receipt_review_revisions") == 1
 
 

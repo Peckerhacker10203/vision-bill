@@ -290,7 +290,7 @@ async def test_upgrade_keeps_legacy_tax_order_and_unknown_run_owner(db):
         ids=[UUID('ffffffff-ffff-ffff-ffff-ffffffffffff'),UUID('00000000-0000-0000-0000-000000000001')]
         await conn.execute("INSERT INTO taxes(id,receipt_id,name,rate,amount) VALUES($1,$3,'first inserted',19,1.234567),($2,$3,'second inserted',7,2.345678)",*ids,row)
         before=await conn.fetch('SELECT id,rate,amount FROM taxes ORDER BY id')
-        migrate(db)
+        migrate(db, '0016')
         after=await conn.fetch('SELECT id,rate,amount FROM taxes ORDER BY position,id')
         assert before==after
         assert await conn.fetchval('SELECT version_num FROM alembic_version')=='0016'
@@ -306,8 +306,9 @@ async def test_new_summary_counts_extraction_failures_without_redefining_success
     b=bench(w)
     run=await b.create_run(model_ids=['m'],receipt_ids=[first.id,second.id],fingerprint='f',model_digests={},timeout=600,
         policy=CouncilPolicy.ALL,absolute=None,relative=None,apply_flags=False,prompt_version='4',scoring_version='4',owner_id=scope.user_id)
-    await b.finish_task({'run_id':run.id,'receipt_id':first.id,'model_id':'m'},success=True,score=1,result={'version':'4','full_receipt_correct':True})
-    await b.finish_task({'run_id':run.id,'receipt_id':second.id,'model_id':'m'},success=False,result={'version':'4','full_receipt_correct':False})
+    tasks = {task['receipt_id']: task for task in [await b.lease_task(), await b.lease_task()]}
+    await b.finish_task(await b.begin_attempt(tasks[first.id]),success=True,score=1,result={'version':'4','full_receipt_correct':True})
+    await b.finish_task(await b.begin_attempt(tasks[second.id]),success=False,result={'version':'4','full_receipt_correct':False})
     summary=(await b.summaries(run.id))[0]
     assert summary.average_score==1
     assert summary.all_case_average_score==.5

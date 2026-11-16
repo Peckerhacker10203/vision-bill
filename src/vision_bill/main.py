@@ -107,7 +107,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         submission_service=submission_service,
     )
     benchmark_service = (
-        BenchmarkService(provider, receipt_service) if receipt_service.db_ready else None
+        BenchmarkService(provider, receipt_service, worker=settings.worker) if receipt_service.db_ready else None
     )
     collection_service = CollectionService(receipt_service) if receipt_service.db_ready else None
     if collection_service is not None:
