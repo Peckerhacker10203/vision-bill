@@ -37,6 +37,8 @@ jobs:
         run: make release-test
       - name: Lint + type check
         run: make lint
+      - name: Validate deployment Compose overlays (CPU, no services)
+        run: make compose-check
       - name: Unit tests
         run: make test
       - name: Frontend check + unit tests + build

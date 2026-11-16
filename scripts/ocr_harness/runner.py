@@ -8,8 +8,10 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.request
 import uuid
 from pathlib import Path
+from typing import Any
 
 from .common import normalize_result
 
@@ -19,11 +21,11 @@ CONTRACT_VERSION = 2
 DEFAULT_LIMITS = {"cpus": "4", "memory": "8g"}
 
 
-def digest(value):
+def digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def model_identity(models):
+def model_identity(models: Path) -> str:
     extensions = {
         ".onnx",
         ".traineddata",
@@ -46,7 +48,7 @@ def model_identity(models):
     return digest(json.dumps(files, sort_keys=True).encode())
 
 
-def bounded_run(argv, timeout, log):
+def bounded_run(argv: list[str], timeout: float, log: Path) -> None:
     with Path(log).open("wb") as stream:
         proc = subprocess.Popen(
             argv, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True
@@ -64,9 +66,9 @@ def bounded_run(argv, timeout, log):
         raise RuntimeError(f"Process exited {code}; see {log}")
 
 
-def image_identity(engine):
+def image_identity(engine: dict[str, Any]) -> dict[str, Any]:
     if engine.get("family") == "http":
-        from .worker import require_local_endpoint, urllib
+        from .worker import require_local_endpoint
         endpoint = engine["options"]["url"].rstrip("/")
         require_local_endpoint(endpoint)
         client = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -91,7 +93,7 @@ def image_identity(engine):
     return {"docker_image": result.stdout.strip()}
 
 
-def execute(engine, image, target, models, timeout, log):
+def execute(engine: dict[str, Any], image: Path, target: Path, models: Path, timeout: float, log: Path) -> None:
     container = None
     if "command" in engine:
         replacements = {"{image}": str(image), "{result}": str(target)}
@@ -165,7 +167,7 @@ def execute(engine, image, target, models, timeout, log):
             )
 
 
-def run_matrix(engines, images, output, timeout=120, force=False, progress=False):
+def run_matrix(engines: list[dict[str, Any]], images: list[Path], output: Path, timeout: float = 120, force: bool = False, progress: bool = False) -> list[dict[str, Any]]:
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True, mode=0o700)
     models = output.parent / "models"
@@ -195,7 +197,7 @@ def run_matrix(engines, images, output, timeout=120, force=False, progress=False
             job = output / "jobs" / key
             job.mkdir(parents=True, exist_ok=True)
             record = job / "record.json"
-            row = {
+            row: dict[str, Any] = {
                 "engine": engine["id"],
                 "input": str(image),
                 "identity": identity,
@@ -263,7 +265,7 @@ def run_matrix(engines, images, output, timeout=120, force=False, progress=False
     return rows
 
 
-def write_reports(output, rows):
+def write_reports(output: Path, rows: list[dict[str, Any]]) -> None:
     (output / "report.json").write_text(
         json.dumps({"contract_version": CONTRACT_VERSION, "results": rows}, indent=2)
     )

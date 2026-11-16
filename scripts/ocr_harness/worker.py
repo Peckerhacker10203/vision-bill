@@ -12,11 +12,39 @@ import socket
 import subprocess
 import urllib.parse
 import urllib.request
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
+from typing import Any, Protocol, cast
 from uuid import uuid4
 
 
-def plain(value):
+class PaddleModel(Protocol):
+    def predict(self, image: str) -> Sequence[Mapping[str, Any]]: ...
+
+
+class EasyModel(Protocol):
+    def readtext(self, image: str, *, detail: int, paragraph: bool) -> Sequence[tuple[Any, str, float]]: ...
+
+
+class DoctrResult(Protocol):
+    def export(self) -> Mapping[str, Any]: ...
+
+
+class VocabularyModel(Protocol):
+    cfg: Mapping[str, Any]
+
+
+class RecognitionPredictor(Protocol):
+    model: VocabularyModel
+
+
+class DoctrModel(Protocol):
+    reco_predictor: RecognitionPredictor
+
+    def __call__(self, document: object) -> DoctrResult: ...
+
+
+def plain(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [plain(v) for v in value]
     if hasattr(value, "tolist"):
@@ -24,7 +52,7 @@ def plain(value):
     return value
 
 
-def block(text, points, confidence=None):
+def block(text: str, points: Any, confidence: float | None = None) -> dict[str, Any]:
     return {
         "text": text,
         "bbox": plain(points),
@@ -32,7 +60,7 @@ def block(text, points, confidence=None):
     }
 
 
-def tesseract(options, image):
+def tesseract(options: dict[str, Any], image: Path | None) -> dict[str, Any] | None:
     variant = options.get("variant", "fast")
     directory = Path("/models/tesseract") / variant
     directory.mkdir(parents=True, exist_ok=True)
@@ -78,8 +106,8 @@ def tesseract(options, image):
     }
 
 
-def paddle(options, image):
-    from paddleocr import PaddleOCR
+def paddle(options: dict[str, Any], image: Path | None) -> dict[str, Any] | None:
+    PaddleOCR = cast(Callable[..., PaddleModel], importlib.import_module("paddleocr").PaddleOCR)
 
     model = PaddleOCR(
         device="cpu",
@@ -105,10 +133,10 @@ def paddle(options, image):
     return {"text": "\n".join(b["text"] for b in blocks), "blocks": blocks}
 
 
-def easyocr(options, image):
-    import easyocr as library
+def easyocr(options: dict[str, Any], image: Path | None) -> dict[str, Any] | None:
+    reader = cast(Callable[..., EasyModel], importlib.import_module("easyocr").Reader)
 
-    model = library.Reader(
+    model = reader(
         ["de", "en"],
         gpu=False,
         model_storage_directory="/models/easyocr",
@@ -123,10 +151,10 @@ def easyocr(options, image):
     return {"text": "\n".join(b["text"] for b in blocks), "blocks": blocks}
 
 
-def doctr(options, image):
-    import torch
-    from doctr.io import DocumentFile
-    from doctr.models import ocr_predictor
+def doctr(options: dict[str, Any], image: Path | None) -> dict[str, Any] | None:
+    torch = importlib.import_module("torch")
+    DocumentFile = importlib.import_module("doctr.io").DocumentFile
+    ocr_predictor = cast(Callable[..., DoctrModel], importlib.import_module("doctr.models").ocr_predictor)
 
     torch.set_num_threads(4)
     model = ocr_predictor(
@@ -153,7 +181,7 @@ def doctr(options, image):
     return {"text": "\n".join(b["text"] for b in blocks), "blocks": blocks, "warnings": warnings}
 
 
-def require_local_endpoint(endpoint):
+def require_local_endpoint(endpoint: str) -> None:
     parsed = urllib.parse.urlsplit(endpoint)
     if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username:
         raise ValueError("Expected a local HTTP OCR endpoint without embedded credentials")
@@ -162,7 +190,7 @@ def require_local_endpoint(endpoint):
         raise ValueError("OCR HTTP endpoint must resolve only to local/private addresses")
 
 
-def http(options, image):
+def http(options: dict[str, Any], image: Path | None) -> dict[str, Any] | None:
     endpoint = options["url"].rstrip("/")
     require_local_endpoint(endpoint)
     # Disable environment proxies: receipt bytes must go straight to the selected local endpoint.
@@ -197,6 +225,8 @@ def http(options, image):
         if len(raw) > 8_000_000:
             raise ValueError("HTTP OCR response exceeds compact-result limit")
     page = json.loads(raw)
+    if not isinstance(page, dict):
+        raise ValueError("OCR response must be an object")  # noqa: TRY004 - invalid serialized contract
     if page.get("contract_version") != 2 or page.get("request_id") != request_id or page.get("source_sha256") != source_sha256 or page.get("photo_index") != 0:
         raise ValueError("OCR v2 response identity mismatch")
     return page
@@ -211,7 +241,7 @@ ADAPTERS = {
 }
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("family", choices=ADAPTERS)
     parser.add_argument("--options", default="{}")

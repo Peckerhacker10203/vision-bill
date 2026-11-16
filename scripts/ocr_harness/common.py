@@ -1,7 +1,8 @@
 import math
+from typing import Any
 
 
-def normalize_result(data):
+def normalize_result(data: object) -> dict[str, Any]:
     if isinstance(data, dict) and data.get("contract_version") == 2:
         from vision_bill.model.ocr import OcrPageMetadata, OcrResponse
         page = OcrResponse.model_validate(data)
@@ -49,7 +50,7 @@ def normalize_result(data):
     }
 
 
-def row_text(blocks):
+def row_text(blocks: list[dict[str, Any]]) -> str:
     """Group horizontal receipt boxes by vertical center, then left-to-right."""
     positioned = []
     loose = []
@@ -62,7 +63,7 @@ def row_text(blocks):
         positioned.append(
             (min(xs), (min(ys) + max(ys)) / 2, max(max(ys) - min(ys), 1), block["text"])
         )
-    rows = []
+    rows: list[list[tuple[float, float, float, str]]] = []
     for item in sorted(positioned, key=lambda b: (b[1], b[0])):
         # Keep the first box as a fixed anchor to avoid drifting into another row.
         if rows and abs(item[1] - rows[-1][0][1]) <= 0.45 * min(item[2], rows[-1][0][2]):

@@ -6,26 +6,28 @@ import html
 import json
 import mimetypes
 from pathlib import Path
+from typing import Any
 
 
-def read_json(path):
+def read_json(path: str | Path | None) -> dict[str, Any] | None:
     try:
-        return json.loads(Path(path).read_text()) if path else None
+        value = json.loads(Path(path).read_text()) if path else None
+        return value if isinstance(value, dict) else None
     except (OSError, ValueError):
         return None
 
 
-def pre(value):
+def pre(value: object) -> str:
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
     return "<pre>" + html.escape(text) + "</pre>"
 
 
-def details(title, value):
+def details(title: str, value: object) -> str:
     return "<details><summary>" + html.escape(title) + "</summary>" + pre(value) + "</details>"
 
 
-def render_report(output, rows):
-    groups = {}
+def render_report(output: Path, rows: list[dict[str, Any]]) -> None:
+    groups: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         groups.setdefault(row["input"], []).append(row)
     parts = [

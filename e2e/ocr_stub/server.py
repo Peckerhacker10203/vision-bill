@@ -12,10 +12,15 @@ from email.parser import BytesParser
 from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
-from owned_files import remove_test_file
-from stub_control import Scenario
+if TYPE_CHECKING:
+    from e2e.owned_files import remove_test_file
+    from e2e.stub_control import Scenario
+else:
+    from owned_files import remove_test_file
+    from stub_control import Scenario
 
 PROFILE = json.loads((Path(__file__).parent / "profile.json").read_text())
 PROFILE_ID = hashlib.sha256(
@@ -25,8 +30,8 @@ RUNTIME = hashlib.sha256(b"cpu-test-wire-fixture-v2").hexdigest()
 state = Scenario()
 
 
-def png(width=320, height=480):
-    def chunk(kind, data):
+def png(width: int = 320, height: int = 480) -> bytes:
+    def chunk(kind: bytes, data: bytes) -> bytes:
         return (
             struct.pack("!I", len(data)) + kind + data + struct.pack("!I", zlib.crc32(kind + data))
         )
@@ -39,7 +44,7 @@ def png(width=320, height=480):
     )
 
 
-def page(raw, request_id, photo_index, source_sha256, *, blank):
+def page(raw: bytes, request_id: str, photo_index: int, source_sha256: str, *, blank: bool) -> dict[str, Any]:
     UUID(request_id)
     if hashlib.sha256(raw).hexdigest() != source_sha256:
         raise ValueError("source hash mismatch")
@@ -51,7 +56,7 @@ def page(raw, request_id, photo_index, source_sha256, *, blank):
         if photo_index == 0
         else ["Printed merchant", "B 2.00", "C 3.00"]
     )
-    blocks = (
+    blocks: list[dict[str, Any]] = (
         []
         if blank
         else [
@@ -92,7 +97,7 @@ def page(raw, request_id, photo_index, source_sha256, *, blank):
     }
 
 
-def readiness():
+def readiness() -> dict[str, Any]:
     return {
         "ready": True,
         "generation": 1,
@@ -103,7 +108,7 @@ def readiness():
 
 
 class Handler(BaseHTTPRequestHandler):
-    def send(self, status, payload):
+    def send(self, status: int, payload: dict[str, Any]) -> None:
         raw = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -114,7 +119,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         if self.path == "/ready":
             self.send(200, readiness())
         elif self.path == "/info":
@@ -134,7 +139,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send(404, {"error": "not found"})
 
-    def do_POST(self):
+    def do_POST(self) -> None:
         raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         try:
             if self.path == "/__files":
@@ -161,10 +166,13 @@ class Handler(BaseHTTPRequestHandler):
             message = BytesParser(policy=default).parsebytes(
                 b"Content-Type: " + self.headers["Content-Type"].encode() + b"\r\n\r\n" + raw
             )
-            fields = {
-                part.get_param("name", header="content-disposition"): part.get_payload(decode=True)
-                for part in message.iter_parts()
-            }
+            fields: dict[str, bytes] = {}
+            for part in message.iter_parts():
+                name = part.get_param("name", header="content-disposition")
+                payload = part.get_payload(decode=True)
+                if not isinstance(name, str) or not isinstance(payload, bytes) or name in fields:
+                    raise ValueError("invalid multipart field")
+                fields[name] = payload
             digest = fields["source_sha256"].decode()
             request_id = str(UUID(fields["request_id"].decode()))
             index = int(fields["photo_index"])
@@ -200,7 +208,7 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, KeyError, TypeError) as exc:
             self.send(422, {"error": str(exc)})
 
-    def log_message(self, *_args):
+    def log_message(self, *_args: object) -> None:
         pass
 
 

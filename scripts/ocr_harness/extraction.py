@@ -1,5 +1,17 @@
 """Optional local Ollama stage; OCR-only execution does not import app dependencies."""
 
+from __future__ import annotations
+
+from collections.abc import Iterator
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from ollama import AsyncClient
+
+    from vision_bill.model.receipt import Receipt
+    from vision_bill.provider.llm.base import LLMProvider
+    from vision_bill.provider.llm.ollama import OllamaProvider
+
 import asyncio
 import json
 import logging
@@ -11,7 +23,7 @@ from time import perf_counter
 from .runner import digest, write_reports
 
 
-def score_expected(path, receipt):
+def score_expected(path: Path, receipt: Receipt) -> dict[str, Any]:
     from vision_bill.model.receipt import Receipt
     from vision_bill.service.experiment_scoring import detailed_score
 
@@ -20,11 +32,11 @@ def score_expected(path, receipt):
     )
 
 
-def score_path(directory, expected):
+def score_path(directory: Path, expected: Path) -> Path:
     return Path(directory) / ("score-" + digest(Path(expected).read_bytes()) + ".json")
 
 
-def make_provider(host):
+def make_provider(host: str) -> OllamaProvider:
     import httpx
     from ollama import AsyncClient
 
@@ -36,21 +48,21 @@ def make_provider(host):
     provider._client = AsyncClient(
         host=host, timeout=httpx.Timeout(600, connect=5), trust_env=False, follow_redirects=False
     )
-    return provider.for_experiment(
+    return cast(OllamaProvider, provider.for_experiment(
         ExperimentOptions(
             temperature=0, think=False, include_classification=False, allow_ocr_fallback=False
         )
-    )
+    ))
 
 
 @contextmanager
-def capture_chat(client, path):
+def capture_chat(client: AsyncClient, path: Path) -> Iterator[None]:
     original = client.chat
-    trace = {"version": 1, "attempts": []}
+    trace: dict[str, Any] = {"version": 1, "attempts": []}
     path.write_text(json.dumps(trace))
 
-    async def observed(*args, **kwargs):
-        attempt = {
+    async def observed(*args: Any, **kwargs: Any) -> Any:
+        attempt: dict[str, Any] = {
             "messages": [
                 {"role": m.get("role"), "content": m.get("content")}
                 for m in kwargs.get("messages", [])
@@ -69,14 +81,15 @@ def capture_chat(client, path):
             attempt["elapsed_ms"] = (perf_counter() - started) * 1000
             path.write_text(json.dumps(trace, ensure_ascii=False, indent=2))
 
-    client.chat = observed
+    method = "chat"
+    setattr(client, method, observed)
     try:
         yield
     finally:
-        client.chat = original
+        setattr(client, method, original)
 
 
-async def service_extract(provider, model, row, text, directory):
+async def service_extract(provider: LLMProvider, model: str, row: dict[str, Any], text: str, directory: Path) -> tuple[Receipt, dict[str, Any]]:
     from .comparison import cached_ocr, compare_case
     case = {"images": [Path(row["input"]).resolve()]}
     pages, _ = cached_ocr(case, [row], row["engine"])
@@ -84,7 +97,7 @@ async def service_extract(provider, model, row, text, directory):
     return result.receipt, result.metadata
 
 
-async def extract_results(rows, output, host, model, refresh=False):
+async def extract_results(rows: list[dict[str, Any]], output: Path, host: str, model: str, refresh: bool = False) -> None:
     from .worker import require_local_endpoint
 
     require_local_endpoint(host)

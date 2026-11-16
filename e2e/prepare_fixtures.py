@@ -74,7 +74,8 @@ def prepare(root: Path, directory: Path) -> None:
                 shutil.copyfile(image, destination / image.name)
                 shutil.copyfile(truth, destination / truth.name)
                 break
-    aliases, registered = {}, {}
+    aliases: dict[str, dict[str, str]] = {}
+    registered: dict[str, str] = {}
     for image in sorted(destination.iterdir()):
         if image.suffix not in (".png", ".jpg", ".jpeg"):
             continue

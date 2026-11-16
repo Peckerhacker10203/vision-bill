@@ -1,5 +1,21 @@
 """Paired local vision/OCR experiments using existing service and scoring paths."""
 
+from __future__ import annotations
+
+from collections.abc import Iterator
+from typing import TYPE_CHECKING, Any, cast
+
+from vision_bill.provider.ocr.base import OcrProvider
+
+if TYPE_CHECKING:
+    from vision_bill.model.ocr import OcrCapabilities, OcrResponse
+    from vision_bill.provider.llm.base import LLMProvider
+    from vision_bill.provider.llm.ollama import OllamaProvider
+    from vision_bill.provider.llm.openai import OpenAIProvider
+    from vision_bill.service.experiment_execution import ExperimentResult
+
+# Provider imports must stay lazy until bootstrap_settings has isolated config.
+
 import argparse
 import asyncio
 import json
@@ -13,7 +29,7 @@ from .runner import digest, write_reports
 from .worker import require_local_endpoint
 
 
-def load_cases(manifest):
+def load_cases(manifest: Path) -> list[dict[str, Any]]:
     manifest = Path(manifest).resolve()
     cases = json.loads(manifest.read_text())["cases"]
     ids = [c["id"] for c in cases]
@@ -34,10 +50,11 @@ def load_cases(manifest):
     return result
 
 
-def cached_ocr(case, rows, engine):
+def cached_ocr(case: dict[str, Any], rows: list[dict[str, Any]], engine: str) -> tuple[list[dict[str, Any]], float]:
     from vision_bill.model.ocr import OcrResponse
 
-    pages, elapsed = [], 0
+    pages: list[dict[str, Any]] = []
+    elapsed = 0.0
     for i, image in enumerate(case["images"]):
         found = [r for r in rows if r["engine"] == engine and Path(r["input"]).resolve() == image]
         if len(found) != 1 or found[0]["status"] != "ok":
@@ -66,29 +83,35 @@ def cached_ocr(case, rows, engine):
     return pages, elapsed
 
 
-class ReplayOCR:
+class ReplayOCR(OcrProvider):
     """Typed recorded pages pass through the same all-photo policy as live OCR."""
 
-    def __init__(self, pages):
+    def __init__(self, pages: list[dict[str, Any]]) -> None:
         from vision_bill.model.ocr import OcrResponse
         self.pages = [OcrResponse.model_validate({k: v for k, v in page.items()
                                                 if k != "artifact_identity"}) for page in pages]
 
-    async def get_capabilities(self):
+    async def check_connection(self) -> bool:
+        return bool(self.pages)
+
+    async def extract_text(self, image: Path) -> dict[str, Any]:
+        raise NotImplementedError("replay requires explicit source and photo identities")
+
+    async def get_capabilities(self) -> OcrCapabilities:
         from vision_bill.model.ocr import OcrCapabilities
         first = self.pages[0]
         return OcrCapabilities(enabled=True, configured=True, reachable=True, ready=True,
                                profile_id=first.profile_id, runtime_fingerprint=first.runtime_fingerprint,
                                ocr_max_new_tokens=first.telemetry.get("max_new_tokens"))
 
-    async def extract_page(self, image, *, photo_index, source_sha256, deadline, expected_profile_id=None):
+    async def extract_page(self, image: Path, *, photo_index: int, source_sha256: str, deadline: float, expected_profile_id: str | None = None) -> OcrResponse:
         page = self.pages[photo_index]
         if page.photo_index != photo_index or page.source_sha256 != source_sha256:
             raise ValueError("replay_source_identity_mismatch")
         return page.model_copy(deep=True)
 
 
-def job_identity(target, case, pipeline, text, timeout, max_tokens):
+def job_identity(target: dict[str, Any], case: dict[str, Any], pipeline: str, text: object, timeout: float, max_tokens: int) -> str:
     root = Path(__file__).resolve().parents[2]
     source = [
         *sorted((root / "src/vision_bill").rglob("*.py")),
@@ -115,7 +138,7 @@ def job_identity(target, case, pipeline, text, timeout, max_tokens):
     )
 
 
-def safe_messages(messages):
+def safe_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result = []
     for message in messages:
         content = message.get("content")
@@ -137,18 +160,22 @@ def safe_messages(messages):
 
 
 @contextmanager
-def capture_requests(provider, kind, path, max_tokens):
-    endpoint = provider._client if kind == "ollama" else provider._client.chat.completions
+def capture_requests(provider: OllamaProvider | OpenAIProvider, kind: str, path: Path, max_tokens: int) -> Iterator[None]:
+    from vision_bill.provider.llm.ollama import OllamaProvider
+    from vision_bill.provider.llm.openai import OpenAIProvider
+
+    endpoint = (cast(OllamaProvider, provider)._client if kind == "ollama"
+                else cast(OpenAIProvider, provider)._client.chat.completions)
     name = "chat" if kind == "ollama" else "create"
     original = getattr(endpoint, name)
-    trace = {"version": 1, "attempts": []}
+    trace: dict[str, Any] = {"version": 1, "attempts": []}
 
-    async def observed(*args, **kwargs):
+    async def observed(*args: Any, **kwargs: Any) -> Any:
         if kind == "ollama":
             kwargs["options"] = {**kwargs.get("options", {}), "num_predict": max_tokens}
         else:
             kwargs["max_tokens"] = max_tokens
-        attempt = {"messages": safe_messages(kwargs.get("messages", [])), "max_tokens": max_tokens}
+        attempt: dict[str, Any] = {"messages": safe_messages(kwargs.get("messages", [])), "max_tokens": max_tokens}
         trace["attempts"].append(attempt)
         started = perf_counter()
         try:
@@ -174,9 +201,9 @@ def capture_requests(provider, kind, path, max_tokens):
         path.write_text(json.dumps(trace, ensure_ascii=False, indent=2))
 
 
-async def compare_case(provider, model, case, pipeline, text, directory, timeout):
+async def compare_case(provider: LLMProvider, model: str, case: dict[str, Any], pipeline: str, text: list[dict[str, Any]] | None, directory: Path, timeout: float) -> ExperimentResult:
     from vision_bill.config import ImageSettings, PGSettings
-    from vision_bill.model.experiment import ExperimentOptions
+    from vision_bill.model.experiment import ExperimentOptions, ExtractionPipeline
     from vision_bill.service.receipt_service import ReceiptService
 
     if pipeline not in {"ocr", "direct_vision"}:
@@ -188,10 +215,10 @@ async def compare_case(provider, model, case, pipeline, text, directory, timeout
         ImageSettings(save_dir=str(directory / "storage"), tmp_dir=str(directory / "tmp")),
         PGSettings(user="harness", password="unused"),
         provider,
-        ReplayOCR(text) if pipeline == "ocr" else None,
+        ReplayOCR(text) if pipeline == "ocr" and text is not None else None,
     )
     options = ExperimentOptions(
-        pipeline=pipeline,
+        pipeline=ExtractionPipeline(pipeline),
         temperature=0,
         think=False if provider.supports_thinking_control else None,
         include_classification=False,
@@ -210,7 +237,7 @@ async def compare_case(provider, model, case, pipeline, text, directory, timeout
     return result
 
 
-def summary(rows):
+def summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result = []
     for label in dict.fromkeys(r["engine"] for r in rows):
         cases = [r for r in rows if r["engine"] == label]
@@ -250,8 +277,8 @@ def summary(rows):
     return result
 
 
-def make_target_provider(target, timeout):
-    import httpx
+def make_target_provider(target: dict[str, Any], timeout: float) -> OllamaProvider | OpenAIProvider:
+    import httpx2
 
     require_local_endpoint(target["host"])
     if target["provider"] == "ollama":
@@ -268,25 +295,28 @@ def make_target_provider(target, timeout):
 
         from vision_bill.provider.llm.openai import OpenAIProvider
 
-        provider = OpenAIProvider(
+        openai_provider = OpenAIProvider(
             target["host"], "local-unused", temperature=0, analysis_timeout_seconds=timeout
         )
-        provider._client = AsyncOpenAI(
+        openai_provider._client = AsyncOpenAI(
             base_url=target["host"],
             api_key="local-unused",
             max_retries=0,
-            http_client=httpx.AsyncClient(trust_env=False, follow_redirects=False, timeout=timeout),
+            http_client=httpx2.AsyncClient(trust_env=False, follow_redirects=False, timeout=timeout),
             timeout=timeout,
         )
+        return openai_provider
     else:
         raise ValueError("Supported local providers: ollama, openai")
     return provider
 
 
-async def run_comparison(cases, targets, ocr_rows, engine, output, timeout=600, max_tokens=8192):
+async def run_comparison(cases: list[dict[str, Any]], targets: list[dict[str, Any]], ocr_rows: list[dict[str, Any]], engine: str, output: Path, timeout: float = 600, max_tokens: int = 8192) -> list[dict[str, Any]]:
     from decimal import Decimal
 
     from vision_bill.model.receipt import Receipt
+    from vision_bill.provider.llm.ollama import OllamaProvider
+    from vision_bill.provider.llm.openai import OpenAIProvider
     from vision_bill.service.experiment_scoring import detailed_score
 
     output = Path(output).resolve()
@@ -295,7 +325,7 @@ async def run_comparison(cases, targets, ocr_rows, engine, output, timeout=600, 
     for target in targets:
         provider = make_target_provider(target, timeout)
         if target["provider"] == "ollama":
-            models = await provider._client.list()
+            models = await cast(OllamaProvider, provider)._client.list()
             actual_digest = next(
                 (m.digest for m in models.models if m.model == target["model"]), None
             )
@@ -309,7 +339,9 @@ async def run_comparison(cases, targets, ocr_rows, engine, output, timeout=600, 
         for case in cases:
             for pipeline in ("direct_vision", "ocr"):
                 label = target["id"] + "/" + (engine + "+llm" if pipeline == "ocr" else "vision")
-                text, ocr_ms, loader_error = None, 0, None
+                text: list[dict[str, Any]] | None = None
+                ocr_ms = 0.0
+                loader_error: Exception | None = None
                 if pipeline == "ocr":
                     try:
                         text, ocr_ms = cached_ocr(case, ocr_rows, engine)
@@ -319,7 +351,7 @@ async def run_comparison(cases, targets, ocr_rows, engine, output, timeout=600, 
                 directory = output / "jobs" / key
                 directory.mkdir(parents=True, exist_ok=True)
                 preview = case.get("preview", case["images"][0])
-                row = {
+                row: dict[str, Any] = {
                     "engine": label,
                     "case": case["id"],
                     "pipeline": pipeline,
@@ -421,13 +453,13 @@ async def run_comparison(cases, targets, ocr_rows, engine, output, timeout=600, 
                     flush=True,
                 )
         if target["provider"] == "ollama":
-            await provider._client._client.aclose()
+            await cast(OllamaProvider, provider)._client._client.aclose()
         else:
-            await provider._client.close()
+            await cast(OpenAIProvider, provider)._client.close()
     return rows
 
 
-def bootstrap_settings(output):
+def bootstrap_settings(output: Path) -> Path:
     """Satisfy config imports without initializing the application's config file."""
     import secrets
 
@@ -454,7 +486,7 @@ def bootstrap_settings(output):
     return path
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--targets", type=Path, required=True)

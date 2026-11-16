@@ -15,12 +15,13 @@ import os
 from copy import deepcopy
 from pathlib import Path
 from time import perf_counter
-from typing import Annotated
+from typing import Annotated, Any, Protocol, cast
 from urllib.parse import urlsplit
 
 from ollama import AsyncClient
 from PIL import Image
-from pydantic import create_model
+from pydantic import BaseModel, create_model
+from pydantic.fields import FieldInfo
 
 from vision_bill.helper.duplicates import verify_duplicate
 from vision_bill.model.receipt import LineItem, Receipt
@@ -28,17 +29,27 @@ from vision_bill.model.receipt_extraction import MultiImageReceipt
 from vision_bill.provider.llm.experiment import extraction_prompt
 from vision_bill.service.experiment_scoring import detailed_score
 
+
+class PartialObservation(Protocol):
+    # Dynamic schema clones Receipt fields, retaining their original constraints.
+    line_items: list[LineItem] | None
+    confidence: float | None
+
+    def model_dump(self, *, exclude_none: bool = False) -> dict[str, Any]: ...
+
+
 # Clone each FieldInfo: nullable observations retain every original constraint.
-PrimaryItem = create_model(
-    "PrimaryItem", **{name: (field.annotation, deepcopy(field))
-                      for name, field in LineItem.model_fields.items()
-                      if name not in {"spending_category", "tags"}},
-)
+primary_fields: dict[str, Any] = {
+    name: (field.annotation, deepcopy(field))
+    for name, field in LineItem.model_fields.items()
+    if name not in {"spending_category", "tags"}
+}
+PrimaryItem = create_model("PrimaryItem", **primary_fields)
 
 
-def nullable_field(name, field):
+def nullable_field(name: str, field: FieldInfo) -> tuple[Any, FieldInfo]:
     cloned = deepcopy(field)
-    annotation = list[PrimaryItem] if name == "line_items" else field.annotation
+    annotation: Any = list.__class_getitem__(PrimaryItem) if name == "line_items" else field.annotation
     # Constraints belong to the non-null branch, never to the optional union.
     constrained = Annotated[annotation, *cloned.metadata] if cloned.metadata else annotation
     cloned.metadata = []
@@ -47,25 +58,29 @@ def nullable_field(name, field):
     return constrained | None, cloned
 
 
-PartialReceipt = create_model(
-    "PartialReceipt", **{name: nullable_field(name, field)
-                         for name, field in Receipt.model_fields.items() if name != "category"},
-)
+partial_fields: dict[str, Any] = {
+    name: nullable_field(name, field)
+    for name, field in Receipt.model_fields.items() if name != "category"
+}
+PartialReceipt = create_model("PartialReceipt", **partial_fields)
 
 
-def digest(data):
+def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def write_json(path, data):
+def write_json(path: Path, data: object) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str))
 
 
-def merge_parts(parts):
+def merge_parts(parts: list[BaseModel]) -> tuple[dict[str, Any], dict[str, Any]]:
     """Suffix/prefix matches only; preserve singleton ambiguity and log conflicts."""
-    payload, decisions, conflicts = {}, [], []
-    items = []
-    for index, part in enumerate(parts):
+    payload: dict[str, Any] = {}
+    decisions: list[dict[str, Any]] = []
+    conflicts: list[dict[str, Any]] = []
+    items: list[LineItem] = []
+    for index, observation in enumerate(parts):
+        part = cast(PartialObservation, observation)
         values = part.model_dump(exclude_none=True)
         incoming = part.line_items or []
         overlap = 0
@@ -117,7 +132,7 @@ def merge_parts(parts):
     }
 
 
-def partial_prompt(kind):
+def partial_prompt(kind: str) -> str:
     return (
         f"Extract only what is actually visible in this {kind}, a PART of ONE receipt. "
         "Return a populated JSON object, not the schema. Fields absent from this piece MUST be null. "
@@ -131,7 +146,7 @@ def partial_prompt(kind):
     )
 
 
-def source_parts(case, mode, output, tile_height):
+def source_parts(case: dict[str, Any], mode: str, output: Path, tile_height: int) -> list[dict[str, Any]]:
     parts = []
     for photo, path in enumerate(case["images"]):
         if mode != "vision_tiles":
@@ -153,7 +168,7 @@ def source_parts(case, mode, output, tile_height):
     return parts
 
 
-def ocr_parts(case, report):
+def ocr_parts(case: dict[str, Any], report: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result = []
     for path in case["images"]:
         matches = [
@@ -177,7 +192,7 @@ def ocr_parts(case, report):
     return result
 
 
-def chunk_ocr_parts(parts, rows):
+def chunk_ocr_parts(parts: list[dict[str, Any]], rows: int) -> list[dict[str, Any]]:
     """Bound text by recognized source lines, preserving three lines of context."""
     if rows < 4:
         raise ValueError("OCR chunks need at least four rows")
@@ -202,7 +217,7 @@ def chunk_ocr_parts(parts, rows):
     return result
 
 
-async def request(client, model, revision, prompt, images, schema, cache, timeout, step):
+async def request(client: AsyncClient, model: str, revision: str, prompt: str, images: list[Path], schema: type[BaseModel], cache: Path, timeout: float, step: dict[str, Any]) -> tuple[BaseModel, dict[str, Any], Path, bool]:
     image_bytes = [p.read_bytes() for p in images]
     identity = {
         "model": model,
@@ -218,15 +233,16 @@ async def request(client, model, revision, prompt, images, schema, cache, timeou
     key = digest(json.dumps(identity, sort_keys=True).encode())
     path = cache / f"{key}.json"
     step["trace"] = str(path)
+    record: dict[str, Any]
     if path.exists():
         record = json.loads(path.read_text())
         if record.get("status") == "ok":
             parsed = schema.model_validate(record["parsed"])
-            if schema is MultiImageReceipt:
+            if isinstance(parsed, MultiImageReceipt):
                 parsed.reconciled(len(images))
             return parsed, record, path, True
     record = {"identity": identity, "attempts": [], "status": "error"}
-    messages = [
+    messages: list[dict[str, Any]] = [
         {
             "role": "user",
             "content": prompt,
@@ -237,7 +253,7 @@ async def request(client, model, revision, prompt, images, schema, cache, timeou
     try:
         async with asyncio.timeout(timeout):
             for _ in range(3):
-                attempt = {"prompt": messages[-1]["content"]}
+                attempt: dict[str, Any] = {"prompt": messages[-1]["content"]}
                 record["attempts"].append(attempt)
                 response = await client.chat(
                     model=model,
@@ -266,7 +282,7 @@ async def request(client, model, revision, prompt, images, schema, cache, timeou
                     parsed = schema.model_validate_json(
                         content.strip().removeprefix("```json").removesuffix("```").strip()
                     )
-                    if schema is MultiImageReceipt:
+                    if isinstance(parsed, MultiImageReceipt):
                         parsed.reconciled(len(images))
                     if schema is PartialReceipt and not any(
                         value is not None for value in parsed.model_dump().values()
@@ -294,7 +310,7 @@ async def request(client, model, revision, prompt, images, schema, cache, timeou
         write_json(path, record)
 
 
-def score(expected, actual):
+def score(expected: Receipt, actual: Receipt) -> dict[str, Any]:
     detail = detailed_score(expected, actual, classification=False)
     payment_ok = not any(
         d["path"] == "payment_method" and not d["equivalent"] for d in detail["differences"]
@@ -317,7 +333,7 @@ def score(expected, actual):
     }
 
 
-def render(output, rows, cases):
+def render(output: Path, rows: list[dict[str, Any]], cases: list[dict[str, Any]]) -> None:
     cards = []
     for row in rows:
         case = next(c for c in cases if c["id"] == row["case"])
@@ -346,7 +362,7 @@ def render(output, rows, cases):
     )
 
 
-async def run(args):
+async def run(args: argparse.Namespace) -> None:
     endpoint = urlsplit(args.host)
     if endpoint.scheme != "http" or endpoint.hostname not in {"127.0.0.1", "localhost", "::1"}:
         raise ValueError("Only same-machine Ollama HTTP endpoints are supported")
@@ -376,7 +392,7 @@ async def run(args):
     rows = []
     for case in cases:
         for mode in args.modes:
-            row = {
+            row: dict[str, Any] = {
                 "case": case["id"],
                 "mode": mode,
                 "model": args.model,
@@ -438,7 +454,7 @@ async def run(args):
                             if "paths" in chunk
                             else ([] if is_ocr else [chunk["path"]])
                         )
-                        step = {
+                        step: dict[str, Any] = {
                             "index": index,
                             "cached": False,
                             "elapsed_ms": 0,
@@ -471,9 +487,9 @@ async def run(args):
                             flush=True,
                         )
                     if mode.endswith("all"):
-                        actual = parts[0]
-                        if isinstance(actual, MultiImageReceipt):
-                            actual = actual.reconciled(len(case["images"]))
+                        first = parts[0]
+                        actual = (first.reconciled(len(case["images"])) if isinstance(first, MultiImageReceipt)
+                                  else Receipt.model_validate(first.model_dump()))
                     else:
                         payload, decisions = merge_parts(parts)
                         row.update(merge=decisions, candidate=payload)
@@ -521,7 +537,7 @@ async def run(args):
     print(json.dumps(summaries, indent=2), flush=True)
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)

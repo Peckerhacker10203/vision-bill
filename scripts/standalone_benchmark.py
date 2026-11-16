@@ -49,7 +49,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from vision_bill.config import ImageSettings, LLMSettings, OcrSettings, PGSettings
 from vision_bill.model.receipt import LineItem, Receipt, TaxLine
 from vision_bill.provider.factory import get_llm_provider, get_ocr_provider
+from vision_bill.provider.llm.base import LLMProvider
+from vision_bill.provider.ocr.base import OcrProvider
 from vision_bill.service.benchmark_scoring import score_receipts
+from vision_bill.service.experiment_execution import ExperimentResult
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +183,7 @@ async def fetch_verified_receipts(
         JOIN images i ON r.id = i.receipt_id
         WHERE r.verified = true
     """
-    params = []
+    params: list[str | int] = []
     if category:
         query += " AND r.category = $1"
         params.append(category)
@@ -272,16 +275,16 @@ async def fetch_receipt_details(
     )
 
 
-async def execute_photos(provider, ocr, model, paths, pg_settings):
+async def execute_photos(provider: LLMProvider, ocr: OcrProvider, model: str, paths: list[Path], pg_settings: PGSettings) -> ExperimentResult:
     from tempfile import TemporaryDirectory
 
-    from vision_bill.model.experiment import ExperimentOptions
+    from vision_bill.model.experiment import ExperimentOptions, ExtractionPipeline
     from vision_bill.service.receipt_service import ReceiptService
     with TemporaryDirectory(prefix="vision-bill-benchmark-") as directory:
         service = ReceiptService(ImageSettings(save_dir=directory, tmp_dir=directory), pg_settings,
                                  provider, ocr_provider=ocr)
         return await service.analyse_submission_with_metadata(
-            model, paths, ExperimentOptions(pipeline="ocr", include_classification=False), [])
+            model, paths, ExperimentOptions(pipeline=ExtractionPipeline.OCR, include_classification=False), [])
 
 
 async def run_benchmark(args: argparse.Namespace) -> BenchmarkSummary:
@@ -325,7 +328,7 @@ async def run_benchmark(args: argparse.Namespace) -> BenchmarkSummary:
     logger.info("LLM connection OK")
 
     logger.info("Checking OCR connection...")
-    if not await ocr_provider.check_connection():
+    if ocr_provider is None or not await ocr_provider.check_connection():
         logger.error("Cannot connect to OCR service")
         sys.exit(1)
     logger.info("OCR connection OK")
@@ -455,9 +458,9 @@ async def run_benchmark(args: argparse.Namespace) -> BenchmarkSummary:
         # Calculate averages
         successful_results = [r for r in summary.results if r.success]
         if successful_results:
-            scores = [r.score for r in successful_results if r.score is not None]
-            if scores:
-                summary.avg_score = sum(scores) / len(scores)
+            successful_scores = [r.score for r in successful_results if r.score is not None]
+            if successful_scores:
+                summary.avg_score = sum(successful_scores) / len(successful_scores)
             ocr_times = [r.ocr_time_ms for r in successful_results if r.ocr_time_ms is not None]
             if ocr_times:
                 summary.avg_ocr_time_ms = sum(ocr_times) / len(ocr_times)
@@ -530,7 +533,7 @@ async def run_benchmark(args: argparse.Namespace) -> BenchmarkSummary:
     return summary
 
 
-def main():
+def main() -> None:
     args = parse_args()
     asyncio.run(run_benchmark(args))
 

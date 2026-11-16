@@ -45,15 +45,26 @@ e2e-up: ## Start a private stack (requires E2E_STATE=/private/directory/state.js
 e2e-down: ## Remove only the explicitly owned stack
 	uv run python e2e/run.py down --state "$(E2E_STATE)"
 
+E2E_BUILD_OVERRIDE ?=
+E2E_OVERRIDE_ARG = $(if $(E2E_BUILD_OVERRIDE),--override "$(E2E_BUILD_OVERRIDE)")
+
 test-e2e: ## Run backend E2E in a unique owned stack
-	uv run --extra dev python e2e/run.py run -- uv run --extra dev pytest tests/e2e/
+	uv run --extra dev python e2e/run.py run $(E2E_OVERRIDE_ARG) -- uv run --extra dev pytest tests/e2e/
 
 fe-test-e2e: ## Run Playwright in a unique owned stack
-	$(NODE) uv run python e2e/run.py run --policy fallback -- npm --prefix frontend run test:e2e
+	$(NODE) uv run python e2e/run.py run --policy fallback $(E2E_OVERRIDE_ARG) -- npm --prefix frontend run test:e2e
+
+PYTHON_CHECK_PATHS := src paddleocr-service/ocr_service paddleocr-service/server.py \
+	paddleocr-service/build e2e scripts/ocr_harness \
+	scripts/receipt_split_experiment.py scripts/standalone_benchmark.py scripts/test_ocr_service.py
+
+.PHONY: compose-check
+compose-check: ## Validate GPU Compose overlays with private synthetic settings (no services)
+	uv run python e2e/check_compose.py
 
 lint: ## Lint (ruff) and type-check (mypy)
-	uv run --extra dev ruff check src
-	uv run --extra dev mypy src
+	uv run --extra dev ruff check $(PYTHON_CHECK_PATHS)
+	uv run --extra dev mypy $(PYTHON_CHECK_PATHS)
 
 # --- Operational scripts -------------------------------------------------
 # Values loaded here become real environment variables and therefore override

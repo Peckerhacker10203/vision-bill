@@ -248,3 +248,42 @@ async def test_optional_extraction_stage_uses_typed_replay_not_legacy_text(tmp_p
     prompt=llm._client.chat.call_args.kwargs['messages'][0]['content']
     assert receipt is not None and metadata['ocr_replayed']
     assert 'ONLY OBSERVED' in prompt and 'REFERENCE_SENTINEL' not in prompt
+
+
+def test_paddle_adapter_preserves_mapping_results_and_lazy_optional_import(monkeypatch, tmp_path):
+    from collections import UserDict
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    from scripts.ocr_harness import worker
+
+    calls = []
+    class Model:
+        def predict(self, image):
+            assert image == str(tmp_path / "image.png")
+            return [UserDict(rec_texts=["MILCH"], rec_polys=[np.array([[0, 0], [1, 1]])], rec_scores=[np.float32(0.5)])]
+
+    def construct(**options):
+        calls.append(options)
+        return Model()
+
+    def native_import(name):
+        assert name == "paddleocr"
+        return SimpleNamespace(PaddleOCR=construct)
+
+    monkeypatch.setattr(worker.importlib, "import_module", native_import)
+    result = worker.paddle({"det": "test-det", "rec": "test-rec"}, tmp_path / "image.png")
+    assert result["text"] == "MILCH"
+    assert result["blocks"] == [{"text": "MILCH", "bbox": [[0, 0], [1, 1]], "confidence": 0.5}]
+    assert calls[0]["device"] == "cpu" and calls[0]["enable_mkldnn"] is False
+
+
+@pytest.mark.parametrize("value", [None, {}, [42], [{"id": None}]])
+def test_engine_manifest_rejects_non_objects_and_non_string_ids(tmp_path, value):
+    from scripts.ocr_harness.__main__ import load_engines
+
+    manifest = tmp_path / "engines.json"
+    manifest.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="objects with string IDs"):
+        load_engines(manifest)

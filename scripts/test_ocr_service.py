@@ -122,7 +122,7 @@ async def run(args: argparse.Namespace) -> tuple[list[dict[str, Any]], int]:
 
     # Check the service is reachable before sending any images.
     print("Checking OCR service connection...")
-    if not await provider.check_connection():
+    if provider is None or not await provider.check_connection():
         print(f"Cannot connect to OCR service at {settings.service_url}", file=sys.stderr)
         return [], 1
     print("Connection OK")

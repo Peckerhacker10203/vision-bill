@@ -13,6 +13,7 @@ import re
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any, NotRequired, TypedDict
 
 FIXTURES_DIR = Path(os.environ.get("VB_E2E_FIXTURES_DIR", "/fixtures"))
 REPLIES_DIR = Path(os.environ.get("VB_E2E_REPLIES_DIR", Path(__file__).parent / "replies"))
@@ -38,11 +39,17 @@ MODELS = [
 # `broken` tracks which image digests already got their one broken response in
 # the current repair_first mode (cleared on every mode change) so the "first
 # call is broken" rule is per-mode, not polluted by earlier tests' requests.
-state = {"mode": "ok", "broken": set()}
-requests_log: list[dict] = []
+class LlmState(TypedDict):
+    mode: str
+    broken: set[tuple[str, tuple[str, ...]]]
+    scenario: NotRequired[str]
 
 
-def _extract_image_hash(body: dict) -> str | None:
+state: LlmState = {"mode": "ok", "broken": set()}
+requests_log: list[dict[str, Any]] = []
+
+
+def _extract_image_hash(body: dict[str, Any]) -> str | None:
     for message in body.get("messages", []):
         content = message.get("content")
         if not isinstance(content, list):
@@ -56,7 +63,7 @@ def _extract_image_hash(body: dict) -> str | None:
     return None
 
 
-def configure_scenario(body: dict) -> None:
+def configure_scenario(body: dict[str, Any]) -> None:
     scenario = body.get("scenario", "complete")
     if scenario not in ("complete", "partial", "policy_unknown", "overlap"):
         raise ValueError("unknown scenario")
@@ -65,7 +72,7 @@ def configure_scenario(body: dict) -> None:
     requests_log.clear()
 
 
-def _request_identity(body: dict) -> tuple[str, list, list, list]:
+def _request_identity(body: dict[str, Any]) -> tuple[str, list[str], list[dict[str, Any]], list[dict[str, Any]]]:
     texts, hashes = [], []
     for message in body.get("messages", []):
         content = message.get("content")
@@ -92,7 +99,7 @@ def _request_identity(body: dict) -> tuple[str, list, list, list]:
             pages = [json.loads(part.split("\n", 1)[1]) for part in observation.split("PHOTO ")[1:]]
             refs = [ref for ref in refs if ref["coordinate_space"] == "working"]
     names = []
-    aliases = {}
+    aliases: dict[str, str] = {}
     for name, identity in ALIASES.items():
         for digest in identity.values():
             if digest in aliases and aliases[digest] != name:
@@ -123,7 +130,7 @@ def _request_identity(body: dict) -> tuple[str, list, list, list]:
     return "ocr" if pages else "direct", names, refs, pages
 
 
-def _content_for(body: dict) -> str:
+def _content_for(body: dict[str, Any]) -> str:
     kind, names, refs, pages = _request_identity(body)
     scenario = state.get("scenario", "complete")
     entry = {
@@ -209,7 +216,7 @@ def _content_for(body: dict) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
-    def _send(self, status: int, payload: dict) -> None:
+    def _send(self, status: int, payload: dict[str, Any]) -> None:
         data = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")

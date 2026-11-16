@@ -65,3 +65,16 @@ def test_fault_injection_accepts_only_exact_owned_submission_file(tmp_path):
         remove_test_file(tmp_path, "../not-owned", "original")
     remove_test_file(tmp_path, image_id, "original")
     assert not original.exists()
+
+
+def test_owned_runner_rejects_malformed_saved_state_before_compose(tmp_path):
+    import pytest
+
+    spec = importlib.util.spec_from_file_location("typed_owned_runner", ROOT / "e2e/run.py")
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    valid = runner.create_state(tmp_path)
+    for state in ([], {**valid, "project": None}, {**valid, "directory": 12},
+                  {**valid, "admin_can_see_all": "false"}, {**valid, "policy": "typo"}):
+        with pytest.raises(ValueError, match="state"):
+            runner.compose(state, "config")

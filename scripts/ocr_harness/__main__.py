@@ -5,12 +5,16 @@ import subprocess
 import sys
 import uuid
 from pathlib import Path
+from typing import Any
 
 from .runner import WORKER, bounded_run, run_matrix
 
 
-def load_engines(path, only=None):
-    engines = json.loads(Path(path).read_text())
+def load_engines(path: Path, only: str | None = None) -> list[dict[str, Any]]:
+    data = json.loads(Path(path).read_text())
+    if not isinstance(data, list) or not all(isinstance(e, dict) and isinstance(e.get("id"), str) for e in data):
+        raise ValueError("Engines must be objects with string IDs")
+    engines: list[dict[str, Any]] = data
     ids = [e["id"] for e in engines]
     if len(ids) != len(set(ids)):
         raise ValueError("Engine IDs must be unique")
@@ -26,7 +30,7 @@ def load_engines(path, only=None):
     return engines
 
 
-def prepare(engines, work, timeout):
+def prepare(engines: list[dict[str, Any]], work: Path, timeout: float) -> list[dict[str, Any]]:
     models = work / "models"
     models.mkdir(parents=True, exist_ok=True)
     records = []
@@ -97,7 +101,7 @@ def prepare(engines, work, timeout):
     return records
 
 
-def build(engines, work, timeout):
+def build(engines: list[dict[str, Any]], work: Path, timeout: float) -> list[str]:
     seen = set()
     errors = []
     for engine in engines:
@@ -144,7 +148,7 @@ def build(engines, work, timeout):
     return errors
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="Offline, cached OCR comparison for receipt images"
     )

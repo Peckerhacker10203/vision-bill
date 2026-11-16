@@ -10,14 +10,45 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
+from types import FrameType
+from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
-from prepare_fixtures import prepare
+if TYPE_CHECKING:
+    from e2e.prepare_fixtures import prepare
+else:
+    from prepare_fixtures import prepare
 
 ROOT = Path(__file__).resolve().parents[1]
 MARKER = "vision-bill-owned-e2e-v1"
 
 
-def create_state(directory: Path) -> dict:
+class OwnedState(TypedDict):
+    owner: str
+    project: str
+    directory: str
+    env_file: str
+    root: str
+    policy: str
+    image: NotRequired[str]
+    override: NotRequired[str]
+    state_file: NotRequired[str]
+    admin_can_see_all: NotRequired[bool]
+
+
+def validate_state(value: object) -> OwnedState:
+    if not isinstance(value, dict):
+        raise ValueError("invalid owned Compose state")  # noqa: TRY004 - invalid serialized state
+    required = ("owner", "project", "directory", "env_file", "root", "policy")
+    optional = ("image", "override", "state_file")
+    if (any(not isinstance(value.get(key), str) or not value[key] for key in required)
+        or any(key in value and not isinstance(value[key], str) for key in optional)
+        or ("admin_can_see_all" in value and not isinstance(value["admin_can_see_all"], bool))
+        or value["policy"] not in {"off", "enabled", "required", "fallback"}):
+        raise ValueError("invalid owned Compose state fields")
+    return cast(OwnedState, value)
+
+
+def create_state(directory: Path) -> OwnedState:
     directory = directory.resolve()
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "config").mkdir()
@@ -35,7 +66,8 @@ def create_state(directory: Path) -> dict:
     }
 
 
-def compose(state: dict, *arguments: str) -> tuple[list[str], dict[str, str]]:
+def compose(state: OwnedState, *arguments: str) -> tuple[list[str], dict[str, str]]:
+    state = validate_state(state)
     if (
         state.get("owner") != MARKER
         or state.get("root") != str(ROOT)
@@ -71,14 +103,14 @@ def compose(state: dict, *arguments: str) -> tuple[list[str], dict[str, str]]:
     return command + list(arguments), environment
 
 
-def call(state: dict, *arguments: str, capture: bool = False):
+def call(state: OwnedState, *arguments: str, capture: bool = False) -> subprocess.CompletedProcess[str]:
     command, environment = compose(state, *arguments)
     return subprocess.run(
         command, env=environment, cwd=ROOT, check=True, text=True, capture_output=capture
     )
 
 
-def endpoints(state: dict) -> dict[str, str]:
+def endpoints(state: OwnedState) -> dict[str, str]:
     result = {
         "VB_E2E_STATE": state.get("state_file", str(Path(state["directory"]) / "state.json")),
         "VB_E2E_PROJECT": state["project"],
@@ -126,9 +158,9 @@ def main() -> int:
     else:
         if args.state is None:
             parser.error("an explicit owned --state is required")
-        state = json.loads(args.state.read_text())
+        state = validate_state(json.loads(args.state.read_text()))
 
-    def terminate(signum, frame):
+    def terminate(signum: int, frame: FrameType | None) -> None:
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, terminate)

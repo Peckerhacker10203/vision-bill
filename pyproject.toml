@@ -57,6 +57,9 @@ extend-exclude = ["alembic"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = ["$MYPY_CONFIG_FILE_DIR/src", "$MYPY_CONFIG_FILE_DIR/paddleocr-service", "$MYPY_CONFIG_FILE_DIR"]
 exclude = ["^alembic/"]
 
 [[tool.mypy.overrides]]

@@ -421,3 +421,17 @@ async def test_failed_dataset_scoring_still_records_both_extractions(tmp_path,mo
     assert len(rows)==2 and execute.await_count==2
     assert all(row['llm_status']=='ok' and row['score_status']=='error' for row in rows)
     assert all(s['cases']==1 and s['scoring_failed']==1 and s['score_excluding_payment']==0 for s in summary(rows))
+
+
+async def test_openai_target_uses_sdk_compatible_local_client():
+    from scripts.ocr_harness.comparison import make_target_provider
+
+    provider = make_target_provider(
+        {"provider": "openai", "host": "http://127.0.0.1:1/v1"}, 12
+    )
+    try:
+        assert provider._client._client.trust_env is False
+        assert provider._client._client.follow_redirects is False
+        assert provider._client.timeout == 12
+    finally:
+        await provider._client.close()
