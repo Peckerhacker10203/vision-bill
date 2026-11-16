@@ -33,6 +33,7 @@ from ..model.workflow import (
     PersistedWorkingView,
     SourcePartBinding,
 )
+from ..provider.llm.base import ModelInfo
 from ..provider.llm.errors import AnalysisTimeoutError, UnreadableReceiptError
 from ..provider.ocr.base import compact_ocr_text
 from .extraction_pipeline import (
@@ -80,6 +81,16 @@ class SubmissionService:
             raise ValueError("execution_snapshot_invalid")
         return permission
 
+    @staticmethod
+    def _initial_model(models: list[ModelInfo], preferred: str, *, vision: bool) -> ModelInfo | None:
+        """Resolve only an unfrozen legacy binding from affirmative discovery."""
+        if vision:
+            return select_vision_model(models, preferred) or next(
+                (model for model in models if select_vision_model([model], model.id) is not None),
+                None,
+            )
+        return next((model for model in models if model.id == preferred), models[0] if models else None)
+
     async def ready_for(self, image: ImageRow) -> bool:
         """Persist only safe reasons against the observed generation/status before a claim."""
         try:
@@ -116,11 +127,14 @@ class SubmissionService:
                 else:
                     alternate = ocr.vision_fallback_model_id
             models = await self.receipts.get_available_models(capability=capability)
+            if not image.effective_options and (not ocr.enabled or capability == "text"):
+                model = self._initial_model(models, selected, vision=capability == "vision")
+                if model is not None:
+                    return None
+                return "vision_model_unavailable" if capability == "vision" else "formatter_model_unavailable"
             if capability == "vision":
                 return None if select_vision_model(models, selected, alternate) is not None else "vision_model_unavailable"
-            return None if any(model.id == selected for model in models) or (
-                not image.effective_options and bool(models)
-            ) else "formatter_model_unavailable"
+            return None if any(model.id == selected for model in models) else "formatter_model_unavailable"
         except (httpx.HTTPError, OSError, ValueError, KeyError):
             return "provider_unavailable"
 
@@ -227,13 +241,11 @@ class SubmissionService:
                 capability="text" if legacy_ocr.enabled else "vision"
             )
             preferred = image.model_id or self.settings.llm.model_name
-            selected = next(
-                (m.id for m in models if m.id == preferred), models[0].id if models else None
-            )
+            selected = self._initial_model(models, preferred, vision=not legacy_ocr.enabled)
             if selected is None:
                 raise RuntimeError("model_unavailable")
             saved = await self.db.ensure_execution_snapshot(
-                claim, model_id=selected, effective_options=self.legacy_snapshot(), deadline=db_deadline
+                claim, model_id=selected.id, effective_options=self.legacy_snapshot(), deadline=db_deadline
             )
             if saved is None:
                 raise StaleClaimError

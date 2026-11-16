@@ -479,3 +479,42 @@ async def test_deletion_preserves_shared_original_and_rejects_changed_durable_so
     async with w.pool.acquire() as conn:
         assert await conn.fetchval('SELECT count(*) FROM images WHERE id=$1',shared)==1
         assert await conn.fetchval('SELECT count(*) FROM resource_deletions')==0
+
+
+@pytest.mark.parametrize('legacy', [True, False])
+@pytest.mark.parametrize('eligible', [True, False])
+async def test_scheduler_initial_legacy_model_resolution_is_frozen_once(workflow_db,settings,tmp_path,legacy,eligible):
+    from vision_bill.service.analysis_scheduler import AnalysisScheduler
+    from vision_bill.provider.llm.base import ModelInfo
+    w,scope=workflow_db
+    image,paths,llm,_,service=await setup(w,scope,settings,tmp_path,ocr=False)
+    settings.llm.model_name='missing-preferred'
+    settings.ocr=OcrSettings(enabled=False)
+    async with w.pool.acquire() as conn:
+        await conn.execute("UPDATE images SET model_id='missing-preferred' WHERE id=$1",image.id)
+        if legacy:
+            await conn.execute("UPDATE images SET effective_options='{}', request_fingerprint=NULL WHERE id=$1",image.id)
+    candidate=(await w.due_candidates())[0]
+    frozen=dict(candidate.effective_options)
+    service.receipts.check_connection=AsyncMock(return_value=True)
+    if not eligible:
+        text=ModelInfo('text-only');text.capabilities=['completion']
+        llm.get_available_models.return_value=[text]
+    service.receipts.get_available_models=llm.get_available_models
+    scheduler=AnalysisScheduler(settings,llm,service.receipts,service.receipts._image_db,service.images,submission_service=service)
+    await scheduler.process_pending()
+    async with w.pool.acquire() as conn:
+        saved=await conn.fetchrow('SELECT * FROM images WHERE id=$1',image.id)
+    if legacy and eligible:
+        assert saved['attempt_count']==1 and saved['receipt_id'] is not None, (saved['status'],saved['result_code'],saved['model_id'])
+        assert saved['model_id']=='fixture'
+        snapshot=json.loads(saved['effective_options'])
+        assert snapshot==service.legacy_snapshot() and snapshot.get('allow_ocr_fallback',False) is False
+        assert llm._client.chat.call_args.kwargs['model']=='fixture'
+        assert await w.claim_next() is None
+    else:
+        assert saved['attempt_count']==0 and saved['receipt_id'] is None
+        assert saved['model_id']=='missing-preferred'
+        assert json.loads(saved['effective_options'])==frozen
+        assert saved['wait_reason']=='vision_model_unavailable'
+        llm._client.chat.assert_not_awaited()
