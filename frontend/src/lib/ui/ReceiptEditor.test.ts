@@ -342,7 +342,7 @@ it.each([
 	['preceding deletion', 1, 2],
 	['out of range', 0, 9]
 ] as const)(
-	'marks overlap association unknown after %s',
+	'keeps safe display and evidence round-trip after %s',
 	async (kind, first_index, second_index) => {
 		const onSave = vi.fn();
 		render(ReceiptEditor, {
@@ -355,9 +355,11 @@ it.each([
 			await fireEvent.click(screen.getAllByRole('button', { name: 'Remove' })[0]);
 		else await fireEvent.input(screen.getByLabelText('Merchant'), { target: { value: 'Changed' } });
 		await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
-		expect(onSave.mock.calls[0][0].overlap_decisions).toEqual([
-			{ verified: false, association_unknown: true }
-		]);
+		expect(onSave.mock.calls[0][0].overlap_decisions).toEqual(
+			kind === 'preceding deletion'
+				? [{ verified: false, association_unknown: true }]
+				: [{ first_index, second_index, verified: true }]
+		);
 		expect(
 			(
 				screen.getByRole('checkbox', {
@@ -366,5 +368,42 @@ it.each([
 			).disabled
 		).toBe(true);
 		expect(screen.getByText('Row association unknown; review the original evidence.')).toBeTruthy();
+	}
+);
+
+it.each([1, 2])(
+	'preserves a producer-verified removed-row pair on classification-only save (removed %s)',
+	async (removed_index) => {
+		const decisions = [
+			{ first_index: removed_index - 1, second_index: removed_index, verified: true, removed_index }
+		];
+		const onSave = vi.fn();
+		render(ReceiptEditor, {
+			receipt: { ...receipt, overlap_decisions: decisions },
+			lineItems: [
+				{ ...line(), description: 'A' },
+				{ ...line(), id: 'b', description: 'B' }
+			],
+			taxes: [],
+			onSave
+		});
+		expect(screen.queryByRole('button', { name: 'Save' })).toBeNull();
+		expect(screen.queryByText(/^Check rows/)).toBeNull();
+		expect(
+			(
+				screen.getByRole('checkbox', {
+					name: 'I reviewed this overlap; keep the current rows'
+				}) as HTMLInputElement
+			).disabled
+		).toBe(true);
+		await fireEvent.change(screen.getByLabelText('Category'), { target: { value: 'electronics' } });
+		await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+		expect(onSave.mock.calls[0][0]).toMatchObject({
+			category: 'electronics',
+			expected_operation_revision: receipt.operation_revision,
+			amount_policy: receipt.amount_policy,
+			field_sources: receipt.field_sources,
+			overlap_decisions: decisions
+		});
 	}
 );

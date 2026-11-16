@@ -1,5 +1,17 @@
-/** Mutable row positions must never stand in for immutable extraction evidence. */
-export function hasOverlapRows(decision: Record<string, unknown>, count: number): boolean {
+/** Display eligibility only: extraction indices are not validated or rewritten by form bounds. */
+export function hasOverlapRows(
+	decision: Record<string, unknown>,
+	count: number,
+	decisions: Record<string, unknown>[] = [decision]
+): boolean {
+	// A producer removal can shift every later extraction index, including pairs
+	// whose own indices still happen to fit inside the final form's row count.
+	if (
+		decisions.some(
+			(evidence) => evidence.removed_index !== null && evidence.removed_index !== undefined
+		)
+	)
+		return false;
 	const first = decision.first_index,
 		second = decision.second_index;
 	return (
@@ -20,12 +32,4 @@ export function unknownOverlap(decision: Record<string, unknown>): Record<string
 	for (const key of ['first_index', 'second_index', 'removed_index'])
 		delete (result as Record<string, unknown>)[key];
 	return result;
-}
-export function currentOverlaps(
-	decisions: Record<string, unknown>[],
-	count: number
-): Record<string, unknown>[] {
-	return decisions.map((decision) =>
-		hasOverlapRows(decision, count) ? decision : unknownOverlap(decision)
-	);
 }

@@ -11,7 +11,7 @@
 	import TagEditor from '$lib/ui/TagEditor.svelte';
 	import CollectionPicker from '$lib/ui/CollectionPicker.svelte';
 	import AmountPolicyEditor from './AmountPolicyEditor.svelte';
-	import { hasOverlapRows, unknownOverlap, currentOverlaps } from './overlap-decisions';
+	import { hasOverlapRows, unknownOverlap } from './overlap-decisions';
 	import type {
 		Category,
 		AmountPolicy,
@@ -103,10 +103,7 @@
 			expected_operation_revision: receipt.operation_revision,
 			amount_policy: structuredClone($state.snapshot(receipt.amount_policy)),
 			field_sources: structuredClone($state.snapshot(receipt.field_sources)),
-			overlap_decisions: currentOverlaps(
-				structuredClone($state.snapshot(receipt.overlap_decisions)),
-				lineItems.length
-			),
+			overlap_decisions: structuredClone($state.snapshot(receipt.overlap_decisions)),
 			confidence: String(receipt.confidence),
 			merchant_name: receipt.merchant_name,
 			merchant_address: receipt.merchant_address ?? '',
@@ -635,7 +632,7 @@
 	{#each form.overlap_decisions as decision, index (index)}
 		<div class="rounded-xl border border-outline-variant p-4">
 			<p>{$t('review.overlapNumber', { values: { number: index + 1 } })}</p>
-			{#if hasOverlapRows(decision, form.lines.length)}
+			{#if hasOverlapRows(decision, form.lines.length, form.overlap_decisions)}
 				<p>
 					{$t('review.overlapRows', {
 						values: {
@@ -648,10 +645,10 @@
 			<label
 				><input
 					type="checkbox"
-					disabled={!hasOverlapRows(decision, form.lines.length)}
+					disabled={!hasOverlapRows(decision, form.lines.length, form.overlap_decisions)}
 					checked={decision.verified === true}
 					onchange={(e) => {
-						if (hasOverlapRows(decision, form.lines.length))
+						if (hasOverlapRows(decision, form.lines.length, form.overlap_decisions))
 							form.overlap_decisions[index] = { ...decision, verified: e.currentTarget.checked };
 					}}
 				/>

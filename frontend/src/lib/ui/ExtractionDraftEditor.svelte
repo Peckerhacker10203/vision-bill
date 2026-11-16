@@ -13,7 +13,7 @@
 	import ExtractionSourceViewer from './ExtractionSourceViewer.svelte';
 	import ReceiptPhotos from './ReceiptPhotos.svelte';
 	import AmountPolicyEditor from './AmountPolicyEditor.svelte';
-	import { hasOverlapRows, unknownOverlap, currentOverlaps } from './overlap-decisions';
+	import { hasOverlapRows, unknownOverlap } from './overlap-decisions';
 	import TagEditor from './TagEditor.svelte';
 	import { isSignedDecimal, isPlainDecimal } from './money';
 	let { id }: { id: string } = $props();
@@ -79,10 +79,7 @@
 		document = clone(value.document);
 		policy = clone(value.amount_policy);
 		sourceDecisions = clone(value.field_sources ?? {});
-		overlapDecisions = currentOverlaps(
-			clone(value.overlap_decisions ?? []),
-			value.document.line_items?.length ?? 0
-		);
+		overlapDecisions = clone(value.overlap_decisions ?? []);
 	}
 	$effect(() => {
 		const view = { id };
@@ -350,7 +347,7 @@
 			{#each overlapDecisions as decision, index (index)}
 				<div class="rounded-xl border border-outline-variant p-4">
 					<p>{$t('review.overlapNumber', { values: { number: index + 1 } })}</p>
-					{#if hasOverlapRows(decision, document.line_items?.length ?? 0)}<p>
+					{#if hasOverlapRows(decision, document.line_items?.length ?? 0, overlapDecisions)}<p>
 							{$t('review.overlapRows', {
 								values: {
 									first: (decision.first_index as number) + 1,
@@ -361,10 +358,14 @@
 					<label
 						><input
 							type="checkbox"
-							disabled={!hasOverlapRows(decision, document.line_items?.length ?? 0)}
+							disabled={!hasOverlapRows(
+								decision,
+								document.line_items?.length ?? 0,
+								overlapDecisions
+							)}
 							checked={decision.verified === true}
 							onchange={(e) => {
-								if (hasOverlapRows(decision, document.line_items?.length ?? 0))
+								if (hasOverlapRows(decision, document.line_items?.length ?? 0, overlapDecisions))
 									overlapDecisions[index] = { ...decision, verified: e.currentTarget.checked };
 							}}
 						/>

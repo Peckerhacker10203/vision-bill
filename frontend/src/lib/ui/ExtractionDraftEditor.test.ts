@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import ExtractionDraftEditor from './ExtractionDraftEditor.svelte';
 import { api, ApiError } from '$lib/api/client';
@@ -184,7 +184,7 @@ it.each([
 	['preceding deletion', 1, 2],
 	['out of range', 0, 9]
 ] as const)(
-	'marks draft overlap association unknown after %s',
+	'keeps safe draft display and evidence round-trip after %s',
 	async (kind, first_index, second_index) => {
 		vi.mocked(api.getDraft).mockResolvedValue({
 			...draft,
@@ -209,8 +209,53 @@ it.each([
 		).toBe(true);
 		expect(screen.getByText('Row association unknown; review the original evidence.')).toBeTruthy();
 		await fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
-		expect(patch.mock.calls[0][1].changes.overlap_decisions).toEqual([
-			{ verified: false, association_unknown: true }
-		]);
+		expect(patch.mock.calls[0][1].changes.overlap_decisions).toEqual(
+			kind === 'preceding deletion' ? [{ verified: false, association_unknown: true }] : undefined
+		);
+	}
+);
+
+it.each([1, 2])(
+	'adopts producer removal evidence verbatim without making a draft dirty (removed %s)',
+	async (removed_index) => {
+		const decisions = [
+			{ first_index: removed_index - 1, second_index: removed_index, verified: true, removed_index }
+		];
+		const loaded = {
+			...draft,
+			overlap_decisions: decisions,
+			document: { ...draft.document, line_items: [{ description: 'A' }, { description: 'B' }] }
+		};
+		vi.mocked(api.getDraft).mockResolvedValue(loaded);
+		const patch = vi.spyOn(api, 'patchDraft').mockResolvedValue({
+			...loaded,
+			revision: 8,
+			document: { ...loaded.document, merchant_name: 'Changed' }
+		});
+		render(ExtractionDraftEditor, { id: 'job' });
+		await screen.findByLabelText('Merchant');
+		expect((screen.getByRole('button', { name: 'Save draft' }) as HTMLButtonElement).disabled).toBe(
+			true
+		);
+		expect(patch).not.toHaveBeenCalled();
+		expect(screen.queryByText(/^Check rows/)).toBeNull();
+		expect(
+			(
+				screen.getByRole('checkbox', {
+					name: 'I reviewed this overlap; keep the current rows'
+				}) as HTMLInputElement
+			).disabled
+		).toBe(true);
+		await fireEvent.input(screen.getByLabelText('Merchant'), { target: { value: 'Changed' } });
+		await fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+		expect(patch).toHaveBeenCalledWith('job', {
+			expected_revision: 7,
+			changes: { merchant_name: 'Changed' }
+		});
+		await waitFor(() =>
+			expect(
+				(screen.getByRole('button', { name: 'Save draft' }) as HTMLButtonElement).disabled
+			).toBe(true)
+		);
 	}
 );
