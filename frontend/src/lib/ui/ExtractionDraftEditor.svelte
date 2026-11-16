@@ -13,6 +13,7 @@
 	import ExtractionSourceViewer from './ExtractionSourceViewer.svelte';
 	import ReceiptPhotos from './ReceiptPhotos.svelte';
 	import AmountPolicyEditor from './AmountPolicyEditor.svelte';
+	import { hasOverlapRows, unknownOverlap, currentOverlaps } from './overlap-decisions';
 	import TagEditor from './TagEditor.svelte';
 	import { isSignedDecimal, isPlainDecimal } from './money';
 	let { id }: { id: string } = $props();
@@ -78,7 +79,10 @@
 		document = clone(value.document);
 		policy = clone(value.amount_policy);
 		sourceDecisions = clone(value.field_sources ?? {});
-		overlapDecisions = clone(value.overlap_decisions ?? []);
+		overlapDecisions = currentOverlaps(
+			clone(value.overlap_decisions ?? []),
+			value.document.line_items?.length ?? 0
+		);
 	}
 	$effect(() => {
 		const view = { id };
@@ -272,6 +276,7 @@
 							/></label
 						>{/each}
 					{#if line.tags !== null && line.tags !== undefined}<TagEditor
+							disabled={busy}
 							value={line.tags}
 							tagOptions={tags.data ?? []}
 							id={`draft-line-${index}`}
@@ -282,10 +287,7 @@
 						type="button"
 						onclick={() => {
 							document.line_items = document.line_items!.filter((_, i) => i !== index);
-							overlapDecisions = overlapDecisions.map((decision) => ({
-								...decision,
-								verified: false
-							}));
+							overlapDecisions = overlapDecisions.map(unknownOverlap);
 							sourceDecisions = Object.fromEntries(
 								Object.entries(sourceDecisions).filter(([path]) => !path.startsWith('line_items'))
 							);
@@ -318,8 +320,12 @@
 							/></label
 						>{/each}<button
 						type="button"
-						onclick={() => (document.taxes = document.taxes!.filter((_, i) => i !== index))}
-						>{$t('common.remove')}</button
+						onclick={() => {
+							document.taxes = document.taxes!.filter((_, i) => i !== index);
+							sourceDecisions = Object.fromEntries(
+								Object.entries(sourceDecisions).filter(([path]) => !/^taxes(?:\.|\[|$)/.test(path))
+							);
+						}}>{$t('common.remove')}</button
 					>
 				</div>{/each}
 			<button
@@ -344,18 +350,23 @@
 			{#each overlapDecisions as decision, index (index)}
 				<div class="rounded-xl border border-outline-variant p-4">
 					<p>{$t('review.overlapNumber', { values: { number: index + 1 } })}</p>
-					{#if typeof decision.first_index === 'number' && typeof decision.second_index === 'number'}<p
-						>
+					{#if hasOverlapRows(decision, document.line_items?.length ?? 0)}<p>
 							{$t('review.overlapRows', {
-								values: { first: decision.first_index + 1, second: decision.second_index + 1 }
+								values: {
+									first: (decision.first_index as number) + 1,
+									second: (decision.second_index as number) + 1
+								}
 							})}
-						</p>{/if}
+						</p>{:else}<p>{$t('review.overlapUnknown')}</p>{/if}
 					<label
 						><input
 							type="checkbox"
+							disabled={!hasOverlapRows(decision, document.line_items?.length ?? 0)}
 							checked={decision.verified === true}
-							onchange={(e) =>
-								(overlapDecisions[index] = { ...decision, verified: e.currentTarget.checked })}
+							onchange={(e) => {
+								if (hasOverlapRows(decision, document.line_items?.length ?? 0))
+									overlapDecisions[index] = { ...decision, verified: e.currentTarget.checked };
+							}}
 						/>
 						{$t('review.reviewedOverlap')}</label
 					>

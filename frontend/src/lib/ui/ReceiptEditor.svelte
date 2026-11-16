@@ -11,6 +11,7 @@
 	import TagEditor from '$lib/ui/TagEditor.svelte';
 	import CollectionPicker from '$lib/ui/CollectionPicker.svelte';
 	import AmountPolicyEditor from './AmountPolicyEditor.svelte';
+	import { hasOverlapRows, unknownOverlap, currentOverlaps } from './overlap-decisions';
 	import type {
 		Category,
 		AmountPolicy,
@@ -102,7 +103,10 @@
 			expected_operation_revision: receipt.operation_revision,
 			amount_policy: structuredClone($state.snapshot(receipt.amount_policy)),
 			field_sources: structuredClone($state.snapshot(receipt.field_sources)),
-			overlap_decisions: structuredClone($state.snapshot(receipt.overlap_decisions)),
+			overlap_decisions: currentOverlaps(
+				structuredClone($state.snapshot(receipt.overlap_decisions)),
+				lineItems.length
+			),
 			confidence: String(receipt.confidence),
 			merchant_name: receipt.merchant_name,
 			merchant_address: receipt.merchant_address ?? '',
@@ -152,7 +156,8 @@
 		onSave,
 		onSaveAndVerify,
 		onDirtyChange,
-		onSource
+		onSource,
+		onPendingChange
 	}: {
 		receipt: ReceiptRow;
 		lineItems: LineItemRow[];
@@ -172,6 +177,7 @@
 		/** Notified with the current dirty state after (re)initialisation. */
 		onDirtyChange?: (dirty: boolean) => void;
 		onSource?: (sources: SourceRef[]) => void;
+		onPendingChange?: (pending: boolean) => void;
 	} = $props();
 
 	function initialForm(): EditorForm {
@@ -184,6 +190,16 @@
 	let initializedRevision = -1;
 	let initializedSavedRevision = 0;
 	let merchantVersion = 0;
+	const pendingTags = new SvelteSet<EditorLine>();
+	const pendingCollections = new SvelteSet<object>();
+	let childPending = $derived(pendingTags.size > 0 || pendingCollections.size > 0);
+	$effect(() => {
+		onPendingChange?.(childPending);
+	});
+	function tagPending(line: EditorLine, pending: boolean) {
+		if (pending) pendingTags.add(line);
+		else pendingTags.delete(line);
+	}
 
 	function dirtyForm(value: EditorForm): string {
 		return JSON.stringify(value, (key, item: unknown) =>
@@ -216,6 +232,8 @@
 
 	$effect(() => {
 		if (receipt.id !== initializedReceiptId || revision !== initializedRevision) {
+			pendingTags.clear();
+			pendingCollections.clear();
 			merchantVersion++;
 			initializedReceiptId = receipt.id;
 			initializedRevision = revision;
@@ -412,10 +430,7 @@
 	}
 
 	function removeLineSources() {
-		form.overlap_decisions = form.overlap_decisions.map((decision) => ({
-			...decision,
-			verified: false
-		}));
+		form.overlap_decisions = form.overlap_decisions.map(unknownOverlap);
 		form.field_sources = Object.fromEntries(
 			Object.entries(form.field_sources).filter(([path]) => !/^line_items(?:\.|\[|$)/.test(path))
 		);
@@ -436,6 +451,9 @@
 	}
 
 	function removeTax(index: number) {
+		form.field_sources = Object.fromEntries(
+			Object.entries(form.field_sources).filter(([path]) => !/^taxes(?:\.|\[|$)/.test(path))
+		);
 		form.taxLines.splice(index, 1);
 	}
 
@@ -541,6 +559,7 @@
 			<div class="sm:col-span-2">
 				<span class={labelClass}>{$t('editor.collections')}</span>
 				<CollectionPicker
+					disabled={busy}
 					options={collections.data ?? []}
 					mode="multi"
 					value={form.collection_ids}
@@ -548,12 +567,20 @@
 					placeholder={$t('collections.searchPlaceholder')}
 					onchange={(v) => (form.collection_ids = v as string[])}
 					oncreate={async (name) => {
+						const mutation = {};
+						const target = form;
+						const receiptId = receipt.id;
+						pendingCollections.add(mutation);
 						try {
 							const created = await api.createCollection({ name });
+							if (form !== target || receipt.id !== receiptId) return;
 							form.collection_ids = [...form.collection_ids, created.id];
 							await queryClient.invalidateQueries({ queryKey: queryKeys.collections() });
 						} catch {
-							snackbar.notify('error', translate('collections.createFailed'));
+							if (form === target && receipt.id === receiptId)
+								snackbar.notify('error', translate('collections.createFailed'));
+						} finally {
+							pendingCollections.delete(mutation);
 						}
 					}}
 				/>
@@ -608,19 +635,24 @@
 	{#each form.overlap_decisions as decision, index (index)}
 		<div class="rounded-xl border border-outline-variant p-4">
 			<p>{$t('review.overlapNumber', { values: { number: index + 1 } })}</p>
-			{#if typeof decision.first_index === 'number' && typeof decision.second_index === 'number'}
+			{#if hasOverlapRows(decision, form.lines.length)}
 				<p>
 					{$t('review.overlapRows', {
-						values: { first: decision.first_index + 1, second: decision.second_index + 1 }
+						values: {
+							first: (decision.first_index as number) + 1,
+							second: (decision.second_index as number) + 1
+						}
 					})}
 				</p>
-			{/if}
+			{:else}<p>{$t('review.overlapUnknown')}</p>{/if}
 			<label
 				><input
 					type="checkbox"
+					disabled={!hasOverlapRows(decision, form.lines.length)}
 					checked={decision.verified === true}
 					onchange={(e) => {
-						form.overlap_decisions[index] = { ...decision, verified: e.currentTarget.checked };
+						if (hasOverlapRows(decision, form.lines.length))
+							form.overlap_decisions[index] = { ...decision, verified: e.currentTarget.checked };
 					}}
 				/>
 				{$t('review.reviewedOverlap')}</label
@@ -765,7 +797,13 @@
 										>{$t('editor.optionalTags')}</summary
 									>
 									<div class="mt-2">
-										<TagEditor value={line.tags} {tagOptions} id={`li-${index}`} />
+										<TagEditor
+											disabled={busy}
+											value={line.tags}
+											{tagOptions}
+											id={`li-${index}`}
+											onPendingChange={(pending) => tagPending(line, pending)}
+										/>
 									</div>
 								</details>
 							</div>
@@ -860,8 +898,10 @@
 					<button
 						type="button"
 						class="rounded-lg border border-outline-variant px-4 py-2.5 text-sm font-medium text-on-surface hover:bg-surface-container-high disabled:opacity-50"
-						disabled={busy || !valid}
-						onclick={() => onSave(buildWrite())}
+						disabled={busy || childPending || !valid}
+						onclick={() => {
+							if (!childPending) onSave(buildWrite());
+						}}
 					>
 						{$t('common.save')}
 					</button>
@@ -870,8 +910,10 @@
 					<button
 						type="button"
 						class="flex items-center justify-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-on-primary hover:opacity-90 disabled:opacity-50"
-						disabled={busy || !valid}
-						onclick={() => onSaveAndVerify(buildWrite())}
+						disabled={busy || childPending || !valid}
+						onclick={() => {
+							if (!childPending) onSaveAndVerify(buildWrite());
+						}}
 					>
 						<Icon icon="check" />
 						{$t('editor.saveAndVerify')}

@@ -82,3 +82,24 @@ describe('CollectionPicker', () => {
 		expect(oncreate).toHaveBeenCalledWith('New Year');
 	});
 });
+it('blocks already-open custom membership and create options while disabled', async () => {
+	const onchange = vi.fn(),
+		oncreate = vi.fn();
+	const props = {
+		options,
+		mode: 'multi' as const,
+		value: [] as string[],
+		allowCreate: true,
+		onchange,
+		oncreate
+	};
+	const view = render(CollectionPicker, props);
+	const input = screen.getByRole('combobox');
+	await fireEvent.click(input);
+	await view.rerender({ ...props, disabled: true });
+	await fireEvent.click(screen.getByRole('option', { name: 'Berlin' }));
+	expect(onchange).not.toHaveBeenCalled();
+	await fireEvent.input(input, { target: { value: 'Late' } });
+	await fireEvent.click(screen.getByRole('option', { name: '+ Create “Late”' }));
+	expect(oncreate).not.toHaveBeenCalled();
+});

@@ -500,6 +500,7 @@
 		},
 		"overlapNumber": "Überlappung {number}",
 		"overlapRows": "Positionen {first} und {second} anhand der Fotos prüfen.",
-		"reviewedOverlap": "Ich habe die Überlappung geprüft; aktuelle Positionen beibehalten"
+		"reviewedOverlap": "Ich habe die Überlappung geprüft; aktuelle Positionen beibehalten",
+		"overlapUnknown": "Positionszuordnung unbekannt; Originalbelege prüfen."
 	}
 }

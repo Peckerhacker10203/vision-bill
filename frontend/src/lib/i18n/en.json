@@ -500,6 +500,7 @@
 		},
 		"overlapNumber": "Overlap {number}",
 		"overlapRows": "Check rows {first} and {second} against the photos.",
-		"reviewedOverlap": "I reviewed this overlap; keep the current rows"
+		"reviewedOverlap": "I reviewed this overlap; keep the current rows",
+		"overlapUnknown": "Row association unknown; review the original evidence."
 	}
 }

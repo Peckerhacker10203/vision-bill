@@ -258,7 +258,7 @@ it('submits an explicit reviewed overlap decision and invalidates it when its ro
 	const overlap = { first_index: 0, second_index: 1, verified: null };
 	render(ReceiptEditor, {
 		receipt: { ...receipt, overlap_decisions: [overlap] },
-		lineItems: [line(), { ...line(), id: 'second' }],
+		lineItems: [line(), { ...line(), id: 'second' }, { ...line(), id: 'third' }],
 		taxes: [],
 		onSave
 	});
@@ -267,13 +267,25 @@ it('submits an explicit reviewed overlap decision and invalidates it when its ro
 	);
 	await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
 	expect(onSave.mock.calls[0][0].overlap_decisions).toEqual([{ ...overlap, verified: true }]);
-	await fireEvent.click(screen.getAllByRole('button', { name: 'Move item down' })[0]);
+	await fireEvent.click(screen.getAllByRole('button', { name: 'Move item down' })[1]);
 	await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
 	expect(onSave.mock.calls[1][0].line_items.map((line: { id: string }) => line.id)).toEqual([
-		'second',
-		'line-1'
+		'line-1',
+		'third',
+		'second'
 	]);
-	expect(onSave.mock.calls[1][0].overlap_decisions[0].verified).toBe(false);
+	expect(onSave.mock.calls[1][0].overlap_decisions[0]).toEqual({
+		verified: false,
+		association_unknown: true
+	});
+	expect(
+		(
+			screen.getByRole('checkbox', {
+				name: 'I reviewed this overlap; keep the current rows'
+			}) as HTMLInputElement
+		).disabled
+	).toBe(true);
+	expect(screen.queryByText('Check rows 1 and 2 against the photos.')).toBeNull();
 });
 
 it('navigates from a field source decision to its exact source references', async () => {
@@ -300,3 +312,59 @@ it('navigates from a field source decision to its exact source references', asyn
 	await fireEvent.click(screen.getByRole('button', { name: 'Show source' }));
 	expect(onSource).toHaveBeenCalledWith([source]);
 });
+it('drops ambiguous tax sources when a preceding tax is deleted', async () => {
+	const onSave = vi.fn();
+	const source = {
+		part_id: 'part',
+		photo_index: 0,
+		source_sha256: 'hash',
+		coordinate_space: 'unknown' as const
+	};
+	render(ReceiptEditor, {
+		receipt: {
+			...receipt,
+			field_sources: { 'taxes.0.amount': [source], 'taxes.1.amount': [source], total: [source] }
+		},
+		lineItems: [],
+		taxes: [
+			{ id: 'tax-a', receipt_id: receipt.id, name: 'A', rate: null, amount: '1' },
+			{ id: 'tax-b', receipt_id: receipt.id, name: 'B', rate: null, amount: '2' }
+		],
+		onSave
+	});
+	await fireEvent.click(screen.getAllByRole('button', { name: 'Remove' })[0]);
+	await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+	expect(onSave.mock.calls[0][0].taxes[0].name).toBe('B');
+	expect(onSave.mock.calls[0][0].field_sources).toEqual({ total: [source] });
+});
+
+it.each([
+	['preceding deletion', 1, 2],
+	['out of range', 0, 9]
+] as const)(
+	'marks overlap association unknown after %s',
+	async (kind, first_index, second_index) => {
+		const onSave = vi.fn();
+		render(ReceiptEditor, {
+			receipt: { ...receipt, overlap_decisions: [{ first_index, second_index, verified: true }] },
+			lineItems: [line(), { ...line(), id: 'b' }, { ...line(), id: 'c' }],
+			taxes: [],
+			onSave
+		});
+		if (kind === 'preceding deletion')
+			await fireEvent.click(screen.getAllByRole('button', { name: 'Remove' })[0]);
+		else await fireEvent.input(screen.getByLabelText('Merchant'), { target: { value: 'Changed' } });
+		await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+		expect(onSave.mock.calls[0][0].overlap_decisions).toEqual([
+			{ verified: false, association_unknown: true }
+		]);
+		expect(
+			(
+				screen.getByRole('checkbox', {
+					name: 'I reviewed this overlap; keep the current rows'
+				}) as HTMLInputElement
+			).disabled
+		).toBe(true);
+		expect(screen.getByText('Row association unknown; review the original evidence.')).toBeTruthy();
+	}
+);

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onDestroy } from 'svelte';
 	import { t } from '$lib/i18n';
 	import { api } from '$lib/api/client';
 	import { queryClient } from '$lib/query/client';
@@ -10,7 +11,9 @@
 	let {
 		value,
 		tagOptions,
-		id
+		id,
+		onPendingChange,
+		disabled = false
 	}: {
 		/** The line item's tags (standard + suggested). Mutated in place. */
 		value: string[];
@@ -18,6 +21,8 @@
 		tagOptions: string[];
 		/** Unique prefix used to build stable input ids. */
 		id: string;
+		onPendingChange?: (pending: boolean) => void;
+		disabled?: boolean;
 	} = $props();
 
 	const labelClass = 'mb-1 block text-xs font-medium text-on-surface-variant';
@@ -26,6 +31,10 @@
 	let open = $state(false);
 	let query = $state('');
 	let creating = $state(false);
+	$effect(() => {
+		onPendingChange?.(creating);
+	});
+	onDestroy(() => onPendingChange?.(false));
 	let wasOpen = $state(false);
 	/** Keyboard highlight offset within `selectableRows` (−1 = nothing). */
 	let activeOffset = $state(-1);
@@ -66,6 +75,7 @@
 	}
 
 	function toggleStandardTag(tag: string): void {
+		if (disabled) return;
 		const next = hasStandardTag(tag)
 			? standardTags.filter((entry) => entry.toLowerCase() !== tag.toLowerCase())
 			: [...standardTags, tag];
@@ -73,10 +83,12 @@
 	}
 
 	function removeStandardTag(tag: string): void {
+		if (disabled) return;
 		setStandardTags(standardTags.filter((entry) => entry.toLowerCase() !== tag.toLowerCase()));
 	}
 
 	function removeSuggested(tag: string): void {
+		if (disabled) return;
 		const next = value.filter((entry) => entry !== tag);
 		value.length = 0;
 		value.push(...next);
@@ -89,7 +101,7 @@
 
 	/** Promote a suggested (non-vocabulary) tag into the standard vocabulary. */
 	async function keepSuggested(tag: string): Promise<void> {
-		if (creating) return;
+		if (creating || disabled) return;
 		creating = true;
 		try {
 			await api.createTag(tag);
@@ -104,7 +116,7 @@
 	/** Create the tag currently typed into the search and attach it to the line. */
 	async function createFromQuery(): Promise<void> {
 		const name = normalizeTag(query);
-		if (name === '' || creating) return;
+		if (name === '' || creating || disabled) return;
 		creating = true;
 		try {
 			const { name: created } = await api.createTag(name);
@@ -143,6 +155,7 @@
 	}
 
 	function openDropdown(): void {
+		if (disabled) return;
 		if (open) return;
 		open = true;
 		// Highlight the first row immediately (no-op when the list is empty).
@@ -180,6 +193,7 @@
 	});
 
 	function onKeydown(event: KeyboardEvent): void {
+		if (disabled) return;
 		const selectable = computeSelectableRows();
 		switch (event.key) {
 			case 'ArrowDown':
@@ -231,7 +245,8 @@
 		bind:this={boxEl}
 		class="relative"
 		role="button"
-		tabindex="0"
+		aria-disabled={disabled}
+		tabindex={disabled ? -1 : 0}
 		aria-label={$t('editor.tags')}
 		onclick={openDropdown}
 		onkeydown={(event) => {

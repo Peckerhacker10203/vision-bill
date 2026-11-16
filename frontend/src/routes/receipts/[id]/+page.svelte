@@ -23,6 +23,7 @@
 	let editorRevision = $state(0);
 	let savedRevision = $state(0);
 	let editorDirty = $state(false);
+	let childPending = $state(false);
 	let acknowledgements = $state<{ finding_id: string; comment: string }[]>([]);
 	let acknowledgementReset = $state(0);
 	let reviewMessage = $state('');
@@ -32,6 +33,15 @@
 	$effect(() => {
 		const view = { id };
 		activeView = view;
+		editorRevision = 0;
+		savedRevision = 0;
+		acknowledgementReset = 0;
+		saving = false;
+		verifying = false;
+		verifyOpen = false;
+		selectedSources = [];
+		editorDirty = false;
+		childPending = false;
 		acknowledgements = [];
 		reviewMessage = '';
 		needsReload = false;
@@ -87,18 +97,22 @@
 		void queryClient.invalidateQueries({ queryKey: ['statistics'] });
 	}
 	async function discardReload() {
+		const requestId = id;
+		const view = activeView;
 		saving = true;
 		try {
-			await refresh();
+			await refresh(requestId, view);
+			if (activeView !== view) return;
 			reviewMessage = '';
 		} catch {
+			if (activeView !== view) return;
 			reviewMessage = translate('receipt.saveFailed');
 		} finally {
-			saving = false;
+			if (activeView === view) saving = false;
 		}
 	}
 	async function save(write: ReceiptWrite, verify: boolean) {
-		if (saving || needsReload) return;
+		if (saving || needsReload || childPending) return;
 		const requestId = id;
 		const view = activeView;
 		saving = true;
@@ -146,7 +160,7 @@
 		return save(write, true);
 	}
 	async function doVerify() {
-		if (verifying || !data || !reviewReady || editorDirty || needsReload) return;
+		if (verifying || !data || !reviewReady || editorDirty || needsReload || childPending) return;
 		const requestId = id;
 		const view = activeView;
 		const receipt = data.receipt;
@@ -211,7 +225,12 @@
 				<button
 					type="button"
 					class="flex items-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-on-primary hover:opacity-90 disabled:opacity-50"
-					disabled={editorDirty || saving || verifying || !reviewReady || needsReload}
+					disabled={editorDirty ||
+						saving ||
+						verifying ||
+						!reviewReady ||
+						needsReload ||
+						childPending}
 					onclick={() => (verifyOpen = true)}
 				>
 					<Icon icon="check" />
@@ -270,6 +289,7 @@
 					onSaveAndVerify={canVerify ? saveAndVerify : undefined}
 					onDirtyChange={(dirty) => (editorDirty = dirty)}
 					onSource={(sources) => (selectedSources = sources)}
+					onPendingChange={(pending) => (childPending = pending)}
 				/>
 			</div>
 		</div>

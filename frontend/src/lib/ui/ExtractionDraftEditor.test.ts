@@ -152,3 +152,65 @@ it('uses the owner tag vocabulary when reusing tag controls in a nullable draft'
 	expect(tags).toHaveBeenCalledOnce();
 	expect(screen.queryByText('Suggested')).toBeNull();
 });
+it('drops ambiguous tax sources when a preceding draft tax is deleted', async () => {
+	const source = {
+		part_id: 'part',
+		photo_index: 0,
+		source_sha256: 'hash',
+		coordinate_space: 'unknown' as const
+	};
+	vi.mocked(api.getDraft).mockResolvedValue({
+		...draft,
+		field_sources: { 'taxes.0.amount': [source], 'taxes.1.amount': [source], total: [source] },
+		document: {
+			...draft.document,
+			line_items: [],
+			taxes: [
+				{ name: 'A', amount: '1' },
+				{ name: 'B', amount: '2' }
+			]
+		}
+	});
+	const patch = vi.spyOn(api, 'patchDraft').mockResolvedValue({ ...draft, revision: 8 });
+	render(ExtractionDraftEditor, { id: 'job' });
+	await screen.findByLabelText('Merchant');
+	await fireEvent.click(screen.getAllByRole('button', { name: 'Remove' })[0]);
+	await fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+	expect(patch.mock.calls[0][1].changes.taxes?.[0].name).toBe('B');
+	expect(patch.mock.calls[0][1].changes.field_sources).toEqual({ total: [source] });
+});
+
+it.each([
+	['preceding deletion', 1, 2],
+	['out of range', 0, 9]
+] as const)(
+	'marks draft overlap association unknown after %s',
+	async (kind, first_index, second_index) => {
+		vi.mocked(api.getDraft).mockResolvedValue({
+			...draft,
+			overlap_decisions: [{ first_index, second_index, verified: true }],
+			document: {
+				...draft.document,
+				line_items: [{ description: 'A' }, { description: 'B' }, { description: 'C' }]
+			}
+		});
+		const patch = vi.spyOn(api, 'patchDraft').mockResolvedValue({ ...draft, revision: 8 });
+		render(ExtractionDraftEditor, { id: 'job' });
+		await screen.findByLabelText('Merchant');
+		if (kind === 'preceding deletion')
+			await fireEvent.click(screen.getAllByRole('button', { name: 'Remove' })[0]);
+		else await fireEvent.input(screen.getByLabelText('Merchant'), { target: { value: 'Changed' } });
+		expect(
+			(
+				screen.getByRole('checkbox', {
+					name: 'I reviewed this overlap; keep the current rows'
+				}) as HTMLInputElement
+			).disabled
+		).toBe(true);
+		expect(screen.getByText('Row association unknown; review the original evidence.')).toBeTruthy();
+		await fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+		expect(patch.mock.calls[0][1].changes.overlap_decisions).toEqual([
+			{ verified: false, association_unknown: true }
+		]);
+	}
+);

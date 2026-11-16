@@ -188,3 +188,13 @@ describe('TagEditor', () => {
 		expect(screen.getByText('No tags yet — type to create one.')).not.toBeNull();
 	});
 });
+it('blocks an already-open custom create option while its parent is saving', async () => {
+	const value: string[] = [];
+	const view = render(TagEditor, { value, tagOptions: OPTIONS, id: 'disabled-tag' });
+	await fireEvent.click(screen.getByRole('button', { name: 'Tags' }));
+	await fireEvent.input(screen.getByPlaceholderText('Search tags…'), { target: { value: 'late' } });
+	await view.rerender({ value, tagOptions: OPTIONS, id: 'disabled-tag', disabled: true });
+	await fireEvent.click(screen.getByRole('option', { name: 'Create “late”' }));
+	expect(value).toEqual([]);
+	expect(vi.mocked(fetch).mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0);
+});
