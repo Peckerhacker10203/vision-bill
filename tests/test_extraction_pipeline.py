@@ -406,7 +406,6 @@ async def test_blocked_preparation_obeys_deadline_and_cleans_owned_files(
     from PIL import ImageOps
 
     gate, entered, cleaned = threading.Event(), threading.Event(), threading.Event()
-    timer = threading.Timer(0.5, gate.set)
     original_read, original_transpose = Path.read_bytes, ImageOps.exif_transpose
     cleanup = tempfile.TemporaryDirectory.cleanup
 
@@ -417,12 +416,12 @@ async def test_blocked_preparation_obeys_deadline_and_cleans_owned_files(
     def read(path):
         if stage == "hash" and path == photos[0]:
             entered.set()
-            gate.wait(0.5)
+            assert gate.wait(5), "test did not release blocked hashing"
         return original_read(path)
 
     def transpose(image, *args, **kwargs):
         entered.set()
-        gate.wait(0.5)
+        assert gate.wait(5), "test did not release blocked normalization"
         return original_transpose(image, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_bytes", read)
@@ -431,23 +430,23 @@ async def test_blocked_preparation_obeys_deadline_and_cleans_owned_files(
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     monkeypatch.setattr(tempfile.TemporaryDirectory, "cleanup", cleanup_observed)
     llm = formatter()
-    timer.start()
     began = time.monotonic()
+    deadline = began + 1
     try:
         with pytest.raises(TimeoutError):
             await pipeline(llm).extract(
                 "fixture",
                 photos,
                 options=ExperimentOptions(pipeline="direct_vision", include_classification=False),
-                deadline=began + 0.08,
+                deadline=deadline,
                 tags=[],
             )
         assert entered.is_set()
-        assert time.monotonic() - began < 0.3
+        assert time.monotonic() < deadline + 0.3
+        assert not gate.is_set()
         llm._client.chat.assert_not_awaited()
     finally:
         gate.set()
-        timer.cancel()
     if stage == "normalization":
         assert await asyncio.to_thread(cleaned.wait, 0.5)
         assert not list(tmp_path.glob("vision-bill-vision-*"))
@@ -459,8 +458,9 @@ async def test_budget_exhausted_after_all_ocr_during_late_call(photos, late_stag
     llm, ocr = formatter(False), sidecar()
     first = llm._client.chat.return_value
     if late_stage == "repair":
+        # A nullable partial receipt is valid; malformed JSON must enter repair.
         first = ChatResponse(
-            message={"role": "assistant", "content": '{"merchant_name":"partial"}'}
+            message={"role": "assistant", "content": '{"merchant_name":'}
         )
     entered = asyncio.Event()
 
@@ -473,6 +473,9 @@ async def test_budget_exhausted_after_all_ocr_during_late_call(photos, late_stag
     llm._client.chat.side_effect = late
     checkpoint = AsyncMock()
     began = time.monotonic()
+    # Include real hashing/parsing and executor scheduling before the late call.
+    # The assertions below still require both OCR checkpoints and late-stage entry.
+    deadline = began + 1
     with pytest.raises(TimeoutError):
         await pipeline(llm, ocr).extract(
             "fixture",
@@ -480,13 +483,13 @@ async def test_budget_exhausted_after_all_ocr_during_late_call(photos, late_stag
             options=ExperimentOptions(
                 pipeline="ocr", include_classification=late_stage == "enrichment"
             ),
-            deadline=began + 0.15,
+            deadline=deadline,
             tags=["food"],
             checkpoint=checkpoint,
         )
     assert checkpoint.await_count == 2
     assert entered.is_set() and llm._client.chat.await_count == 2
-    assert time.monotonic() - began < 0.5
+    assert time.monotonic() < deadline + 0.35
 
 
 async def test_ollama_serializes_exact_prepared_png_after_temporary_cleanup(

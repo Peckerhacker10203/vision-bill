@@ -83,18 +83,29 @@ async def test_saved_snapshot_is_forwarded_without_current_defaults(settings, tm
 
 async def test_hung_attempt_includes_binding_in_original_budget(settings, tmp_path):
     service, _receipt, db, claim, _part = context(settings, tmp_path)
-    # A short controlled budget exercises exactly the same 600-second outer timer.
-    service.worker = settings.worker.model_copy(update={"attempt_timeout_seconds": 0.2})
+    # Exercise the real timer with enough reserve for error persistence under load.
+    service.worker = settings.worker.model_copy(update={"attempt_timeout_seconds": 2})
     entered = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    finished = []
 
     async def hang(*args, **kwargs):
         entered.set()
         await asyncio.Event().wait()
 
+    async def finish(*args, deadline):
+        finished.append(loop.time())
+        assert finished[-1] < deadline
+        return CommitResult(stale=False)
+
     db.bind_source_parts.side_effect = hang
-    async with asyncio.timeout(0.8):
-        await service.process_claim(claim)
+    db.finish_attempt.side_effect = finish
+    began = loop.time()
+    async with asyncio.timeout(2.8):
+        result = await service.process_claim(claim)
     assert entered.is_set()
+    assert not result.stale and len(finished) == 1
+    assert finished[0] < began + 2
     assert db.finish_attempt.call_args.args[1].result_code == "timed_out"
 
 

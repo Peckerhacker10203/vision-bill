@@ -1,5 +1,6 @@
 import hashlib
 import threading
+import time
 from io import BytesIO
 from uuid import uuid4
 
@@ -32,15 +33,27 @@ def test_feature_requires_lifecycle_api():
 
 def test_health_does_not_imply_readiness_and_metadata_is_safe():
     from ocr_service.api import create_app
+    from ocr_service.worker import OcrWorkerManager
 
-    worker = manager(FakeContext(init_fail=True))
+    context = FakeContext(init_fail=True, init_blocked=True)
+    worker = OcrWorkerManager(mp_context=context, startup_timeout=2)
     with TestClient(create_app(worker_factory=lambda: worker)) as client:
+        assert context.started.wait(1)
         assert client.get("/health").status_code == 200
         ready = client.get("/ready")
+        assert ready.status_code == 503
+        assert ready.json()["reason_code"] == "ocr_starting"
+        context.init_release.set()
+        deadline = time.monotonic() + 1
+        while ready.json()["reason_code"] == "ocr_starting":
+            assert time.monotonic() < deadline, ready.text
+            ready = client.get("/ready")
+        assert client.get("/health").status_code == 200
         assert ready.status_code == 503
         assert ready.json()["reason_code"] == "ocr_init_failed"
         info = client.get("/info").json()
         assert info["contract_version"] == 2
+        assert info["worker"]["reason_code"] == "ocr_init_failed"
         assert "model_dirs" not in str(info)
         assert "exception" not in str(info)
 

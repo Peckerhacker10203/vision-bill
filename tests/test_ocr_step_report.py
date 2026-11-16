@@ -20,7 +20,7 @@ def test_html_shows_stages_and_escapes_untrusted_model_output(tmp_path):
             {
                 "attempts": [
                     {
-                        "messages": [{"role": "user", "content": "format receipt"}],
+                        "messages": [{"role": "user", "content": "format <untrusted> receipt"}],
                         "response": '</pre><script>alert("unsafe")</script>',
                     },
                     {"response": '{"total":"1.29"}'},
@@ -42,11 +42,16 @@ def test_html_shows_stages_and_escapes_untrusted_model_output(tmp_path):
     write_reports(tmp_path, [row])
     text = (tmp_path / "report.html").read_text()
     assert "data:image/png;base64," in text
-    assert "OCR output" in text and "Text sent to LLM" in text
+    assert "OCR output" in text
+    assert "Display transcript (actual requests are recorded below)" in text
+    assert "MILCH  1,29" in text
+    assert "Request / prompt" in text
+    assert "format &lt;untrusted&gt; receipt" in text
+    assert "format <untrusted> receipt" not in text
     assert "Attempt 1" in text and "Attempt 2" in text
     assert "ReceiptService return" in text
     assert '<script>alert("unsafe")</script>' not in text
-    assert "&lt;script&gt;" in text
+    assert "&lt;/pre&gt;&lt;script&gt;alert(&quot;unsafe&quot;)&lt;/script&gt;" in text
     assert "default-src 'none'" in text
 
 
