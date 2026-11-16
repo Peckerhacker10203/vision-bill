@@ -93,7 +93,9 @@ class OpenAIProvider(LLMProvider):
             api_key=api_key,
             timeout=analysis_timeout_seconds,
             max_retries=0,
-            http_client=DefaultAsyncHttpxClient(trust_env=False),
+            http_client=DefaultAsyncHttpxClient(
+                trust_env=False, follow_redirects=model_lifecycle == "none"
+            ),
         )
         self._temperature = temperature
         from ...service.gpu_handoff import configure_handoff

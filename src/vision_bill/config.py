@@ -57,13 +57,8 @@ class LLMSettings(BaseModel):
     analysis_timeout_seconds: float = Field(default=600, gt=0, le=600)
     max_output_tokens: int = Field(default=8192, gt=0)
     vision_model_ids: list[str] = Field(default_factory=list)
+    # OpenAI-only option; other providers keep their own lifecycle after a switch.
     model_lifecycle: Literal["none", "llamacpp"] = "none"
-
-    @model_validator(mode="after")
-    def validate_model_lifecycle(self) -> Self:
-        if self.model_lifecycle != "none" and self.provider != LLMProviderEnum.OPENAI:
-            raise ValueError("llamacpp model lifecycle requires provider=openai")
-        return self
 
 
 class ApiSettings(BaseModel):
