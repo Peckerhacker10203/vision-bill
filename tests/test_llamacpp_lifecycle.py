@@ -3,6 +3,7 @@
 import json
 from contextlib import asynccontextmanager
 from time import monotonic
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -10,6 +11,7 @@ from openai import AsyncOpenAI
 
 from vision_bill.config import LLMSettings
 from vision_bill.provider.factory import get_llm_provider
+from vision_bill.provider.llm import llamacpp as lifecycle_module
 from vision_bill.provider.llm.openai import OpenAIProvider
 from vision_bill.service.gpu_handoff import ModelHandoff
 
@@ -53,7 +55,9 @@ async def configured(monkeypatch, handler, host="http://llama.local/llama/v1"):
             assert kwargs.get("follow_redirects") is False
             return REAL_CLIENT(transport=transport, **kwargs)
 
-        monkeypatch.setattr(httpx, "AsyncClient", control_client)
+        monkeypatch.setattr(lifecycle_module, "httpx", SimpleNamespace(
+            AsyncClient=control_client, Timeout=httpx.Timeout,
+        ))
         yield provider
     finally:
         await provider._client.close()
@@ -278,6 +282,7 @@ def test_llamacpp_option_does_not_break_saved_provider_switch(settings, tmp_path
 
 @pytest.mark.asyncio
 async def test_managed_openai_client_does_not_follow_inference_redirect(monkeypatch):
+    import httpx2
     from openai import APIStatusError
 
     from vision_bill.provider.llm import openai as provider_module
@@ -287,10 +292,10 @@ async def test_managed_openai_client_does_not_follow_inference_redirect(monkeypa
     def handler(request):
         hosts.append(request.url.host)
         if request.url.host == "llama.local":
-            return httpx.Response(307, headers={
+            return httpx2.Response(307, headers={
                 "location": "http://other.local/v1/chat/completions",
             })
-        return httpx.Response(200, json={
+        return httpx2.Response(200, json={
             "id": "chat", "object": "chat.completion", "created": 0,
             "model": "own",
             "choices": [{"index": 0, "message": {"role": "assistant", "content": "wrong"},
@@ -300,7 +305,7 @@ async def test_managed_openai_client_does_not_follow_inference_redirect(monkeypa
     sdk_client_class = provider_module.DefaultAsyncHttpxClient
 
     def client_factory(**kwargs):
-        return sdk_client_class(transport=httpx.MockTransport(handler), **kwargs)
+        return sdk_client_class(transport=httpx2.MockTransport(handler), **kwargs)
 
     monkeypatch.setattr(provider_module, "DefaultAsyncHttpxClient", client_factory)
     provider = OpenAIProvider(
