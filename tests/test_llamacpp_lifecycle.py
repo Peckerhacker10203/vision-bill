@@ -258,9 +258,57 @@ async def test_router_never_unloads_blocks_successor_ocr(monkeypatch, tmp_path):
         assert json.loads((tmp_path / "handoff.json").read_text())["models"] == ["own"]
 
 
-def test_lifecycle_setting_rejects_non_openai_provider():
-    with pytest.raises(ValueError, match="openai"):
-        LLMSettings(
-            provider="ollama", host="http://local", api_key="none",
-            model_name="own", temperature=0.0, model_lifecycle="llamacpp",
-        )
+def test_llamacpp_option_does_not_break_saved_provider_switch(settings, tmp_path, monkeypatch):
+    import yaml
+
+    from vision_bill.config import CONFIG_PATH_ENV, LLMProviderEnum, Settings, write_config_file
+
+    settings.llm.provider = LLMProviderEnum.OPENAI
+    settings.llm.model_lifecycle = "llamacpp"
+    candidate = settings.model_copy(deep=True)
+    # The settings API assigns editable fields before persisting the full object.
+    candidate.llm.provider = LLMProviderEnum.OLLAMA
+    path = tmp_path / "config.yaml"
+    monkeypatch.setenv(CONFIG_PATH_ENV, str(path))
+    write_config_file(candidate)
+    restored = Settings(**yaml.safe_load(path.read_text()))
+    assert restored.llm.provider == LLMProviderEnum.OLLAMA
+    assert restored.llm.model_lifecycle == "llamacpp"
+
+
+@pytest.mark.asyncio
+async def test_managed_openai_client_does_not_follow_inference_redirect(monkeypatch):
+    from openai import APIStatusError
+
+    from vision_bill.provider.llm import openai as provider_module
+
+    hosts = []
+
+    def handler(request):
+        hosts.append(request.url.host)
+        if request.url.host == "llama.local":
+            return httpx.Response(307, headers={
+                "location": "http://other.local/v1/chat/completions",
+            })
+        return httpx.Response(200, json={
+            "id": "chat", "object": "chat.completion", "created": 0,
+            "model": "own",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "wrong"},
+                         "finish_reason": "stop"}],
+        })
+
+    sdk_client_class = provider_module.DefaultAsyncHttpxClient
+
+    def client_factory(**kwargs):
+        return sdk_client_class(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(provider_module, "DefaultAsyncHttpxClient", client_factory)
+    provider = OpenAIProvider(
+        "http://llama.local/v1", "test-key", model_lifecycle="llamacpp"
+    )
+    try:
+        with pytest.raises(APIStatusError):
+            await provider.send_message("own", [{"role": "user", "content": "hi"}])
+        assert hosts == ["llama.local"]
+    finally:
+        await provider._client.close()

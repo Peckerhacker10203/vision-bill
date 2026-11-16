@@ -27,8 +27,7 @@ class LlamaCppLifecycle:
             raise ValueError("llamacpp lifecycle requires an unambiguous local router URL")
         # Validate the port before any request or journal identity is created.
         _ = parts.port
-        if path.endswith("/v1"):
-            path = path[:-3]
+        path = path.removesuffix("/v1")
         self._base_url = urlunsplit((parts.scheme, parts.netloc, path + "/", "", ""))
         self._api_key = api_key
         self.identity = "llamacpp:" + hashlib.sha256(self._base_url.encode()).hexdigest()
@@ -61,11 +60,9 @@ class LlamaCppLifecycle:
                 if state == "unloaded":
                     return
                 response = await client.post("models/unload", json={"model": model_id})
-                if response.status_code == 400:
-                    # The router may have reaped the child between GET and POST.
-                    # Reconcile inside this transaction, before clearing unsettled.
-                    if await self._status(client, model_id) == "unloaded":
-                        return
+                # Reconcile an already-stopped race before clearing unsettled.
+                if response.status_code == 400 and await self._status(client, model_id) == "unloaded":
+                    return
                 response.raise_for_status()
                 body = response.json()
                 if not isinstance(body, dict) or body.get("success") is not True:
@@ -80,7 +77,8 @@ class LlamaCppLifecycle:
         body = response.json()
         entries = body.get("data") if isinstance(body, dict) else None
         if not isinstance(entries, list):
-            raise RuntimeError("model_release_unconfirmed: router status is unavailable")
+            # A malformed remote protocol response is a runtime failure.
+            raise RuntimeError("model_release_unconfirmed: router status is unavailable")  # noqa: TRY004
         matches = [
             entry for entry in entries if isinstance(entry, dict) and entry.get("id") == model_id
         ]
