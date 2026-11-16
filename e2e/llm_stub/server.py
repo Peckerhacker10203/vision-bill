@@ -162,7 +162,10 @@ def _content_for(body: dict[str, Any]) -> str:
             {
                 "category": receipt.get("category", "grocery"),
                 "line_items": [
-                    {"tags": row.get("tags", []), "spending_category": "unknown"}
+                    {
+                        "tags": ["food"] if row["description"] in ("Milk", "Bread") else [],
+                        "spending_category": "unknown",
+                    }
                     for row in receipt["line_items"]
                 ],
             }

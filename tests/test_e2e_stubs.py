@@ -244,3 +244,56 @@ def test_transparent_generic_alias_matches_production_pixels_and_rejects_unknown
     image['image_url']['url'] = 'data:image/png;base64,' + base64.b64encode(b'unknown input').decode()
     with pytest.raises(ValueError, match='unregistered'):
         server._content_for(body)
+
+
+@pytest.mark.parametrize(
+    ("descriptions", "expected_tags"),
+    [
+        (["Milk", "Bread"], [["food"], ["food"]]),
+        (["Unregistered product", "Milk"], [[], ["food"]]),
+        (["Bread", "Unregistered product"], [["food"], []]),
+    ],
+)
+def test_classification_stub_enriches_ordered_rows_without_changing_raw_observations(
+    descriptions, expected_tags
+):
+    from vision_bill.model.extraction import InferenceEnvelope
+    from vision_bill.provider.llm.ollama import OllamaProvider
+
+    server = module("classification_stub_test", "e2e/llm_stub/server.py")
+    server.configure_scenario({"scenario": "complete"})
+    observed = json.loads((ROOT / "e2e/llm_stub/replies/a.complete.json").read_text())
+    for row, description in zip(observed["line_items"], descriptions, strict=True):
+        row["description"] = description
+        assert "tags" not in row and "spending_category" not in row
+    assert "category" not in observed
+    original = json.dumps(observed)
+    provider = OllamaProvider("http://unused-local")
+    prototype = InferenceEnvelope.model_validate(
+        {
+            "provenance": {
+                "requested_pipeline": "direct_vision",
+                "used_pipeline": "direct_vision",
+                "source_image_count": 1,
+                "ordered_source_sha256": ["a" * 64],
+                "model_id": "e2e-vision",
+            },
+            "telemetry": {"elapsed_ms": 0, "max_output_tokens": 8192},
+        }
+    )
+    parsed = provider._parse_receipt_input(
+        original,
+        input=ReceiptInput(mode="direct_vision", image_paths=["unused"]),
+        prototype=prototype,
+    )
+    raw = parsed.draft.model_dump()
+    before = parsed.receipt.model_dump(exclude={"line_items": {"__all__": {"tags"}}})
+    prompt = provider._classification_prompt(parsed, ["food"])
+    reply = server._content_for({"messages": [{"role": "user", "content": prompt}]})
+    enriched = provider._parse_classification(reply, parsed)
+    assert [row.tags for row in enriched.receipt.line_items] == expected_tags
+    assert enriched.receipt.model_dump(exclude={"line_items": {"__all__": {"tags"}}}) == before
+    assert enriched.draft.model_dump() == raw == parsed.draft.model_dump()
+    assert all(row.tags is None for row in enriched.draft.line_items)
+    assert all(row.tags == [] for row in parsed.receipt.line_items)
+    assert json.dumps(observed) == original
