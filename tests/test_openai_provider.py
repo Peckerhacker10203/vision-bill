@@ -245,7 +245,7 @@ async def test_send_message_empty_content(mock_client):
 
 
 @pytest.mark.asyncio
-async def test_send_message_sends_temperature_and_reasoning_effort(mock_client):
+async def test_send_message_sends_temperature_without_optional_reasoning_extension(mock_client):
     mock_client.chat.completions.create.return_value = _chat_response("ok")
 
     provider = OpenAIProvider(host="http://localhost:8642/v1", api_key="none", temperature=0.3)
@@ -254,7 +254,7 @@ async def test_send_message_sends_temperature_and_reasoning_effort(mock_client):
     kwargs = mock_client.chat.completions.create.call_args.kwargs
     assert kwargs["model"] == "model-x"
     assert kwargs["temperature"] == 0.3
-    assert kwargs["reasoning_effort"] == "low"
+    assert "reasoning_effort" not in kwargs
 
 
 @pytest.mark.asyncio

@@ -4,7 +4,7 @@ import logging
 import mimetypes
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Any, Literal, cast
 
 from ...helper.logging_config import setup_logging
@@ -14,6 +14,7 @@ setup_logging()
 from ...model.receipt import Receipt
 from ...provider.llm.base import TEXT_CAPABILITIES, AnalysisResult, LLMProvider, ModelInfo
 from .experiment import chat_telemetry
+from .llamacpp import LlamaCppLifecycle
 
 try:
     from openai import APIConnectionError, APIStatusError, AsyncOpenAI, DefaultAsyncHttpxClient
@@ -26,8 +27,6 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 RETRY_LIMIT = 3
-# Typed as a literal so it matches the SDK's reasoning_effort parameter type.
-REASONING_EFFORT: Literal["low"] = "low"
 VISION_CAPABILITY_FIELDS = ("multimodal", "vision")
 DEFAULT_IMAGE_MIME = "image/jpeg"
 
@@ -79,7 +78,13 @@ class OpenAIProvider(LLMProvider):
         analysis_timeout_seconds: float = 600,
         max_output_tokens: int = 8192,
         vision_model_ids: Sequence[str] = (),
+        model_lifecycle: Literal["none", "llamacpp"] = "none",
     ):
+        if model_lifecycle not in ("none", "llamacpp"):
+            raise ValueError("Unsupported OpenAI-compatible model lifecycle")
+        self._lifecycle = LlamaCppLifecycle(host, api_key) if model_lifecycle == "llamacpp" else None
+        self.supports_model_release = self._lifecycle is not None
+        self.lifecycle_identity = self._lifecycle.identity if self._lifecycle else "unsupported"
         self._vision_model_ids = frozenset(vision_model_ids)
         self.analysis_timeout_seconds = analysis_timeout_seconds
         self.max_output_tokens = max_output_tokens
@@ -93,6 +98,11 @@ class OpenAIProvider(LLMProvider):
         self._temperature = temperature
         from ...service.gpu_handoff import configure_handoff
         configure_handoff(self)
+
+    async def release_model(self, model_id: str) -> None:
+        if self._lifecycle is None:
+            raise ValueError("model_release_unsupported")
+        await self._lifecycle.release_model(model_id)
 
     def update_runtime_settings(self, *, temperature: float) -> None:
         self._temperature = temperature
@@ -211,18 +221,35 @@ class OpenAIProvider(LLMProvider):
         return result
 
     async def send_message(self, model_id: str, messages: Sequence[Mapping[str, Any]]) -> str:
-        if self.handoff is not None:
+        from ...service.gpu_handoff import current_owner
+
+        if self.handoff is not None and not self.supports_model_release:
             raise ValueError("model_release_unsupported: managed OCR requires an unload-capable provider")
+        owner = current_owner()
+        if owner is not None:
+            if owner.coordinator.provider.lifecycle_identity != self.lifecycle_identity:
+                raise ValueError("model_handoff_identity_changed")
+            await owner.llm_phase(model_id)
+        elif self.handoff is not None:
+            async with self.handoff.session(monotonic() + self.analysis_timeout_seconds) as owner:
+                await owner.llm_phase(model_id)
+                return await self._send_message(model_id, messages)
+        return await self._send_message(model_id, messages)
+
+    async def _send_message(self, model_id: str, messages: Sequence[Mapping[str, Any]]) -> str:
+        from ...service.gpu_handoff import current_owner
+
         # Plain dicts are exactly what the SDK serializes (verified against
         # the live server); cast() satisfies the TypedDict-parameter overloads.
         started = perf_counter()
-        response = await self._client.chat.completions.create(
+        call = self._client.chat.completions.create(
             model=model_id,
             messages=cast(Any, messages),
             temperature=self._temperature,
-            reasoning_effort=REASONING_EFFORT,
             max_tokens=self.max_output_tokens,
         )
+        owner = current_owner()
+        response = await owner.model_call(call) if owner is not None else await call
         if self.experiment_trace is not None:
             self.experiment_trace.append(
                 chat_telemetry(response, messages, (perf_counter() - started) * 1000)
