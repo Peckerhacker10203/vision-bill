@@ -139,15 +139,9 @@ async def update_receipt(
 async def verify_receipt(
     receipt_id: UUID,
     receipt_service: ReceiptService = Depends(get_receipt_service),  # noqa: B008
-    image_service: ImageService = Depends(get_image_service),  # noqa: B008
     current_user: User = Depends(get_current_user),  # noqa: B008
 ) -> ReceiptRow:
-    """Verify a receipt, moving its image from tmp to permanent storage.
-
-    Flow: receipt -> image row -> store_perm_image -> update_image_path ->
-    verify_receipt. The path now lives on the images row, not the receipt.
-    Non-see-all users may only verify their own receipts.
-    """
+    """Verify receipt metadata while preserving original and legacy file paths."""
     if not receipt_service.db_ready:
         raise HTTPException(status_code=503, detail="Database not available")
 
@@ -159,19 +153,6 @@ async def verify_receipt(
 
     if row.status == "verified":
         raise HTTPException(status_code=409, detail="Receipt already verified")
-
-    if row.image_id is not None:
-        image = await receipt_service.get_image_by_id(
-            row.image_id, user_id=current_user.id, can_see_all=current_user.can_see_all
-        )
-        if image is not None and image.image_path:
-            new_path, new_thumb = image_service.store_perm_image(Path(image.image_path), receipt_id)
-            if new_path is not None:
-                await receipt_service.update_image_path(row.image_id, str(new_path))
-            if new_thumb is not None:
-                await receipt_service.update_image_thumbnail_path(row.image_id, str(new_thumb))
-            if image.additional_images:
-                await receipt_service.move_additional_images(image, receipt_id)
 
     verified = await receipt_service.verify_receipt(
         receipt_id, user_id=current_user.id, can_see_all=current_user.can_see_all

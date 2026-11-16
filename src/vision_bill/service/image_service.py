@@ -1,6 +1,9 @@
 import logging
+import os
 import shutil
+import tempfile
 import uuid
+from hashlib import sha256
 from pathlib import Path
 from uuid import UUID
 
@@ -9,6 +12,7 @@ import pillow_heif
 from PIL import Image, ImageOps
 
 from ..config import ImageSettings
+from ..model.db.image import ImagePart
 from ..model.image import ImageInfo
 
 pillow_heif.register_heif_opener()  # type: ignore[attr-defined]
@@ -85,6 +89,53 @@ class ImageService:
             media_type=media_type,
             size_bytes=len(content),
             content=content,
+        )
+
+    def store_original(
+        self, content: bytes, submission_id: UUID, photo_index: int, media_type: str
+    ) -> ImagePart:
+        """Publish original bytes atomically without ever replacing an existing file.
+
+        The caller supplies the detected MIME type. DB assigns source-part UUIDs
+        after acceptance; this method supplies only the original hash and order.
+        """
+        extensions = {
+            "image/jpeg": "jpg",
+            "image/png": "png",
+            "image/webp": "webp",
+            "image/heic": "heic",
+            "image/heif": "heif",
+            "image/gif": "gif",
+        }
+        if media_type not in extensions:
+            raise UnsupportedImageTypeError(media_type)
+        if photo_index < 0:
+            raise ValueError("photo index must be nonnegative")
+        directory = self._save_dir / "submissions" / str(submission_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / f"{photo_index}.{extensions[media_type]}"
+        with tempfile.NamedTemporaryFile(dir=directory, delete=False) as handle:
+            temporary = Path(handle.name)
+            try:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+                os.link(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+        # Persist the new directory entries as well as the file contents.
+        for parent in (directory, directory.parent, self._save_dir):
+            descriptor = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        return ImagePart(
+            image_path=str(target),
+            media_type=media_type,
+            size_bytes=len(content),
+            source_sha256=sha256(content).hexdigest(),
+            photo_index=photo_index,
         )
 
     def store_tmp_image(self, content: bytes) -> Path:

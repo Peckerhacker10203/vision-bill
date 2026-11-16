@@ -13,17 +13,19 @@ import httpx
 from fastapi import UploadFile
 from openai import APITimeoutError
 
-from ..config import ImageSettings, OcrSettings, PGSettings
+from ..config import ImageSettings, OcrSettings, PGSettings, WorkerSettings
 from ..model.db.image import ImagePart, ImageRow
 from ..model.db.receipt import ReceiptRow, ReceiptWithDetails
 from ..model.extraction import InferenceEnvelope
 from ..model.receipt import Receipt
 from ..model.search import ProductSearchResponse
 from ..model.statistics import ReceiptStatistics
+from ..model.workflow import AccessScope, EnqueueResult, SubmissionCreate, SubmissionStatus
 from ..provider.db.collection_db import CollectionDB
 from ..provider.db.image_db import ImageDB
 from ..provider.db.receipt_db import ReceiptDB
 from ..provider.db.user_db import UserDB
+from ..provider.db.workflow_db import WorkflowDB
 from ..provider.llm.base import LLMProvider, ModelInfo
 from ..provider.llm.errors import AnalysisTimeoutError
 from ..provider.ocr.base import OcrProvider
@@ -62,6 +64,7 @@ class ReceiptService:
         provider: LLMProvider,
         ocr_provider: OcrProvider | None = None,
         ocr_settings: OcrSettings | None = None,
+        worker_settings: WorkerSettings | None = None,
     ):
         self._provider: LLMProvider = provider
         self._ocr_provider: OcrProvider | None = ocr_provider
@@ -70,6 +73,7 @@ class ReceiptService:
         self._db = ReceiptDB(pg_settings)
         self._image_db = ImageDB(pg_settings)
         self._user_db = UserDB(pg_settings)
+        self._workflow_db = WorkflowDB(pg_settings, worker_settings=worker_settings)
         self._collection_db: CollectionDB | None = None
 
     # ── Database delegation ──────────────────────────────────────────
@@ -78,11 +82,34 @@ class ReceiptService:
         await self._db.init_db()
         await self._image_db.init_db()
         await self._user_db.init_db()
+        await self._workflow_db.init_db()
 
     async def destroy_db(self) -> None:
         await self._db.destroy_db()
         await self._image_db.destroy_db()
         await self._user_db.destroy_db()
+        await self._workflow_db.destroy_db()
+
+    @property
+    def workflow_db(self) -> WorkflowDB:
+        """Durable submission provider shared with the workflow worker."""
+        return self._workflow_db
+
+    @property
+    def workflow_ready(self) -> bool:
+        return self._workflow_db.is_ready
+
+    async def enqueue_submission(
+        self, submission: SubmissionCreate, *, scope: AccessScope, idempotency_key: str | None
+    ) -> EnqueueResult:
+        return await self._workflow_db.enqueue_submission(
+            submission, scope=scope, idempotency_key=idempotency_key
+        )
+
+    async def get_submission(
+        self, image_id: UUID, *, scope: AccessScope
+    ) -> SubmissionStatus | None:
+        return await self._workflow_db.get_submission(image_id, scope=scope)
 
     @property
     def pool(self) -> asyncpg.Pool:

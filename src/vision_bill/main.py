@@ -76,7 +76,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.warning("OCR initialization failed: %s", type(exc).__name__)
 
     receipt_service = ReceiptService(
-        settings.images, settings.pg, provider, ocr_provider=ocr_provider, ocr_settings=settings.ocr
+        settings.images,
+        settings.pg,
+        provider,
+        ocr_provider=ocr_provider,
+        ocr_settings=settings.ocr,
+        worker_settings=settings.worker,
     )
     try:
         await receipt_service.init_db()

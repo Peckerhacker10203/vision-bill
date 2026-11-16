@@ -7,6 +7,10 @@ from pydantic import BaseModel, Field, field_validator
 
 class ImagePart(BaseModel):
     image_path: str
+    # Assigned only by image_source_parts; file allocation is not a part identity.
+    part_id: UUID | None = None
+    source_sha256: str | None = None
+    photo_index: int | None = Field(default=None, ge=0)
     thumbnail_path: str | None = None
     original_filename: str | None = None
     media_type: str | None = None

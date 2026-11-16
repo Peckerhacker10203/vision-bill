@@ -11,8 +11,8 @@ import pytest
 from fastapi import UploadFile
 
 from vision_bill.config import Settings
-from vision_bill.model.db.image import ImageRow
 from vision_bill.model.collection import Collection
+from vision_bill.model.db.image import ImageRow
 from vision_bill.model.db.receipt import ReceiptRow
 from vision_bill.model.receipt import LineItem, Receipt, TaxLine
 from vision_bill.model.search import ProductPurchase
@@ -337,6 +337,7 @@ def delegation_context(settings: Settings) -> Generator[DelegationContext, None,
         patch("vision_bill.service.receipt_service.ReceiptDB") as mock_db_class,
         patch("vision_bill.service.receipt_service.ImageDB") as mock_image_db_class,
         patch("vision_bill.service.receipt_service.UserDB") as mock_user_db_class,
+        patch("vision_bill.service.receipt_service.WorkflowDB") as mock_workflow_db_class,
     ):
         mock_db = mock_db_class.return_value
         mock_db.init_db = AsyncMock()
@@ -370,6 +371,8 @@ def delegation_context(settings: Settings) -> Generator[DelegationContext, None,
         mock_user_db.destroy_db = AsyncMock()
         mock_user_db.is_ready = True
 
+        mock_workflow_db_class.return_value.init_db = AsyncMock()
+        mock_workflow_db_class.return_value.destroy_db = AsyncMock()
         service = ReceiptService(settings.images, settings.pg, MagicMock(spec=LLMProvider))
         yield service, mock_db, mock_image_db
 
@@ -913,3 +916,16 @@ async def test_persist_receipt_capture_failure_is_fail_safe(delegation_context) 
     row = await service.persist_receipt(_make_receipt(), user_id=OWNER_ID)  # must not raise
 
     assert row is not None
+
+
+async def test_workflow_provider_lifecycle_and_readiness(delegation_context):
+    service, _, _ = delegation_context
+    database = service.workflow_db
+    database.is_ready = False
+    assert service.workflow_ready is False
+    await service.init_db()
+    database.init_db.assert_awaited_once_with()
+    database.is_ready = True
+    assert service.workflow_ready is True
+    await service.destroy_db()
+    database.destroy_db.assert_awaited_once_with()

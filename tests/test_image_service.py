@@ -221,3 +221,20 @@ def test_delete_image_removes_thumb(image_service: ImageService, tmp_path: Path)
     assert image_service.delete_image(src) is True
     assert not src.exists()
     assert not thumb.exists()
+
+
+def test_store_original_keeps_actual_bytes_hash_order_and_immutable_path(image_service, settings):
+    from hashlib import sha256
+
+    content = b"original bytes"
+    part = image_service.store_original(content, RECEIPT_ID, 1, "image/jpeg")
+    target = Path(settings.images.save_dir) / "submissions" / str(RECEIPT_ID) / "1.jpg"
+    assert Path(part.image_path) == target
+    assert target.read_bytes() == content
+    assert part.source_sha256 == sha256(content).hexdigest()
+    assert part.photo_index == 1
+    assert part.part_id is None  # Only WorkflowDB assigns actual source-part identities.
+    with pytest.raises(FileExistsError):
+        image_service.store_original(b"changed", RECEIPT_ID, 1, "image/jpeg")
+    assert target.read_bytes() == content
+    assert list(target.parent.iterdir()) == [target]
