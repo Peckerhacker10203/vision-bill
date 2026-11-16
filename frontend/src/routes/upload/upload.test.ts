@@ -1,0 +1,109 @@
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { afterEach, expect, it, vi } from 'vitest';
+import { api } from '$lib/api/client';
+import { queryClient } from '$lib/query/client';
+import { session } from '$lib/auth';
+import Upload from './+page.svelte';
+const { goto } = vi.hoisted(() => ({ goto: vi.fn() }));
+vi.mock('$app/navigation', () => ({ goto }));
+vi.mock('$app/paths', () => ({ resolve: (path: string) => path }));
+vi.mock('$app/state', () => ({ page: { url: new URL('http://localhost/upload') } }));
+afterEach(() => {
+	cleanup();
+	queryClient.clear();
+	localStorage.clear();
+	vi.restoreAllMocks();
+	goto.mockReset();
+});
+it.each([
+	[1, 'pending'],
+	[2, 'pending'],
+	[1, 'analyzed'],
+	[2, 'analyzed']
+])('navigates every accepted %s-photo %s upload to its durable job', async (count, state) => {
+	session.set({ id: 'owner', username: 'test', is_admin: false, can_see_all: false });
+	let preview = 0;
+	vi.spyOn(URL, 'createObjectURL').mockImplementation(() => `blob:preview-${preview++}`);
+	vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+	vi.spyOn(api, 'getUiConfig').mockResolvedValue({
+		bypass_review_default: true,
+		registration_open: true
+	});
+	vi.spyOn(api, 'uploadImages').mockResolvedValue({
+		id: 'durable-job',
+		terminal: state === 'analyzed',
+		status: state,
+		receipt_id: state === 'analyzed' ? 'receipt' : null
+	} as never);
+	const { container } = render(Upload);
+	const input = container.querySelector('input[type=file]')!;
+	await fireEvent.change(input, {
+		target: {
+			files: Array.from({ length: Number(count) }, (_, i) => new File([String(i)], `${i}.png`))
+		}
+	});
+	await fireEvent.click(screen.getByRole('button', { name: 'Upload' }));
+	await waitFor(() => expect(goto).toHaveBeenCalledWith('/upload?job=durable-job'));
+	expect(api.uploadImages).toHaveBeenCalledWith(expect.any(Array), {}, expect.any(String));
+});
+
+it('reload recovery never posts automatically or adopts changed defaults as explicit input', async () => {
+	const { prepareUpload, readPendingUpload } = await import('$lib/api/upload');
+	session.set({ id: 'owner', username: 'test', is_admin: false, can_see_all: false });
+	const file = new File(['same bytes'], 'photo.png');
+	const pending = await prepareUpload('owner', [file], { bypass_review: false });
+	vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:recover');
+	vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+	vi.spyOn(api, 'getUiConfig').mockResolvedValue({
+		bypass_review_default: true,
+		registration_open: true
+	});
+	const upload = vi.spyOn(api, 'uploadImages').mockRejectedValue(new Error('lost response'));
+	const { container, unmount } = render(Upload);
+	await screen.findByText(/unknown outcome/);
+	expect(upload).not.toHaveBeenCalled();
+	expect((screen.getByRole('checkbox') as HTMLInputElement).checked).toBe(false);
+	await fireEvent.change(container.querySelector('input[type=file]')!, {
+		target: { files: [file] }
+	});
+	await fireEvent.click(screen.getByRole('button', { name: 'Upload' }));
+	await waitFor(() => expect(upload).toHaveBeenCalledWith([file], pending.options, pending.key));
+	await screen.findByRole('alert');
+	expect(readPendingUpload('owner')).toEqual(pending);
+	unmount();
+	render(Upload);
+	await screen.findByText(/unknown outcome/);
+	expect(upload).toHaveBeenCalledTimes(1);
+});
+
+it('does not submit under a different authenticated owner if the session changes while hashing', async () => {
+	session.set({ id: 'owner', username: 'test', is_admin: false, can_see_all: false });
+	let finish!: (bytes: ArrayBuffer) => void;
+	const file = new File(['photo'], 'photo.png');
+	Object.defineProperty(file, 'arrayBuffer', {
+		value: () =>
+			new Promise<ArrayBuffer>((resolve) => {
+				finish = resolve;
+			})
+	});
+	vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:owner');
+	vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+	vi.spyOn(api, 'getUiConfig').mockResolvedValue({
+		bypass_review_default: false,
+		registration_open: true
+	});
+	const upload = vi.spyOn(api, 'uploadImages').mockResolvedValue({ id: 'job' } as never);
+	const { container } = render(Upload);
+	await fireEvent.change(container.querySelector('input[type=file]')!, {
+		target: { files: [file] }
+	});
+	await fireEvent.click(screen.getByRole('button', { name: 'Upload' }));
+	session.set({ id: 'other', username: 'other', is_admin: false, can_see_all: false });
+	finish(new Uint8Array([1, 2]).buffer);
+	await waitFor(() =>
+		expect((screen.getByRole('button', { name: 'Upload' }) as HTMLButtonElement).disabled).toBe(
+			false
+		)
+	);
+	expect(upload).not.toHaveBeenCalled();
+});

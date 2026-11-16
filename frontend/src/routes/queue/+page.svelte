@@ -12,7 +12,14 @@
 	import ReceiptImage from '$lib/ui/ReceiptImage.svelte';
 	import type { ImageRow, ImageStatus } from '$lib/types';
 
-	const statuses: ImageStatus[] = ['pending', 'processing', 'failed', 'timed_out', 'unreadable'];
+	const statuses: ImageStatus[] = [
+		'pending',
+		'processing',
+		'failed',
+		'timed_out',
+		'unreadable',
+		'needs_review'
+	];
 
 	const list = createQuery(
 		() => ({
@@ -150,6 +157,23 @@
 								<span>{$t(`submission.${image.status}`)}</span>
 							{/if}
 						</p>
+						<p class="mt-1 text-xs text-on-surface-variant">
+							{$t('submission.attempt', {
+								values: { count: image.attempt_count, max: image.max_attempts }
+							})}
+						</p>
+						{#if !image.terminal && image.retry_at}
+							<p class="mt-1 text-xs text-on-surface-variant">
+								{$t('submission.retryAt', {
+									values: { time: new Date(image.retry_at).toLocaleString() }
+								})}
+							</p>
+						{/if}
+						{#if !image.terminal && image.wait_reason}<p
+								class="mt-1 text-xs text-on-surface-variant"
+							>
+								{$t('submission.waitReason')}: {image.wait_reason}
+							</p>{/if}
 						{#if image.error}
 							<p class="mt-1 truncate text-xs text-error" title={image.error}>
 								{image.error}

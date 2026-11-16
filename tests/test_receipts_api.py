@@ -257,7 +257,14 @@ def test_ui_config_exposes_bypass_review_default(
     response = api_context.client.get("/api/v1/system/ui-config")
 
     assert response.status_code == 200
-    assert response.json() == {"bypass_review_default": True, "registration_open": True}
+    assert response.json() == {
+        "bypass_review_default": True,
+        "registration_open": True,
+        "ocr_enabled": False,
+        "ocr_required": False,
+        "ocr_allow_vision_fallback": False,
+        "formatter_max_output_tokens": settings.llm.max_output_tokens,
+    }
 
 
 def test_upload_image_rejects_non_image(api_context: ApiContext) -> None:

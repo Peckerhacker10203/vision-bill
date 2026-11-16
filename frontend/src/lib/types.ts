@@ -1,5 +1,5 @@
 export type ImageStatus =
-	'pending' | 'processing' | 'analyzed' | 'failed' | 'timed_out' | 'unreadable';
+	'pending' | 'processing' | 'analyzed' | 'failed' | 'timed_out' | 'unreadable' | 'needs_review';
 
 export type ReceiptStatus = 'unverified' | 'verified';
 
@@ -16,7 +16,31 @@ export type Category =
 export type PaymentMethod =
 	'cash' | 'credit_card' | 'debit_card' | 'mobile_payment' | 'check' | 'other' | 'unknown';
 
-export interface ImageRow {
+export interface SourceView {
+	view_id: string;
+	photo_index: number;
+	coordinate_space: 'original' | 'working';
+	width: number;
+	height: number;
+	sha256: string;
+	url: string;
+	transforms: Record<string, unknown>[];
+	inverse_mapping: null;
+}
+
+export interface SubmissionStatus {
+	generation: number;
+	terminal: boolean;
+	attempt_count: number;
+	max_attempts: number;
+	retry_at: string | null;
+	result_code: string | null;
+	wait_reason: string | null;
+	draft_available: boolean;
+	latest_extraction_id: string | null;
+	source_views: SourceView[];
+	bypass_review: boolean;
+	model_id: string | null;
 	additional_images?: { original_filename: string | null }[];
 	id: string;
 	original_filename: string | null;
@@ -31,6 +55,27 @@ export interface ImageRow {
 	created_at: string | null;
 	analyzed_at: string | null;
 	processing_at: string | null;
+}
+
+export type ImageRow = SubmissionStatus;
+
+export interface UploadOptions {
+	model_id?: string;
+	bypass_review?: boolean;
+}
+export interface RetryRequest {
+	expected_generation: number;
+	request_key: string;
+}
+export interface ReviewRequest {
+	expected_operation_revision?: number;
+	expected_review_revision?: number;
+	acknowledgements: { finding_id: string; comment: string }[];
+}
+export interface ModelInfo {
+	id: string;
+	parameter_size?: string | null;
+	context_window_tokens?: number | null;
 }
 
 export interface ReceiptRow {
@@ -120,18 +165,6 @@ export interface ReceiptWithDetails {
 	collection_ids: string[];
 }
 
-/** Body for POST /images (file uploaded via FormData, model_id as query param). */
-export interface ImageCreated {
-	image_id: string;
-	status: ImageStatus;
-	receipt_id?: string | null;
-	warning?: string;
-	original_filename?: string;
-	media_type?: string;
-	size_bytes?: number;
-	image_path?: string;
-}
-
 /** Authenticated principal (mirrors the backend `User` model). */
 export interface User {
 	id: string;
@@ -144,6 +177,10 @@ export interface User {
 export interface UiConfig {
 	bypass_review_default: boolean;
 	registration_open: boolean;
+	ocr_enabled?: boolean;
+	ocr_required?: boolean;
+	ocr_allow_vision_fallback?: boolean;
+	formatter_max_output_tokens?: number;
 }
 
 export interface CurrencyStatistics {

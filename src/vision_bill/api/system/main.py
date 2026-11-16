@@ -31,11 +31,15 @@ class SettingsView(SettingsUpdate):
 
 
 @router.get("/ui-config")
-async def get_ui_config() -> dict[str, bool]:
+async def get_ui_config() -> dict[str, bool | int]:
     """Return safe runtime defaults needed by the browser UI (public, pre-auth)."""
     return {
         "bypass_review_default": settings.images.bypass_review_default,
         "registration_open": settings.auth.allow_registration,
+        "ocr_enabled": settings.ocr.enabled,
+        "ocr_required": settings.ocr.required,
+        "ocr_allow_vision_fallback": settings.ocr.allow_vision_fallback,
+        "formatter_max_output_tokens": settings.llm.max_output_tokens,
     }
 
 

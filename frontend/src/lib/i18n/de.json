@@ -14,11 +14,19 @@
 		"openReceipt": "Beleg öffnen und prüfen",
 		"newUpload": "Weiteren Beleg hochladen",
 		"reference": "Auftragsreferenz",
-		"tryAgain": "Lade die Bilder für einen neuen Versuch erneut hoch. Nimm bei unlesbaren Belegen schärfere Nahaufnahmen mit überlappenden Zeilen auf.",
 		"loadError": "Der Auftrag konnte nicht geladen werden. Prüfe deine Verbindung und ob du mit dem Konto angemeldet bist, das ihn hochgeladen hat.",
 		"refresh": "Aktualisieren",
 		"photos": "Belegfotos",
-		"photo": "Foto {number}"
+		"photo": "Foto {number}",
+		"needs_review": "Dein Beleg muss geprüft werden",
+		"attempt": "Versuch {count} von {max}",
+		"retryAt": "Automatischer Wiederholungsversuch geplant: {time}",
+		"waitReason": "Warten auf Dienst / Wiederholung",
+		"resultCode": "Analyseergebnis",
+		"retry": "Analyse wiederholen",
+		"openDraft": "Belegentwurf öffnen",
+		"recovery": "Der Ausgang eines vorherigen Uploads ist unbekannt. Prüfe zuerst die Warteschlange. Wähle zur Wiederherstellung dieselben Fotos in derselben Reihenfolge und klicke auf Hochladen. Die ursprünglichen Optionen und die Anfragekennung werden wiederverwendet. Es wird kein Upload automatisch gesendet.",
+		"ownerChanged": "Dein Konto hat sich geändert. Wähle die Fotos vor dem Hochladen erneut aus."
 	},
 	"app": {
 		"name": "Vision Bill"
@@ -149,8 +157,8 @@
 		"takePhoto": "Foto aufnehmen",
 		"dropHint": "oder ein Bild hierher ziehen",
 		"supportedTypes": "JPG, PNG, WebP, AVIF oder HEIC",
-		"bypassLabel": "Prüfung überspringen – direkt als geprüft speichern",
-		"bypassHint": "Der Beleg wird ohne manuelle Prüfung direkt als geprüft gespeichert.",
+		"bypassLabel": "Prüfung überspringen, wenn alle Kontrollen bestehen",
+		"bypassHint": "Automatische Bestätigung ist nur für vollständige Belege möglich, die alle aktuellen Kontrollen bestehen. Andernfalls ist eine Prüfung erforderlich.",
 		"upload": "Hochladen",
 		"uploading": "{file} wird hochgeladen…",
 		"processingTitle": "Dein Beleg wird gelesen",
@@ -333,7 +341,7 @@
 		"loadError": "Einstellungen konnten nicht geladen werden.",
 		"saveError": "Einstellungen konnten nicht gespeichert werden.",
 		"saved": "Einstellungen gespeichert.",
-		"llm": "Bildmodell",
+		"llm": "Belegformatierer",
 		"provider": "Anbieter",
 		"host": "Host",
 		"model": "Standardmodell",
@@ -344,7 +352,12 @@
 		"restartRequired": "Der laufende Anbieter unterscheidet sich vom konfigurierten Anbieter oder Host. Starten Sie den Server neu, um die Änderung anzuwenden.",
 		"sourceEnvironment": "Umgebung",
 		"sourceConfig": "Konfiguration",
-		"sourceDefault": "Standard"
+		"sourceDefault": "Standard",
+		"contextWindow": "Kontextfenster (Token)",
+		"formatterLimit": "Ausgabelimit des Formatierers (Token)",
+		"unknown": "Unbekannt",
+		"ocrLimitUnknown": "Gemeldetes OCR-Ausgabelimit: unbekannt. Konfigurierte Grenzen sind von tatsächlichem Tokenverbrauch getrennt.",
+		"modelsUnavailable": "Modellabfrage nicht verfügbar. Eine Modellkennung kann weiterhin eingegeben werden."
 	},
 	"editor": {
 		"spendingCategory": "Ausgabenkategorie",

@@ -1,4 +1,4 @@
-import type { BrowserContext } from '@playwright/test';
+import { expect, type BrowserContext } from '@playwright/test';
 
 export interface LlmSettings {
 	provider: string;
@@ -67,7 +67,68 @@ export async function uploadViaApi(
 	mimeType = 'image/png'
 ): Promise<{ status: number; body: Record<string, unknown> }> {
 	const response = await context.request.post('/api/v1/images', {
+		headers: { 'Idempotency-Key': crypto.randomUUID() },
 		multipart: { receipt: { name, mimeType, buffer: bytes } }
 	});
-	return { status: response.status(), body: (await response.json()) as Record<string, unknown> };
+	const body = (await response.json()) as Record<string, unknown>;
+	if (response.status() !== 202) return { status: response.status(), body };
+	expect(typeof body.id).toBe('string');
+	return { status: response.status(), body: await awaitSubmission(context, body.id as string) };
+}
+
+/** Await the durable outcome, never treat acceptance as a usable receipt. */
+export async function awaitSubmission(
+	context: BrowserContext,
+	id: string
+): Promise<Record<string, unknown>> {
+	let outcome: Record<string, unknown> = {};
+	await expect
+		.poll(
+			async () => {
+				const response = await context.request.get(`/api/v1/images/${id}`);
+				if (!response.ok()) throw new Error(`get submission failed: ${response.status()}`);
+				outcome = await response.json();
+				return outcome.terminal;
+			},
+			{ timeout: 90_000, intervals: [200, 500, 1000] }
+		)
+		.toBe(true);
+	return outcome;
+}
+
+/** Calling tests must enumerate expected findings and their review comments. */
+export async function verifyReceiptViaApi(
+	context: BrowserContext,
+	id: string,
+	expected: { id?: string; code: string; comment: string }[] = []
+): Promise<void> {
+	const response = await context.request.get(`/api/v1/receipts/${id}`);
+	expect(response.ok()).toBeTruthy();
+	const { receipt } = await response.json();
+	const findings = receipt.findings as { id: string; code: string; severity: string }[];
+	expect(findings.filter((finding) => finding.severity === 'integrity')).toEqual([]);
+	const reviews = findings.filter((finding) => finding.severity === 'review');
+	expect(reviews.map((finding) => finding.code).sort()).toEqual(
+		expected.map((finding) => finding.code).sort()
+	);
+	const remaining = [...reviews];
+	const acknowledgements = expected.map((finding) => {
+		expect(finding.comment.trim()).not.toBe('');
+		const index = remaining.findIndex(
+			(actual) =>
+				actual.code === finding.code && (finding.id === undefined || actual.id === finding.id)
+		);
+		expect(index, `Expected review finding ${finding.code}`).toBeGreaterThanOrEqual(0);
+		const [actual] = remaining.splice(index, 1);
+		return { finding_id: actual.id, comment: finding.comment };
+	});
+	const verified = await context.request.post(`/api/v1/receipts/${id}/verify`, {
+		data: {
+			expected_operation_revision: receipt.operation_revision,
+			expected_review_revision: receipt.review_revision,
+			acknowledgements
+		}
+	});
+	expect(verified.status()).toBe(200);
+	expect((await verified.json()).verified).toBe(true);
 }

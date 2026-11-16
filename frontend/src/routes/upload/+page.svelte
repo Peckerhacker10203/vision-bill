@@ -8,7 +8,8 @@
 	import { api, ApiError } from '$lib/api/client';
 	import { queryClient } from '$lib/query/client';
 	import { queryKeys } from '$lib/query/keys';
-	import { snackbar } from '$lib/ui/snackbar.svelte';
+	import { session } from '$lib/auth';
+	import { prepareUpload, readPendingUpload, clearPendingUpload } from '$lib/api/upload';
 	import Icon from '$lib/ui/Icon.svelte';
 	import SubmissionStatus from '$lib/ui/SubmissionStatus.svelte';
 
@@ -25,7 +26,9 @@
 	let bypassReview = $state(false);
 	let bypassReviewDefaultApplied = $state(false);
 	let uploading = $state(false);
-	let queued: { image_id: string; warning?: string } | null = $state(null);
+	let bypassTouched = $state(false);
+	let recoveryOwner = $state('');
+	let recovering = $state(false);
 	let uploadError = $state('');
 
 	const uiConfig = createQuery(
@@ -38,7 +41,18 @@
 	);
 
 	$effect(() => {
-		if (!bypassReviewDefaultApplied && uiConfig.data) {
+		if ($session && $session !== 'loading' && recoveryOwner !== $session.id) {
+			recoveryOwner = $session.id;
+			const pending = readPendingUpload($session.id);
+			recovering = !!pending;
+			bypassTouched = false;
+			bypassReviewDefaultApplied = false;
+			if (pending?.options.bypass_review !== undefined) {
+				bypassReview = pending.options.bypass_review;
+				bypassReviewDefaultApplied = true;
+			}
+		}
+		if (!bypassReviewDefaultApplied && uiConfig.data && !bypassTouched) {
 			bypassReview = uiConfig.data.bypass_review_default;
 			bypassReviewDefaultApplied = true;
 		}
@@ -51,7 +65,6 @@
 			return;
 		}
 		photos = [...photos, ...next.map((file) => ({ file, url: URL.createObjectURL(file) }))];
-		queued = null;
 		uploadError = '';
 	}
 
@@ -80,50 +93,40 @@
 	function onBypassChange(event: Event) {
 		const checkbox = event.currentTarget as HTMLInputElement;
 		bypassReview = checkbox.checked;
+		bypassTouched = true;
 	}
 
 	async function upload() {
-		if (!file || uploading) {
-			return;
-		}
+		const owner = $session;
+		if (!file || uploading || !owner || owner === 'loading') return;
 		uploading = true;
 		uploadError = '';
-		queued = null;
 		try {
-			const result = await api.uploadImage(
-				photos.map((photo) => photo.file),
-				bypassReview
+			const files = photos.map((photo) => photo.file);
+			const pending = await prepareUpload(
+				owner.id,
+				files,
+				bypassTouched ? { bypass_review: bypassReview } : undefined
 			);
-			if (result.status === 'pending') {
-				if (photos.length > 1) {
-					photos.forEach((photo) => URL.revokeObjectURL(photo.url));
-					photos = [];
-					await goto(resolve(`/upload?job=${result.image_id}`));
-					return;
-				}
-				queued = { image_id: result.image_id, warning: result.warning };
-				snackbar.notify('info', translate('upload.queuedTitle'));
-			} else if (result.receipt_id !== undefined && result.receipt_id !== null) {
-				void queryClient.invalidateQueries({ queryKey: ['receipts'] });
-				void queryClient.invalidateQueries({ queryKey: ['images'] });
-				await goto(resolve(`/receipts/${result.receipt_id}`));
+			if (!$session || $session === 'loading' || $session.id !== owner.id) {
+				throw new Error(translate('submission.ownerChanged'));
 			}
+			const result = await api.uploadImages(files, pending.options, pending.key);
+			// Treat a malformed successful response as ambiguous, retaining the key/options.
+			if (!result.id) throw new ApiError(202, 'Response did not include a submission ID');
+			clearPendingUpload(owner.id, pending.key);
+			photos.forEach((photo) => URL.revokeObjectURL(photo.url));
+			photos = [];
+			void queryClient.invalidateQueries({ queryKey: ['images'] });
+			void queryClient.invalidateQueries({ queryKey: ['receipts'] });
+			await goto(resolve(`/upload?job=${result.id}`));
 		} catch (error) {
-			if (error instanceof ApiError) {
-				if (error.imageId) {
-					await goto(resolve(`/upload?job=${error.imageId}`));
-					return;
-				}
-				if (error.status === 415) {
-					uploadError = translate('upload.errorUnsupported');
-				} else if (error.status === 503) {
-					uploadError = translate('upload.errorDb');
-				} else {
-					uploadError = translate('upload.errorGeneric');
-				}
-			} else {
-				uploadError = translate('upload.errorGeneric');
+			recovering = !!readPendingUpload(owner.id);
+			if (error instanceof ApiError && error.imageId) {
+				await goto(resolve(`/upload?job=${error.imageId}`));
+				return;
 			}
+			uploadError = error instanceof Error ? error.message : translate('upload.errorGeneric');
 		} finally {
 			uploading = false;
 		}
@@ -151,25 +154,10 @@
 	{:else}
 		<p class="mt-3 text-sm text-on-surface-variant">{$t('submission.captureHint')}</p>
 
-		{#if queued}
-			<div
-				class="mt-4 flex flex-col gap-3 rounded-xl border border-outline-variant bg-secondary-container p-4 sm:flex-row sm:items-center sm:justify-between"
-				role="status"
-			>
-				<div class="flex items-start gap-3">
-					<Icon icon="queue" />
-					<div>
-						<p class="font-medium text-on-secondary-container">{$t('upload.queuedTitle')}</p>
-						<p class="text-sm text-on-secondary-container/80">{$t('upload.queuedBody')}</p>
-					</div>
-				</div>
-				<a
-					href={resolve('/queue')}
-					class="rounded-lg bg-secondary px-4 py-2.5 text-center text-sm font-medium text-on-secondary hover:opacity-90"
-				>
-					{$t('upload.openQueue')}
-				</a>
-			</div>
+		{#if recovering}
+			<p class="mt-4 rounded-xl border border-outline-variant p-4 text-sm" role="status">
+				{$t('submission.recovery')}
+			</p>
 		{/if}
 
 		<!-- Dropzone / preview -->
@@ -294,7 +282,7 @@
 		<button
 			type="button"
 			class="mt-4 w-full rounded-lg bg-primary px-4 py-3 text-sm font-medium text-on-primary hover:opacity-90 disabled:opacity-50"
-			disabled={!file || uploading}
+			disabled={!file || uploading || !$session || $session === 'loading'}
 			onclick={upload}
 		>
 			{#if uploading}

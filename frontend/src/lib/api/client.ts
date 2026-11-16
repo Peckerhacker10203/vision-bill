@@ -6,7 +6,11 @@ import type {
 	CollectionDetail,
 	CollectionSummary,
 	CollectionUpdate,
-	ImageCreated,
+	SubmissionStatus,
+	UploadOptions,
+	RetryRequest,
+	ReviewRequest,
+	ModelInfo,
 	ImageListFilters,
 	ImageRow,
 	ItemSpendingStatistics,
@@ -95,13 +99,21 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 		return undefined as T;
 	}
 
-	return (await response.json()) as T;
+	try {
+		return (await response.json()) as T;
+	} catch {
+		// A successful status with an unreadable body is still an ambiguous mutation.
+		throw new ApiError(response.status, 'Response body could not be read');
+	}
 }
 
-function toQueryString(params: Record<string, string | number | undefined>): string {
+function toQueryString(
+	params: Record<string, string | number | undefined>,
+	preserveEmpty = false
+): string {
 	const parts: string[] = [];
 	for (const [key, value] of Object.entries(params)) {
-		if (value === undefined || value === '') {
+		if (value === undefined || (value === '' && !preserveEmpty)) {
 			continue;
 		}
 		parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`);
@@ -110,20 +122,37 @@ function toQueryString(params: Record<string, string | number | undefined>): str
 }
 
 export const api = {
-	/**
-	 * Upload a receipt image. With `bypassReview` the receipt is persisted
-	 * directly as `verified` (no manual review step).
-	 */
-	async uploadImage(file: File | File[], bypassReview = false): Promise<ImageCreated> {
+	/** Files are appended in capture order; absent options stay absent. */
+	async uploadImages(
+		files: File[],
+		options: UploadOptions,
+		idempotencyKey: string
+	): Promise<SubmissionStatus> {
 		const form = new FormData();
-		for (const image of Array.isArray(file) ? file : [file]) form.append('receipt', image);
-		return request<ImageCreated>(
-			`/images${toQueryString({ bypass_review: String(bypassReview) })}`,
-			{
-				method: 'POST',
-				body: form
-			}
+		for (const image of files) form.append('receipt', image);
+		return request<SubmissionStatus>(
+			`/images${toQueryString(
+				{
+					model_id: options.model_id,
+					bypass_review:
+						options.bypass_review === undefined ? undefined : String(options.bypass_review)
+				},
+				true
+			)}`,
+			{ method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: form }
 		);
+	},
+
+	retrySubmission(id: string, body: RetryRequest): Promise<SubmissionStatus> {
+		return request<SubmissionStatus>(`/images/${id}/retry`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(body)
+		});
+	},
+
+	listModels(capability: 'vision' | 'text' = 'vision'): Promise<ModelInfo[]> {
+		return request<ModelInfo[]>(`/llm/models${capability === 'text' ? '?capability=text' : ''}`);
 	},
 
 	getUiConfig(): Promise<UiConfig> {
@@ -249,8 +278,13 @@ export const api = {
 	},
 
 	/** POST /receipts/{id}/verify returns the verified receipt row (409 if already verified). */
-	verifyReceipt(id: string): Promise<ReceiptRow> {
-		return request<ReceiptRow>(`/receipts/${id}/verify`, { method: 'POST' });
+	verifyReceipt(id: string, body?: ReviewRequest): Promise<ReceiptRow> {
+		return request<ReceiptRow>(`/receipts/${id}/verify`, {
+			method: 'POST',
+			...(body
+				? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+				: {})
+		});
 	},
 
 	/** DELETE /receipts/{id} removes the receipt (and its image). 409 if a benchmark references it. */

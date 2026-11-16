@@ -14,11 +14,19 @@
 		"openReceipt": "Open and review receipt",
 		"newUpload": "Upload another receipt",
 		"reference": "Submission reference",
-		"tryAgain": "Upload again to retry. For unreadable receipts, take clearer close-up photos with overlapping rows.",
 		"loadError": "Could not load this submission. Check your connection and that you are signed in to the account that uploaded it.",
 		"refresh": "Refresh",
 		"photos": "Receipt photos",
-		"photo": "Photo {number}"
+		"photo": "Photo {number}",
+		"needs_review": "Your receipt needs review",
+		"attempt": "Attempt {count} of {max}",
+		"retryAt": "Automatic retry scheduled: {time}",
+		"waitReason": "Waiting for service / retry",
+		"resultCode": "Analysis result",
+		"retry": "Retry analysis",
+		"openDraft": "Open receipt draft",
+		"recovery": "An earlier upload has an unknown outcome. Check Queue first. To recover it, select the same photos in the same order and click Upload. Its original options and request key will be reused. No upload is sent automatically.",
+		"ownerChanged": "Your account changed. Select the photos again before uploading."
 	},
 	"app": {
 		"name": "Vision Bill"
@@ -149,8 +157,8 @@
 		"takePhoto": "Take photo",
 		"dropHint": "or drop an image here",
 		"supportedTypes": "JPG, PNG, WebP, AVIF or HEIC",
-		"bypassLabel": "Skip review – save directly as verified",
-		"bypassHint": "The receipt is stored as verified without a manual review step.",
+		"bypassLabel": "Skip review when checks pass",
+		"bypassHint": "Automatic verification is available only for complete receipts that pass the current checks. Otherwise review is required.",
 		"upload": "Upload",
 		"uploading": "Uploading {file}…",
 		"processingTitle": "Reading your receipt",
@@ -333,7 +341,7 @@
 		"loadError": "Could not load settings.",
 		"saveError": "Could not save settings.",
 		"saved": "Settings saved.",
-		"llm": "Vision model",
+		"llm": "Receipt formatter",
 		"provider": "Provider",
 		"host": "Host",
 		"model": "Default model",
@@ -344,7 +352,12 @@
 		"restartRequired": "The running provider differs from the configured provider or host. Restart the server to apply that change.",
 		"sourceEnvironment": "Environment",
 		"sourceConfig": "Config",
-		"sourceDefault": "Default"
+		"sourceDefault": "Default",
+		"contextWindow": "Context window (tokens)",
+		"formatterLimit": "Formatter output limit (tokens)",
+		"unknown": "Unknown",
+		"ocrLimitUnknown": "Reported OCR output limit: unknown. Configured limits are separate from actual token usage.",
+		"modelsUnavailable": "Model discovery is unavailable. You can still enter a model ID."
 	},
 	"editor": {
 		"spendingCategory": "Spending category",

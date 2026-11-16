@@ -15,5 +15,6 @@ export const queryKeys = {
 	statistics: (weeks = 12, collectionId = '') => ['statistics', weeks, collectionId] as const,
 	itemStatistics: (months = 12, collectionId = '') =>
 		['statistics', 'items', months, collectionId] as const,
+	models: (capability: 'vision' | 'text' = 'vision') => ['models', capability] as const,
 	settings: () => ['system', 'settings'] as const
 };

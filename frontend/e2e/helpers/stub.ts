@@ -1,5 +1,6 @@
 import { test } from '@playwright/test';
 
+// Submission polling lives in helpers/api.ts; it never changes this global mode.
 const STUB_BASE = 'http://localhost:9123';
 
 export type StubMode = 'ok' | 'down' | 'repair_first' | 'broken' | 'unreadable' | 'slow';

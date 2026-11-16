@@ -164,3 +164,57 @@ describe('api image URL helpers', () => {
 		expect(api.imageThumbUrl('abc-123')).toBe('/api/v1/images/abc-123/thumb');
 	});
 });
+
+describe('durable submissions', () => {
+	it('keeps ordered multipart files and explicit option presence with an idempotency key', async () => {
+		vi.stubGlobal(
+			'fetch',
+			vi
+				.fn()
+				.mockResolvedValue({
+					ok: true,
+					status: 202,
+					json: async () => ({ id: 'job', terminal: false, status: 'pending' })
+				})
+		);
+		const files = [new File(['second'], 'b.png'), new File(['first'], 'a.png')];
+		expect(await api.uploadImages(files, {}, 'stable-key')).toMatchObject({
+			id: 'job',
+			terminal: false
+		});
+		const [url, init] = vi.mocked(fetch).mock.calls[0];
+		expect(url).toBe('/api/v1/images');
+		expect(init?.headers).toEqual({ 'Idempotency-Key': 'stable-key' });
+		expect((init?.body as FormData).getAll('receipt')).toEqual(files);
+		await api.uploadImages(files, { bypass_review: false, model_id: 'text model' }, 'stable-key');
+		expect(vi.mocked(fetch).mock.calls[1][0]).toBe(
+			'/api/v1/images?model_id=text%20model&bypass_review=false'
+		);
+	});
+	it('sends generation and request key for retries and preserves conflict details', async () => {
+		vi.stubGlobal(
+			'fetch',
+			vi.fn().mockResolvedValue({
+				ok: false,
+				status: 409,
+				json: async () => ({ detail: { reason: 'stale generation', generation: 2 } })
+			})
+		);
+		await expect(
+			api.retrySubmission('job', { expected_generation: 1, request_key: 'retry-key' })
+		).rejects.toMatchObject({
+			status: 409,
+			detail: '{"reason":"stale generation","generation":2}'
+		});
+		expect(JSON.parse(vi.mocked(fetch).mock.calls[0][1]!.body as string)).toEqual({
+			expected_generation: 1,
+			request_key: 'retry-key'
+		});
+	});
+});
+
+it('preserves explicitly empty model selection instead of changing option presence', async () => {
+	mockOkFetch();
+	await api.uploadImages([new File(['image'], 'a.png')], { model_id: '' }, 'key');
+	expect(vi.mocked(fetch).mock.calls[0][0]).toBe('/api/v1/images?model_id=');
+});

@@ -17,6 +17,20 @@
 		() => queryClient
 	);
 
+	const uiConfig = createQuery(
+		() => ({ queryKey: queryKeys.uiConfig(), queryFn: () => api.getUiConfig() }),
+		() => queryClient
+	);
+	const capability = $derived(uiConfig.data?.ocr_enabled ? 'text' : 'vision');
+	const models = createQuery(
+		() => ({
+			queryKey: queryKeys.models(capability),
+			queryFn: () => api.listModels(capability),
+			enabled: !!uiConfig.data
+		}),
+		() => queryClient
+	);
+
 	let form = $state<SettingsUpdate>({
 		llm: { provider: 'ollama', host: '', model_name: '', temperature: 0 },
 		allow_registration: true
@@ -131,10 +145,29 @@
 						>
 						<input
 							class="mt-1 block w-full rounded-lg border border-outline-variant bg-surface p-2.5"
+							list="formatter-models"
 							bind:value={form.llm.model_name}
 							disabled={isLocked('llm.model_name')}
 						/>
 					</label>
+					<datalist id="formatter-models">
+						{#each models.data ?? [] as model (model.id)}
+							<option value={model.id}
+								>{model.parameter_size ?? ''} · {$t('settings.contextWindow')}: {model.context_window_tokens ??
+									$t('settings.unknown')}</option
+							>
+						{/each}
+					</datalist>
+					<p class="text-xs text-on-surface-variant">
+						{$t('settings.formatterLimit')}: {uiConfig.data?.formatter_max_output_tokens ??
+							$t('settings.unknown')}
+					</p>
+					{#if uiConfig.data?.ocr_enabled}
+						<p class="text-xs text-on-surface-variant">{$t('settings.ocrLimitUnknown')}</p>
+					{/if}
+					{#if models.error}<p class="text-xs text-error">
+							{$t('settings.modelsUnavailable')}
+						</p>{/if}
 					<label class="block text-sm">
 						<span class="flex items-center justify-between gap-2"
 							><span>{$t('settings.temperature')}</span><span
