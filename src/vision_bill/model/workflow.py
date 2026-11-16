@@ -208,3 +208,12 @@ class CommitResult(BaseModel):
     stale: bool
     submission: SubmissionStatus | None = None
     receipt: ReceiptRow | None = None
+
+
+class DeletedResource(BaseModel):
+    """Owned file identities returned only after the authorized DB deletion commits."""
+    image_id: UUID | None = None
+    receipt_id: UUID | None = None
+    parts: list[ImagePart] = Field(default_factory=list)
+    working_views: list[PersistedWorkingView] = Field(default_factory=list)
+    thumbnail_sha256: dict[str, str | None] = Field(default_factory=dict)

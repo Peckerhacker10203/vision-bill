@@ -19,8 +19,15 @@ from ..model.extraction import (
 )
 from ..model.ocr import OcrPageMetadata, OcrResponse, SourceRef
 from ..model.review import ReviewFinding
-from ..provider.llm.base import LLMProvider
+from ..provider.llm.base import LLMProvider, ModelInfo
 from ..provider.ocr.base import OcrProvider, compact_ocr_text
+
+
+def select_vision_model(models: Sequence[ModelInfo], requested_id: str, alternate_id: str | None = None) -> ModelInfo | None:
+    """Prefer the requested eligible vision model; use an explicitly permitted alternate."""
+    available = {m.id: m for m in models if m.capabilities and
+                 any(c in m.capabilities for c in ("vision", "multimodal"))}
+    return available.get(requested_id) or (available.get(alternate_id) if alternate_id else None)
 
 
 class OriginalSourceChangedError(ValueError):
@@ -122,6 +129,7 @@ class ExtractionPipeline:
                 source_image_count=len(paths),
                 ordered_source_sha256=hashes,
                 model_id=model_id,
+                requested_model_id=model_id,
             ),
             telemetry=InferenceTelemetry(
                 elapsed_ms=0, max_output_tokens=provider.max_output_tokens
@@ -232,24 +240,13 @@ class ExtractionPipeline:
                     ReviewFinding(id=reason, code=reason, severity="info", field_path="input")
                 )
             # Only discovered Vision models may receive originals/normalized image derivatives.
-            vision_id = model_id
             models = await provider.get_available_models(capability="vision")
-            available = {
-                m.id: m
-                for m in models
-                if m.capabilities and any(c in m.capabilities for c in ("vision", "multimodal"))
-            }
-            if vision_id not in available:
-                if use_ocr and self.settings.vision_fallback_model_id:
-                    vision_id = self.settings.vision_fallback_model_id
-                if vision_id not in available:
-                    if use_ocr:
-                        result.provenance.fallback_reason = "vision_fallback_unavailable"
-                    return self._failed(
-                        result,
-                        "vision_fallback_unavailable" if use_ocr else "vision_model_unavailable",
-                        started,
-                    )
+            model = select_vision_model(models, model_id, self.settings.vision_fallback_model_id if use_ocr else None)
+            if model is None:
+                if use_ocr:
+                    result.provenance.fallback_reason = "vision_fallback_unavailable"
+                return self._failed(result, "vision_fallback_unavailable" if use_ocr else "vision_model_unavailable", started)
+            vision_id = model.id
             formatted = await provider.extract_receipt_input(
                 vision_id,
                 ReceiptInput(
@@ -261,8 +258,9 @@ class ExtractionPipeline:
             if [view.source_sha256 for view in formatted.input_views] != hashes:
                 raise OriginalSourceChangedError("vision_source_hash_mismatch")
             result.provenance.fallback_used = use_ocr
-            result.provenance.model_digest = available[vision_id].digest
-            formatted.telemetry.context_window_tokens = available[vision_id].context_window_tokens
+            result.provenance.model_id = vision_id
+            result.provenance.model_digest = model.digest
+            formatted.telemetry.context_window_tokens = model.context_window_tokens
             return self._finish(formatted, result, started)
 
     @staticmethod

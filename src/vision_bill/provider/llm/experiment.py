@@ -92,8 +92,12 @@ def source_extraction_prompt(
 ) -> str:
     """Classification-free observations with explicit photo/source boundaries, never PNG data."""
     from ...model.extraction import ExtractionDraft
+    from ...model.review import AmountPolicy
 
     schema = ExtractionDraft.model_json_schema()
+    schema.setdefault("$defs", {})["AmountPolicy"] = AmountPolicy.model_json_schema()
+    schema["properties"]["amount_policy"] = {"$ref": "#/$defs/AmountPolicy"}
+    schema.setdefault("required", []).append("amount_policy")
     for obj in [schema, *schema.get("$defs", {}).values()]:
         props = obj.get("properties", {})
         for name in ("category", "spending_category", "tags"):
@@ -115,8 +119,19 @@ def source_extraction_prompt(
         "Do not classify, categorize or tag. Preserve every original printed row in photo order, "
         "then top-to-bottom, including overlapping rows and genuinely repeated purchases. "
         "Each line_item must include source_image (zero-based photo index). "
-        "Return a flat populated receipt object following the nullable schema below; "
-        "also include duplicate_candidates as pairs {first_index,second_index} only for the "
+        "Return a flat populated receipt object following the nullable schema below. "
+        "Include amount_policy based only on printed evidence: tax_basis gross means line "
+        "amounts include tax, net means tax is additive, unknown means evidence is insufficient. "
+        "discount_treatment included_in_lines means already applied, subtract means a separate "
+        "discount, otherwise unknown. tip_treatment included means already in line amounts, "
+        "add means added to the receipt total, outside_receipt means paid separately, none means "
+        "no tip, otherwise unknown. subtotal_origin printed means the observed printed subtotal; "
+        "derived_net means line amounts converted to net using explicit known tax evidence "
+        "before separately applied discounts/tips; derive only with sufficient inputs, otherwise "
+        "leave subtotal null and origin unknown. tax_information present means observed tax "
+        "information, explicit_zero requires printed zero/exempt evidence, missing means absent "
+        "or unreadable and must never be inferred as zero. Do not invent financial defaults. "
+        "Also include duplicate_candidates as pairs {first_index,second_index} only for the "
         "complete ordered suffix/prefix overlap between adjacent photos. Never search globally "
         "for duplicate products. Include overlap_decisions for all overlap proposals. "
         "Optional field_sources map field paths to supplied SourceRef objects; use only supplied "

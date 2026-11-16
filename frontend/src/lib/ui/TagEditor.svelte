@@ -34,7 +34,11 @@
 	$effect(() => {
 		onPendingChange?.(creating);
 	});
-	onDestroy(() => onPendingChange?.(false));
+	let alive = true;
+	onDestroy(() => {
+		alive = false;
+		onPendingChange?.(false);
+	});
 	let wasOpen = $state(false);
 	/** Keyboard highlight offset within `selectableRows` (−1 = nothing). */
 	let activeOffset = $state(-1);
@@ -117,9 +121,12 @@
 	async function createFromQuery(): Promise<void> {
 		const name = normalizeTag(query);
 		if (name === '' || creating || disabled) return;
+		const owner = value;
+		const ownerId = id;
 		creating = true;
 		try {
 			const { name: created } = await api.createTag(name);
+			if (!alive || value !== owner || id !== ownerId) return;
 			if (!value.includes(created)) {
 				value.push(created);
 				revision++;

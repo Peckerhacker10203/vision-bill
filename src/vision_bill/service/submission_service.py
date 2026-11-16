@@ -35,7 +35,11 @@ from ..model.workflow import (
 )
 from ..provider.llm.errors import AnalysisTimeoutError, UnreadableReceiptError
 from ..provider.ocr.base import compact_ocr_text
-from .extraction_pipeline import OcrRuntimeChangedError, OriginalSourceChangedError
+from .extraction_pipeline import (
+    OcrRuntimeChangedError,
+    OriginalSourceChangedError,
+    select_vision_model,
+)
 from .image_service import ImageService
 from .receipt_review import evaluate_receipt, receipt_from_draft
 from .receipt_service import ReceiptService
@@ -77,6 +81,16 @@ class SubmissionService:
         return permission
 
     async def ready_for(self, image: ImageRow) -> bool:
+        """Persist only safe reasons against the observed generation/status before a claim."""
+        try:
+            async with asyncio.timeout(4):
+                reason = await self._readiness_reason(image)
+        except TimeoutError:
+            reason = "provider_unavailable"
+        await self.db.set_wait_reason(image, reason)
+        return reason is None
+
+    async def _readiness_reason(self, image: ImageRow) -> str | None:
         """Readiness precedes claim, and therefore never spends the attempt budget."""
         snapshot = image.effective_options or self.legacy_snapshot()
         try:
@@ -84,28 +98,31 @@ class SubmissionService:
             ocr = OcrSettings.model_validate(snapshot["ocr"])
         except (ValueError, KeyError):
             # Claim malformed saved options to record a terminal safe diagnostic.
-            return True
+            return None
         try:
             if not await self.receipts.check_connection():
-                return False
+                return "provider_unavailable"
             capability = "vision"
+            alternate = None
             selected = image.model_id or self.settings.llm.model_name
             if ocr.enabled:
                 capabilities = await self.receipts.ocr_capabilities(ocr)
                 if not capabilities.ready and (
                     ocr.required or not ocr.allow_vision_fallback or not permission
                 ):
-                    return False
+                    return "ocr_unavailable"
                 if capabilities.ready:
                     capability = "text"
                 else:
-                    selected = ocr.vision_fallback_model_id or selected
+                    alternate = ocr.vision_fallback_model_id
             models = await self.receipts.get_available_models(capability=capability)
-            return any(model.id == selected for model in models) or (
+            if capability == "vision":
+                return None if select_vision_model(models, selected, alternate) is not None else "vision_model_unavailable"
+            return None if any(model.id == selected for model in models) or (
                 not image.effective_options and bool(models)
-            )
+            ) else "formatter_model_unavailable"
         except (httpx.HTTPError, OSError, ValueError, KeyError):
-            return False
+            return "provider_unavailable"
 
     async def process_claim(self, claim: AnalysisClaim) -> CommitResult:
         deadline = monotonic() + self.worker.attempt_timeout_seconds

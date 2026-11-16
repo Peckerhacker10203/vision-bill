@@ -23,10 +23,22 @@ from ..model.review import (
 )
 
 
+def observation_values(document: Receipt | ExtractionDraft) -> dict[str, Any]:
+    """Project optional enrichment defaults without changing any printed observation."""
+    values = document.model_dump()
+    if values.get("category") is None:
+        values.pop("category", None)
+    for row in values.get("line_items") or []:
+        for key in ("tags", "spending_category"):
+            if row.get(key) is None:
+                row.pop(key, None)
+    return values
+
+
 def receipt_from_draft(document: ExtractionDraft) -> Receipt:
-    """Pass explicit nulls through validation; never substitute Receipt defaults."""
+    """Preserve null observations; only optional enrichment uses Receipt defaults."""
     try:
-        receipt = Receipt.model_validate(document.model_dump())
+        receipt = Receipt.model_validate(observation_values(document))
     except ValidationError as exc:
         raise ValueError("draft_incomplete") from exc
     if not receipt.merchant_name.strip() or any(
@@ -114,7 +126,7 @@ def evaluate_receipt(
         )
 
     try:
-        complete = Receipt.model_validate(receipt.model_dump())
+        complete = Receipt.model_validate(observation_values(receipt))
     except ValidationError as exc:
         complete = None
         for error in exc.errors():
@@ -201,13 +213,38 @@ def evaluate_receipt(
                     Decimal(str(item.quantity)) * item.unit_price,
                     "0.01",
                 )
-            compare(
-                "subtotal_discrepancy",
-                "subtotal",
-                complete.subtotal,
-                sum((item.total_price for item in complete.line_items), Decimal(0)),
-                "0.05",
+            supported = (
+                amount_policy.tax_basis != "unknown"
+                and amount_policy.subtotal_origin != "unknown"
+                and not any(
+                    f.code in {"unknown_discount_treatment", "unknown_tip_treatment"}
+                    for f in findings
+                )
             )
+            needs_tax = (
+                amount_policy.tax_basis == "net" or amount_policy.subtotal_origin == "derived_net"
+            )
+            if needs_tax and amount_policy.tax_information == "missing":
+                supported = False
+            derived_gross = (
+                amount_policy.subtotal_origin == "derived_net"
+                and amount_policy.tax_basis == "gross"
+            )
+            if derived_gross and (
+                (complete.discount_total and amount_policy.discount_treatment == "subtract")
+                or (complete.tip and amount_policy.tip_treatment == "add")
+            ):
+                finding("uncertain_net_subtotal_basis", "subtotal")
+                supported = False
+            if supported:
+                expected_subtotal = sum(
+                    (item.total_price for item in complete.line_items), Decimal(0)
+                )
+                if derived_gross:
+                    expected_subtotal -= complete.tax_total
+                compare(
+                    "subtotal_discrepancy", "subtotal", complete.subtotal, expected_subtotal, "0.05"
+                )
             if amount_policy.tax_information != "missing":
                 compare(
                     "tax_discrepancy",
@@ -218,11 +255,9 @@ def evaluate_receipt(
                 )
                 if amount_policy.tax_information == "explicit_zero" and complete.tax_total != 0:
                     finding("tax_information_conflict", "tax_total")
-            if amount_policy.tax_basis != "unknown" and not any(
-                f.code in {"unknown_discount_treatment", "unknown_tip_treatment"} for f in findings
-            ):
+            if supported:
                 expected = complete.subtotal
-                if amount_policy.tax_basis == "net":
+                if amount_policy.tax_basis == "net" or derived_gross:
                     expected += complete.tax_total
                 if amount_policy.discount_treatment == "subtract":
                     expected -= complete.discount_total
@@ -267,6 +302,7 @@ def persistent_findings(findings: Sequence[ReviewFinding]) -> list[ReviewFinding
         "tax_discrepancy",
         "tax_information_conflict",
         "amount_discrepancy",
+        "uncertain_net_subtotal_basis",
     }
     return [finding for finding in findings if finding.code not in recalculated_codes]
 

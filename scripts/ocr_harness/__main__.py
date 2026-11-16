@@ -110,24 +110,6 @@ def build(engines: list[dict[str, Any]], work: Path, timeout: float) -> list[str
         seen.add(engine["image"])
         log = work / f"build-{engine['target']}.log"
         try:
-            if engine["target"] == "paddle":
-                probe = subprocess.run(
-                    ["docker", "image", "inspect", "vision-bill-paddleocr-service:latest"],
-                    capture_output=True,
-                    check=False,
-                )
-                if probe.returncode:
-                    bounded_run(
-                        [
-                            "docker",
-                            "build",
-                            "-t",
-                            "vision-bill-paddleocr-service:latest",
-                            str(WORKER.parents[2] / "paddleocr-service"),
-                        ],
-                        timeout,
-                        work / "build-paddle-base.log",
-                    )
             bounded_run(
                 [
                     "docker",

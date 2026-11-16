@@ -313,3 +313,81 @@ it.each([1, 2])(
 		);
 	}
 );
+
+it('blocks save, finalize and removal during pending tag creation', async () => {
+	vi.mocked(api.listTags).mockResolvedValue(['food']);
+	let finish!: (value: { name: string; created: boolean }) => void;
+	vi.spyOn(api, 'createTag').mockImplementation(
+		() =>
+			new Promise((resolve) => {
+				finish = resolve;
+			})
+	);
+	vi.mocked(api.getDraft).mockResolvedValue({
+		...draft,
+		document: {
+			...draft.document,
+			line_items: [
+				{ description: 'First', tags: [] },
+				{ description: 'Second', tags: [] }
+			]
+		}
+	});
+	const patch = vi.spyOn(api, 'patchDraft').mockResolvedValue(draft);
+	const finalize = vi.spyOn(api, 'finalizeDraft');
+	render(ExtractionDraftEditor, { id: 'job' });
+	await screen.findByDisplayValue('First');
+	await fireEvent.click(screen.getAllByRole('button', { name: 'Tags' })[0]);
+	await fireEvent.input(screen.getByPlaceholderText('Search tags…'), { target: { value: 'new' } });
+	await fireEvent.click(screen.getByRole('option', { name: 'Create “new”' }));
+	await fireEvent.input(screen.getByLabelText('Merchant'), { target: { value: 'Changed' } });
+	for (const name of ['Save draft', 'Finalize draft', 'Remove'])
+		for (const button of screen.getAllByRole('button', { name }))
+			expect((button as HTMLButtonElement).disabled).toBe(true);
+	await fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+	await fireEvent.click(screen.getByRole('button', { name: 'Finalize draft' }));
+	expect(patch).not.toHaveBeenCalled();
+	expect(finalize).not.toHaveBeenCalled();
+	finish({ name: 'new', created: true });
+	await waitFor(() =>
+		expect((screen.getByRole('button', { name: 'Save draft' }) as HTMLButtonElement).disabled).toBe(
+			false
+		)
+	);
+	await fireEvent.click(screen.getAllByRole('button', { name: 'Remove' })[0]);
+	await fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+	expect(patch.mock.calls[0][1].changes.line_items).toEqual([{ description: 'Second', tags: [] }]);
+});
+
+it('ignores pending tag completion after draft replacement', async () => {
+	vi.mocked(api.listTags).mockResolvedValue(['food']);
+	let finish!: (value: { name: string; created: boolean }) => void;
+	vi.spyOn(api, 'createTag').mockImplementation(
+		() =>
+			new Promise((resolve) => {
+				finish = resolve;
+			})
+	);
+	vi.mocked(api.getDraft).mockResolvedValue({
+		...draft,
+		document: { ...draft.document, line_items: [{ description: 'First', tags: [] }] }
+	});
+	const view = render(ExtractionDraftEditor, { id: 'job' });
+	await screen.findByDisplayValue('First');
+	await fireEvent.click(screen.getByRole('button', { name: 'Tags' }));
+	await fireEvent.input(screen.getByPlaceholderText('Search tags…'), { target: { value: 'new' } });
+	await fireEvent.click(screen.getByRole('option', { name: 'Create “new”' }));
+	vi.mocked(api.getDraft).mockResolvedValue({
+		...draft,
+		image_id: 'other',
+		document: { ...draft.document, line_items: [{ description: 'Second', tags: [] }] }
+	});
+	await view.rerender({ id: 'other' });
+	await screen.findByDisplayValue('Second');
+	finish({ name: 'new', created: true });
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(screen.queryByRole('button', { name: 'Remove “new”' })).toBeNull();
+	expect((screen.getByRole('button', { name: 'Save draft' }) as HTMLButtonElement).disabled).toBe(
+		true
+	);
+});

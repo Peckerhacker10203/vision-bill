@@ -136,7 +136,7 @@ def run_stage(stage: str, payload: dict[str, Any], directory: Path) -> dict[str,
     return result
 
 
-def device_identity(paddle: Any, runtime: RuntimeSettings) -> dict[str, Any]:
+def device_identity(paddle: Any, runtime: RuntimeSettings, *, compute: bool = True) -> dict[str, Any]:
     if os.environ.get("HSA_OVERRIDE_GFX_VERSION"):
         raise ValueError("Architecture spoofing is forbidden")
     result = {
@@ -169,7 +169,8 @@ def device_identity(paddle: Any, runtime: RuntimeSettings) -> dict[str, Any]:
                     raise ValueError("Required kernel inventory changed")
         result["gfx_target"] = target
         result["kernel_inventory_sha256"] = content_identity(kernels)
-        result["compute_probe"] = compute_probe(paddle, runtime.gpu_index)
+        if compute:
+            result["compute_probe"] = compute_probe(paddle, runtime.gpu_index)
     else:
         result["compute_capability"] = list(
             paddle.device.cuda.get_device_capability(runtime.gpu_index)
@@ -394,6 +395,7 @@ def qualify_runtime(runtime: RuntimeSettings, cases: Path, output: Path) -> Qual
             collected = run_stage("collect", {**base, "inventory": inventory}, directory)
             report.device = collected["device"]
             manifest = {
+                "qualified_target": {key: value for key, value in report.device.items() if key != "compute_probe"},
                 "dependencies": dependencies,
                 "image_identity": runtime.image_identity,
                 "paddle_identity": "paddle:" + runtime.expected_paddle_commit,

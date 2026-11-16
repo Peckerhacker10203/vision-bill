@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .ocr import Sha256, SourceRef
 
-CHECKS_VERSION = "1"
+CHECKS_VERSION = "2"
 
 
 class ReviewFinding(BaseModel):

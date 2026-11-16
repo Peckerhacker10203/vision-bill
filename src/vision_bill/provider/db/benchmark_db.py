@@ -210,7 +210,7 @@ class BenchmarkDB:
                 for row in rows]
 
     async def _reference_preview(
-        self, conn: asyncpg.Connection, receipt_id: UUID, scope: AccessScope,
+        self, conn: asyncpg.Connection, receipt_id: UUID, scope: AccessScope, *, lock: bool = True,
     ) -> ReferencePreview:
         from ...model.db.image import ImageRow
         from ...model.extraction import EXTRACTION_SCHEMA_VERSION
@@ -224,7 +224,7 @@ class BenchmarkDB:
             validate_acknowledgements,
         )
         assert self._receipts is not None
-        row = await self._receipts._lock_review_receipt(conn, receipt_id, scope.user_id, scope.can_see_all)
+        row = await self._receipts._lock_review_receipt(conn, receipt_id, scope.user_id, scope.can_see_all, lock=lock)
         if row is None:
             raise ValueError('Receipt not found')
         current = self._receipts._receipt_row_from_record(row)
@@ -235,8 +235,8 @@ class BenchmarkDB:
         if not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM receipt_review_revisions WHERE receipt_id=$1 AND event_kind='verified' AND actor_user_id IS NOT NULL)", receipt_id):
             raise ValueError('Ordinary human verification provenance required')
         document = await self._receipts._review_document(conn, row)
-        await self._receipts._validate_review_sources(conn, current.image_id, current.field_sources, current.overlap_decisions)
-        originals = await self._receipts._review_originals(conn, current.image_id)
+        await self._receipts._validate_review_sources(conn, current.image_id, current.field_sources, current.overlap_decisions, lock=lock)
+        originals = await self._receipts._review_originals(conn, current.image_id, lock=lock)
         evaluation = evaluate_receipt(document, current.amount_policy, current.field_sources,
                                       current.overlap_decisions, originals,
                                       retained_findings=persistent_findings(current.findings))

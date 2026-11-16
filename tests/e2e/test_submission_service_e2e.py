@@ -280,3 +280,202 @@ async def test_migrated_legacy_first_resolution_persisted_once(db, settings, tmp
         assert await w.claim_next() is None
     finally:
         await w.destroy_db()
+
+
+@pytest.mark.parametrize('completed',[False,True])
+async def test_committed_resource_deletion_removes_owned_originals_and_working_files(workflow_db,settings,tmp_path,completed):
+    from vision_bill.api.images import delete_image
+    from vision_bill.api.receipts import delete_receipt
+    w,scope=workflow_db
+    image,paths,llm,native,service=await setup(w,scope,settings,tmp_path)
+    if not completed:
+        llm._client.chat.side_effect=ValueError('private failure')
+    result=await service.process_claim(await w.claim_next())
+    async with w.pool.acquire() as conn:
+        working=[Path(r['artifact_path']) for r in await conn.fetch('SELECT artifact_path FROM extraction_working_views WHERE image_id=$1',image.id)]
+        if not completed:
+            await conn.execute("UPDATE images SET status='failed' WHERE id=$1",image.id)
+    assert working and all(p.exists() for p in working)
+    receipts=service.receipts
+    receipts._db._pool=w.pool
+    receipts._image_db._pool=w.pool
+    user=User(id=scope.user_id,username='owner')
+    if completed:
+        assert result.receipt is not None
+        await delete_receipt(result.receipt.id,receipts,service.images,user)
+    else:
+        await delete_image(image.id,receipts,service.images,user)
+    assert not any(p.exists() for p in [*paths,*working])
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval('SELECT count(*) FROM images WHERE id=$1',image.id)==0
+
+
+async def test_delete_unlink_failure_retains_owner_scoped_retry_manifest(workflow_db,settings,tmp_path,monkeypatch):
+    from vision_bill.api.receipts import delete_receipt
+    from fastapi import HTTPException
+    w,scope=workflow_db
+    image,paths,llm,native,service=await setup(w,scope,settings,tmp_path)
+    result=await service.process_claim(await w.claim_next())
+    receipts=service.receipts;receipts._db._pool=w.pool
+    user=User(id=scope.user_id,username='owner')
+    original=service.images.remove_deleted_files
+    monkeypatch.setattr(service.images,'remove_deleted_files',lambda _: (_ for _ in ()).throw(OSError('private path')))
+    with pytest.raises(OSError): await delete_receipt(result.receipt.id,receipts,service.images,user)
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval('SELECT count(*) FROM resource_deletions')==1
+        assert await conn.fetchval('SELECT count(*) FROM images WHERE id=$1',image.id)==0
+        assert await conn.fetchval('SELECT count(*) FROM receipts WHERE id=$1',result.receipt.id)==0
+    assert all(path.exists() for path in paths)
+    monkeypatch.setattr(service.images,'remove_deleted_files',original)
+    with pytest.raises(HTTPException) as error:
+        await delete_receipt(result.receipt.id,receipts,service.images,User(id=uuid4(),username='outsider'))
+    assert error.value.status_code==404 and all(path.exists() for path in paths)
+    await delete_receipt(result.receipt.id,receipts,service.images,user)
+    assert not any(path.exists() for path in paths)
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval('SELECT count(*) FROM resource_deletions')==0
+
+
+async def test_provider_wait_visible_and_stale_probe_cannot_touch_claim(workflow_db,settings,tmp_path):
+    w,scope=workflow_db
+    image,paths,llm,native,service=await setup(w,scope,settings,tmp_path)
+    service.receipts.check_connection=AsyncMock(return_value=False)
+    from vision_bill.model.db.image import ImageRow
+    candidate=(await w.due_candidates())[0]
+    assert not await service.ready_for(candidate)
+    status=await w.get_submission(image.id,scope=scope)
+    assert status.wait_reason=='provider_unavailable' and status.attempt_count==0
+    assert (await w.due_candidates())[0].wait_reason=='provider_unavailable'
+    service.receipts.check_connection.return_value=True
+    service.receipts.get_available_models=llm.get_available_models
+    assert await service.ready_for(candidate)
+    assert (await w.get_submission(image.id,scope=scope)).wait_reason is None
+    claim=await w.claim_next()
+    assert not await w.set_wait_reason(candidate,'provider_unavailable')
+    assert not await w.set_wait_reason(claim.image.model_copy(update={'generation':2}),'provider_unavailable')
+    current=await w.get_submission(image.id,scope=scope)
+    assert current.wait_reason is None and current.attempt_count==1
+
+
+async def test_benchmark_blocked_delete_rolls_back_receipt_image_and_cleanup_manifest(workflow_db,settings,tmp_path):
+    from vision_bill.api.receipts import delete_receipt
+    from fastapi import HTTPException
+    w,scope=workflow_db
+    image,paths,llm,native,service=await setup(w,scope,settings,tmp_path)
+    result=await service.process_claim(await w.claim_next())
+    service.receipts._db._pool=w.pool
+    async with w.pool.acquire() as conn:
+        run=await conn.fetchval("INSERT INTO benchmark_runs(model_ids,receipt_ids,dataset_fingerprint,prompt_version,scoring_version) VALUES('[]','[]','f','4','4') RETURNING id")
+        await conn.execute("INSERT INTO benchmark_tasks(run_id,model_id,receipt_id) VALUES($1,'fixture',$2)",run,result.receipt.id)
+        working=[Path(r['artifact_path']) for r in await conn.fetch('SELECT artifact_path FROM extraction_working_views WHERE image_id=$1',image.id)]
+    with pytest.raises(HTTPException) as error:
+        await delete_receipt(result.receipt.id,service.receipts,service.images,User(id=scope.user_id,username='owner'))
+    assert error.value.status_code==409 and 'benchmark' in error.value.detail
+    assert all(p.exists() for p in [*paths,*working])
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval('SELECT count(*) FROM resource_deletions')==0
+        assert await conn.fetchval('SELECT count(*) FROM images WHERE id=$1',image.id)==1
+        assert await conn.fetchval('SELECT count(*) FROM receipts WHERE id=$1',result.receipt.id)==1
+
+
+@pytest.mark.parametrize('interruption',['cancel','uncertain_commit'])
+async def test_deletion_interruption_never_unlinks_until_confirmed_retry(workflow_db,settings,tmp_path,monkeypatch,interruption):
+    w,scope=workflow_db
+    image,paths,_,_,service=await setup(w,scope,settings,tmp_path)
+    result=await service.process_claim(await w.claim_next())
+    service.receipts._db._pool=w.pool
+    remove=service.images.remove_deleted_files
+    calls=[]
+    monkeypatch.setattr(service.images,'remove_deleted_files',lambda deleted:(calls.append(deleted),remove(deleted)))
+    if interruption=='cancel':
+        async with w.pool.acquire() as blocker,blocker.transaction():
+            await blocker.fetchrow('SELECT id FROM images WHERE id=$1 FOR UPDATE',image.id)
+            task=asyncio.create_task(service.receipts.delete_resource(result.receipt.id,receipt=True,scope=scope,images=service.images))
+            try:
+                async with asyncio.timeout(3):
+                    async with w.pool.acquire() as observer:
+                        while not await observer.fetchval("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock')"):
+                            await asyncio.sleep(0)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError): await task
+            finally:
+                task.cancel();await asyncio.gather(task,return_exceptions=True)
+        async with w.pool.acquire() as conn:
+            assert await conn.fetchval('SELECT count(*) FROM resource_deletions')==0
+            assert await conn.fetchval('SELECT count(*) FROM images WHERE id=$1',image.id)==1
+    else:
+        delete=w.delete_resource
+        async def lost_ack(*args,**kwargs):
+            await delete(*args,**kwargs)
+            raise ConnectionError('commit acknowledgement lost')
+        monkeypatch.setattr(w,'delete_resource',lost_ack)
+        with pytest.raises(ConnectionError):
+            await service.receipts.delete_resource(result.receipt.id,receipt=True,scope=scope,images=service.images)
+        monkeypatch.setattr(w,'delete_resource',delete)
+        async with w.pool.acquire() as conn:
+            assert await conn.fetchval('SELECT count(*) FROM resource_deletions')==1
+    assert calls==[] and all(path.exists() for path in paths)
+    assert await service.receipts.delete_resource(result.receipt.id,receipt=True,scope=scope,images=service.images)
+    assert len(calls)==1 and not any(path.exists() for path in paths)
+
+
+@pytest.mark.parametrize('changed',['original','working','symlink','live_reference'])
+async def test_cleanup_retry_retains_changed_or_live_evidence(workflow_db,settings,tmp_path,changed):
+    w,scope=workflow_db
+    image,paths,_,_,service=await setup(w,scope,settings,tmp_path)
+    result=await service.process_claim(await w.claim_next())
+    deleted=await w.delete_resource(result.receipt.id,receipt=True,scope=scope,
+        validate_files=lambda d:service.images.validate_deleted_files(d,initial=True))
+    working=Path(deleted.working_views[0].artifact_path)
+    if changed=='original': paths[0].write_bytes(b'changed original')
+    if changed=='working': working.write_bytes(b'changed derived bytes')
+    if changed=='symlink':
+        paths[0].unlink();paths[0].symlink_to(paths[1])
+    if changed=='live_reference':
+        async with w.pool.acquire() as conn:
+            await conn.execute("INSERT INTO images(image_path,user_id,status) VALUES($1,$2,'pending')",str(paths[0]),scope.user_id)
+    with pytest.raises(ValueError):
+        await w.cleanup_deleted_resource(result.receipt.id,receipt=True,scope=scope,remove_files=service.images.remove_deleted_files)
+    assert all(p.exists() for p in paths) and working.exists()
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval('SELECT count(*) FROM resource_deletions')==1
+
+
+async def test_cleanup_admin_visibility_and_duplicate_retries_are_serialized(workflow_db,settings,tmp_path):
+    from vision_bill.model.workflow import AccessScope
+    w,scope=workflow_db
+    image,paths,_,_,service=await setup(w,scope,settings,tmp_path)
+    result=await service.process_claim(await w.claim_next())
+    await w.delete_resource(result.receipt.id,receipt=True,scope=scope,
+        validate_files=lambda d:service.images.validate_deleted_files(d,initial=True))
+    admin_id=uuid4()
+    assert await w.delete_resource(result.receipt.id,receipt=True,scope=AccessScope(user_id=admin_id),validate_files=lambda _:None) is None
+    admin=AccessScope(user_id=admin_id,can_see_all=True)
+    assert await w.delete_resource(result.receipt.id,receipt=True,scope=admin,validate_files=lambda _:None)
+    calls=[]
+    def remove(deleted):
+        calls.append(deleted);service.images.remove_deleted_files(deleted)
+    results=await asyncio.gather(*(w.cleanup_deleted_resource(result.receipt.id,receipt=True,scope=admin,remove_files=remove) for _ in range(2)))
+    assert sorted(results)==[False,True] and len(calls)==1
+    assert not any(path.exists() for path in paths)
+
+
+async def test_deletion_preserves_shared_original_and_rejects_changed_durable_source(workflow_db,settings,tmp_path):
+    w,scope=workflow_db
+    image,paths,_,_,service=await setup(w,scope,settings,tmp_path)
+    result=await service.process_claim(await w.claim_next())
+    original=paths[0].read_bytes()
+    paths[0].write_bytes(b'changed source')
+    with pytest.raises(ValueError,match='identity_changed'):
+        await w.delete_resource(result.receipt.id,receipt=True,scope=scope,
+            validate_files=lambda d:service.images.validate_deleted_files(d,initial=True))
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval('SELECT count(*) FROM receipts WHERE id=$1',result.receipt.id)==1
+        assert await conn.fetchval('SELECT count(*) FROM resource_deletions')==0
+        shared=await conn.fetchval("INSERT INTO images(image_path,user_id,status) VALUES($1,$2,'pending') RETURNING id",str(paths[0]),scope.user_id)
+    paths[0].write_bytes(original)
+    assert await service.receipts.delete_resource(result.receipt.id,receipt=True,scope=scope,images=service.images)
+    assert paths[0].read_bytes()==original and not paths[1].exists()
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval('SELECT count(*) FROM images WHERE id=$1',shared)==1
+        assert await conn.fetchval('SELECT count(*) FROM resource_deletions')==0

@@ -89,3 +89,46 @@ def test_heif_source_uses_actual_decoder_and_preserves_bytes(tmp_path):
             assert derived.size == (12, 8)
         assert normalized.transforms[0]["source_format"] == "HEIF"
     assert source.read_bytes() == original
+
+
+@pytest.mark.parametrize("mode", ["RGBA", "LA", "P"])
+@pytest.mark.parametrize("native", [True, False])
+def test_transparent_document_preserves_black_ink_on_white_background(tmp_path, mode, native):
+    from ocr_service.images import normalize_source
+    from vision_bill.model.extraction import ReceiptInput
+    from vision_bill.provider.llm.ollama import OllamaProvider
+
+    source = tmp_path / "transparent.png"
+    if mode == "RGBA":
+        image = Image.new(mode, (2, 1), (0, 0, 0, 0))
+        image.putpixel((0, 0), (0, 0, 0, 255))
+    elif mode == "LA":
+        image = Image.new(mode, (2, 1), (0, 0))
+        image.putpixel((0, 0), (0, 255))
+    else:
+        image = Image.new(mode, (2, 1), 0)
+        image.putpalette([0, 0, 0, 0, 0, 0] + [0] * 762)
+        image.info["transparency"] = 0
+        image.putpixel((0, 0), 1)
+    image.save(source)
+    original = source.read_bytes()
+    digest = hashlib.sha256(original).hexdigest()
+    if native:
+        with normalize_source(source, digest) as normalized:
+            derived = normalized.path.read_bytes()
+            transforms = normalized.transforms
+    else:
+        _, _, views = OllamaProvider("http://local")._prepare_receipt_input(
+            ReceiptInput(mode="direct_vision", image_paths=[str(source)])
+        )
+        view = views[0]
+        derived = base64.b64decode(view.working_image.png_base64)
+        transforms = view.working_image.transforms
+        assert view.source_sha256 == digest
+        assert view.working_image.sha256 == hashlib.sha256(derived).hexdigest()
+        assert view.working_image.inverse_mapping is None
+    with Image.open(BytesIO(derived)) as rgb:
+        assert rgb.size == (2, 1)
+        assert [rgb.getpixel((x, 0)) for x in range(2)] == [(0, 0, 0), (255, 255, 255)]
+    assert transforms[0]["alpha_background"] == "#ffffff"
+    assert source.read_bytes() == original

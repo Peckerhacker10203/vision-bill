@@ -311,6 +311,13 @@ def build_pipeline(profile: OcrProfile, runtime: RuntimeSettings) -> PipelineAda
     model_content = {name: tree_identity(path) for name, path in runtime.model_dirs.items()}
     if model_content != manifest["model_content"]:
         raise ValueError("Native model content identity mismatch")
+    from .qualify import device_identity
+
+    paddle = importlib.import_module("paddle")
+    check_accelerator(paddle, runtime.accelerator, runtime.gpu_index)
+    actual_target = device_identity(paddle, runtime, compute=False)
+    if not manifest.get("qualified_target") or actual_target != manifest["qualified_target"]:
+        raise ValueError("Native qualified target identity mismatch; requalification required")
     native, paddle, PaddleStaticRunner = construct_native(profile, runtime)
     preprocessor = native.doc_preprocessor_pipeline
     models = (

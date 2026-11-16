@@ -1654,3 +1654,48 @@ async def test_capture_serializes_concurrent_activation(workflow_db, tmp_path, m
             if task is not None:
                 task.cancel()
         await asyncio.gather(*(t for t in (creation, activation) if t is not None), return_exceptions=True)
+
+
+async def test_finalized_draft_receipt_can_be_deleted_without_benchmark(workflow_db,tmp_path):
+    w,scope=workflow_db
+    image,create=await capture_creation(w,scope,'draft',tmp_path)
+    row=await create()
+    w._receipts._pool = w.pool
+    deleted=await w._receipts.delete_receipt(row.id,user_id=scope.user_id)
+    assert deleted.id == row.id
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval('SELECT finalized_receipt_id FROM receipt_drafts WHERE image_id=$1',image.id) is None
+        assert await conn.fetchval('SELECT count(*) FROM receipts WHERE id=$1',row.id)==0
+
+
+async def test_atomic_finalized_deletion_cannot_refinalize_in_delete_interval(workflow_db,tmp_path):
+    from vision_bill.model.workflow import DraftFinalize
+    w,scope=workflow_db
+    image,create=await capture_creation(w,scope,'draft',tmp_path)
+    row=await create()
+    async with w.pool.acquire() as conn:
+        await conn.execute("""CREATE FUNCTION deletion_barrier() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN PERFORM pg_advisory_xact_lock(731829); RETURN OLD; END $$;
+            CREATE TRIGGER deletion_barrier BEFORE DELETE ON receipts FOR EACH ROW EXECUTE FUNCTION deletion_barrier()""")
+    async with w.pool.acquire() as blocker:
+        await blocker.execute('SELECT pg_advisory_lock(731829)')
+        delete=asyncio.create_task(w.delete_resource(row.id,receipt=True,scope=scope,validate_files=lambda _:None))
+        finalize=None
+        try:
+            async with asyncio.timeout(3):
+                async with w.pool.acquire() as observer:
+                    while not await observer.fetchval("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event='advisory')"):
+                        await asyncio.sleep(0)
+            finalize=asyncio.create_task(w.finalize_draft(image.id,DraftFinalize(expected_revision=2,request_key='interleaved'),scope=scope,originals=[]))
+            await blocker.execute('SELECT pg_advisory_unlock(731829)')
+            assert (await delete).receipt_id==row.id
+            assert await finalize is None
+            async with w.pool.acquire() as conn:
+                assert await conn.fetchval('SELECT count(*) FROM receipts WHERE image_id=$1',image.id)==0
+                assert await conn.fetchval('SELECT count(*) FROM receipt_drafts WHERE image_id=$1',image.id)==0
+                assert await conn.fetchval('SELECT count(*) FROM images WHERE id=$1',image.id)==0
+        finally:
+            await blocker.execute('SELECT pg_advisory_unlock(731829)')
+            delete.cancel()
+            if finalize: finalize.cancel()
+            await asyncio.gather(delete,*([finalize] if finalize else []),return_exceptions=True)

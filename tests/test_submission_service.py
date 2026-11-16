@@ -44,6 +44,7 @@ def context(settings, tmp_path):
         part_id=uuid4(), photo_index=0, source_sha256=digest, image_path=str(path)
     )
     db = SimpleNamespace(
+        set_wait_reason=AsyncMock(return_value=True),
         bind_source_parts=AsyncMock(return_value=[part]),
         get_ocr_checkpoint=AsyncMock(return_value=None),
         finish_attempt=AsyncMock(return_value=CommitResult(stale=False)),
@@ -178,7 +179,9 @@ async def test_preclaim_ocr_text_model_is_eligible_but_missing_model_waits(setti
         mode="json"
     )
     receipts.check_connection = AsyncMock(return_value=True)
-    receipts.get_available_models = AsyncMock(return_value=[ModelInfo("saved-model")])
+    model = ModelInfo("saved-model")
+    model.capabilities = ["vision", "completion"]
+    receipts.get_available_models = AsyncMock(return_value=[model])
     receipts.ocr_capabilities = AsyncMock(
         return_value=OcrCapabilities(
             enabled=True,
@@ -288,7 +291,9 @@ async def test_saved_fallback_permission_used_in_readiness_and_execution(
     receipts.ocr_capabilities = AsyncMock(
         return_value=OcrCapabilities(enabled=True, configured=True, reachable=True, ready=False)
     )
-    receipts.get_available_models = AsyncMock(return_value=[ModelInfo("saved-model")])
+    model = ModelInfo("saved-model")
+    model.capabilities = ["vision", "completion"]
+    receipts.get_available_models = AsyncMock(return_value=[model])
     assert await service.ready_for(claim.image) is (
         permission is True or isinstance(permission, str)
     )
@@ -302,3 +307,35 @@ async def test_saved_fallback_permission_used_in_readiness_and_execution(
             permission is True
         )
     assert claim.image.effective_options == snapshot
+
+
+@pytest.mark.parametrize("vision,alternate,expected", [(True,False,True),(False,False,False),(False,True,True)])
+async def test_readiness_selects_same_vision_model_as_execution(settings,tmp_path,vision,alternate,expected):
+    from vision_bill.model.ocr import OcrCapabilities
+    from vision_bill.provider.llm.base import ModelInfo
+    service, receipts, db, claim, _ = context(settings,tmp_path)
+    claim.image.effective_options.update(allow_ocr_fallback=True,
+        ocr=OcrSettings(enabled=True,allow_vision_fallback=True,vision_fallback_model_id="alternate").model_dump(mode="json"))
+    receipts.check_connection = AsyncMock(return_value=True)
+    receipts.ocr_capabilities = AsyncMock(return_value=OcrCapabilities(enabled=True,configured=True,reachable=False,ready=False))
+    requested=ModelInfo("saved-model");requested.capabilities=["vision"] if vision else ["completion"]
+    other=ModelInfo("alternate");other.capabilities=["vision"]
+    receipts.get_available_models=AsyncMock(return_value=[requested]+([other] if alternate else []))
+    assert await service.ready_for(claim.image) is expected
+
+
+async def test_readiness_wait_is_persisted_and_cleared_without_attempt(settings,tmp_path):
+    service, receipts, db, claim, _ = context(settings,tmp_path)
+    waits=[]
+    async def persist(image, reason): waits.append((image.id,image.generation,image.status,reason))
+    db.set_wait_reason=persist
+    receipts.check_connection=AsyncMock(return_value=False)
+    assert not await service.ready_for(claim.image)
+    assert waits == [(claim.image.id,1,'pending','provider_unavailable')]
+    from vision_bill.provider.llm.base import ModelInfo
+    model=ModelInfo('saved-model');model.capabilities=['vision']
+    receipts.check_connection.return_value=True
+    receipts.get_available_models=AsyncMock(return_value=[model])
+    assert await service.ready_for(claim.image)
+    assert waits[-1][-1] is None
+    assert claim.image.attempt_count == 0

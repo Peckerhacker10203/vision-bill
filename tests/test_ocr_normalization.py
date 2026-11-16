@@ -85,3 +85,11 @@ async def test_diagnostic_script_rejects_empty_http_success(tmp_path, monkeypatc
     assert exit_code == 1
     assert results[0]["ok"] is False
     assert "recognized text" in results[0]["error"]
+
+
+def test_explicit_ocr_diagnostic_activates_real_provider_factory():
+    from scripts.test_ocr_service import get_ocr_settings
+    from vision_bill.provider.factory import get_ocr_provider
+    settings = get_ocr_settings(SimpleNamespace(ocr_url='http://local:8082',timeout=300))
+    assert settings.enabled
+    assert get_ocr_provider(settings) is not None

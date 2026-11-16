@@ -82,6 +82,7 @@ def parse_args() -> argparse.Namespace:
 def get_ocr_settings(args: argparse.Namespace) -> OcrSettings:
     """Build OcrSettings from environment or command-line args."""
     return OcrSettings(
+        enabled=True,
         service_url=args.ocr_url or os.getenv("OCR__SERVICE_URL", "http://localhost:8082"),
         timeout_seconds=args.timeout or int(os.getenv("OCR__TIMEOUT_SECONDS", "300")),
     )

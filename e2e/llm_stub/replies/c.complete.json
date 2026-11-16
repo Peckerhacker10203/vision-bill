@@ -3,14 +3,12 @@
   "merchant_name": "Cafe Test",
   "date": "2026-07-01",
   "currency": "USD",
-  "category": "restaurant",
   "line_items": [
     {
       "description": "Coffee",
       "quantity": 1,
       "unit_price": "4.50",
-      "total_price": "4.50",
-      "tags": []
+      "total_price": "4.50"
     }
   ],
   "subtotal": "4.50",

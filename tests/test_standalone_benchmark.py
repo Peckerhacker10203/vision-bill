@@ -122,28 +122,66 @@ async def test_standalone_uses_all_ordered_photos_in_common_pipeline(settings, t
     assert [call.kwargs['photo_index'] for call in ocr.extract_page.await_args_list] == [0,1]
 
 
-async def test_standalone_failure_denominator_and_logs_exclude_receipt_content(settings,tmp_path,monkeypatch,caplog):
+@pytest.mark.parametrize("failure", ["inference", "reference", "source"])
+async def test_standalone_failure_denominator_and_logs_exclude_receipt_content(settings,tmp_path,monkeypatch,caplog,failure):
     import sys
     import logging
+    import hashlib
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
+    from uuid import uuid4
     from scripts import standalone_benchmark as script
     from test_experiment_scoring import receipt
-    monkeypatch.setattr(sys,'argv',['benchmark','--model','fixture'])
+    from vision_bill.service.experiment_execution import ExperimentResult
+    from vision_bill.service.experiment_scoring import OBSERVABLE_FIELDS
+    owner=uuid4()
+    monkeypatch.setattr(sys,'argv',['benchmark','--model','fixture','--user-id',str(owner)])
     args=script.parse_args()
     path=tmp_path/'source';path.write_bytes(b'image')
+    digest=hashlib.sha256(b'image').hexdigest()
     pool=SimpleNamespace(close=AsyncMock())
     monkeypatch.setattr(script,'get_pg_settings',lambda args:settings.pg)
-    monkeypatch.setattr(script,'get_llm_settings',lambda args:settings.llm)
+    monkeypatch.setattr(script,'get_llm_settings',lambda args:settings.llm.model_copy(update={'model_name':'fixture'}))
     monkeypatch.setattr(script,'get_ocr_settings',lambda args:settings.ocr)
     provider=SimpleNamespace(check_connection=AsyncMock(return_value=True))
+    provider.for_experiment=lambda options: SimpleNamespace(build_prompt=lambda *a,**k: "prompt")
     monkeypatch.setattr(script,'get_llm_provider',lambda settings:provider)
     monkeypatch.setattr(script,'get_ocr_provider',lambda settings:provider)
     monkeypatch.setattr(script.asyncpg,'create_pool',AsyncMock(return_value=pool))
-    monkeypatch.setattr(script,'fetch_verified_receipts',AsyncMock(return_value=[{'id':'id','image_path':str(path),'merchant_name':'PRIVATE_MERCHANT','date':'2026-01-01'}]))
-    monkeypatch.setattr(script,'fetch_receipt_details',AsyncMock(return_value=receipt()))
-    monkeypatch.setattr(script,'execute_photos',AsyncMock(side_effect=ValueError('PRIVATE_PROVIDER_TEXT')))
-    with caplog.at_level(logging.INFO):
-        summary=await script.run_benchmark(args)
-    assert summary.total_receipts==1 and summary.failed==1
-    assert 'PRIVATE_MERCHANT' not in caplog.text and 'PRIVATE_PROVIDER_TEXT' not in caplog.text
+    actual=receipt().model_copy(update={'tip':__import__('decimal').Decimal('0')})
+    good=actual.model_dump(mode='json')
+    def reference(expected):
+        data={'receipt_identity':str(uuid4()),'expected':expected,'sources':[{'path':str(path),'sha256':digest}], 'scored_fields':list(OBSERVABLE_FIELDS)}
+        return SimpleNamespace(**data,model_dump=lambda **kwargs:data)
+    refs=[reference(good.copy()),reference(good.copy())]
+    if failure=='reference': refs[0].expected['date']='malformed'
+    if failure=='source': refs[0].sources[0]['sha256']='0'*64
+    monkeypatch.setattr(script,'freeze_references',AsyncMock(return_value=refs))
+    identity={'requested_model':{'id':'fixture','digest':'d'},'pipeline':{'ocr_runtime':{'profile_id':'p','runtime_fingerprint':'r'}}}
+    monkeypatch.setattr(script,'execution_identity',AsyncMock(return_value=identity))
+    metadata={'model_id':'fixture','model_digest':'d','ordered_source_sha256':[digest],'used_pipeline':'ocr','profile_id':'p','runtime_fingerprint':'r'}
+    result=ExperimentResult(actual,1,12,metadata)
+    execute=AsyncMock(side_effect=[ValueError('PRIVATE_PROVIDER_TEXT'),result] if failure=='inference' else [result])
+    monkeypatch.setattr(script,'execute_photos',execute)
+    with caplog.at_level(logging.INFO): summary=await script.run_benchmark(args)
+    assert summary.total_receipts==2 and summary.failed==1 and summary.successful==1
+    assert summary.avg_score==1 and summary.all_case_average_score==.5
+    assert summary.full_receipt_correct_rate==.5
+    assert summary.results[1].metadata==metadata
+    assert summary.manifest['scope']=={'user_id':str(owner),'can_see_all':False}
+    assert len(summary.manifest_sha256)==64
+    assert summary.item_omissions==(0 if failure=='reference' else len(good['line_items']))
+    assert 'PRIVATE_PROVIDER_TEXT' not in caplog.text
+    # Extraction receives only ordered images/settings, never reference data.
+    assert execute.call_args.args[3]==[path]
+    assert set(execute.call_args.kwargs)=={'ocr_settings'}
+
+
+async def test_actual_asyncpg_time_type_preserves_subminute_precision(query_pool,monkeypatch):
+    from datetime import time
+    fetch=query_pool.fetchrow
+    async def pg_row(*args):
+        row=dict(await fetch(*args));row['time']=time(14,30,15,1);return row
+    monkeypatch.setattr(query_pool,'fetchrow',pg_row)
+    result=await fetch_receipt_details(query_pool,'groceries-new')
+    assert result.time == '14:30:15.000001'

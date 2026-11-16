@@ -95,14 +95,17 @@ def prepare(root: Path, directory: Path) -> None:
         observed = json.loads(image.with_suffix(".json").read_text())
         # Explicit complete test scenario; nullable partial files are separate artifacts.
         complete = {
-            "category": "other",
             "currency": "EUR",
             "discount_total": "0",
             "taxes": [],
             "tip": None,
             **observed,
         }
-        complete["line_items"] = [{"tags": [], **line} for line in observed["line_items"]]
+        complete.pop("category", None)
+        complete["line_items"] = [
+            {key: value for key, value in line.items() if key not in {"tags", "spending_category"}}
+            for line in observed["line_items"]
+        ]
         complete["amount_policy"] = {
             "tax_basis": "net",
             "discount_treatment": "included_in_lines",

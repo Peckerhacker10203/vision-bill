@@ -302,6 +302,16 @@ class ReceiptService:
     ) -> ReceiptRow | None:
         return await self._db.verify_receipt(receipt_id, request, scope=scope, user_id=user_id, can_see_all=can_see_all)
 
+    async def delete_resource(self, resource_id: UUID, *, receipt: bool, scope: AccessScope, images: "ImageService") -> bool:
+        try:
+            deleted = await self.workflow_db.delete_resource(resource_id, receipt=receipt, scope=scope, validate_files=lambda deleted: images.validate_deleted_files(deleted, initial=True))
+        except asyncpg.ForeignKeyViolationError as exc:
+            raise ReceiptReferencedError("resource_referenced") from exc
+        if deleted is None:
+            return False
+        await self.workflow_db.cleanup_deleted_resource(resource_id, receipt=receipt, scope=scope, remove_files=images.remove_deleted_files)
+        return True
+
     async def delete_receipt(
         self, receipt_id: UUID, user_id: UUID | None = None, can_see_all: bool = False
     ) -> ReceiptRow | None:

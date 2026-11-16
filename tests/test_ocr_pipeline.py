@@ -355,7 +355,8 @@ def test_source_verifier_rejects_drift(tmp_path):
         verify_sources(tmp_path)
 
 
-def test_factory_bootstraps_then_requires_real_forward_for_all_models(tmp_path, monkeypatch):
+@pytest.mark.parametrize("target_change", ["name", "architecture", "override", "missing_seal"])
+def test_factory_bootstraps_then_requires_real_forward_for_all_models(tmp_path, monkeypatch, target_change):
     import json
     from types import ModuleType
 
@@ -392,6 +393,7 @@ def test_factory_bootstraps_then_requires_real_forward_for_all_models(tmp_path, 
                     name: {"version": version, "content_sha256": "a" * 64}
                     for name, version in dependency_versions.items()
                 },
+                "qualified_target": {"name":"fake-native-GPU", "gpu_index":0, "paddle_build":"3.3.1", "compute_capability":[8,6]},
                 "image_identity": "image-sha256",
                 "paddle_identity": "paddle:commit-331",
                 "smoke_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
@@ -480,7 +482,7 @@ def test_factory_bootstraps_then_requires_real_forward_for_all_models(tmp_path, 
                 "parsing_res_list": [{"block_content": "SHOP", "block_bbox": [0, 0, 3, 8]}],
             }
 
-    cuda = SimpleNamespace(device_count=lambda: 1, get_device_name=lambda index: "fake-native-GPU")
+    cuda = SimpleNamespace(device_count=lambda: 1, get_device_name=lambda index: "fake-native-GPU", get_device_capability=lambda index: (8,6))
     module(
         "paddle",
         is_compiled_with_rocm=lambda: False,
@@ -536,6 +538,18 @@ def test_factory_bootstraps_then_requires_real_forward_for_all_models(tmp_path, 
             source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
         )
     assert adapter.qualified is False
+    if target_change == "name":
+        cuda.get_device_name = lambda index: "another-device"
+    elif target_change == "architecture":
+        cuda.get_device_capability = lambda index: (9,0)
+    elif target_change == "override":
+        monkeypatch.setenv("HSA_OVERRIDE_GFX_VERSION", "10.3.0")
+    else:
+        manifest = json.loads(manifest_path.read_text())
+        manifest.pop("qualified_target")
+        manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="qualified target|spoofing"):
+        factory.build_pipeline(load_profile(Path(__file__).parents[1] / "paddleocr-service/profile.json"), runtime)
 
 
 def test_static_runner_actual_model_name_must_match(tmp_path):

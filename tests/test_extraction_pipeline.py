@@ -254,6 +254,7 @@ async def test_explicit_vision_fallback_model_is_used_for_text_formatter(photos)
     llm = formatter(False)
     vision = ModelInfo("vision-fallback")
     vision.capabilities = ["vision"]
+    vision.digest = "alternate-digest"
     llm.get_available_models.return_value.append(vision)
     result = await pipeline(
         llm, sidecar(1), allow_vision_fallback=True, vision_fallback_model_id="vision-fallback"
@@ -266,7 +267,9 @@ async def test_explicit_vision_fallback_model_is_used_for_text_formatter(photos)
         deadline=time.monotonic() + 2,
         tags=[],
     )
-    assert result.provenance.model_id == "fixture"
+    assert result.provenance.model_id == "vision-fallback"
+    assert result.provenance.requested_model_id == "fixture"
+    assert result.provenance.model_digest == "alternate-digest"
     assert llm._client.chat.call_args.kwargs["model"] == "vision-fallback"
     assert result.telemetry.calls[0]["requested_model"] == "vision-fallback"
     assert len(result.input_views) == 2

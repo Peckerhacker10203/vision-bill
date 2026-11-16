@@ -29,7 +29,7 @@ def main() -> None:
             + json.dumps(str(dotenv))
             + "\n"
         )
-        for accelerator in ("cuda", "rocm"):
+        for accelerator in (None, "cuda", "rocm"):
             command = [
                 "docker",
                 "compose",
@@ -43,8 +43,7 @@ def main() -> None:
                 "ocr",
                 "-f",
                 str(ROOT / "docker-compose.yml"),
-                "-f",
-                str(ROOT / f"docker-compose.{accelerator}.yml"),
+                *(["-f", str(ROOT / f"docker-compose.{accelerator}.yml")] if accelerator else []),
                 "-f",
                 str(override),
                 "config",
@@ -65,6 +64,13 @@ def main() -> None:
             assert services["db"]["image"] == "postgres:18"
             assert services["db"]["environment"]["POSTGRES_USER"] == "compose_test"
             assert services["vision_bill"]["environment"]["PG__PASSWORD"] == "unused_test_value"
+            app_env = services["vision_bill"]["environment"]
+            assert str(app_env.get("OCR__ENABLED", "false")).lower() == ("true" if accelerator else "false")
+            assert str(app_env.get("OCR__REQUIRED", "false")).lower() == "false"
+            assert str(app_env.get("OCR__ALLOW_VISION_FALLBACK", "false")).lower() == "false"
+            if accelerator is None:
+                print("main: OCR disabled (no services started)")
+                continue
             ocr = services["paddleocr-service"]
             assert ocr["build"]["dockerfile"] == f"paddleocr-service/Dockerfile.{accelerator}"
             assert ocr["profiles"] == ["ocr"]

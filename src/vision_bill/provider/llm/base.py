@@ -20,6 +20,7 @@ from PIL import Image, ImageOps
 from pydantic import ValidationError
 
 from ...helper.deadline import check_deadline, run_sync_before
+from ...helper.document_image import NORMALIZER_VERSION, document_rgb
 from ...helper.duplicates import verify_duplicate
 from ...model.experiment import ExperimentOptions
 from ...model.extraction import (
@@ -335,13 +336,15 @@ class LLMProvider(ABC):
                     transforms = [
                         {
                             "operation": "first_frame_exif_rgb",
+                            "normalizer_version": NORMALIZER_VERSION,
+                            "alpha_background": "#ffffff",
                             "frame_count": getattr(original, "n_frames", 1),
                             "frame_index": 0,
                             "exif_orientation": original.getexif().get(274),
                             "source_format": original.format,
                         }
                     ]
-                    working = ImageOps.exif_transpose(original).convert("RGB")
+                    working = document_rgb(ImageOps.exif_transpose(original))
                     working.save(target, format="PNG")
                 png = target.read_bytes()
                 digest = hashlib.sha256(png).hexdigest()
@@ -604,10 +607,7 @@ class LLMProvider(ABC):
                     if key in additions:
                         row[key] = additions[key]
             result.receipt = Receipt.model_validate(updated)
-            if result.draft is not None:
-                result.draft.category = result.receipt.category
-                # The original draft rows include overlap; classification targets only final rows.
-                # Keep per-row enrichment on Receipt rather than misassigning it to overlap rows.
+            # Raw observations, including null classification and overlapping rows, stay unchanged.
         except (ValueError, TypeError, AttributeError):
             return result
 

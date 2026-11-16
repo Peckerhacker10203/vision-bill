@@ -166,6 +166,7 @@ async def pipeline_identity(
     """Freeze effective local execution contracts without receipt/reference observations."""
     import inspect
 
+    from ..helper.document_image import NORMALIZER_VERSION, document_rgb
     from ..model.extraction import (
         EXTRACTION_SCHEMA_VERSION,
         SOURCE_PROJECTION_VERSION,
@@ -178,8 +179,18 @@ async def pipeline_identity(
     capabilities = None
     if ocr is not None and options.pipeline != ExtractionPipeline.DIRECT:
         capabilities = (await ocr.get_capabilities()).model_dump(mode="json")
+    alternate_identity = None
+    if (settings.enabled and not settings.required and settings.allow_vision_fallback
+            and effective_options.allow_ocr_fallback and settings.vision_fallback_model_id):
+        from .extraction_pipeline import select_vision_model
+        alternate = select_vision_model(await provider.get_available_models(capability="vision"),
+                                        settings.vision_fallback_model_id)
+        if alternate is not None:
+            alternate_identity = {"id": alternate.id, "digest": alternate.digest}
     return {
+        "vision_fallback_model": alternate_identity,
         "version": 1,
+        "normalizer_version": NORMALIZER_VERSION,
         "schema_version": EXTRACTION_SCHEMA_VERSION,
         "source_projection_version": SOURCE_PROJECTION_VERSION,
         "source_prompt_sha256": hashlib.sha256(
@@ -190,7 +201,8 @@ async def pipeline_identity(
         ).hexdigest(),
         "preprocessing_sha256": hashlib.sha256(
             (
-                inspect.getsource(provider._prepare_receipt_input)
+                inspect.getsource(document_rgb)
+                + inspect.getsource(provider._prepare_receipt_input)
                 + inspect.getsource(provider._authorized_source_refs)
             ).encode()
         ).hexdigest(),

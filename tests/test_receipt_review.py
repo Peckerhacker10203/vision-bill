@@ -154,11 +154,14 @@ def test_stable_ids_bind_whole_material_document_but_ignore_classification():
     assert first.findings[0].id == evaluate(document(total="12", category="grocery")).findings[0].id
 
 
-@pytest.mark.parametrize("first,equivalent,different", [
-    ("14:30", "14:30:00.0", "14:30:01"),
-    ("14:30:15.1", "14:30:15.100000", "14:30:15.100001"),
-    ("14:30:00.000001", "14:30:00.000001", "14:30:00.000002"),
-])
+@pytest.mark.parametrize(
+    "first,equivalent,different",
+    [
+        ("14:30", "14:30:00.0", "14:30:01"),
+        ("14:30:15.1", "14:30:15.100000", "14:30:15.100001"),
+        ("14:30:00.000001", "14:30:00.000001", "14:30:00.000002"),
+    ],
+)
 def test_time_canonicalization_keeps_material_and_finding_ids_stable(first, equivalent, different):
     left = document(total="12", time=first)
     right = document(total="12", time=equivalent)
@@ -323,3 +326,101 @@ def test_readable_legacy_original_is_human_only_not_automatic_bypass():
     assert result.can_finalize
     assert not result.can_auto_verify
     review.validate_acknowledgements(result, [])
+
+
+@pytest.mark.parametrize(
+    "basis,origin,lines,subtotal,tax,total,discount,tip",
+    [
+        ("gross", "derived_net", "119", "100", "19", "119", "0", None),
+        ("net", "printed", "100", "100", "19", "119", "0", None),
+        ("net", "derived_net", "100", "100", "19", "111", "10", "2"),
+        ("gross", "derived_net", "-100", "-119", "19", "-100", "0", None),
+    ],
+)
+def test_subtotal_origin_drives_evidence_supported_equations(
+    basis, origin, lines, subtotal, tax, total, discount, tip
+):
+    doc = document(
+        line_items=[
+            {"description": "Item", "quantity": 1, "unit_price": lines, "total_price": lines}
+        ],
+        subtotal=subtotal,
+        tax_total=tax,
+        taxes=[{"name": "VAT", "amount": tax}],
+        total=total,
+        discount_total=discount,
+        tip=tip,
+    )
+    before = doc.model_dump()
+    result = evaluate(
+        doc,
+        POLICY.model_copy(
+            update={
+                "tax_basis": basis,
+                "subtotal_origin": origin,
+                "discount_treatment": "subtract",
+                "tip_treatment": "add" if tip else "none",
+            }
+        ),
+    )
+    assert result.findings == []
+    assert doc.model_dump() == before
+
+
+@pytest.mark.parametrize(
+    "basis,origin,tax_info,discount,tip",
+    [
+        ("unknown", "printed", "present", "0", None),
+        ("gross", "unknown", "present", "0", None),
+        ("gross", "derived_net", "missing", "0", None),
+        ("net", "printed", "missing", "0", None),
+        ("gross", "derived_net", "present", "10", None),
+        ("gross", "derived_net", "present", "0", "2"),
+    ],
+)
+def test_uncertain_policy_does_not_invent_expected_subtotal_or_total(
+    basis, origin, tax_info, discount, tip
+):
+    doc = document(subtotal="100", total="119", discount_total=discount, tip=tip)
+    result = evaluate(
+        doc,
+        POLICY.model_copy(
+            update={
+                "tax_basis": basis,
+                "subtotal_origin": origin,
+                "tax_information": tax_info,
+                "discount_treatment": "subtract",
+                "tip_treatment": "add" if tip else "none",
+            }
+        ),
+    )
+    assert result.findings
+    assert not any(
+        f.code in {"subtotal_discrepancy", "amount_discrepancy"} for f in result.findings
+    )
+
+
+def test_changed_checks_reject_stale_ack_without_mutating_history(monkeypatch):
+    doc=document(total='12')
+    with monkeypatch.context() as old:
+        old.setattr(review,'CHECKS_VERSION','1')
+        historical=evaluate(doc)
+    approvals=[FindingAcknowledgement(finding_id=f.id,comment='historical review') for f in historical.findings]
+    current=evaluate(doc)
+    assert current.checks_version=='2' and historical.checks_version=='1'
+    with pytest.raises(ValueError,match='acknowledgements'):
+        review.validate_acknowledgements(current,approvals)
+    assert approvals[0].finding_id==historical.findings[0].id
+    assert current.findings[0].id != historical.findings[0].id
+
+
+def test_derived_net_genuine_discrepancy_and_negative_return_line():
+    doc=document(line_items=[{'description':'Purchase','quantity':1,'unit_price':'119','total_price':'119'},
+        {'description':'Return','quantity':1,'unit_price':'-11.90','total_price':'-11.90'}],
+        subtotal='90',total='107.10',tax_total='17.10',taxes=[{'name':'VAT','amount':'17.10'}])
+    policy=POLICY.model_copy(update={'subtotal_origin':'derived_net'})
+    assert evaluate(doc,policy).findings==[]
+    wrong=doc.model_copy(update={'subtotal':Decimal('91')})
+    findings=evaluate(wrong,policy).findings
+    assert {f.code for f in findings}=={'subtotal_discrepancy','amount_discrepancy'}
+    assert next(f for f in findings if f.code=='subtotal_discrepancy').comparison['expected']=='90.00'

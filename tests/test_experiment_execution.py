@@ -445,3 +445,22 @@ def test_upload_experiment_does_not_invent_frozen_fallback_permission(
     _, _, effective = effective_policy(service, options)
     assert effective.allow_ocr_fallback is (global_permission and permission is True)
     assert options.model_dump() == before
+
+
+async def test_fallback_pipeline_identity_binds_eligible_alternate_digest(settings,tmp_path):
+    from test_extraction_pipeline import formatter, sidecar
+    from vision_bill.config import OcrSettings
+    from vision_bill.provider.llm.base import ModelInfo
+    from vision_bill.service.receipt_service import ReceiptService
+    from vision_bill.service.experiment_execution import pipeline_identity
+    provider=formatter(False)
+    alternate=ModelInfo('alternate');alternate.digest='first';alternate.capabilities=['vision']
+    provider.get_available_models.return_value.append(alternate)
+    service=ReceiptService(settings.images, settings.pg, provider, ocr_provider=sidecar(),
+        ocr_settings=OcrSettings(enabled=True,allow_vision_fallback=True,vision_fallback_model_id='alternate'))
+    options=ExperimentOptions(pipeline='upload',allow_ocr_fallback=True)
+    first=await pipeline_identity(service, options)
+    alternate.digest='changed'
+    second=await pipeline_identity(service, options)
+    assert first != second
+    assert first['vision_fallback_model'] == {'id':'alternate','digest':'first'}

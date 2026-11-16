@@ -499,22 +499,27 @@ def test_delete_image(api_context: ApiContext, settings: Settings) -> None:
     ctx = api_context
     tmp_file = Path(settings.images.tmp_dir) / "x.png"
     tmp_file.write_bytes(b"queued-image-bytes")
-    ctx.conn.fetchrow = AsyncMock(
-        return_value=_image_row(id=IMAGE_ID, status="pending", image_path=str(tmp_file))
-    )
+    async def rows(query, *args):
+        if "SELECT files FROM resource_deletions" in query:
+            insert = next(call for call in ctx.conn.execute.call_args_list if "INSERT INTO resource_deletions" in call.args[0])
+            return {"files": insert.args[4]}
+        if "resource_deletions" in query:
+            return None
+        return _image_row(id=IMAGE_ID, user_id=USER_ID, status="pending", image_path=str(tmp_file))
+    ctx.conn.fetchrow = AsyncMock(side_effect=rows)
     ctx.conn.execute = AsyncMock()
 
     response = ctx.client.delete(f"{IMAGES_URL}/{IMAGE_ID}")
 
     assert response.status_code == 200
     assert response.json()["deleted"] == str(IMAGE_ID)
-    ctx.conn.execute.assert_awaited_once()
+    assert any("DELETE FROM images" in call.args[0] for call in ctx.conn.execute.call_args_list)
     assert not tmp_file.exists()
 
 
 def test_delete_analyzed_image_conflict(api_context: ApiContext) -> None:
     ctx = api_context
-    ctx.conn.fetchrow = AsyncMock(return_value=_image_row(id=IMAGE_ID, status="analyzed"))
+    ctx.conn.fetchrow = AsyncMock(side_effect=[None, _image_row(id=IMAGE_ID, status="analyzed")])
 
     response = ctx.client.delete(f"{IMAGES_URL}/{IMAGE_ID}")
 
@@ -953,20 +958,16 @@ def test_delete_receipt(api_context: ApiContext, settings: Settings) -> None:
     ctx = api_context
     tmp_file = Path(settings.images.tmp_dir) / "img.png"
     tmp_file.write_bytes(b"receipt-image-bytes")
-    ctx.conn.fetchrow = AsyncMock(
-        side_effect=[
-            {"image_id": IMAGE_ID},
-            {"id": IMAGE_ID},
-            _receipt_row(id=RECEIPT_ID, image_id=IMAGE_ID, merchant_name="Doomed Store"),
-            _receipt_row(id=RECEIPT_ID, image_id=IMAGE_ID, merchant_name="Doomed Store"),
-            _image_row(
-                id=IMAGE_ID,
-                status="analyzed",
-                receipt_id=RECEIPT_ID,
-                image_path=str(tmp_file),
-            ),
-        ]
-    )
+    async def rows(query, *args):
+        if "SELECT files FROM resource_deletions" in query:
+            insert = next(call for call in ctx.conn.execute.call_args_list if "INSERT INTO resource_deletions" in call.args[0])
+            return {"files": insert.args[4]}
+        if "resource_deletions" in query:
+            return None
+        if "FROM receipts" in query:
+            return _receipt_row(id=RECEIPT_ID, user_id=USER_ID, image_id=IMAGE_ID, merchant_name="Doomed Store")
+        return _image_row(id=IMAGE_ID, status="analyzed", receipt_id=RECEIPT_ID, image_path=str(tmp_file))
+    ctx.conn.fetchrow = AsyncMock(side_effect=rows)
     ctx.conn.execute = AsyncMock()
 
     response = ctx.client.delete(f"{RECEIPTS_URL}/{RECEIPT_ID}")
@@ -974,7 +975,7 @@ def test_delete_receipt(api_context: ApiContext, settings: Settings) -> None:
     assert response.status_code == 200
     assert response.json()["deleted"] == str(RECEIPT_ID)
     executed = [call.args[0] for call in ctx.conn.execute.call_args_list]
-    assert image_db_module.DELETE_IMAGE_SQL in executed
+    assert any("DELETE FROM images" in query for query in executed)
     assert not tmp_file.exists()
 
 

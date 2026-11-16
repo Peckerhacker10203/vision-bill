@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import base64
 import logging
@@ -21,6 +23,7 @@ from ..model.db.image import ImagePart
 from ..model.image import ImageInfo
 from ..model.ocr import WorkingImage, WorkingImageMetadata
 from ..model.review import OriginalAvailability
+from ..model.workflow import DeletedResource
 
 pillow_heif.register_heif_opener()  # type: ignore[attr-defined]
 
@@ -354,6 +357,50 @@ class ImageService:
         except BaseException:
             task.add_done_callback(discard)
             raise
+
+    def validate_deleted_files(self, deleted: DeletedResource, *, initial: bool = False) -> None:
+        """Seal before deletion; recheck the committed owned identities before every retry."""
+        for part in deleted.parts:
+            path = Path(part.image_path)
+            if path.absolute() != path.resolve():
+                raise ValueError("invalid_original_artifact_path")
+            if path.exists():
+                actual = sha256(path.read_bytes()).hexdigest()
+                if part.source_sha256 != actual and (not initial or part.source_sha256 is not None):
+                    raise ValueError("original_artifact_identity_changed")
+                part.source_sha256 = actual
+            if initial:
+                thumbnail = self._thumb_for(path)
+                if part.thumbnail_path and Path(part.thumbnail_path).absolute() != thumbnail:
+                    raise ValueError("invalid_thumbnail_artifact_path")
+                if thumbnail.absolute() != thumbnail.resolve():
+                    raise ValueError("invalid_thumbnail_artifact_path")
+                deleted.thumbnail_sha256[str(thumbnail)] = sha256(thumbnail.read_bytes()).hexdigest() if thumbnail.exists() else None
+        for name, expected_hash in deleted.thumbnail_sha256.items():
+            thumbnail = Path(name)
+            if thumbnail.absolute() != thumbnail.resolve():
+                raise ValueError("invalid_thumbnail_artifact_path")
+            if thumbnail.exists() and sha256(thumbnail.read_bytes()).hexdigest() != expected_hash:
+                raise ValueError("thumbnail_artifact_identity_changed")
+        for view in deleted.working_views:
+            if deleted.image_id is None:
+                raise ValueError("invalid_working_artifact_owner")
+            expected = self._working_path(deleted.image_id, view.metadata.view_id)
+            if Path(view.artifact_path).absolute() != expected or expected.absolute() != expected.resolve():
+                raise ValueError("invalid_working_artifact_path")
+            if expected.exists():
+                self.read_working_image(deleted.image_id, view.artifact_path, view.metadata)
+
+    def remove_deleted_files(self, deleted: DeletedResource) -> None:
+        """Only a confirmed committed deletion authorizes unlink; failures retain metadata."""
+        self.validate_deleted_files(deleted)
+        for view in deleted.working_views:
+            assert deleted.image_id is not None
+            self.remove_unreferenced_working_image(deleted.image_id, view.artifact_path, view.metadata)
+        for part in deleted.parts:
+            Path(part.image_path).unlink(missing_ok=True)
+        for name in deleted.thumbnail_sha256:
+            Path(name).unlink(missing_ok=True)
 
     def remove_unreferenced_working_image(
         self,

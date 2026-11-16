@@ -803,3 +803,89 @@ async def test_original_to_working_binding_accepts_only_exact_saved_page_geometr
         assert result.field_sources["merchant_name"][0].model_dump(mode="json") == ref
         assert result.field_sources["input"] == [original]
         assert result.provenance.ordered_source_sha256 == [original.source_sha256]
+
+
+@pytest.mark.parametrize("classification", [False, True])
+@pytest.mark.parametrize("overlap", [False, True])
+async def test_prompt_compliant_observations_admit_complete_without_raw_classification(
+    classification, overlap
+):
+    from test_multi_image_extraction import extraction, item
+    from vision_bill.model.experiment import ExperimentOptions
+    from vision_bill.model.review import OriginalAvailability
+    from vision_bill.service.submission_service import SubmissionService
+
+    inp = ocr_input()
+    rows = [item()]
+    if overlap:
+        page = OcrResponse.model_validate(wire_page(1, "b" * 64))
+        ref = inp.source_refs[0].model_copy(
+            update={
+                "part_id": uuid4(),
+                "photo_index": 1,
+                "source_sha256": "b" * 64,
+                "view_id": page.working_image.view_id,
+            }
+        )
+        inp = ReceiptInput(
+            mode="ocr",
+            image_paths=["a", "b"],
+            ocr_pages=[*inp.ocr_pages, page],
+            source_refs=[*inp.source_refs, ref],
+        )
+        rows += [item(source=1)]
+    payload = extraction(rows, [(0, 1)] if overlap else [])
+    payload.update(
+        currency="EUR",
+        payment_method="cash",
+        discount_total="0",
+        tax_total="0",
+        taxes=[],
+        subtotal="2.50",
+        total="2.50",
+        amount_policy={
+            "tax_basis": "gross",
+            "subtotal_origin": "printed",
+            "tax_information": "explicit_zero",
+            "discount_treatment": "included_in_lines",
+            "tip_treatment": "none",
+        },
+    )
+    provider = OllamaProvider("http://local").for_experiment(
+        ExperimentOptions(include_classification=classification)
+    )
+    provider.send_message = AsyncMock(
+        side_effect=[
+            json.dumps(payload),
+            json.dumps(
+                {
+                    "category": "grocery",
+                    "line_items": [{"tags": ["food"], "spending_category": "food"}],
+                }
+            ),
+        ]
+    )
+    result = await provider.extract_receipt_input(
+        "requested", inp, tags=[], deadline=time.monotonic() + 2
+    )
+    outcome = SubmissionService._outcome(
+        result,
+        [],
+        [
+            OriginalAvailability(part_id=r.part_id, available=True, sha256_matches=True)
+            for r in inp.source_refs
+        ],
+    )
+    assert outcome.kind == "complete", outcome.review
+    assert outcome.review.can_auto_verify
+    assert result.draft.category is None
+    assert all(row.tags is None for row in result.draft.line_items)
+    assert len(result.draft.line_items) == (2 if overlap else 1)
+    assert len(result.receipt.line_items) == 1
+    assert result.receipt.line_items[0].tags == (["food"] if classification else [])
+    prompt = provider.send_message.call_args_list[0].args[1][0]["content"]
+    schema = json.loads(prompt.split("Nullable schema: ")[1].split("\nObservations:")[0])
+    assert "amount_policy" in schema["properties"]
+    policy_schema = schema["$defs"]["AmountPolicy"]["properties"]
+    assert set(policy_schema["tax_basis"]["enum"]) == {"gross", "net", "unknown"}
+    assert "explicit_zero" in policy_schema["tax_information"]["enum"]

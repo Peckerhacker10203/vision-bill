@@ -255,18 +255,11 @@ async def delete_image(
     if not receipt_service.db_ready:
         raise HTTPException(status_code=503, detail="Database not available")
 
-    image = await receipt_service.get_image_by_id(
-        image_id, user_id=current_user.id, can_see_all=current_user.can_see_all
-    )
-    if image is None:
+    try:
+        deleted = await receipt_service.delete_resource(image_id, receipt=False,
+            scope=AccessScope(user_id=current_user.id, can_see_all=current_user.can_see_all), images=image_service)
+    except ValueError:
+        raise HTTPException(status_code=409, detail="Cannot delete an active or referenced submission") from None
+    if not deleted:
         raise HTTPException(status_code=404, detail="Image not found")
-    if image.status not in ("pending", "failed", "timed_out", "unreadable"):
-        raise HTTPException(
-            status_code=409, detail="Cannot delete an active or analyzed submission"
-        )
-
-    await receipt_service.delete_image_row(image_id)
-    for part in image.parts():
-        if part.image_path:
-            image_service.delete_image(Path(part.image_path))
     return {"deleted": image_id}

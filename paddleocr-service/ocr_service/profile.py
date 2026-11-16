@@ -11,8 +11,10 @@ from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from pydantic import BaseModel, ConfigDict, Field
 
+from vision_bill.helper import document_image
+
 ADAPTER_VERSION = "native-fp32-v1"
-NORMALIZER_VERSION = "rgb-source-view-v1"
+NORMALIZER_VERSION = document_image.NORMALIZER_VERSION
 MODEL_NAMES = (
     "PP-DocLayoutV3",
     "PP-LCNet_x1_0_doc_ori",

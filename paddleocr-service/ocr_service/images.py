@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from PIL import Image, ImageOps
 
+from vision_bill.helper.document_image import NORMALIZER_VERSION, document_rgb
 from vision_bill.model.ocr import WorkingImage
 
 
@@ -40,12 +41,14 @@ def normalize_source(source: Path, source_sha256: str) -> Iterator[NormalizedSou
             decoded.seek(0)
             transform = {
                 "operation": "normalize_rgb",
+                "normalizer_version": NORMALIZER_VERSION,
+                "alpha_background": "#ffffff",
                 "source_format": decoded.format,
                 "exif_orientation": decoded.getexif().get(274, 1),
                 "selected_frame": 0,
                 "frame_count": frame_count,
             }
-            ImageOps.exif_transpose(decoded).convert("RGB").save(derived_path, format="PNG")
+            document_rgb(ImageOps.exif_transpose(decoded)).save(derived_path, format="PNG")
         findings = ["multiframe_first_frame_only"] if frame_count > 1 else []
         yield NormalizedSource(derived_path, [transform], findings)
 

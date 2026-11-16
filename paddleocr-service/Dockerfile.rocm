@@ -56,6 +56,7 @@ WORKDIR /app
 COPY paddleocr-service/ocr_service/ /app/ocr_service/
 COPY paddleocr-service/profile.json paddleocr-service/server.py /app/
 COPY src/vision_bill/model/ocr.py /app/vision_bill/model/ocr.py
+COPY src/vision_bill/helper/document_image.py /app/vision_bill/helper/document_image.py
 COPY src/vision_bill/__init__.py /app/vision_bill/__init__.py
 COPY src/vision_bill/model/__init__.py /app/vision_bill/model/__init__.py
 COPY paddleocr-service/runtime-lock.json /opt/ocr/runtime-lock.json

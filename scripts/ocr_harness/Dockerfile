@@ -14,5 +14,7 @@ RUN pip install --no-cache-dir easyocr==1.7.2
 FROM torch-cpu AS doctr
 RUN pip install --no-cache-dir python-doctr
 
-# Reuse the project's pinned Paddle environment; no second Paddle dependency set.
-FROM vision-bill-paddleocr-service:latest AS paddle
+# Historical PP-OCR CPU comparator; independent of the native-only production service.
+FROM base AS paddle
+COPY requirements.paddle-cpu.lock /tmp/requirements.paddle-cpu.lock
+RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements.paddle-cpu.lock

@@ -238,3 +238,18 @@ def test_store_original_keeps_actual_bytes_hash_order_and_immutable_path(image_s
         image_service.store_original(b"changed", RECEIPT_ID, 1, "image/jpeg")
     assert target.read_bytes() == content
     assert list(target.parent.iterdir()) == [target]
+
+
+def test_deleted_original_retry_removes_owned_thumbnail_after_original_is_missing(image_service, tmp_path):
+    from vision_bill.model.db.image import ImagePart
+    from vision_bill.model.workflow import DeletedResource
+    original = tmp_path / 'original.png'
+    original.write_bytes(b'original')
+    thumbnail = image_service._thumb_for(original)
+    thumbnail.parent.mkdir()
+    thumbnail.write_bytes(b'thumbnail')
+    deleted = DeletedResource(parts=[ImagePart(image_path=str(original), thumbnail_path=str(thumbnail))])
+    image_service.validate_deleted_files(deleted, initial=True)
+    original.unlink()  # The first attempt removed it before an unlink failure.
+    image_service.remove_deleted_files(deleted)
+    assert not thumbnail.exists()

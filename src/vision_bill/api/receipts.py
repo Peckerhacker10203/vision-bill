@@ -1,6 +1,5 @@
 import logging
 from datetime import date
-from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -176,24 +175,12 @@ async def delete_receipt(
         raise HTTPException(status_code=503, detail="Database not available")
 
     try:
-        row = await receipt_service.delete_receipt(
-            receipt_id, user_id=current_user.id, can_see_all=current_user.can_see_all
-        )
+        deleted = await receipt_service.delete_resource(receipt_id, receipt=True,
+            scope=AccessScope(user_id=current_user.id, can_see_all=current_user.can_see_all), images=image_service)
     except ReceiptReferencedError:
-        raise HTTPException(
-            status_code=409,
-            detail="Receipt is referenced by a benchmark run and cannot be deleted",
-        )
-    if row is None:
+        raise HTTPException(status_code=409, detail="Receipt is referenced by a benchmark run and cannot be deleted") from None
+    except ValueError:
+        raise HTTPException(status_code=409, detail="Receipt evidence is still referenced or has invalid ownership") from None
+    if not deleted:
         raise HTTPException(status_code=404, detail="Receipt not found")
-
-    if row.image_id is not None:
-        image = await receipt_service.get_image_by_id(
-            row.image_id, user_id=current_user.id, can_see_all=current_user.can_see_all
-        )
-        if image is not None:
-            await receipt_service.delete_image_row(image.id)
-            for part in image.parts():
-                if part.image_path:
-                    image_service.delete_image(Path(part.image_path))
     return {"deleted": receipt_id}

@@ -150,6 +150,10 @@ def _worker_main(
             )
             message.update(kind="result", artifact=publish_result(result, reply_directory))
         except Exception:  # noqa: BLE001 - native boundary must hide exception details
+            if not adapter.qualified:
+                message.update(kind="qualification_invalidated", code="ocr_qualification_invalidated")
+                output_channel.put(message)
+                return
             message.update(kind="error", code="ocr_inference_failed")
         output_channel.put(message)
 
@@ -381,6 +385,9 @@ class OcrWorkerManager:
                     request.request_id
                 ):
                     continue
+                if message.get("kind") == "qualification_invalidated":
+                    self._recover("ocr_qualification_invalidated")
+                    raise OcrWorkerError("ocr_qualification_invalidated", 503)
                 if message.get("kind") != "result":
                     raise OcrWorkerError("ocr_inference_failed", 502)
                 try:

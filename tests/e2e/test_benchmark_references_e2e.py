@@ -270,6 +270,13 @@ async def test_qualification_race_before_run_creation_is_rejected(workflow_db,tm
     w,scope=workflow_db
     row,_,path=await human(w,scope,tmp_path)
     b=bench(w)
+    # Exercise both source-reference validation and original validation without FOR SHARE.
+    from hashlib import sha256
+    part=uuid4();digest=sha256(path.read_bytes()).hexdigest()
+    source={"part_id":str(part),"photo_index":0,"source_sha256":digest,"coordinate_space":"original"}
+    async with w.pool.acquire() as conn:
+        await conn.execute("INSERT INTO image_source_parts(part_id,image_id,photo_index,source_sha256,image_path,metadata) VALUES($1,$2,0,$3,$4,'{}')",part,row.image_id,digest,str(path))
+        await conn.execute("UPDATE receipts SET field_sources=$2::jsonb WHERE id=$1",row.id,json.dumps({"total":[source]}))
     preview=await b.reference_preview(row.id,scope=scope)
     gold=await b.qualify_reference(row.id,1,preview.document_sha256,scope=scope)
     manifest={'inputs':[{'receipt_id':str(row.id),'reference':gold.model_dump(mode='json')} ]}
@@ -574,3 +581,76 @@ async def test_reference_hash_read_unavailability_is_a_domain_failure(workflow_d
     monkeypatch.setattr(experiment_execution,'image_digest',vanished)
     with pytest.raises(ValueError,match='original_integrity_failed'):
         await bench(w).reference_preview(row.id,scope=scope)
+
+
+async def test_readonly_gold_dataset_freezes_current_owner_references(workflow_db,tmp_path):
+    from scripts.standalone_benchmark import freeze_references, fetch_receipt_details
+    from datetime import time
+    w,scope=workflow_db
+    row,body,path=await human(w,scope,tmp_path)
+    async with w.pool.acquire() as conn:
+        await conn.execute("UPDATE receipts SET time=$2 WHERE id=$1",row.id,time(14,30,15,1))
+    assert (await fetch_receipt_details(w.pool,row.id)).time=="14:30:15.000001"
+    b=bench(w)
+    # Exercise both source-reference validation and original validation without FOR SHARE.
+    from hashlib import sha256
+    part=uuid4();digest=sha256(path.read_bytes()).hexdigest()
+    source={"part_id":str(part),"photo_index":0,"source_sha256":digest,"coordinate_space":"original"}
+    async with w.pool.acquire() as conn:
+        await conn.execute("INSERT INTO image_source_parts(part_id,image_id,photo_index,source_sha256,image_path,metadata) VALUES($1,$2,0,$3,$4,'{}')",part,row.image_id,digest,str(path))
+        await conn.execute("UPDATE receipts SET field_sources=$2::jsonb WHERE id=$1",row.id,json.dumps({"total":[source]}))
+    preview=await b.reference_preview(row.id,scope=scope)
+    gold=await b.qualify_reference(row.id,1,preview.document_sha256,scope=scope)
+    # Genuine SELECT-only role; read-only transaction must use no row locks.
+    async with w.pool.acquire() as conn:
+        await conn.execute('CREATE ROLE standalone_reader')
+        await conn.execute('GRANT USAGE ON SCHEMA public TO standalone_reader')
+        await conn.execute('GRANT SELECT ON ALL TABLES IN SCHEMA public TO standalone_reader')
+    async def reader(conn): await conn.execute('SET ROLE standalone_reader')
+    pool=await asyncpg.create_pool(dsn=w._settings.pg_dsn,setup=reader)
+    try:
+        frozen=await freeze_references(pool,w._settings,scope,limit=1,category=None)
+        assert len(frozen)==1 and frozen[0].id==gold.id
+        assert frozen[0].sources[0]['sha256']==gold.sources[0]['sha256']
+        with pytest.raises(ValueError,match='application user not found'):
+            await freeze_references(pool,w._settings,AccessScope(user_id=uuid4()),limit=1,category=None)
+    finally:
+        await pool.close()
+        async with w.pool.acquire() as conn:
+            await conn.execute('DROP OWNED BY standalone_reader')
+            await conn.execute('DROP ROLE standalone_reader')
+
+
+async def test_standalone_gold_selection_is_one_snapshot_and_excludes_bypass_legacy_stale(workflow_db,tmp_path,monkeypatch):
+    from scripts.standalone_benchmark import freeze_references
+    w,scope=workflow_db
+    b=bench(w)
+    rows=[]
+    for _ in range(5):
+        row,_,_=await human(w,scope,tmp_path)
+        preview=await b.reference_preview(row.id,scope=scope)
+        await b.qualify_reference(row.id,1,preview.document_sha256,scope=scope)
+        rows.append(row)
+    async with w.pool.acquire() as conn:
+        await conn.execute("UPDATE receipts SET verification_source='bypass' WHERE id=$1",rows[2].id)
+        await conn.execute("UPDATE receipts SET verification_source='legacy' WHERE id=$1",rows[3].id)
+        await conn.execute("UPDATE receipts SET merchant_name='stale' WHERE id=$1",rows[4].id)
+    original=BenchmarkDB._reference_preview
+    seen=[]
+    changed=[]
+    async def barrier(self,conn,receipt_id,scope,**kwargs):
+        result=await original(self,conn,receipt_id,scope,**kwargs)
+        seen.append(receipt_id)
+        if len(seen)==1:
+            other=next(row.id for row in rows[:2] if row.id!=receipt_id)
+            changed.append(other)
+            async with w.pool.acquire() as writer:
+                await writer.execute("UPDATE receipts SET merchant_name='concurrent edit' WHERE id=$1",other)
+        return result
+    monkeypatch.setattr(BenchmarkDB,'_reference_preview',barrier)
+    frozen=await freeze_references(w.pool,w._settings,scope,limit=None,category=None)
+    assert {r.receipt_identity for r in frozen}=={r.id for r in rows[:2]}
+    assert all(r.expected['merchant_name']=='Shop' for r in frozen)
+    monkeypatch.setattr(BenchmarkDB,'_reference_preview',original)
+    current=await freeze_references(w.pool,w._settings,scope,limit=1,category=None)
+    assert len(current)==1 and current[0].receipt_identity in {row.id for row in rows[:2]} - set(changed)

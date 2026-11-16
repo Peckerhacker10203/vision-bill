@@ -91,6 +91,7 @@ class PipelineProvenance(BaseModel):
     source_image_count: int = Field(ge=1)
     ordered_source_sha256: list[Sha256]
     model_id: str
+    requested_model_id: str | None = None  # Unknown for historical saved envelopes.
     model_digest: str | None = None
     profile_id: str | None = None
     runtime_fingerprint: str | None = None

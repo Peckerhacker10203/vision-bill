@@ -198,3 +198,26 @@ it('blocks an already-open custom create option while its parent is saving', asy
 	expect(value).toEqual([]);
 	expect(vi.mocked(fetch).mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0);
 });
+
+it('does not attach a pending tag to a successor value after props change', async () => {
+	const { api } = await import('$lib/api/client');
+	let finish!: (value: { name: string; created: boolean }) => void;
+	const create = vi.spyOn(api, 'createTag').mockImplementation(
+		() =>
+			new Promise((resolve) => {
+				finish = resolve;
+			})
+	);
+	const original: string[] = [],
+		successor: string[] = [];
+	const view = render(TagEditor, { value: original, tagOptions: OPTIONS, id: 'original' });
+	await fireEvent.click(screen.getByRole('button', { name: 'Tags' }));
+	await fireEvent.input(screen.getByPlaceholderText('Search tags…'), { target: { value: 'late' } });
+	await fireEvent.click(screen.getByRole('option', { name: 'Create “late”' }));
+	await view.rerender({ value: successor, tagOptions: OPTIONS, id: 'successor' });
+	finish({ name: 'late', created: true });
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(successor).toEqual([]);
+	expect(original).toEqual([]);
+	create.mockRestore();
+});

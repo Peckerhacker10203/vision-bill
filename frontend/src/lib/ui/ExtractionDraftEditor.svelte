@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
+	import { SvelteSet } from 'svelte/reactivity';
 	import { createQuery } from '@tanstack/svelte-query';
 	import { queryClient } from '$lib/query/client';
 	import { queryKeys } from '$lib/query/keys';
@@ -26,6 +27,12 @@
 	let policy = $state<AmountPolicy | null>(null);
 	let error = $state('');
 	let busy = $state(false);
+	const pendingTags = new SvelteSet<object>();
+	let childPending = $derived(pendingTags.size > 0);
+	function tagPending(line: object, pending: boolean) {
+		if (pending) pendingTags.add(line);
+		else pendingTags.delete(line);
+	}
 	let selectedSources = $state<SourceRef[]>([]);
 	let sourceDecisions = $state<Record<string, SourceRef[]>>({});
 	let overlapDecisions = $state<Record<string, unknown>[]>([]);
@@ -75,6 +82,7 @@
 		return JSON.parse(JSON.stringify(value)) as T;
 	}
 	function adopt(value: DraftView) {
+		pendingTags.clear();
 		draft = value;
 		document = clone(value.document);
 		policy = clone(value.amount_policy);
@@ -85,6 +93,7 @@
 		const view = { id };
 		active = view;
 		draft = null;
+		pendingTags.clear();
 		error = '';
 		busy = false;
 		finalizeKey = null;
@@ -155,7 +164,7 @@
 		return errors;
 	}
 	async function save() {
-		if (!draft || busy) return;
+		if (!draft || busy || childPending) return;
 		const invalid = validation();
 		if (invalid.length) {
 			error = translate('review.invalidFields') + ': ' + invalid.join(', ');
@@ -185,13 +194,12 @@
 		}
 	}
 	async function finalize() {
-		if (!draft || busy) return;
+		if (!draft || busy || childPending) return;
 		const required = [
 			'confidence',
 			'merchant_name',
 			'date',
 			'currency',
-			'category',
 			'line_items',
 			'taxes',
 			'subtotal',
@@ -204,7 +212,7 @@
 			(key) => document[key] == null || document[key] === ''
 		);
 		for (const [i, line] of (document.line_items ?? []).entries())
-			for (const key of ['description', 'quantity', 'unit_price', 'total_price', 'tags'] as const)
+			for (const key of ['description', 'quantity', 'unit_price', 'total_price'] as const)
 				if (line[key] == null || line[key] === '') missing.push(`line_items.${i}.${key}`);
 		if (missing.length) {
 			error = translate('review.missingFields') + ': ' + missing.join(', ');
@@ -257,7 +265,7 @@
 					>{/each}
 			</div>
 			<h3>{$t('editor.lineItems')}</h3>
-			{#each document.line_items ?? [] as line, index (index)}
+			{#each document.line_items ?? [] as line, index (line)}
 				<div class="grid grid-cols-2 gap-2 rounded border p-3">
 					{#each ['description', 'quantity', 'unit_price', 'total_price', 'spending_category'] as field (field)}<label
 							>{$t(labelKeys[field])}<input
@@ -275,6 +283,7 @@
 					{#if line.tags !== null && line.tags !== undefined}<TagEditor
 							disabled={busy}
 							value={line.tags}
+							onPendingChange={(pending) => tagPending(line, pending)}
 							tagOptions={tags.data ?? []}
 							id={`draft-line-${index}`}
 						/>{:else}<button type="button" onclick={() => (line.tags = [])}
@@ -282,7 +291,9 @@
 						>{/if}
 					<button
 						type="button"
+						disabled={busy || childPending}
 						onclick={() => {
+							if (busy || childPending) return;
 							document.line_items = document.line_items!.filter((_, i) => i !== index);
 							overlapDecisions = overlapDecisions.map(unknownOverlap);
 							sourceDecisions = Object.fromEntries(
@@ -378,10 +389,13 @@
 				<button
 					type="button"
 					class="rounded bg-primary p-3 text-on-primary"
-					disabled={busy || !dirty}
+					disabled={busy || childPending || !dirty}
 					onclick={save}>{$t('review.saveDraft')}</button
-				><button type="button" class="rounded border p-3" disabled={busy} onclick={finalize}
-					>{$t('review.finalizeDraft')}</button
+				><button
+					type="button"
+					class="rounded border p-3"
+					disabled={busy || childPending}
+					onclick={finalize}>{$t('review.finalizeDraft')}</button
 				>
 			</div>
 		</fieldset>

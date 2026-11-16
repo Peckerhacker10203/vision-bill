@@ -412,6 +412,11 @@ class BenchmarkService:
         if manifest.get("identity") is not None:
             if result.metadata.get("ordered_source_sha256") != [image["sha256"] for image in item["images"]]:
                 raise ValueError("Executed source identity differs from frozen input")
+            alternate = manifest["identity"].get("vision_fallback_model")
+            if (result.metadata.get("fallback_used") and result.metadata.get("model_id") != model_id
+                and (not alternate or any(result.metadata.get(key) != alternate.get(target)
+                    for key, target in (("model_id", "id"), ("model_digest", "digest"))))):
+                raise ValueError("Executed fallback model differs from frozen input")
             runtime = manifest["identity"].get("ocr_runtime")
             if runtime and result.metadata.get("used_pipeline") == "ocr" and any(
                 runtime.get(key) != result.metadata.get(key)

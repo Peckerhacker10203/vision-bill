@@ -402,6 +402,7 @@ def test_coordinator_inspects_then_collects_then_seals_then_fresh_replays(
         runtime, tmp_path / "cases.toml", tmp_path / "qualification.json"
     )
     assert report.qualified and len(report.cases) == 10
+    assert json.loads(runtime.qualification_manifest.read_text())["qualified_target"] == {"name":"actual-device"}
     assert stages == ["inspect"] * 3 + ["collect"] + ["replay"] * 10
     assert (tmp_path / "qualification.runtime.json").exists()
 

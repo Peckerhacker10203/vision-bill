@@ -36,10 +36,13 @@ import json
 import logging
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
+from datetime import time as Time
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import asyncpg
 
@@ -47,7 +50,10 @@ import asyncpg
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from vision_bill.config import ImageSettings, LLMSettings, OcrSettings, PGSettings
+from vision_bill.model.benchmark import GoldSnapshot
+from vision_bill.model.experiment import ExperimentOptions, ExtractionPipeline
 from vision_bill.model.receipt import LineItem, Receipt, TaxLine
+from vision_bill.model.workflow import AccessScope
 from vision_bill.provider.factory import get_llm_provider, get_ocr_provider
 from vision_bill.provider.llm.base import LLMProvider
 from vision_bill.provider.ocr.base import OcrProvider
@@ -72,6 +78,8 @@ class BenchmarkResult:
     llm_time_ms: float | None = None
     total_time_ms: float | None = None
     attempts: int | None = None
+    detail: dict[str, Any] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -84,6 +92,12 @@ class BenchmarkSummary:
     successful: int = 0
     failed: int = 0
     avg_score: float | None = None
+    all_case_average_score: float = 0
+    full_receipt_correct_rate: float = 0
+    item_omissions: int = 0
+    item_extras: int = 0
+    manifest: dict[str, Any] = field(default_factory=dict)
+    manifest_sha256: str = ""
     avg_ocr_time_ms: float | None = None
     avg_llm_time_ms: float | None = None
     avg_total_time_ms: float | None = None
@@ -94,6 +108,12 @@ class BenchmarkSummary:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--user-id",
+        type=UUID,
+        required=True,
+        help="Application owner whose qualified Gold references are selected",
+    )
     parser.add_argument(
         "--limit", type=int, default=None, help="Maximum number of receipts to benchmark"
     )
@@ -261,7 +281,9 @@ async def fetch_receipt_details(
         merchant_address=receipt_row["merchant_address"],
         receipt_number=receipt_row["receipt_number"],
         date=receipt_row["date"],
-        time=receipt_row["time"],
+        time=receipt_row["time"].isoformat()
+        if isinstance(receipt_row["time"], Time)
+        else receipt_row["time"],
         currency=receipt_row["currency"],
         category=receipt_row["category"],
         line_items=items,
@@ -275,16 +297,111 @@ async def fetch_receipt_details(
     )
 
 
-async def execute_photos(provider: LLMProvider, ocr: OcrProvider, model: str, paths: list[Path], pg_settings: PGSettings) -> ExperimentResult:
+async def freeze_references(
+    pool: asyncpg.Pool,
+    pg_settings: PGSettings,
+    scope: AccessScope,
+    *,
+    limit: int | None,
+    category: str | None,
+) -> list[GoldSnapshot]:
+    """Capture qualified current truth in one read-only MVCC snapshot before inference."""
+    from vision_bill.provider.db.benchmark_db import BenchmarkDB
+    from vision_bill.provider.db.receipt_db import ReceiptDB
+    from vision_bill.service.image_service import ImageService
+
+    if limit is not None and limit <= 0:
+        raise ValueError("limit must be positive")
+    if scope.can_see_all:
+        raise ValueError("standalone benchmark requires an explicit owner scope")
+    db = BenchmarkDB(pool, ReceiptDB(pg_settings, original_checker=ImageService.check_originals))
+    selected = []
+    async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+        if not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM users WHERE id=$1)", scope.user_id):
+            raise ValueError("application user not found")
+        candidates = await conn.fetch(
+            """SELECT r.id FROM receipts r WHERE r.user_id=$1
+            AND r.verified AND r.status='verified' AND r.verification_source='human'
+            AND ($2::text IS NULL OR r.category=$2)
+            AND EXISTS(SELECT 1 FROM benchmark_references b WHERE b.receipt_id=r.id AND b.owner_id=$1)
+            ORDER BY r.date DESC,r.id DESC""",
+            scope.user_id,
+            category,
+        )
+        for candidate in candidates:
+            try:
+                preview = await db._reference_preview(conn, candidate["id"], scope, lock=False)
+            except ValueError:
+                continue  # Domain ineligibility only; database errors abort the entire selection.
+            row = await conn.fetchrow(
+                """SELECT * FROM benchmark_references WHERE receipt_id=$1
+                AND review_revision=$2 AND document_sha256=$3 AND owner_id=$4""",
+                candidate["id"],
+                preview.review_revision,
+                preview.document_sha256,
+                scope.user_id,
+            )
+            if row is not None:
+                selected.append(db._reference(row))
+                if limit is not None and len(selected) == limit:
+                    break
+    return selected
+
+
+async def execute_photos(
+    provider: LLMProvider,
+    ocr: OcrProvider,
+    model: str,
+    paths: list[Path],
+    pg_settings: PGSettings,
+    *,
+    ocr_settings: OcrSettings | None = None,
+) -> ExperimentResult:
     from tempfile import TemporaryDirectory
 
     from vision_bill.model.experiment import ExperimentOptions, ExtractionPipeline
     from vision_bill.service.receipt_service import ReceiptService
+
     with TemporaryDirectory(prefix="vision-bill-benchmark-") as directory:
-        service = ReceiptService(ImageSettings(save_dir=directory, tmp_dir=directory), pg_settings,
-                                 provider, ocr_provider=ocr)
+        service = ReceiptService(
+            ImageSettings(save_dir=directory, tmp_dir=directory),
+            pg_settings,
+            provider,
+            ocr_provider=ocr,
+            ocr_settings=ocr_settings,
+        )
         return await service.analyse_submission_with_metadata(
-            model, paths, ExperimentOptions(pipeline=ExtractionPipeline.OCR, include_classification=False), [])
+            model,
+            paths,
+            ExperimentOptions(pipeline=ExtractionPipeline.OCR, include_classification=False),
+            [],
+        )
+
+
+async def execution_identity(
+    provider: LLMProvider, ocr: OcrProvider, pg: PGSettings, settings: OcrSettings, model_id: str
+) -> dict[str, Any]:
+    from vision_bill.provider.llm.experiment import endpoint_fingerprint
+    from vision_bill.service.experiment_execution import pipeline_identity
+    from vision_bill.service.receipt_service import ReceiptService
+
+    service = ReceiptService(ImageSettings(), pg, provider, ocr_provider=ocr, ocr_settings=settings)
+    options = ExperimentOptions(pipeline=ExtractionPipeline.OCR, include_classification=False)
+    model = next(
+        (m for m in await provider.get_available_models(capability="text") if m.id == model_id),
+        None,
+    )
+    if model is None:
+        raise ValueError("formatter_model_unavailable")
+    return {
+        "pipeline": await pipeline_identity(service, options),
+        "provider": type(provider).__name__,
+        "endpoint_fingerprint": endpoint_fingerprint(provider),
+        "requested_model": {"id": model.id, "digest": model.digest},
+        "validation_schema_sha256": sha256(
+            json.dumps(Receipt.model_json_schema(), sort_keys=True).encode()
+        ).hexdigest(),
+    }
 
 
 async def run_benchmark(args: argparse.Namespace) -> BenchmarkSummary:
@@ -339,119 +456,131 @@ async def run_benchmark(args: argparse.Namespace) -> BenchmarkSummary:
     logger.info("Database connection OK")
 
     try:
-        # Fetch verified receipts
-        logger.info("Fetching verified receipts...")
-        receipts = await fetch_verified_receipts(pool, args.limit, args.category)
-        logger.info("Found %d verified receipts", len(receipts))
+        from vision_bill.service.benchmark_scoring import PROMPT_VERSION
+        from vision_bill.service.experiment_execution import image_digest
+        from vision_bill.service.experiment_scoring import DETAIL_SCORING_VERSION, detailed_score
 
-        if not receipts:
-            logger.error("No verified receipts found")
-            sys.exit(1)
-
-        # Run benchmark
+        scope = AccessScope(user_id=UUID(str(args.user_id)), can_see_all=False)
+        references = await freeze_references(
+            pool, pg_settings, scope, limit=args.limit, category=args.category
+        )
+        if not references:
+            raise ValueError("No current qualified Gold references found")
+        identity = await execution_identity(
+            llm_provider, ocr_provider, pg_settings, ocr_settings, llm_settings.model_name
+        )
+        manifest = {
+            "version": 1,
+            "scope": scope.model_dump(mode="json"),
+            "identity": identity,
+            "prompt_version": PROMPT_VERSION,
+            "scoring_version": DETAIL_SCORING_VERSION,
+            "references": [reference.model_dump(mode="json") for reference in references],
+        }
         summary = BenchmarkSummary(
             model=llm_settings.model_name,
             provider=str(llm_settings.provider),
-            total_receipts=len(receipts),
+            total_receipts=len(references),
             started_at=datetime.now(UTC).isoformat(),
+            manifest=manifest,
+            manifest_sha256=sha256(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
         )
-
-        for i, receipt in enumerate(receipts, 1):
-            receipt_id = str(receipt["id"])
-            image_path = receipt["image_path"]
-            additional = receipt.get("additional_images") or []
-            additional = json.loads(additional) if isinstance(additional, str) else additional
-            paths = [Path(image_path), *[Path(part["image_path"]) for part in additional]]
-            logger.info(
-                "[%d/%d] Processing receipt %s",
-                i,
-                len(receipts),
-                receipt_id,
+        for reference in references:
+            record = BenchmarkResult(
+                receipt_id=str(reference.receipt_identity),
+                merchant=str(reference.expected.get("merchant_name", "")),
+                date=str(reference.expected.get("date", "")),
+                success=False,
             )
-
-            # Check if image exists
-            if any(not path.is_file() for path in paths):
-                logger.warning("Image not found: %s", image_path)
-                summary.results.append(
-                    BenchmarkResult(
-                        receipt_id=receipt_id,
-                        merchant=receipt.get("merchant_name", "unknown"),
-                        date=str(receipt.get("date", "")),
-                        success=False,
-                        error=f"Image not found: {image_path}",
-                    )
-                )
-                summary.failed += 1
-                continue
-
-            # Get expected receipt details
-            expected = await fetch_receipt_details(pool, receipt_id)
-            if not expected:
-                logger.warning("Could not fetch receipt details: %s", receipt_id)
-                summary.results.append(
-                    BenchmarkResult(
-                        receipt_id=receipt_id,
-                        merchant=receipt.get("merchant_name", "unknown"),
-                        date=str(receipt.get("date", "")),
-                        success=False,
-                        error="Could not fetch receipt details",
-                    )
-                )
-                summary.failed += 1
-                continue
-
-            # Run OCR + LLM pipeline
+            summary.results.append(record)
             try:
-
-                result = await execute_photos(llm_provider, ocr_provider, llm_settings.model_name, paths, pg_settings)
-                actual = result.receipt
-                ocr_time = result.metadata.get("telemetry", {}).get("stage_ms", {}).get("ocr", 0)
-                llm_time = result.metadata.get("llm_ms", 0)
-                total_time = result.elapsed_ms
-
-                # Score
-                scores = score_receipts(expected, actual)
-
-                logger.info(
-                    "  Score: %.2f (header=%.2f, totals=%.2f, items=%.2f, taxes=%.2f) | "
-                    "OCR: %.0fms, LLM: %.0fms, Total: %.0fms",
-                    scores["overall"],
-                    scores["header"],
-                    scores["totals"],
-                    scores["line_items"],
-                    scores["taxes"],
-                    ocr_time,
-                    llm_time,
-                    total_time,
-                )
-
-                summary.results.append(
-                    BenchmarkResult(
-                        receipt_id=receipt_id,
-                        merchant=actual.merchant_name or receipt.get("merchant_name", "unknown"),
-                        date=str(actual.date or receipt.get("date", "")),
-                        success=True,
-                        score=scores["overall"],
-                        scores=scores,
-                        ocr_time_ms=ocr_time,
-                        llm_time_ms=llm_time,
-                        total_time_ms=total_time,
+                # Every selected case, including invalid references/files, remains in the denominator.
+                expected = Receipt.model_validate(reference.expected)
+                paths = [Path(source["path"]) for source in reference.sources]
+                hashes = [source["sha256"] for source in reference.sources]
+                if (
+                    not paths
+                    or [await asyncio.to_thread(image_digest, path) for path in paths] != hashes
+                ):
+                    raise ValueError("source_identity_changed")
+                if (
+                    await execution_identity(
+                        llm_provider,
+                        ocr_provider,
+                        pg_settings,
+                        ocr_settings,
+                        llm_settings.model_name,
                     )
+                    != identity
+                ):
+                    raise ValueError("execution_identity_changed")
+                result = await execute_photos(
+                    llm_provider,
+                    ocr_provider,
+                    llm_settings.model_name,
+                    paths,
+                    pg_settings,
+                    ocr_settings=ocr_settings,
                 )
+                record.metadata = result.metadata
+                record.attempts = result.attempts
+                if result.metadata.get("ordered_source_sha256") != hashes:
+                    raise ValueError("executed_source_identity_changed")
+                if any(
+                    result.metadata.get(key) != identity["requested_model"].get(target)
+                    for key, target in (("model_id", "id"), ("model_digest", "digest"))
+                ):
+                    raise ValueError("executed_model_identity_changed")
+                runtime = identity["pipeline"].get("ocr_runtime") or {}
+                if result.metadata.get("used_pipeline") != "ocr" or any(
+                    result.metadata.get(key) != runtime.get(key)
+                    for key in ("profile_id", "runtime_fingerprint")
+                ):
+                    raise ValueError("executed_ocr_identity_changed")
+                record.scores = score_receipts(expected, result.receipt)
+                record.score = record.scores["overall"]
+                record.detail = detailed_score(
+                    reference.expected,
+                    result.receipt,
+                    classification=False,
+                    scored_fields=reference.scored_fields,
+                )
+                record.ocr_time_ms = (
+                    result.metadata.get("telemetry", {}).get("stage_ms", {}).get("ocr", 0)
+                )
+                record.llm_time_ms = result.metadata.get("llm_ms", 0)
+                record.total_time_ms = result.elapsed_ms
+                record.success = True
                 summary.successful += 1
-
-            except Exception as e:  # noqa: BLE001 - preserve every failed dataset case
-                logger.error("Receipt processing failed: %s", type(e).__name__)
-                summary.results.append(
-                    BenchmarkResult(
-                        receipt_id=receipt_id,
-                        merchant=receipt.get("merchant_name", "unknown"),
-                        date=str(receipt.get("date", "")),
-                        success=False,
-                        error=str(e),
+            except Exception as exc:  # noqa: BLE001 - each selected case gets a report
+                logger.error("Receipt processing failed: %s", type(exc).__name__)
+                record.error = type(exc).__name__
+                record.metadata = getattr(exc, "metadata", record.metadata)
+                record.attempts = len(record.metadata.get("calls", []))
+                try:
+                    record.detail = detailed_score(
+                        reference.expected,
+                        None,
+                        classification=False,
+                        scored_fields=reference.scored_fields,
                     )
-                )
+                except (ValueError, TypeError, KeyError):
+                    record.detail = None  # Corrupt reference still contributes zero, never a fabricated Receipt.
                 summary.failed += 1
+        summary.all_case_average_score = (
+            sum(r.detail["scores"]["normalized"] if r.detail else 0 for r in summary.results)
+            / summary.total_receipts
+        )
+        summary.full_receipt_correct_rate = (
+            sum(bool(r.detail and r.detail["full_receipt_correct"]) for r in summary.results)
+            / summary.total_receipts
+        )
+        summary.item_omissions = sum(
+            r.detail["item_fn"] if r.detail else 0 for r in summary.results
+        )
+        summary.item_extras = sum(r.detail["item_fp"] if r.detail else 0 for r in summary.results)
 
         summary.finished_at = datetime.now(UTC).isoformat()
 
@@ -482,8 +611,12 @@ async def run_benchmark(args: argparse.Namespace) -> BenchmarkSummary:
         print(f"Total receipts: {summary.total_receipts}")
         print(f"Successful: {summary.successful}")
         print(f"Failed: {summary.failed}")
+        print(f"All-case normalized score: {summary.all_case_average_score:.4f}")
+        print(f"Full-receipt correct rate: {summary.full_receipt_correct_rate:.4f}")
+        print(f"Item omissions: {summary.item_omissions}; extras: {summary.item_extras}")
+        print(f"Manifest SHA-256: {summary.manifest_sha256}")
         if summary.avg_score is not None:
-            print(f"Average score: {summary.avg_score:.4f}")
+            print(f"Historical average score (successful cases): {summary.avg_score:.4f}")
         if summary.avg_ocr_time_ms is not None:
             print(f"Average OCR time: {summary.avg_ocr_time_ms:.0f}ms")
         if summary.avg_llm_time_ms is not None:
@@ -496,34 +629,7 @@ async def run_benchmark(args: argparse.Namespace) -> BenchmarkSummary:
 
         # Write output file if requested
         if args.output:
-            output_data = {
-                "model": summary.model,
-                "provider": summary.provider,
-                "total_receipts": summary.total_receipts,
-                "successful": summary.successful,
-                "failed": summary.failed,
-                "avg_score": summary.avg_score,
-                "avg_ocr_time_ms": summary.avg_ocr_time_ms,
-                "avg_llm_time_ms": summary.avg_llm_time_ms,
-                "avg_total_time_ms": summary.avg_total_time_ms,
-                "started_at": summary.started_at,
-                "finished_at": summary.finished_at,
-                "results": [
-                    {
-                        "receipt_id": r.receipt_id,
-                        "merchant": r.merchant,
-                        "date": r.date,
-                        "success": r.success,
-                        "score": r.score,
-                        "scores": r.scores,
-                        "error": r.error,
-                        "ocr_time_ms": r.ocr_time_ms,
-                        "llm_time_ms": r.llm_time_ms,
-                        "total_time_ms": r.total_time_ms,
-                    }
-                    for r in summary.results
-                ],
-            }
+            output_data = asdict(summary)
             await asyncio.to_thread(Path(args.output).write_text, json.dumps(output_data, indent=2))
             print(f"Results written to {args.output}")
 

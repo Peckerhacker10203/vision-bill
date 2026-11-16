@@ -571,7 +571,10 @@ class ReceiptDB:
         receipt_id: UUID,
         user_id: UUID | None,
         can_see_all: bool,
+        *, lock: bool = True,
     ) -> asyncpg.Record | None:
+        if not lock:
+            return await conn.fetchrow("SELECT * FROM receipts WHERE id=$1 AND ($3 OR user_id=$2)", receipt_id, user_id, can_see_all)
         # Match workflow's image-before-receipt lock order. Recheck scope after locking.
         visible = await conn.fetchrow(
             "SELECT image_id FROM receipts WHERE id=$1 AND ($3 OR $2::uuid IS NULL OR user_id=$2)",
@@ -621,6 +624,7 @@ class ReceiptDB:
         image_id: UUID | None,
         sources: dict[str, list[SourceRef]],
         overlaps: list[dict[str, Any]],
+        *, lock: bool = True,
     ) -> None:
         assert_metadata_only(overlaps)
         references = [ref for refs in sources.values() for ref in refs]
@@ -650,7 +654,7 @@ class ReceiptDB:
         parts = {
             part["photo_index"]: part
             for part in await conn.fetch(
-                "SELECT * FROM image_source_parts WHERE image_id=$1 ORDER BY photo_index FOR SHARE",
+                "SELECT * FROM image_source_parts WHERE image_id=$1 ORDER BY photo_index" + (" FOR SHARE" if lock else ""),
                 image_id,
             )
         }
@@ -676,6 +680,7 @@ class ReceiptDB:
         self,
         conn: asyncpg.Connection,
         image_id: UUID | None,
+        *, lock: bool = True,
     ) -> list[OriginalAvailability]:
         if image_id is None:
             return []
@@ -684,7 +689,7 @@ class ReceiptDB:
             return []
         image = ImageRow.model_validate(dict(row))
         durable = await conn.fetch(
-            "SELECT * FROM image_source_parts WHERE image_id=$1 ORDER BY photo_index FOR SHARE",
+            "SELECT * FROM image_source_parts WHERE image_id=$1 ORDER BY photo_index" + (" FOR SHARE" if lock else ""),
             image_id,
         )
         by_index = {part["photo_index"]: part for part in durable}

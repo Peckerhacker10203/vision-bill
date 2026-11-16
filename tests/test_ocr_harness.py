@@ -287,3 +287,20 @@ def test_engine_manifest_rejects_non_objects_and_non_string_ids(tmp_path, value)
     manifest.write_text(json.dumps(value))
     with pytest.raises(ValueError, match="objects with string IDs"):
         load_engines(manifest)
+
+
+def test_historical_paddle_build_never_adopts_or_builds_production_sidecar(tmp_path,monkeypatch):
+    from scripts.ocr_harness import __main__ as cli
+    calls=[]
+    monkeypatch.setattr(cli,'bounded_run',lambda argv,*args: calls.append(argv))
+    def no_inspect(*args,**kwargs):
+        raise AssertionError('historical comparator must not inspect stale production tag')
+    monkeypatch.setattr(cli.subprocess,'run',no_inspect)
+    assert cli.build([{'target':'paddle','image':'vb-historical-cpu-test'}],tmp_path,30)==[]
+    assert len(calls)==1
+    assert calls[0] == ['docker','build','--target','paddle','-t','vb-historical-cpu-test',str(cli.WORKER.parent)]
+    recipe=(cli.WORKER.parent/'Dockerfile').read_text()
+    # Build-recipe boundary: historical CPU stage must be independently constructible.
+    paddle_stage=recipe.split(' AS paddle\n')[1]
+    assert 'requirements.paddle-cpu.lock' in paddle_stage
+    assert 'vision-bill-paddleocr-service' not in recipe

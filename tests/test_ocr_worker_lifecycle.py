@@ -99,6 +99,10 @@ class FakeProcess:
             self.active_request = request
             self.context.requests.append(request)
             self.context.entered.set()
+            if self.context.mode == "fatal":
+                self.context.init_release.clear()
+                out_q.put({"generation":generation, "request_id":str(request.request_id), "kind":"qualification_invalidated"})
+                continue
             if self.context.mode == "crash":
                 self.dead.set()
                 return
@@ -638,3 +642,54 @@ def test_runtime_readiness_belongs_to_live_generation_only():
     assert worker.readiness().runtime_fingerprint == "runtime"
     worker.stop()
     assert worker.readiness().runtime_fingerprint is None
+
+
+def test_native_invalidated_qualification_exits_child_instead_of_serving_again(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from ocr_service import pipeline
+    from ocr_service.worker import _worker_main
+
+    item = request(tmp_path)
+    calls = []
+    adapter = SimpleNamespace(qualified=True, profile_id='p', runtime_fingerprint='r', qualify=lambda p: None)
+    def predict(*args, **kwargs):
+        calls.append(kwargs['request_id'])
+        adapter.qualified = False
+        raise ValueError('private native failure')
+    adapter.predict = predict
+    monkeypatch.setattr(pipeline, 'build_pipeline', lambda *a: adapter)
+    incoming, outgoing = queue.Queue(), queue.Queue()
+    incoming.put(item)
+    incoming.put(item)
+    incoming.put(None)
+    _worker_main(incoming, outgoing, 1, Path(__file__).parents[1] / 'paddleocr-service/profile.json', object(), tmp_path, tmp_path)
+    assert outgoing.get()['kind'] == 'ready'
+    assert outgoing.get()['kind'] == 'qualification_invalidated'
+    assert calls == [item.request_id]
+
+
+def test_fatal_live_worker_retires_owned_generation_and_waits_for_fresh_qualification(tmp_path):
+    from ocr_service.worker import OcrWorkerError
+    context = FakeContext('fatal')
+    worker = manager(context)
+    first = request(tmp_path)
+    old_proc, old_in, old_out = worker._proc, worker._in_q, worker._out_q
+    old_directory = Path(worker._reply_directory.name)
+    try:
+        with pytest.raises(OcrWorkerError, match='ocr_qualification_invalidated'):
+            worker.infer(first, deadline_monotonic=time.monotonic()+1)
+        assert not worker.readiness().ready
+        assert not old_proc.is_alive() and old_in.closed and old_out.closed
+        assert not old_directory.exists()
+        context.mode = 'ok'
+        context.init_release.set()
+        for _ in range(100):
+            if worker.readiness().ready:
+                break
+            time.sleep(.01)
+        assert worker.readiness().ready
+        second = request(tmp_path)
+        assert worker.infer(second, deadline_monotonic=time.monotonic()+1).request_id == second.request_id
+        assert context.requests == [first, second]
+    finally:
+        worker.stop()

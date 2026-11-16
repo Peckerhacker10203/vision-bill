@@ -8,7 +8,7 @@ application's artifact cleanup, but never a partially committed receipt.
 """
 
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -26,6 +26,7 @@ from ...model.workflow import (
     AnalysisClaim,
     AttemptOutcome,
     CommitResult,
+    DeletedResource,
     DraftFinalize,
     DraftPatch,
     EnqueueResult,
@@ -517,6 +518,114 @@ class WorkflowDB:
                     model_id,
                 )
             return ImageRow.model_validate(dict(row))
+
+    async def set_wait_reason(self, image: ImageRow, reason: str | None) -> bool:
+        """A readiness observation cannot mutate a successor generation or claimed state."""
+        if reason not in {None, "provider_unavailable", "ocr_unavailable", "vision_model_unavailable", "formatter_model_unavailable"}:
+            raise ValueError("invalid_wait_reason")
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """UPDATE images SET wait_reason=$4 WHERE id=$1 AND generation=$2 AND status=$3
+                AND claim_token IS NOT DISTINCT FROM $5::uuid AND receipt_id IS NULL
+                AND status IN ('pending','processing')
+                AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id) RETURNING id""",
+                image.id, image.generation, image.status, reason, image.claim_token,
+            )
+        return row is not None
+
+    async def delete_resource(
+        self, resource_id: UUID, *, receipt: bool, scope: AccessScope,
+        validate_files: Callable[[DeletedResource], None],
+    ) -> DeletedResource | None:
+        """Image-before-receipt lock, captured ownership, and one atomic DB deletion."""
+        async with self.pool.acquire() as conn, conn.transaction():
+            kind = "receipt" if receipt else "image"
+            pending = await conn.fetchrow("SELECT * FROM resource_deletions WHERE resource_id=$1 AND resource_kind=$2 AND ($4 OR owner_id=$3) FOR UPDATE", resource_id, kind, scope.user_id, scope.can_see_all)
+            if pending is not None:
+                return DeletedResource.model_validate(_decoded(pending["files"]))
+            receipt_row = None
+            if receipt:
+                receipt_row = await self._receipts._lock_review_receipt(conn, resource_id, scope.user_id, scope.can_see_all)
+                if receipt_row is None:
+                    return None
+                image_id = receipt_row["image_id"]
+            else:
+                image_id = resource_id
+            row = await conn.fetchrow("SELECT * FROM images WHERE id=$1 AND ($3 OR user_id=$2) FOR UPDATE", image_id, scope.user_id, scope.can_see_all) if image_id else None
+            if not receipt and row is None:
+                return None
+            if receipt and image_id is not None and row is None:
+                raise ValueError("invalid_image_owner")
+            if row is not None:
+                linked = await conn.fetch("SELECT id FROM receipts WHERE image_id=$1", image_id)
+                if any(item["id"] != (resource_id if receipt else None) for item in linked):
+                    raise ValueError("resource_still_referenced")
+                if not receipt and row["status"] not in {"pending", "failed", "timed_out", "unreadable"}:
+                    raise ValueError("active_submission")
+            deleted = DeletedResource(image_id=image_id, receipt_id=resource_id if receipt else None)
+            if row is not None:
+                image = ImageRow.model_validate(dict(row))
+                originals = {part["photo_index"]: part for part in await conn.fetch(
+                    "SELECT * FROM image_source_parts WHERE image_id=$1 ORDER BY photo_index FOR SHARE", image_id)}
+                for index, part in enumerate(image.parts()):
+                    if original := originals.get(index):
+                        if original["image_path"] != part.image_path:
+                            raise ValueError("original_artifact_identity_changed")
+                        part.part_id = original["part_id"]
+                        part.source_sha256 = original["source_sha256"]
+                        part.photo_index = index
+                    shared = await conn.fetchval("""SELECT EXISTS(SELECT 1 FROM images WHERE id<>$1 AND
+                        (image_path=$2 OR additional_images @> jsonb_build_array(jsonb_build_object('image_path',$2::text))))
+                        OR EXISTS(SELECT 1 FROM image_source_parts WHERE image_id<>$1 AND image_path=$2)""", image_id, part.image_path)
+                    if not shared:
+                        deleted.parts.append(part)
+                views = await conn.fetch("""SELECT v.*,p.photo_index,p.source_sha256,p.image_id AS part_image_id
+                    FROM extraction_working_views v JOIN image_source_parts p ON p.part_id=v.part_id
+                    WHERE v.image_id=$1""", image_id)
+                for view in views:
+                    if view["part_image_id"] != image_id:
+                        raise ValueError("invalid_working_artifact_owner")
+                    shared = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM extraction_working_views WHERE image_id<>$1 AND artifact_path=$2)", image_id, view["artifact_path"])
+                    if not shared:
+                        deleted.working_views.append(PersistedWorkingView(
+                            part_id=view["part_id"], photo_index=view["photo_index"], source_sha256=view["source_sha256"],
+                            artifact_path=view["artifact_path"], metadata=WorkingImageMetadata.model_validate(_decoded(view["metadata"]))))
+            validate_files(deleted)
+            if receipt_row is not None:
+                owner_id = receipt_row["user_id"]
+            else:
+                assert row is not None
+                owner_id = row["user_id"]
+            await conn.execute("INSERT INTO resource_deletions(resource_id,resource_kind,owner_id,files) VALUES($1,$2,$3,$4::jsonb)", resource_id, kind, owner_id, _json(deleted.model_dump(mode="json")))
+            if receipt:
+                await conn.execute("DELETE FROM receipts WHERE id=$1", resource_id)
+            if row is not None:
+                await conn.execute("DELETE FROM images WHERE id=$1", image_id)
+        return deleted
+
+    async def cleanup_deleted_resource(self, resource_id: UUID, *, receipt: bool, scope: AccessScope,
+                                       remove_files: Callable[[DeletedResource], None]) -> bool:
+        """Serialize retries; retain metadata if cleanup, proof, cancellation or commit fails."""
+        async with self.pool.acquire() as conn, conn.transaction():
+            kind = "receipt" if receipt else "image"
+            row = await conn.fetchrow("SELECT files FROM resource_deletions WHERE resource_id=$1 AND resource_kind=$2 AND ($4 OR owner_id=$3) FOR UPDATE", resource_id, kind, scope.user_id, scope.can_see_all)
+            if row is None:
+                return False
+            deleted = DeletedResource.model_validate(_decoded(row["files"]))
+            if await conn.fetchval("SELECT EXISTS(SELECT 1 FROM images WHERE id=$1) OR EXISTS(SELECT 1 FROM receipts WHERE id=$2 OR image_id=$1)", deleted.image_id, deleted.receipt_id):
+                raise ValueError("resource_still_referenced")
+            # All live file references must be absent at the retry boundary. Failed proof retains
+            # the manifest and files; it never broadens the deletion set.
+            for path in [p.image_path for p in deleted.parts] + [v.artifact_path for v in deleted.working_views] + list(deleted.thumbnail_sha256):
+                if await conn.fetchval("""SELECT EXISTS(SELECT 1 FROM images WHERE image_path=$1 OR thumbnail_path=$1 OR
+                    additional_images @> jsonb_build_array(jsonb_build_object('image_path',$1::text)) OR
+                    additional_images @> jsonb_build_array(jsonb_build_object('thumbnail_path',$1::text)))
+                    OR EXISTS(SELECT 1 FROM image_source_parts WHERE image_path=$1)
+                    OR EXISTS(SELECT 1 FROM extraction_working_views WHERE artifact_path=$1)""", path):
+                    raise ValueError("resource_still_referenced")
+            remove_files(deleted)
+            await conn.execute("DELETE FROM resource_deletions WHERE resource_id=$1 AND resource_kind=$2", resource_id, kind)
+        return True
 
     async def due_candidates(self) -> list[ImageRow]:
         async with self.pool.acquire() as conn:

@@ -1,5 +1,10 @@
 # Only the selected render node and KFD; no privileged/container-wide DRI access.
 services:
+  vision_bill:
+    environment:
+      OCR__ENABLED: "true"
+      OCR__REQUIRED: "${OCR__REQUIRED:-false}"
+      OCR__ALLOW_VISION_FALLBACK: "${OCR__ALLOW_VISION_FALLBACK:-false}"
   paddleocr-service:
     build:
       context: .
