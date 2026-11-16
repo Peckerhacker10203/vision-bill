@@ -92,7 +92,9 @@ def postgres():
             db="workflow_admin",
         )
     finally:
-        subprocess.run(["docker", "rm", "--force", name], check=True, capture_output=True)
+        subprocess.run(
+            ["docker", "rm", "--force", "--volumes", name], check=True, capture_output=True
+        )
 
 
 def migrate(settings, revision="head", direction="upgrade", check=True):

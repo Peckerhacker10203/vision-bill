@@ -81,7 +81,7 @@ def role_cluster():
             ),
         )
     finally:
-        docker("rm", "--force", name)
+        docker("rm", "--force", "--volumes", name)
 
 
 def migrate(owner, directory, revision):
