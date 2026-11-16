@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { t } from '$lib/i18n';
+	import { diagnosticLabel } from '$lib/diagnostics';
 	import type { ReviewFinding, SourceRef } from '$lib/types';
 	let {
 		findings,
@@ -32,10 +33,16 @@
 <div class="my-4 space-y-3" aria-label={$t('review.findings')}>
 	{#each findings as finding (finding.id)}
 		<article class="rounded-xl border border-outline-variant p-3" data-severity={finding.severity}>
-			<p class="font-medium">{finding.severity}: {finding.code}</p>
-			<p class="text-sm">{finding.field_path}</p>
+			<p class="font-medium">
+				{diagnosticLabel($t, 'severity', finding.severity)}: {diagnosticLabel(
+					$t,
+					'checks',
+					finding.code
+				)}
+			</p>
+			<p class="text-xs text-on-surface-variant">{finding.code} · {finding.field_path}</p>
 			{#each Object.entries(finding.comparison) as [key, value] (key)}<p class="text-sm">
-					{key}: {value ?? '—'}
+					{diagnosticLabel($t, 'comparison', key)}: {value ?? '—'}
 				</p>{/each}
 			{#if finding.source_refs.length && onSource}<button
 					type="button"
@@ -44,7 +51,7 @@
 				>{/if}
 			{#if finding.severity === 'review' && editable}
 				<label class="mt-2 block text-sm"
-					>{$t('review.comment')}: {finding.code}<textarea
+					>{$t('review.comment')}: {diagnosticLabel($t, 'checks', finding.code)}<textarea
 						class="block w-full rounded border p-2"
 						bind:value={comments[finding.id]}></textarea></label
 				>

@@ -693,3 +693,95 @@ def test_fatal_live_worker_retires_owned_generation_and_waits_for_fresh_qualific
         assert context.requests == [first, second]
     finally:
         worker.stop()
+
+
+def test_idle_death_recovers_from_readiness_only_and_qualifies_new_request(tmp_path):
+    context = FakeContext()
+    worker = manager(context)
+    old = context.processes[0]
+    old_channels = [worker._in_q, worker._out_q, worker._reply_sender]
+    old_dir = Path(worker._reply_directory.name)
+    try:
+        old.dead.set()
+        old.thread.join(1)
+        context.started.clear()
+        context.init_release.clear()
+        assert not worker.readiness().ready
+        assert context.started.wait(1), "readiness did not schedule replacement"
+        assert worker.readiness().generation == 2
+        assert not worker.readiness().ready, "replacement must freshly qualify"
+        assert not context.requests
+        assert all(channel.closed for channel in old_channels)
+        assert not old_dir.exists()
+        context.init_release.set()
+        wait_ready(worker)
+        item = request(tmp_path)
+        assert worker.infer(item, deadline_monotonic=time.monotonic() + 1).request_id == item.request_id
+        assert context.requests == [item]
+        assert len(context.processes) == 2
+    finally:
+        worker.stop()
+
+
+def test_concurrent_idle_observers_schedule_one_replacement_without_blocking_http(tmp_path):
+    context = FakeContext()
+    worker = manager(context)
+    try:
+        context.processes[0].dead.set()
+        context.processes[0].thread.join(1)
+        # Hold inference ownership to make background recovery observably pending.
+        worker._active.acquire()
+        try:
+            with ThreadPoolExecutor(12) as pool:
+                observations = list(pool.map(lambda _: worker.readiness(), range(24)))
+            assert all(not item.ready for item in observations)
+            assert len(context.processes) == 1
+        finally:
+            worker._active.release()
+        wait_ready(worker)
+        assert len(context.processes) == 2
+        item = request(tmp_path)
+        assert worker.infer(item, deadline_monotonic=time.monotonic() + 1).request_id == item.request_id
+    finally:
+        worker.stop()
+
+
+def test_stop_wins_over_scheduled_idle_recovery():
+    context = FakeContext()
+    worker = manager(context)
+    worker._active.acquire()
+    try:
+        context.processes[0].dead.set()
+        context.processes[0].thread.join(1)
+        assert not worker.readiness().ready
+        worker.stop()
+    finally:
+        worker._active.release()
+    # A scheduled recovery must finish without starting another process.
+    for thread in threading.enumerate():
+        if thread.name == 'ocr-idle-recovery':
+            thread.join(1)
+            assert not thread.is_alive()
+    assert len(context.processes) == 1
+    assert worker.readiness().reason_code == 'ocr_stopped'
+
+
+def test_failed_idle_replacement_is_not_an_infinite_configuration_restart_loop():
+    context = FakeContext()
+    worker = manager(context)
+    try:
+        context.init_fail = True
+        context.processes[0].dead.set()
+        context.processes[0].thread.join(1)
+        context.started.clear()
+        worker.readiness()
+        assert context.started.wait(1), "no replacement was attempted"
+        for thread in threading.enumerate():
+            if thread.name == 'ocr-idle-recovery':
+                thread.join(1)
+        for _ in range(20):
+            assert not worker.readiness().ready
+        assert len(context.processes) == 2
+        assert worker.readiness().reason_code == 'ocr_init_failed'
+    finally:
+        worker.stop()

@@ -103,3 +103,28 @@ it('blocks already-open custom membership and create options while disabled', as
 	await fireEvent.click(screen.getByRole('option', { name: '+ Create “Late”' }));
 	expect(oncreate).not.toHaveBeenCalled();
 });
+
+it('supports native text editing, filtering and inline creation', async () => {
+	const create = vi.fn();
+	render(CollectionPicker, {
+		options,
+		mode: 'multi',
+		value: [],
+		allowCreate: true,
+		oncreate: create,
+		onchange: vi.fn()
+	});
+	const input = screen.getByRole('combobox') as HTMLInputElement;
+	await fireEvent.click(input);
+	// Native text-selection editing is unavailable on checkboxes. Unlike
+	// target.value injection, this executes the editable input contract.
+	input.setSelectionRange(0, 0);
+	input.setRangeText('Berl', 0, 0, 'end');
+	await fireEvent.input(input);
+	expect(screen.getByRole('option', { name: 'Berlin' })).not.toBeNull();
+	expect(screen.queryByRole('option', { name: 'Christmas' })).toBeNull();
+	input.setRangeText('Summer Trip', 0, input.value.length, 'end');
+	await fireEvent.input(input);
+	await fireEvent.keyDown(input, { key: 'Enter' });
+	expect(create).toHaveBeenCalledWith('Summer Trip');
+});

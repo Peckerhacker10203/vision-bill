@@ -12,7 +12,8 @@ THEROCK_BUILD="$SOURCE_ROOT/therock-build"
 PADDLE_SRC="$SOURCE_ROOT/Paddle"
 # Fresh sources/caches only: a previous native build is not a reproducible input.
 test ! -e "$THEROCK_SRC" && test ! -e "$PADDLE_SRC" && test ! -e "$THEROCK_BUILD"
-TARGETS='gfx1030;gfx1031;gfx1032;gfx1034'
+TARGETS="$(python "$RECIPE/../ocr_service/targets.py" --targets "${AMDGPU_TARGETS:-}" --output "$EVIDENCE/targets.json")"
+export VISION_BILL_AMDGPU_TARGETS="$TARGETS"
 
 git clone --no-checkout https://github.com/ROCm/TheRock.git "$THEROCK_SRC"
 git -C "$THEROCK_SRC" checkout --detach b324869fb3116353ac7eec5e6926aa3d452ac987
@@ -28,7 +29,7 @@ cmake -S "$THEROCK_SRC" -B "$THEROCK_BUILD" -GNinja \
   -DCMAKE_BUILD_TYPE=Release -DTHEROCK_ENABLE_ALL=ON \
   -DTHEROCK_AMDGPU_FAMILIES= "-DTHEROCK_AMDGPU_TARGETS=$TARGETS" \
   -DTHEROCK_DIST_AMDGPU_FAMILIES= "-DTHEROCK_DIST_AMDGPU_TARGETS=$TARGETS" \
-  -DTHEROCK_AMDGPU_DIST_BUNDLE_NAME=vision-bill-rdna2-v1 -DBUILD_TESTING=OFF
+  -DTHEROCK_AMDGPU_DIST_BUNDLE_NAME=vision-bill-candidate-v1 -DBUILD_TESTING=OFF
 cmake --build "$THEROCK_BUILD" --target dist-rocm --parallel "$BUILD_JOBS"
 cmake --install "$THEROCK_BUILD" --component rocm --prefix "$SDK"
 cp "$THEROCK_BUILD/CMakeCache.txt" "$EVIDENCE/therock-CMakeCache.txt"

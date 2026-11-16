@@ -25,8 +25,10 @@ RUN curl --fail --location https://static.rust-lang.org/dist/2026-04-16/rust-1.9
  && /tmp/rust-1.95.0-x86_64-unknown-linux-gnu/install.sh --prefix=/usr/local --without=rust-docs \
  && rm -rf /tmp/rust.tar.xz /tmp/rust-1.95.0-x86_64-unknown-linux-gnu
 COPY paddleocr-service/build/ /opt/ocr/build/
+COPY paddleocr-service/ocr_service/targets.py /opt/ocr/ocr_service/targets.py
+ARG AMDGPU_TARGETS
 ARG BUILD_JOBS=8
-RUN BUILD_JOBS="$BUILD_JOBS" bash /opt/ocr/build/build_rocm.sh
+RUN BUILD_JOBS="$BUILD_JOBS" AMDGPU_TARGETS="$AMDGPU_TARGETS" bash /opt/ocr/build/build_rocm.sh
 COPY paddleocr-service/requirements.runtime.lock /opt/locks/requirements.runtime.lock
 RUN python -m pip install --require-hashes --no-deps --no-build-isolation -r /opt/locks/requirements.runtime.lock \
  && cd / && sha256sum -c /opt/ocr/build-evidence/native-wheels.sha256 \
@@ -36,6 +38,7 @@ ENV LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib:/opt/rocm/lib/rocm_sysd
 RUN python /opt/ocr/build/inspect_kernels.py --sdk /opt/rocm \
     --paddle /opt/venv/lib/python3.12/site-packages/paddle \
     --output /opt/ocr/build-evidence/kernels.json \
+    --target-profile /opt/ocr/build-evidence/targets.json \
     --compile-log /opt/ocr/build-evidence/paddle-build.log
 # Candidate native source/build caches stay out of the final artifact.
 FROM ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5

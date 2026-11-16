@@ -253,3 +253,68 @@ def test_deleted_original_retry_removes_owned_thumbnail_after_original_is_missin
     original.unlink()  # The first attempt removed it before an unlink failure.
     image_service.remove_deleted_files(deleted)
     assert not thumbnail.exists()
+
+
+@pytest.mark.parametrize('mode', ['RGBA', 'LA', 'P'])
+def test_thumbnail_composites_transparent_document_over_white(image_service, tmp_path, mode):
+    from PIL import Image as PILImage
+    source = tmp_path / f'{mode}.png'
+    if mode == 'RGBA':
+        image = PILImage.new(mode, (40, 40), (0, 0, 0, 0))
+        ink = (0, 0, 0, 255)
+    elif mode == 'LA':
+        image = PILImage.new(mode, (40, 40), (0, 0))
+        ink = (0, 255)
+    else:
+        image = PILImage.new('P', (40, 40), 0)
+        image.putpalette([0, 0, 0, 0, 0, 0] + [0] * 762)
+        image.info['transparency'] = 0
+        ink = 1
+    for x in range(15, 25):
+        for y in range(15, 25):
+            image.putpixel((x, y), ink)
+    image.save(source)
+    original = source.read_bytes()
+    thumb = image_service.generate_thumbnail(source)
+    assert thumb is not None
+    with PILImage.open(thumb) as decoded:
+        assert min(decoded.getpixel((3, 3))[:3]) > 235
+        assert max(decoded.getpixel((20, 20))[:3]) < 20
+    assert source.read_bytes() == original
+
+
+def test_relative_thumbnail_deletion_seals_paths_and_retries(image_service, tmp_path, monkeypatch):
+    from vision_bill.model.db.image import ImagePart
+    from vision_bill.model.workflow import DeletedResource
+    monkeypatch.chdir(tmp_path)
+    original = Path('uploads/original.png')
+    original.parent.mkdir(exist_ok=True)
+    original.write_bytes(b'original')
+    thumb = image_service._thumb_for(original)
+    thumb.parent.mkdir()
+    thumb.write_bytes(b'thumbnail')
+    deleted = DeletedResource(parts=[ImagePart(image_path=str(original), thumbnail_path=str(thumb))])
+    image_service.validate_deleted_files(deleted, initial=True)
+    original.unlink()
+    image_service.remove_deleted_files(deleted)
+    assert not thumb.exists()
+    image_service.remove_deleted_files(deleted)
+
+
+@pytest.mark.parametrize('bad', ['wrong', 'symlink', 'changed'])
+def test_relative_thumbnail_deletion_retains_identity_guards(image_service, tmp_path, monkeypatch, bad):
+    from vision_bill.model.db.image import ImagePart
+    from vision_bill.model.workflow import DeletedResource
+    monkeypatch.chdir(tmp_path)
+    original = Path('original.png'); original.write_bytes(b'original')
+    thumb = image_service._thumb_for(original); thumb.parent.mkdir(); thumb.write_bytes(b'thumbnail')
+    deleted = DeletedResource(parts=[ImagePart(image_path=str(original), thumbnail_path=str(thumb))])
+    if bad == 'wrong': deleted.parts[0].thumbnail_path = 'other.webp'
+    elif bad == 'symlink':
+        other = Path('other.webp'); other.write_bytes(b'thumbnail'); thumb.unlink(); thumb.symlink_to(other.absolute())
+    else:
+        image_service.validate_deleted_files(deleted, initial=True)
+        thumb.write_bytes(b'changed')
+    with pytest.raises(ValueError, match='thumbnail_artifact'):
+        image_service.validate_deleted_files(deleted, initial=bad != 'changed')
+    assert original.exists() and thumb.exists()

@@ -2,6 +2,7 @@
 	import { onDestroy } from 'svelte';
 	import { t } from '$lib/i18n';
 	import { api } from '$lib/api/client';
+	import { currentSessionGeneration } from '$lib/session-lifetime';
 	import { queryClient } from '$lib/query/client';
 	import { queryKeys } from '$lib/query/keys';
 	import { snackbar } from '$lib/ui/snackbar.svelte';
@@ -39,6 +40,30 @@
 		alive = false;
 		onPendingChange?.(false);
 	});
+	let activeOwner: { value: string[]; id: string } | null = null;
+	$effect(() => {
+		if (activeOwner?.value === value && activeOwner.id === id) return;
+		const owner = { value, id };
+		activeOwner = owner;
+		creating = false;
+		query = '';
+		open = false;
+	});
+	function ownerLifetime() {
+		const owner = activeOwner,
+			original = value,
+			ownerId = id,
+			generation = currentSessionGeneration();
+		return {
+			samePrincipal: () => generation === currentSessionGeneration(),
+			current: () =>
+				alive &&
+				activeOwner === owner &&
+				value === original &&
+				id === ownerId &&
+				generation === currentSessionGeneration()
+		};
+	}
 	let wasOpen = $state(false);
 	/** Keyboard highlight offset within `selectableRows` (−1 = nothing). */
 	let activeOffset = $state(-1);
@@ -106,14 +131,15 @@
 	/** Promote a suggested (non-vocabulary) tag into the standard vocabulary. */
 	async function keepSuggested(tag: string): Promise<void> {
 		if (creating || disabled) return;
+		const origin = ownerLifetime();
 		creating = true;
 		try {
 			await api.createTag(tag);
-			await refreshVocabulary();
+			if (origin.samePrincipal()) await refreshVocabulary();
 		} catch {
-			snackbar.notify('error', $t('editor.tagsCreateFailed'));
+			if (origin.current()) snackbar.notify('error', $t('editor.tagsCreateFailed'));
 		} finally {
-			creating = false;
+			if (origin.current()) creating = false;
 		}
 	}
 
@@ -121,22 +147,22 @@
 	async function createFromQuery(): Promise<void> {
 		const name = normalizeTag(query);
 		if (name === '' || creating || disabled) return;
-		const owner = value;
-		const ownerId = id;
+		const origin = ownerLifetime();
 		creating = true;
 		try {
 			const { name: created } = await api.createTag(name);
-			if (!alive || value !== owner || id !== ownerId) return;
-			if (!value.includes(created)) {
-				value.push(created);
-				revision++;
+			if (origin.current()) {
+				if (!value.includes(created)) {
+					value.push(created);
+					revision++;
+				}
+				query = '';
 			}
-			query = '';
-			await refreshVocabulary();
+			if (origin.samePrincipal()) await refreshVocabulary();
 		} catch {
-			snackbar.notify('error', $t('editor.tagsCreateFailed'));
+			if (origin.current()) snackbar.notify('error', $t('editor.tagsCreateFailed'));
 		} finally {
-			creating = false;
+			if (origin.current()) creating = false;
 		}
 	}
 

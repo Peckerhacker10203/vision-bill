@@ -110,7 +110,9 @@ it('does not verify new material findings using pre-save comments', async () => 
 	await screen.findByLabelText('Merchant');
 	await fireEvent.input(screen.getByLabelText('Merchant'), { target: { value: 'Changed' } });
 	await fireEvent.click(screen.getByRole('button', { name: 'Save & verify' }));
-	await screen.findByLabelText('Review comment: total_mismatch');
+	await screen.findByLabelText(
+		'Review comment: Additional diagnostic: total mismatch. Check the original or processing status.'
+	);
 	expect(verify).not.toHaveBeenCalled();
 	expect(screen.queryByRole('button', { name: 'Save' })).toBeNull();
 });
@@ -153,7 +155,7 @@ it('has no acknowledgement control for missing originals and disables verificati
 		})
 	);
 	render(Page);
-	await screen.findByText('integrity: missing_original');
+	await screen.findByText(/Verification blocked: The original photo is missing/);
 	expect(screen.queryByRole('textbox', { name: /Review comment/ })).toBeNull();
 	expect((screen.getByRole('button', { name: 'Verify' }) as HTMLButtonElement).disabled).toBe(true);
 });

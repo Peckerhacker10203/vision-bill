@@ -88,7 +88,7 @@ class ImageDB:
             return
 
         dsn = self._settings.pg_dsn
-        logger.info("Creating asyncpg image connection pool (dsn=%s…)", dsn[:30])
+        logger.info("Creating asyncpg image connection pool")
         self._pool = await asyncpg.create_pool(dsn=dsn)
 
         async with self._pool.acquire() as conn:

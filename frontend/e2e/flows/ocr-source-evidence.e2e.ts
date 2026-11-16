@@ -82,7 +82,7 @@ test.describe('saved OCR evidence and original integrity', () => {
 		await page.route('**' + view.url, (route) => route.fulfill({ status: 404 }));
 		await page.reload();
 		await expect(page.getByText('Source image unavailable', { exact: true })).toBeVisible();
-		await expect(page.getByText('missing_original', { exact: true })).toHaveCount(0);
+		await expect(page.getByText(/The original photo is missing/)).toHaveCount(0);
 	});
 
 	test('accepted boundary overlap projects final C row to its own exact block and polygon', async ({
@@ -188,9 +188,14 @@ test.describe('saved OCR evidence and original integrity', () => {
 		).toBe(true);
 		await page.goto(`/receipts/${job.receipt_id}`);
 		await expect(
-			page.getByText('integrity: original_integrity_failed', { exact: true })
+			page.getByText(
+				'Verification blocked: The original is unavailable or its bytes have changed. Verification is blocked.',
+				{ exact: true }
+			)
 		).toBeVisible();
-		await expect(page.getByRole('textbox', { name: /original_integrity_failed/ })).toHaveCount(0);
+		await expect(
+			page.getByRole('textbox', { name: /Review comment: The original is unavailable/ })
+		).toHaveCount(0);
 		await expect(page.getByRole('button', { name: 'Verify', exact: true })).toBeDisabled();
 		const denied = await context.request.post(`/api/v1/receipts/${job.receipt_id}/verify`, {
 			data: {

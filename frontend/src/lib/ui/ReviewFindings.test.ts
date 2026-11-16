@@ -25,7 +25,7 @@ it('only review findings accept comments and reset on a new review version', asy
 	const onChange = vi.fn();
 	const view = render(ReviewFindings, { findings, revision: 1, onChange });
 	expect(screen.getAllByRole('textbox')).toHaveLength(1);
-	await fireEvent.input(screen.getByLabelText('Review comment: total_mismatch'), {
+	await fireEvent.input(screen.getByRole('textbox'), {
 		target: { value: 'Printed total checked' }
 	});
 	expect(onChange).toHaveBeenLastCalledWith([
@@ -44,3 +44,66 @@ it('clears prior comments as soon as material editing starts', async () => {
 	expect((screen.getByRole('textbox') as HTMLTextAreaElement).value).toBe('');
 	expect(onChange).toHaveBeenLastCalledWith([]);
 });
+
+it.each(['en', 'de'] as const)(
+	'explains checks2 and exact comparison strings in %s',
+	async (language) => {
+		const { setLocale } = await import('$lib/i18n');
+		setLocale(language);
+		const checks = [
+			'uncertain_net_subtotal_basis',
+			'unknown_discount_treatment',
+			'missing_tax_information',
+			'amount_discrepancy',
+			'unknown_source_mapping'
+		];
+		render(ReviewFindings, {
+			revision: 2,
+			findings: checks.map((code, i): ReviewFinding => {
+				const comparison: Record<string, string | null> =
+					i === 3
+						? { observed: '-0.00000000100', expected: '1.234567890123', tolerance: '0.05' }
+						: {};
+				return {
+					id: String(i),
+					code,
+					severity: 'review',
+					field_path: 'subtotal',
+					source_refs: [],
+					comparison
+				};
+			})
+		});
+		expect(
+			screen.getByText(
+				language === 'en'
+					? /A net subtotal cannot be compared reliably/
+					: /Eine Nettozwischensumme lässt sich nicht zuverlässig/,
+				{ selector: 'p' }
+			)
+		).not.toBeNull();
+		expect(
+			screen.getByText(
+				language === 'en' ? /Specify whether the discount/ : /Gib an, ob der Rabatt/,
+				{ selector: 'p' }
+			)
+		).not.toBeNull();
+		expect(
+			screen.getByText(language === 'en' ? /Tax information is missing/ : /Steuerangaben fehlen/, {
+				selector: 'p'
+			})
+		).not.toBeNull();
+		expect(
+			screen.getByText(
+				language === 'en' ? /Observed: -0.00000000100/ : /Beobachtet: -0.00000000100/
+			)
+		).not.toBeNull();
+		expect(
+			screen.getByText(language === 'en' ? /Expected: 1.234567890123/ : /Erwartet: 1.234567890123/)
+		).not.toBeNull();
+		expect(
+			screen.getByText(language === 'en' ? /Tolerance: 0.05/ : /Toleranz: 0.05/)
+		).not.toBeNull();
+		setLocale('en');
+	}
+);

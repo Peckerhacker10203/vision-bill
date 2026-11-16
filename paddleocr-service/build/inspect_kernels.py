@@ -10,10 +10,14 @@ import hashlib
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
-TARGETS = {"gfx1030", "gfx1031", "gfx1032", "gfx1034"}
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ocr_service.targets import DEFAULT_TARGETS, validate_profile
+
+TARGETS = set(DEFAULT_TARGETS)
 
 
 def require_targets(found: set[str], required: set[str]) -> None:
@@ -23,7 +27,7 @@ def require_targets(found: set[str], required: set[str]) -> None:
         )
 
 
-def validate_compile_targets(path: Path) -> None:
+def validate_compile_targets(path: Path, required_targets: set[str] = TARGETS) -> None:
     if path.suffix == ".json":
         commands = [
             row.get("command", " ".join(row.get("arguments", [])))
@@ -38,14 +42,14 @@ def validate_compile_targets(path: Path) -> None:
         found = set(re.findall(r"--offload-arch=(gfx[0-9a-f]+)", command))
         if not found:
             continue
-        if found != TARGETS:
-            raise ValueError("Native compile target flags differ from exact RDNA2 set")
+        if found != required_targets:
+            raise ValueError("Native compile target flags differ from selected candidate set")
         matched += 1
     if not matched:
         raise ValueError("Native compile target commands are unavailable")
 
 
-def inventory(roots: list[Path], tool: Path) -> dict[str, Any]:
+def inventory(roots: list[Path], tool: Path, required_targets: set[str] = TARGETS) -> dict[str, Any]:
     targets: set[str] = set()
     files: dict[str, str] = {}
     if not roots or not any(path.is_file() for path in roots):
@@ -89,11 +93,11 @@ def inventory(roots: list[Path], tool: Path) -> dict[str, Any]:
         )
         targets.update(found)
     if targets:
-        require_targets(targets, TARGETS)
+        require_targets(targets, required_targets)
     return {
         "targets": sorted(targets),
         "files": files,
-        "offline_status": "verified" if TARGETS <= targets else "unverified",
+        "offline_status": "verified" if required_targets <= targets else "unverified",
     }
 
 
@@ -103,15 +107,19 @@ if __name__ == "__main__":
     parser.add_argument("--sdk", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compile-log", type=Path, required=True)
+    parser.add_argument("--target-profile", type=Path, required=True)
     args = parser.parse_args()
+    target_profile = validate_profile(json.loads(args.target_profile.read_text()))
+    selected = set(target_profile["candidate_targets"])
     tool = args.sdk / "lib/llvm/bin/llvm-objdump"
-    validate_compile_targets(args.compile_log)
+    validate_compile_targets(args.compile_log, selected)
     library = args.sdk / "lib"
     result = {
-        "paddle": inventory(list(args.paddle.rglob("*.so")), tool),
-        "rocblas": inventory(list(library.glob("librocblas.so*")) + [library / "rocblas"], tool),
+        "target_profile": target_profile,
+        "paddle": inventory(list(args.paddle.rglob("*.so")), tool, selected),
+        "rocblas": inventory(list(library.glob("librocblas.so*")) + [library / "rocblas"], tool, selected),
         "miopen": inventory(
-            list(library.glob("libMIOpen.so*")) + [args.sdk / "share/miopen"], tool
+            list(library.glob("libMIOpen.so*")) + [args.sdk / "share/miopen"], tool, selected
         ),
     }
     args.output.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n")

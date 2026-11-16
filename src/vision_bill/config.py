@@ -5,6 +5,7 @@ import os
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Any, Self
+from urllib.parse import quote
 
 import yaml
 from pydantic import BaseModel, Field, PostgresDsn, computed_field, model_validator
@@ -118,20 +119,16 @@ class PGSettings(BaseModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def database_url(self) -> PostgresDsn:
-        return PostgresDsn.build(
-            scheme="postgresql+asyncpg",
-            username=self.user,
-            password=self.password,
-            host=self.host,
-            port=self.port,
-            path=self.db,
-        )
+        return PostgresDsn(self.pg_dsn.replace("postgresql://", "postgresql+asyncpg://", 1))
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def pg_dsn(self) -> str:
         """Plain DSN suitable for asyncpg.create_pool."""
-        return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.db}"
+        host = self.host
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        return f"postgresql://{quote(self.user, safe='')}:{quote(self.password, safe='')}@{host}:{self.port}/{quote(self.db, safe='')}"
 
 
 class AuthSettings(BaseModel):

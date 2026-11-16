@@ -180,6 +180,7 @@ class OcrWorkerManager:
         self._active = threading.Lock()
         self._stopped = threading.Event()
         self._generation = 0
+        self._idle_recovery_generation: int | None = None
         self._reason: str | None = "ocr_starting"
         self._profile_id: str | None = None
         self._runtime_fingerprint: str | None = None
@@ -197,6 +198,7 @@ class OcrWorkerManager:
             return max(0, self._admitted - 1)
 
     def readiness(self) -> WorkerReadiness:
+        recover_generation = None
         with self._state:
             try:
                 alive = self._ready and self._proc is not None and self._proc.is_alive()
@@ -208,13 +210,42 @@ class OcrWorkerManager:
                 reason = "ocr_stopped"
             elif self._ready and not alive:
                 reason = "ocr_worker_crashed"
-            return WorkerReadiness(
+                self._ready, self._reason = False, reason
+                if self._idle_recovery_generation != self._generation:
+                    self._idle_recovery_generation = self._generation
+                    recover_generation = self._generation
+            observation = WorkerReadiness(
                 ready=ready,
                 generation=max(1, self._generation),
                 profile_id=self._profile_id,
                 reason_code=reason,
                 runtime_fingerprint=self._runtime_fingerprint if ready else None,
             )
+
+        if recover_generation is not None:
+            threading.Thread(
+                target=self._recover_idle,
+                args=(recover_generation,),
+                name="ocr-idle-recovery",
+                daemon=True,
+            ).start()
+        return observation
+
+    def _recover_idle(self, generation: int) -> None:
+        # A polling thread never owns an in-flight request's artifacts. Wait
+        # for its owner to finish, then recheck generation under lifecycle lock:
+        # request recovery or shutdown may already have retired this process.
+        with self._active, self._control:
+            if self._stopped.is_set() or generation != self._generation:
+                return
+            try:
+                self._set_unready("ocr_worker_crashed")
+                self._teardown()
+                self.start()
+            except OcrWorkerError:
+                # Teardown preserves ownership and marks unstoppable workers
+                # unready. Polling cannot turn this into a restart loop.
+                pass
 
     def _set_unready(self, reason: str) -> None:
         with self._state:

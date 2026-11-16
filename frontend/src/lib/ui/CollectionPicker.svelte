@@ -168,7 +168,7 @@
 			{/each}
 		{/if}
 		<input
-			type="checkbox"
+			type="text"
 			id={listId + '-input'}
 			role="combobox"
 			{disabled}

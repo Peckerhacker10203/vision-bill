@@ -41,6 +41,7 @@ from .profile import (
     load_profile,
     verify_dependencies,
 )
+from .targets import validate_profile
 
 PROFILE = Path(__file__).resolve().parents[1] / "profile.json"
 KINDS = {"upright", "rotated", "warped", "table", "formula"}
@@ -153,9 +154,10 @@ def device_identity(paddle: Any, runtime: RuntimeSettings, *, compute: bool = Tr
             text=True,
         )
         target = completed.stdout.strip().split(":", 1)[0]
-        if target not in {"gfx1030", "gfx1031", "gfx1032", "gfx1034"}:
-            raise ValueError("Actual HIP target is outside the candidate target set")
         kernels = json.loads(Path("/opt/ocr/build-evidence/kernels.json").read_text())
+        profile = validate_profile(kernels.get("target_profile"))
+        if target not in profile["candidate_targets"]:
+            raise ValueError("Actual HIP target is outside the candidate target set")
         for library in ("paddle", "rocblas", "miopen"):
             if not kernels[library].get("files"):
                 raise ValueError("Required kernel/library inventory is empty")

@@ -268,7 +268,7 @@ class ReceiptDB:
             return
 
         dsn = self._settings.pg_dsn
-        logger.info("Creating asyncpg connection pool (dsn=%s…)", dsn[:30])
+        logger.info("Creating asyncpg connection pool")
         self._pool = await asyncpg.create_pool(dsn=dsn)
 
         async with self._pool.acquire() as conn:
@@ -503,11 +503,7 @@ class ReceiptDB:
         is ``None`` for receipts created without an associated image. ``user_id``
         is the owning user (``None`` for legacy/unowned rows).
         """
-        logger.info(
-            "Persisting receipt for '%s' on %s",
-            receipt.merchant_name,
-            receipt.date,
-        )
+        logger.info("Persisting receipt")
 
         values = (
             receipt.confidence,

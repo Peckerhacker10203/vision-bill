@@ -90,9 +90,10 @@ def capture_chat(client: AsyncClient, path: Path) -> Iterator[None]:
 
 
 async def service_extract(provider: LLMProvider, model: str, row: dict[str, Any], text: str, directory: Path) -> tuple[Receipt, dict[str, Any]]:
-    from .comparison import cached_ocr, compare_case
+    from .comparison import compare_case
+    from .historical import load_replay
     case = {"images": [Path(row["input"]).resolve()]}
-    pages, _ = cached_ocr(case, [row], row["engine"])
+    pages, _ = load_replay(case, [row], row["engine"])
     result = await compare_case(provider, model, case, "ocr", pages, directory, 600)
     return result.receipt, result.metadata
 
@@ -117,9 +118,10 @@ async def extract_results(rows: list[dict[str, Any]], output: Path, host: str, m
         try:
             ocr = json.loads(Path(row["artifact"]).read_text())
             text = ocr["row_text"]
-            from .comparison import cached_ocr, job_identity
+            from .comparison import job_identity
+            from .historical import load_replay
             case = {"images": [Path(row["input"]).resolve()]}
-            pages, _ = cached_ocr(case, [row], row["engine"])
+            pages, _ = load_replay(case, [row], row["engine"])
             identity = {"host": host, "model": model, "digest": model_digest, "pages": pages}
             key = job_identity({"host": host, "model": model, "digest": model_digest},
                                case, "ocr", pages, 600, provider.max_output_tokens)

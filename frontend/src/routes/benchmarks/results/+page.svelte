@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import { session } from '$lib/auth';
 	import BenchmarkResultDetails from '$lib/ui/BenchmarkResultDetails.svelte';
 	import type { IndividualResult } from '$lib/benchmark-experiments';
@@ -43,41 +43,64 @@
 			void goto(resolve('/'));
 		}
 	});
+	let alive = true;
+	let refreshRequest = 0,
+		detailsRequest = 0;
+	onDestroy(() => {
+		alive = false;
+	});
 	let details = $state<IndividualResult[]>([]);
 	let detailsOffset = $state(0),
 		loadingDetails = $state(false);
 	async function loadDetails(offset = 0) {
-		if (!selectedId) return;
+		const runId = selectedId,
+			request = ++detailsRequest;
+		const current = () => alive && selectedId === runId && detailsRequest === request;
+		if (!runId) return;
 		loadingDetails = true;
 		try {
-			const response = await fetch(
-				`/api/v1/benchmarks/${selectedId}/results?limit=50&offset=${offset}`
-			);
+			const response = await fetch(`/api/v1/benchmarks/${runId}/results?limit=50&offset=${offset}`);
 			if (!response.ok) throw new Error('Unable to load individual results.');
-			details = await response.json();
+			const rows = await response.json();
+			if (!current()) return;
+			details = rows;
 			detailsOffset = offset;
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Unable to load individual results.';
+			if (current())
+				error = cause instanceof Error ? cause.message : 'Unable to load individual results.';
 		} finally {
-			loadingDetails = false;
+			if (current()) loadingDetails = false;
 		}
 	}
 	const fmt = (value: number | null, digits = 2) => (value === null ? '—' : value.toFixed(digits));
 	async function refresh() {
+		const request = ++refreshRequest;
+		const current = () => alive && refreshRequest === request;
 		try {
 			const response = await fetch('/api/v1/benchmarks');
 			if (!response.ok) throw new Error('Unable to load benchmark runs.');
-			runs = (await response.json()) as Run[];
-			if (!selectedId || !runs.some((run) => run.id === selectedId))
+			const available = (await response.json()) as Run[];
+			if (!current()) return;
+			runs = available;
+			if (!selectedId || !runs.some((run) => run.id === selectedId)) {
 				selectedId = runs[0]?.id ?? null;
+				detailsRequest++;
+				result = null;
+				details = [];
+				detailsOffset = 0;
+				loadingDetails = false;
+			}
 			if (selectedId) {
 				const status = await fetch(`/api/v1/benchmarks/${selectedId}`);
 				if (!status.ok) throw new Error('Unable to load benchmark results.');
-				result = (await status.json()) as Status;
+				const next = (await status.json()) as Status;
+				if (!current()) return;
+				result = next;
 			}
-			error = '';
+			if (current()) error = '';
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Unable to load benchmark results.';
+			if (current())
+				error = cause instanceof Error ? cause.message : 'Unable to load benchmark results.';
 		}
 	}
 	onMount(() => {
@@ -111,6 +134,10 @@
 				value={selectedId ?? ''}
 				onchange={(event) => {
 					selectedId = event.currentTarget.value;
+					++detailsRequest;
+					loadingDetails = false;
+					result = null;
+					error = '';
 					details = [];
 					detailsOffset = 0;
 					void refresh();

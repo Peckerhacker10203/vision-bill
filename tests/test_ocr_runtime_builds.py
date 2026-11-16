@@ -44,7 +44,8 @@ def test_rocm_exact_pins_full_sdk_targets_and_no_spoofing():
     assert "WITH_FLASHATTN=OFF" in script
     assert "git apply --check" in script
     patch = (SERVICE / "build/hip-rdna2-v1.patch").read_text()
-    assert patch.count("+        --offload-arch=gfx1034") == 2
+    assert "+  list(APPEND HIP_HCC_FLAGS --offload-arch=${target})" in patch
+    assert "+  list(APPEND HIP_CLANG_FLAGS --offload-arch=${target})" in patch
     assert "WITH_ROCM AND WITH_FLASHATTN" in patch
 
 

@@ -211,6 +211,10 @@ async def compare_case(provider: LLMProvider, model: str, case: dict[str, Any], 
     if pipeline == "ocr" and (not isinstance(text, list) or len(text) != len(case["images"])):
         raise ValueError("Typed OCR text pages for every photo are required; vision fallback is disabled")
 
+    if pipeline == "ocr" and text and any("replay_kind" in page for page in text):
+        from .historical import execute
+        return await execute(provider, model, text, timeout)
+
     service = ReceiptService(
         ImageSettings(save_dir=str(directory / "storage"), tmp_dir=str(directory / "tmp")),
         PGSettings(user="harness", password="unused"),
@@ -319,11 +323,14 @@ async def run_comparison(cases: list[dict[str, Any]], targets: list[dict[str, An
     from vision_bill.provider.llm.openai import OpenAIProvider
     from vision_bill.service.experiment_scoring import detailed_score
 
+    from .historical import CONTRACT, load_replay
+
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True, mode=0o700)
     rows = []
     for target in targets:
         provider = make_target_provider(target, timeout)
+        provider.max_output_tokens = max_tokens
         if target["provider"] == "ollama":
             models = await cast(OllamaProvider, provider)._client.list()
             actual_digest = next(
@@ -344,7 +351,7 @@ async def run_comparison(cases: list[dict[str, Any]], targets: list[dict[str, An
                 loader_error: Exception | None = None
                 if pipeline == "ocr":
                     try:
-                        text, ocr_ms = cached_ocr(case, ocr_rows, engine)
+                        text, ocr_ms = load_replay(case, ocr_rows, engine)
                     except (ValueError, OSError, KeyError) as exc:
                         loader_error = exc
                 key = job_identity(target, case, pipeline, text, timeout, max_tokens)
@@ -366,14 +373,14 @@ async def run_comparison(cases: list[dict[str, Any]], targets: list[dict[str, An
                     "cache_mode": "ocr_replay" if pipeline == "ocr" else "live",
                     "warm_state": "unknown",
                     "artifact": str(directory / "ocr.json"),
-                    "preview_note": "Display overview only; every original photo traverses the complete typed pipeline in capture order.",
+                    "preview_note": "Display overview only; inference uses every original photo or its validated transcript in capture order.",
                     "source_images": [
                         {"path": str(p), "sha256": digest(p.read_bytes())} for p in case["images"]
                     ],
                     "elapsed_ms": ocr_ms,
                     "accuracy": None,
                     "trace_artifact": str(directory / "trace.json"),
-                    "execution_path": "receipt_service",
+                    "execution_path": "historical_cpu_transcript" if text and text[0].get("replay_kind") == CONTRACT else "receipt_service",
                 }
                 if text:
                     Path(row["artifact"]).write_text(
@@ -383,7 +390,7 @@ async def run_comparison(cases: list[dict[str, Any]], targets: list[dict[str, An
                                 "row_text": "\n\n".join(page["text"] for page in text),
                                 "blocks": [],
                                 "warnings": [
-                                    "Display transcript only; inference receives separate typed pages."
+                                    "Display transcript only; inference receives all ordered pages under their declared replay contract."
                                 ],
                             }
                         )

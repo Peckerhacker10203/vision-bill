@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { diagnosticLabel } from '$lib/diagnostics';
 	import { createQuery } from '@tanstack/svelte-query';
 	import { resolve } from '$app/paths';
 	import { t, translate } from '$lib/i18n';
@@ -172,7 +173,10 @@
 						{#if (image.status === 'pending' || image.status === 'processing') && image.wait_reason}<p
 								class="mt-1 text-xs text-on-surface-variant"
 							>
-								{$t('submission.waitReason')}: {image.wait_reason}
+								{$t('submission.waitReason')}: {diagnosticLabel($t, 'reasons', image.wait_reason)} ({image.wait_reason})
+								{#if image.status === 'pending' && image.wait_reason !== 'retry_backoff'}{$t(
+										'diagnostics.readinessWait'
+									)}{/if}
 							</p>{/if}
 						{#if image.error}
 							<p class="mt-1 truncate text-xs text-error" title={image.error}>

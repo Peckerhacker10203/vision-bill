@@ -299,3 +299,38 @@ it('ignores the first A retry after returning to A and starting another request'
 	second.reject(new ApiError(0, 'Current A error'));
 	expect((await screen.findByRole('alert')).textContent).toContain('Current A error');
 });
+
+it.each(['en', 'de'] as const)(
+	'explains readiness waits without spending attempts in %s',
+	async (language) => {
+		const { setLocale } = await import('$lib/i18n');
+		setLocale(language);
+		vi.spyOn(api, 'getImage').mockResolvedValue(
+			status({
+				status: 'pending',
+				attempt_count: 0,
+				wait_reason: 'formatter_model_unavailable',
+				result_code: 'ocr_unavailable'
+			}) as never
+		);
+		render(SubmissionStatus, { id: 'job' });
+		await screen.findByText(
+			language === 'en'
+				? /selected text formatter model is unavailable/
+				: /gewählte Textformatierungsmodell ist nicht verfügbar/
+		);
+		expect(
+			screen.getByText(
+				language === 'en'
+					? /Readiness waits do not use an attempt/
+					: /Warten auf Bereitschaft verbraucht keinen Versuch/
+			)
+		).not.toBeNull();
+		expect(
+			screen.getByText(
+				language === 'en' ? /OCR service is not ready/ : /OCR-Dienst ist nicht bereit/
+			)
+		).not.toBeNull();
+		setLocale('en');
+	}
+);

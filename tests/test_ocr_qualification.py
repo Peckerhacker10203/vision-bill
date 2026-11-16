@@ -168,7 +168,7 @@ def test_hip_device_inventory_missing_kernel_fails(tmp_path, monkeypatch):
     monkeypatch.setattr(
         Path,
         "read_text",
-        lambda self: json.dumps({"paddle": {"targets": [], "files": {"library": "hash"}}}),
+        lambda self: json.dumps({"target_profile": {"schema": 1, "candidate_targets": ["gfx1030"]}, "paddle": {"targets": [], "files": {"library": "hash"}}}),
     )
     with pytest.raises(ValueError, match="kernels are missing"):
         module.device_identity(paddle, runtime)
@@ -283,10 +283,10 @@ def test_unverified_kernel_inventory_cannot_be_empty(tmp_path, monkeypatch):
         Path,
         "read_text",
         lambda self: json.dumps(
-            {
+            {"target_profile": {"schema": 1, "candidate_targets": ["gfx1030"]}, **{
                 name: {"targets": [], "offline_status": "unverified", "files": {}}
                 for name in ("paddle", "rocblas", "miopen")
-            }
+            }}
         ),
     )
     monkeypatch.setattr(module, "compute_probe", lambda *args: {"passed": True})

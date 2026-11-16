@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { t } from '$lib/i18n';
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import { onMount } from 'svelte';
@@ -60,12 +61,12 @@
 	let experiment = $state(defaultExperiment());
 	let capabilities = $state({ ocr_available: false, ocr_enabled: false, thinking_control: false });
 	let loaded = $state(false);
+	let capability = $derived(
+		experiment.pipeline === 'ocr' || (experiment.pipeline === 'upload' && capabilities.ocr_enabled)
+			? 'text'
+			: 'vision'
+	);
 	$effect(() => {
-		const capability =
-			experiment.pipeline === 'ocr' ||
-			(experiment.pipeline === 'upload' && capabilities.ocr_enabled)
-				? 'text'
-				: 'vision';
 		if (!loaded) return;
 		let active = true;
 		models = [];
@@ -196,7 +197,10 @@
 		}}
 	>
 		<fieldset class="rounded-xl border border-outline-variant p-4">
-			<legend class="px-1 font-medium">Vision models</legend
+			<legend class="px-1 font-medium"
+				>{$t(
+					capability === 'text' ? 'diagnostics.formatterModels' : 'diagnostics.visionModels'
+				)}</legend
 			>{#each models as model (model.id)}<label class="mr-4 inline-flex items-center gap-2 py-1"
 					><input
 						type="checkbox"

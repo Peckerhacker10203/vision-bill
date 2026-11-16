@@ -111,8 +111,9 @@ class CollectionDB:
         end_date: Date | None,
         active: bool = False,
     ) -> Collection:
-        async with self.pool.acquire() as conn:
+        async with self.pool.acquire() as conn, conn.transaction():
             if active:
+                await conn.execute(MEMBERSHIP_LOCK_SQL)
                 await conn.execute(ACTIVATE_DEACTIVATE_SIBLINGS_SQL, user_id)
             row = await conn.fetchrow(
                 CREATE_COLLECTION_SQL, user_id, name, color, start_date, end_date, active
@@ -232,17 +233,18 @@ class CollectionDB:
         """Mark active, deactivating the user's other active collection (one active per user)."""
         args: list[Any] = [collection_id]
         set_sql = self._scoped_returning(SET_ACTIVE_SQL, args, user_id, can_see_all)
-        # Verify the target belongs to the caller BEFORE deactivating siblings, so
-        # activating a non-owned collection is a clean no-op (returns None) instead
-        # of silently destroying the caller's currently-active collection. Two
-        # auto-committed statements (matching the DB layer's convention); the
-        # ux_collections_one_active_per_user index still caps active at one per user.
-        async with self.pool.acquire() as conn:
-            if not can_see_all and user_id is not None:
-                owned = await conn.fetchrow(COLLECTION_OWNER_CHECK_SQL, collection_id, user_id)
-                if owned is None:
-                    return None
-                await conn.execute(ACTIVATE_DEACTIVATE_SIBLINGS_SQL, user_id)
+        visible_args: list[Any] = [collection_id]
+        visible_sql = GET_COLLECTION_SQL + self._owner_scope(visible_args, user_id, can_see_all)
+        async with self.pool.acquire() as conn, conn.transaction():
+            if await conn.fetchrow(visible_sql, *visible_args) is None:
+                return None
+            # Same order as capture/delete: membership ownership before rows.
+            # Recheck visibility after waiting; the target could have been deleted.
+            await conn.execute(MEMBERSHIP_LOCK_SQL)
+            target = await conn.fetchrow(visible_sql + " FOR UPDATE", *visible_args)
+            if target is None:
+                return None
+            await conn.execute(ACTIVATE_DEACTIVATE_SIBLINGS_SQL, target["user_id"])
             row = await conn.fetchrow(set_sql, *args)
         return self._collection_from_row(row) if row is not None else None
 

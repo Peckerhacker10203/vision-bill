@@ -230,7 +230,9 @@ test.describe('receipt editor', () => {
 		await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
 		await page.getByRole('button', { name: 'Save', exact: true }).click();
 		await expect(page.getByText('Changes saved')).toBeVisible({ timeout: 15_000 });
-		await expect(page.getByText(/review: amount_discrepancy/)).toBeVisible();
+		await expect(
+			page.getByText(/Review required: The total differs from the subtotal/)
+		).toBeVisible();
 	});
 
 	test('line items can be added, filled and removed', async ({ page, context }) => {

@@ -4,10 +4,16 @@ import { loginAdmin } from '../helpers/auth';
 test.describe('benchmarks create form (admin)', () => {
 	test('lists the model and disables create without a selection', async ({ page, context }) => {
 		await loginAdmin(context);
+		const capabilityResponse = await context.request.get('/api/v1/benchmarks/capabilities');
+		expect(capabilityResponse.status()).toBe(200);
+		const capabilities = await capabilityResponse.json();
 		await page.goto('/benchmarks');
 		await expect(page.getByRole('checkbox', { name: 'e2e-vision' })).toBeChecked();
 		const models = page
-			.getByRole('group', { name: 'Vision models', exact: true })
+			.getByRole('group', {
+				name: capabilities.ocr_enabled ? 'OCR text formatter models' : 'Vision models',
+				exact: true
+			})
 			.getByRole('checkbox');
 		for (const model of await models.all()) {
 			await model.uncheck();

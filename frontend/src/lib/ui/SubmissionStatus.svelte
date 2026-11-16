@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { diagnosticLabel } from '$lib/diagnostics';
 	import { createQuery } from '@tanstack/svelte-query';
 	import { resolve } from '$app/paths';
 	import { api, ApiError } from '$lib/api/client';
@@ -133,11 +134,16 @@
 				</p>
 			{/if}
 			{#if job.data.wait_reason}<p class="mt-2 text-sm">
-					{$t('submission.waitReason')}: {job.data.wait_reason}
+					{$t('submission.waitReason')}: {diagnosticLabel($t, 'reasons', job.data.wait_reason)} ({job
+						.data.wait_reason})
+					{#if job.data.status === 'pending' && job.data.wait_reason !== 'retry_backoff'}{$t(
+							'diagnostics.readinessWait'
+						)}{/if}
 				</p>{/if}
 		{/if}
 		{#if job.data.result_code}<p class="mt-2 text-sm">
-				{$t('submission.resultCode')}: {job.data.result_code}
+				{$t('submission.resultCode')}: {diagnosticLabel($t, 'reasons', job.data.result_code)} ({job
+					.data.result_code})
 			</p>{/if}
 		{#if job.data.error}<p class="mt-2 text-sm text-error">{job.data.error}</p>{/if}
 		{#if job.data.receipt_id}

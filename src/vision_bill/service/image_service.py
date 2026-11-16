@@ -19,6 +19,7 @@ from PIL import Image, ImageOps
 
 from ..config import ImageSettings
 from ..helper.deadline import check_deadline
+from ..helper.document_image import document_rgb
 from ..model.db.image import ImagePart
 from ..model.image import ImageInfo
 from ..model.ocr import WorkingImage, WorkingImageMetadata
@@ -247,7 +248,7 @@ class ImageService:
             src = Image.open(src_path)
             src.load()
             img = ImageOps.exif_transpose(src)
-            img = img.convert("RGB")
+            img = document_rgb(img)
             img.thumbnail((self._max_edge, self._max_edge), Image.Resampling.LANCZOS)
             dest = self._thumb_for(src_path)
             dest.parent.mkdir(parents=True, exist_ok=True)
@@ -371,7 +372,7 @@ class ImageService:
                 part.source_sha256 = actual
             if initial:
                 thumbnail = self._thumb_for(path)
-                if part.thumbnail_path and Path(part.thumbnail_path).absolute() != thumbnail:
+                if part.thumbnail_path and Path(part.thumbnail_path).absolute() != thumbnail.absolute():
                     raise ValueError("invalid_thumbnail_artifact_path")
                 if thumbnail.absolute() != thumbnail.resolve():
                     raise ValueError("invalid_thumbnail_artifact_path")

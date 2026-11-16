@@ -71,10 +71,33 @@ it('loads text formatter models for forced OCR and offers no misleading fallback
 	);
 	render(Page);
 	await screen.findByText('vision-model');
+	expect(screen.getByRole('group', { name: 'Vision models' })).not.toBeNull();
 	await fireEvent.change(screen.getByLabelText('Pipeline'), { target: { value: 'ocr' } });
 	await screen.findByText('text-only');
+	expect(screen.getByRole('group', { name: 'OCR text formatter models' })).not.toBeNull();
 	expect(calls).toContain('/api/v1/llm/models?capability=text');
 	expect(screen.queryByLabelText(/Allow direct vision fallback/)).toBeNull();
 	await fireEvent.change(screen.getByLabelText('Pipeline'), { target: { value: 'direct_vision' } });
 	await screen.findByText('vision-model');
+	expect(screen.getByRole('group', { name: 'Vision models' })).not.toBeNull();
+});
+
+it('labels the default upload policy as a text formatter when OCR is enabled', async () => {
+	session.set({ id: 'owner', username: 'admin', is_admin: true, can_see_all: false });
+	const calls: string[] = [];
+	vi.stubGlobal(
+		'fetch',
+		vi.fn(async (url: string) => {
+			calls.push(url);
+			if (url.endsWith('/capabilities'))
+				return Response.json({ ocr_available: true, ocr_enabled: true, thinking_control: false });
+			return Response.json([
+				{ id: url.includes('capability=text') ? 'upload-formatter' : 'vision-model' }
+			]);
+		})
+	);
+	render(Page);
+	await screen.findByText('upload-formatter');
+	expect(screen.getByRole('group', { name: 'OCR text formatter models' })).not.toBeNull();
+	expect(calls).toContain('/api/v1/llm/models?capability=text');
 });

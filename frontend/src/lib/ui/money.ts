@@ -34,11 +34,12 @@ interface Scaled {
 }
 
 function toScaled(value: string): Scaled {
-	const [intPart, fracPart = ''] = value.trim().split('.');
-	return {
-		int: BigInt(intPart || '0') * 10n ** BigInt(fracPart.length),
-		digits: fracPart.length
-	};
+	const match = /^(-?)(\d+)(?:\.(\d+))?(?:e([+-]?\d+))?$/i.exec(value.trim());
+	if (!match) throw new Error('Invalid decimal');
+	const [, sign, whole, fraction = '', exponent = '0'] = match;
+	const scale = fraction.length - Number(exponent);
+	const integer = BigInt(`${sign}${whole}${fraction}`);
+	return { int: scale < 0 ? integer * 10n ** BigInt(-scale) : integer, digits: Math.max(0, scale) };
 }
 
 function formatScaled(int: bigint, digits: number): string {

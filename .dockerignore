@@ -56,3 +56,15 @@ paddleocr-service/build/**
 !paddleocr-service/build/resolve_cuda.py
 !paddleocr-service/build/runtime.in
 !paddleocr-service/build/native-build.in
+
+# Local test output and runtime configuration are not build inputs.
+frontend/test-results
+frontend/test-results/**
+frontend/playwright-report
+frontend/playwright-report/**
+**/.env
+**/.env.*
+**/__pycache__
+**/__pycache__/**
+**/*.pyc
+**/*.pyo

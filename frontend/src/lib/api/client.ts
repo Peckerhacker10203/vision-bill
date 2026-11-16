@@ -1,3 +1,4 @@
+import { currentSessionGeneration, requireSessionGeneration } from '$lib/session-lifetime';
 import type {
 	AnalyzeResponse,
 	DraftView,
@@ -61,14 +62,17 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+	const generation = currentSessionGeneration();
 	let response: Response;
 	try {
 		// same-origin so the HttpOnly session cookie is sent automatically.
 		response = await fetch(`${API_BASE}${path}`, { credentials: 'same-origin', ...init });
 	} catch {
+		requireSessionGeneration(generation);
 		throw new ApiError(0, 'Network error');
 	}
 
+	requireSessionGeneration(generation);
 	if (!response.ok) {
 		// A 401 on a protected endpoint means the session expired: bounce to
 		// login. The /auth/ endpoints 401 for bad credentials, not an expired
@@ -95,6 +99,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 		} catch {
 			// Non-JSON error body: keep the status text.
 		}
+		requireSessionGeneration(generation);
 		throw new ApiError(response.status, detail, imageId);
 	}
 
@@ -103,8 +108,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	}
 
 	try {
-		return (await response.json()) as T;
+		const body = (await response.json()) as T;
+		requireSessionGeneration(generation);
+		return body;
 	} catch {
+		requireSessionGeneration(generation);
 		// A successful status with an unreadable body is still an ambiguous mutation.
 		throw new ApiError(response.status, 'Response body could not be read');
 	}

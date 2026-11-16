@@ -32,6 +32,24 @@
 
 	let unassigningId: string | null = $state(null);
 
+	let activeView: { id: string } | null = null;
+	let editOwner: object | null = null;
+	let deleteOwner: object | null = null;
+	$effect(() => {
+		const view = { id };
+		activeView = view;
+		editOwner = deleteOwner = null;
+		editOpen = deleteOpen = saving = deleting = false;
+		name = startDate = endDate = formError = '';
+		color = PRESET_COLORS[0] ?? null;
+		unassigningId = null;
+		return () => {
+			if (activeView === view) activeView = null;
+		};
+	});
+	const isCurrent = (view: { id: string } | null) =>
+		view !== null && activeView === view && id === view.id;
+
 	const detail = createQuery(
 		() => ({
 			queryKey: queryKeys.collection(id),
@@ -57,13 +75,16 @@
 	let data = $derived(detail.data ?? null);
 	let stats = $derived(statistics.data ?? null);
 
-	async function refresh(): Promise<void> {
+	async function refresh(view: { id: string }): Promise<void> {
+		if (!isCurrent(view)) return;
 		await queryClient.invalidateQueries({ queryKey: queryKeys.collections() });
-		await queryClient.invalidateQueries({ queryKey: queryKeys.statistics(12, id) });
+		if (!isCurrent(view)) return;
+		await queryClient.invalidateQueries({ queryKey: queryKeys.statistics(12, view.id) });
 	}
 
 	function openEdit(): void {
-		if (!data) return;
+		if (!data || !isCurrent(activeView)) return;
+		editOwner = activeView;
 		name = data.name;
 		color = data.color ?? PRESET_COLORS[0] ?? null;
 		startDate = data.start_date ?? '';
@@ -89,7 +110,8 @@
 	}
 
 	async function submitEdit(): Promise<void> {
-		if (saving || !data) return;
+		const view = activeView;
+		if (saving || !data || !view || !isCurrent(view) || editOwner !== view) return;
 		if (!name.trim()) {
 			formError = translate('collections.name');
 			return;
@@ -101,45 +123,52 @@
 		saving = true;
 		formError = '';
 		try {
-			await api.updateCollection(id, {
+			await api.updateCollection(view.id, {
 				name: name.trim(),
 				color,
 				start_date: startDate || null,
 				end_date: endDate || null
 			});
+			if (!isCurrent(view)) return;
 			editOpen = false;
-			await refresh();
+			await refresh(view);
 		} catch {
-			snackbar.notify('error', translate('collections.updateFailed'));
+			if (isCurrent(view)) snackbar.notify('error', translate('collections.updateFailed'));
 		} finally {
-			saving = false;
+			if (isCurrent(view)) saving = false;
 		}
 	}
 
 	async function removeCollection(): Promise<void> {
-		if (deleting) return;
+		const view = activeView;
+		if (deleting || !view || !isCurrent(view) || deleteOwner !== view) return;
 		deleting = true;
 		try {
-			await api.deleteCollection(id);
+			await api.deleteCollection(view.id);
+			if (!isCurrent(view)) return;
 			await queryClient.invalidateQueries({ queryKey: queryKeys.collections() });
-			await goto(resolve('/collections'));
+			if (isCurrent(view)) await goto(resolve('/collections'));
 		} catch {
-			snackbar.notify('error', translate('collections.deleteFailed'));
-			deleting = false;
+			if (isCurrent(view)) {
+				snackbar.notify('error', translate('collections.deleteFailed'));
+				deleting = false;
+			}
 		}
 	}
 
 	async function removeReceipt(receipt: ReceiptRow): Promise<void> {
-		if (unassigningId) return;
+		const view = activeView;
+		if (unassigningId || !view || !isCurrent(view)) return;
 		unassigningId = receipt.id;
 		try {
-			await api.unassignReceiptFromCollection(id, receipt.id);
+			await api.unassignReceiptFromCollection(view.id, receipt.id);
+			if (!isCurrent(view)) return;
 			snackbar.notify('success', translate('collections.removedFromCollection'));
-			await refresh();
+			await refresh(view);
 		} catch {
-			snackbar.notify('error', translate('common.error'));
+			if (isCurrent(view)) snackbar.notify('error', translate('common.error'));
 		} finally {
-			unassigningId = null;
+			if (isCurrent(view)) unassigningId = null;
 		}
 	}
 
@@ -210,7 +239,10 @@
 				<button
 					type="button"
 					class="inline-flex items-center gap-2 rounded-lg border border-error/50 px-4 py-2 text-sm font-medium text-error hover:bg-error-container"
-					onclick={() => (deleteOpen = true)}
+					onclick={() => {
+						deleteOwner = activeView;
+						deleteOpen = true;
+					}}
 				>
 					<Icon icon="trash" />
 					{$t('collections.delete')}

@@ -53,7 +53,7 @@
    message(STATUS "${PACKAGE_NAME} version: ${${PACKAGE_NAME}_VERSION}")
  endmacro()
 
-@@ -159,15 +168,19 @@
+@@ -159,15 +168,18 @@
  # Ask hcc to generate device code during compilation so we can use
  # host linker to link.
  list(APPEND HIP_HCC_FLAGS -fno-gpu-rdc)
@@ -61,27 +61,26 @@
 -list(APPEND HIP_HCC_FLAGS --offload-arch=gfx926) # K100 (KONGING)
 -list(APPEND HIP_HCC_FLAGS --offload-arch=gfx928) # K100_AI (KONGING_AI)
 -list(APPEND HIP_HCC_FLAGS --offload-arch=gfx936) # BW1000 (BOWEN)
-+list(APPEND HIP_HCC_FLAGS
-+        --offload-arch=gfx1030
-+        --offload-arch=gfx1031
-+        --offload-arch=gfx1032
-+        --offload-arch=gfx1034
-+)
++set(VISION_BILL_AMDGPU_TARGETS "$ENV{VISION_BILL_AMDGPU_TARGETS}")
++if(VISION_BILL_AMDGPU_TARGETS STREQUAL "")
++  message(FATAL_ERROR "Explicit validated candidate targets are required")
++endif()
++foreach(target IN LISTS VISION_BILL_AMDGPU_TARGETS)
++  if(NOT target MATCHES "^gfx[0-9a-f]+$")
++    message(FATAL_ERROR "Invalid candidate target")
++  endif()
++  list(APPEND HIP_HCC_FLAGS --offload-arch=${target})
++  list(APPEND HIP_CLANG_FLAGS --offload-arch=${target})
++endforeach()
  list(APPEND HIP_CLANG_FLAGS -fno-gpu-rdc)
 -list(APPEND HIP_CLANG_FLAGS --offload-arch=gfx906) # Z100 (ZIFANG)
 -list(APPEND HIP_CLANG_FLAGS --offload-arch=gfx926) # K100 (KONGING)
 -list(APPEND HIP_CLANG_FLAGS --offload-arch=gfx928) # K100_AI (KONGING_AI)
 -list(APPEND HIP_CLANG_FLAGS --offload-arch=gfx936) # BW1000 (BOWEN)
-+list(APPEND HIP_CLANG_FLAGS
-+        --offload-arch=gfx1030
-+        --offload-arch=gfx1031
-+        --offload-arch=gfx1032
-+        --offload-arch=gfx1034
-+)
 
  if(HIP_COMPILER STREQUAL clang)
    set(hip_library_name amdhip64)
-@@ -177,7 +190,13 @@
+@@ -177,7 +189,13 @@
  message(STATUS "HIP library name: ${hip_library_name}")
 
  # set HIP link libs
