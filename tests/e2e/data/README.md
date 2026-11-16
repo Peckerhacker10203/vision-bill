@@ -31,6 +31,6 @@ tracked operator config or adopt shared services.
 
 Example (add your own):
 
-    fixtures.toml:  fixtures = ["seed_receipt", "my-receipt"]
+    fixtures.toml:  fixtures = ["seed_receipt", "deposit_refund", "my-receipt"]
     my-receipt.jpg  (your photo, gitignored)
     my-receipt.json (what a perfect extraction would return, gitignored)

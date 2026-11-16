@@ -54,8 +54,9 @@ Entity IDs are UUIDs. DB-unavailable paths return 503.
 - `GET /images`, `GET /images/{id}`, `/file?part=N`, `/thumb`,
   `/views/{view_id}`, `/extractions/{extraction_id}` expose scoped state/evidence.
   No successful synchronous upload shortcut remains.
-- `POST /images/analyze` triggers a scoped cycle; `/images/{id}/retry` requires
-  expected_generation/request_key. Draft GET/PATCH uses expected_revision;
+- `POST /images/analyze` triggers a shared analysis cycle and returns only results
+  visible to the caller. `/images/{id}/retry` requires expected_generation/request_key.
+  Draft GET reads current state; PATCH requires expected_revision;
   `/draft/finalize` also takes request_key.
 - Receipts list/get/update/delete/verify retain exact amounts and file paths.
   Verify uses current operation/review revision and exact finding acknowledgements;
