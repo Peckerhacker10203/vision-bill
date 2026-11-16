@@ -509,9 +509,13 @@
 			</div>
 			<div>
 				<label class={labelClass} for="re-time">{$t('editor.time')}</label>
+				<!-- Native time inputs can sanitize microseconds; retain a text control
+				     throughout editing when the saved value has sub-minute precision. -->
 				<input
 					id="re-time"
-					type="time"
+					type={receipt.time && !/^\d{2}:\d{2}(?::00(?:\.0+)?)?$/.test(receipt.time)
+						? 'text'
+						: 'time'}
 					class={inputClass}
 					value={form.time}
 					oninput={(e) => (form.time = (e.currentTarget as HTMLInputElement).value)}

@@ -177,7 +177,7 @@ export interface ReceiptRow {
 	receipt_number: string | null;
 	/** ISO date, YYYY-MM-DD */
 	date: string;
-	/** HH:MM 24h */
+	/** Local HH:MM[:SS[.ffffff]], preserving sub-minute precision */
 	time: string | null;
 	currency: string;
 	category: Category;
@@ -429,7 +429,7 @@ export interface ProductPurchase {
 	merchant_name: string;
 	/** ISO date, YYYY-MM-DD */
 	date: string;
-	/** HH:MM 24h */
+	/** Local HH:MM[:SS[.ffffff]], preserving sub-minute precision */
 	time: string | null;
 	quantity: number;
 	unit_price: string;

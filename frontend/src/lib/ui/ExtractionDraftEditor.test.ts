@@ -69,6 +69,60 @@ it('conflicts preserve dirty input and original expected revision', async () => 
 	await fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
 	expect(patch.mock.calls[1][1].expected_revision).toBe(7);
 });
+
+it('preserves visible precise time through a merchant-only partial save', async () => {
+	const loaded = { ...draft, document: { ...draft.document, time: '14:30:00.000001' } };
+	vi.mocked(api.getDraft).mockResolvedValue(loaded);
+	const patch = vi.spyOn(api, 'patchDraft').mockResolvedValue({
+		...loaded,
+		revision: 8,
+		document: { ...loaded.document, merchant_name: 'Shop' }
+	});
+	render(ExtractionDraftEditor, { id: 'job' });
+	await screen.findByLabelText('Time');
+	expect((screen.getByLabelText('Time') as HTMLInputElement).value).toBe('14:30:00.000001');
+	await fireEvent.input(screen.getByLabelText('Merchant'), { target: { value: 'Shop' } });
+	await fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+	expect(patch).toHaveBeenCalledWith('job', {
+		expected_revision: 7,
+		changes: { merchant_name: 'Shop' }
+	});
+	await waitFor(() =>
+		expect((screen.getByRole('button', { name: 'Save draft' }) as HTMLButtonElement).disabled).toBe(
+			true
+		)
+	);
+	expect((screen.getByLabelText('Time') as HTMLInputElement).value).toBe('14:30:00.000001');
+	expect((screen.getByLabelText('Subtotal') as HTMLInputElement).value).toBe('');
+});
+
+it('sends precise draft time, adopts canonical response and retains rejected edits', async () => {
+	const patch = vi
+		.spyOn(api, 'patchDraft')
+		.mockResolvedValueOnce({
+			...draft,
+			revision: 8,
+			document: { ...draft.document, time: '14:30:15.100000' }
+		})
+		.mockRejectedValueOnce(new ApiError(422, 'Invalid local time'));
+	render(ExtractionDraftEditor, { id: 'job' });
+	await screen.findByLabelText('Time');
+	await fireEvent.input(screen.getByLabelText('Time'), { target: { value: '14:30:15.1' } });
+	await fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+	expect(patch).toHaveBeenCalledWith('job', {
+		expected_revision: 7,
+		changes: { time: '14:30:15.1' }
+	});
+	await screen.findByDisplayValue('14:30:15.100000');
+	await fireEvent.input(screen.getByLabelText('Time'), { target: { value: '14:30:15.1234567' } });
+	await fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+	await screen.findByRole('alert');
+	expect((screen.getByLabelText('Time') as HTMLInputElement).value).toBe('14:30:15.1234567');
+	expect(patch.mock.calls[1][1]).toEqual({
+		expected_revision: 8,
+		changes: { time: '14:30:15.1234567' }
+	});
+});
 it('shows required missing fields without attempting incomplete finalization', async () => {
 	const finalize = vi.spyOn(api, 'finalizeDraft');
 	render(ExtractionDraftEditor, { id: 'job' });

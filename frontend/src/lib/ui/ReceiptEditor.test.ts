@@ -438,3 +438,30 @@ it('preserves legacy nonzero seconds for explicit validation rather than truncat
 	await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
 	expect(onSave.mock.calls[0][0].time).toBe('14:30:15');
 });
+
+describe.each(['Save', 'Save & verify'])('%s time precision', (action) => {
+	it.each([
+		['14:30:00.000000', '14:30', 'time'],
+		['14:30:15', '14:30:15', 'text'],
+		['14:30:15.123000', '14:30:15.123000', 'text'],
+		['14:30:00.000001', '14:30:00.000001', 'text']
+	])('displays and emits %s across reload', async (stored, displayed, type) => {
+		const onSave = vi.fn();
+		const onSaveAndVerify = vi.fn();
+		const view = render(ReceiptEditor, {
+			receipt: { ...receipt, time: stored },
+			lineItems: [line()],
+			taxes: [],
+			onSave,
+			onSaveAndVerify
+		});
+		expect((screen.getByLabelText('Time') as HTMLInputElement).value).toBe(displayed);
+		expect(screen.getByLabelText('Time').getAttribute('type')).toBe(type);
+		await fireEvent.input(screen.getByLabelText('Merchant'), { target: { value: 'Changed' } });
+		await fireEvent.click(screen.getByRole('button', { name: action }));
+		const callback = action === 'Save' ? onSave : onSaveAndVerify;
+		expect(callback.mock.calls[0][0].time).toBe(displayed);
+		await view.rerender({ receipt: { ...receipt, time: stored, operation_revision: 2 } });
+		expect((screen.getByLabelText('Time') as HTMLInputElement).value).toBe(displayed);
+	});
+});

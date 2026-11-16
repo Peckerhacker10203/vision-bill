@@ -73,6 +73,56 @@ test.describe('receipt editor', () => {
 		await expect(page.getByRole('button', { name: 'Verify' })).toBeVisible();
 	});
 
+	test('six-digit local time is visible, editable and survives Save and Save & verify', async ({
+		page,
+		context
+	}) => {
+		test.setTimeout(120_000);
+		const id = await uploadFixture(page, context, await loadFixture('a'), { verify: false });
+		const path = `/api/v1/receipts/${id}`;
+		const before = await (await context.request.get(path)).json();
+		const prepared = await context.request.put(path, {
+			data: {
+				...before.receipt,
+				expected_operation_revision: before.receipt.operation_revision,
+				time: '14:30:00.000001',
+				line_items: before.line_items,
+				taxes: before.taxes
+			}
+		});
+		expect(prepared.status()).toBe(200);
+		expect((await prepared.json()).findings).toEqual([]);
+		await page.reload();
+		await expect(page.locator('#re-time')).toBeVisible();
+		await expect(page.locator('#re-time')).toHaveAttribute('type', 'text');
+		await expect(page.locator('#re-time')).toHaveValue('14:30:00.000001');
+		for (const [action, time, merchant] of [
+			['Save', '14:30:00.000001', 'Precise save'],
+			['Save & verify', '14:30:15.123456', 'Precise verified']
+		]) {
+			if (action === 'Save & verify') await page.locator('#re-time').fill(time);
+			await page.locator('#re-merchant').fill(merchant);
+			const outgoing = page.waitForRequest(
+				(request) => request.method() === 'PUT' && new URL(request.url()).pathname === path
+			);
+			await page.getByRole('button', { name: action, exact: true }).click();
+			expect((await outgoing).postDataJSON().time).toBe(time);
+			await expect(
+				page.getByText(action === 'Save' ? 'Changes saved' : 'Receipt verified')
+			).toBeVisible({ timeout: 15_000 });
+			const after = await (await context.request.get(path)).json();
+			expect(after.receipt.time).toBe(time);
+			expect(after.receipt.verified).toBe(action !== 'Save');
+			expect(after.receipt.total).toBe(before.receipt.total);
+			expect(after.line_items.map((line: { id: string }) => line.id)).toEqual(
+				before.line_items.map((line: { id: string }) => line.id)
+			);
+			await page.reload();
+			await expect(page.locator('#re-time')).toHaveValue(time);
+			await expect(page.locator('#re-merchant')).toHaveValue(merchant);
+		}
+	});
+
 	test('empty merchant shows the required error and disables save', async ({ page, context }) => {
 		test.setTimeout(120_000);
 		await uploadFixture(page, context, await loadFixture('a'), { verify: false });

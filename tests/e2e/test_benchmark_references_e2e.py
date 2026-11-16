@@ -430,7 +430,8 @@ async def test_filtered_creation_qualifies_before_limit_and_explicit_ids_are_str
     provider._client.chat.assert_not_awaited()
 
 
-async def test_public_human_null_completion_remains_observed_in_gold(workflow_db, tmp_path):
+@pytest.mark.parametrize('time,canonical', [('14:30:00.000001','14:30:00.000001'), ('14:30:15.1','14:30:15.100000')])
+async def test_public_human_null_completion_remains_observed_in_gold(workflow_db, tmp_path, time, canonical):
     from decimal import Decimal
     from uuid import UUID
     import httpx
@@ -473,14 +474,27 @@ async def test_public_human_null_completion_remains_observed_in_gold(workflow_db
     changes = workflow.complete(total='10').envelope.receipt.model_dump(mode='json')
     changes.update(currency='EUR',discount_total='0',taxes=[],tax_total='0',amount_policy=reviews.POLICY.model_dump())
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://test') as client:
-        patched = await client.patch(f'/images/{image.id}/draft',json={'expected_revision':1,'changes':changes})
+        initial = (await client.get(f'/images/{image.id}/draft')).json()
+        assert initial['document']['time'] is None
+        partial = await client.patch(f'/images/{image.id}/draft',json={'expected_revision':1,'changes':{'merchant_name':'Human'}})
+        assert partial.status_code == 200, partial.text
+        assert partial.json()['document']['time'] is None and partial.json()['document']['total'] is None
+        invalid = await client.patch(f'/images/{image.id}/draft',json={'expected_revision':2,'changes':{'time':'14:30:00.1234567'}})
+        assert invalid.status_code == 422
+        assert (await client.get(f'/images/{image.id}/draft')).json() == partial.json()
+        changes['time'] = time
+        patched = await client.patch(f'/images/{image.id}/draft',json={'expected_revision':2,'changes':changes})
         assert patched.status_code == 200, patched.text
         assert patched.json()['field_sources'] == {}
-        finalized = await client.post(f'/images/{image.id}/draft/finalize',json={'expected_revision':2,'request_key':'human-final'})
+        assert patched.json()['document']['time'] == canonical
+        assert (await client.get(f'/images/{image.id}/draft')).json()['document']['time'] == canonical
+        finalized = await client.post(f'/images/{image.id}/draft/finalize',json={'expected_revision':3,'request_key':'human-final'})
         assert finalized.status_code == 200, finalized.text
         receipt_id = UUID(finalized.json()['id'])
-        acknowledgements = [{'finding_id':f['id'],'comment':'Checked against original'} for f in finalized.json()['findings'] if f['severity']=='review']
-        verified = await client.post(f'/receipts/{receipt_id}/verify',json={'acknowledgements':acknowledgements})
+        assert (await client.post(f'/images/{image.id}/draft/finalize',json={'expected_revision':3,'request_key':'human-final'})).json()['id'] == str(receipt_id)
+        assert (await client.get(f'/receipts/{receipt_id}')).json()['receipt']['time'] == canonical
+        assert finalized.json()['findings'] == []
+        verified = await client.post(f'/receipts/{receipt_id}/verify')
         assert verified.status_code == 200, verified.text
         preview = await client.get(f'/benchmarks/references/{receipt_id}')
         assert preview.status_code == 200, preview.text
@@ -489,9 +503,23 @@ async def test_public_human_null_completion_remains_observed_in_gold(workflow_db
         assert (await client.get(f'/benchmarks/references/{receipt_id}')).json()['document_sha256'] == current['document_sha256']
         qualified = await client.post(f'/benchmarks/references/{receipt_id}',json={'expected_review_revision':current['review_revision'],'expected_document_sha256':current['document_sha256']})
         assert qualified.status_code == 200, qualified.text
+        assert (await client.get(f'/benchmarks/references/{receipt_id}')).json() == current
     gold = await benchmarks._db.current_reference(receipt_id,scope=scope)
     assert str(gold.id) == qualified.json()['id'] and gold.scored_fields == current['scored_fields']
     expected = Receipt.model_validate(gold.expected)
+    assert gold.expected['time'] == canonical
+    assert detailed_score(gold.expected, expected, scored_fields=gold.scored_fields)['full_receipt_correct']
+    assert not detailed_score(gold.expected, expected.model_copy(update={'time':'14:30:00.000002'}), scored_fields=gold.scored_fields)['full_receipt_correct']
+    async with w.pool.acquire() as conn:
+        frozen = await conn.fetchrow('SELECT * FROM benchmark_references WHERE id=$1',gold.id)
+    body = reviews.ReceiptUpdate.model_validate(expected.model_dump(mode='json') | {'time':'14:30:00.000002','expected_operation_revision':2})
+    edited = await w._receipts.update_receipt(receipt_id,body,user_id=scope.user_id)
+    assert edited.verified and edited.review_revision == 2  # Existing clean-edit policy.
+    fresh = await benchmarks.reference_preview(receipt_id,scope=scope)
+    assert fresh.document_sha256 != current['document_sha256']
+    await benchmarks.qualify_reference(receipt_id,fresh.review_revision,fresh.document_sha256,scope=scope)
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchrow('SELECT * FROM benchmark_references WHERE id=$1',gold.id) == frozen
     for field, wrong in [('currency','USD'),('discount_total',Decimal('1'))]:
         assert not detailed_score(gold.expected,expected.model_copy(update={field:wrong}),scored_fields=gold.scored_fields)['full_receipt_correct']
     async with w.pool.acquire() as conn:

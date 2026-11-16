@@ -1,8 +1,9 @@
 from datetime import date as Date
+from datetime import time as Time
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, ValidationInfo, field_validator
+from pydantic import AfterValidator, BaseModel, Field, ValidationInfo, field_validator
 
 from .item_category import SpendingCategory, llm_category
 
@@ -20,7 +21,24 @@ Category = Literal[
 
 MAX_TAG_LENGTH = 100
 Currency = Annotated[str, Field(pattern=r"^[A-Z]{3}$")]
-ReceiptTime = Annotated[str, Field(pattern=r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$")]
+
+
+def _canonical_local_time(value: str) -> str:
+    # Match stored review material before hashing; parsing follows strict validation
+    # so unsupported ISO forms and precision beyond PostgreSQL TIME cannot be lost.
+    parsed = Time.fromisoformat(value)
+    return (
+        parsed.isoformat(timespec="minutes")
+        if not parsed.second and not parsed.microsecond
+        else parsed.isoformat()
+    )
+
+
+ReceiptTime = Annotated[
+    str,
+    Field(pattern=r"^(?:[01][0-9]|2[0-3]):[0-5][0-9](?::[0-5][0-9](?:\.[0-9]{1,6})?)?$"),
+    AfterValidator(_canonical_local_time),
+]
 
 
 class LineItem(BaseModel):
@@ -89,7 +107,10 @@ class Receipt(BaseModel):
     )
     receipt_number: str | None = Field(default=None, description="Transaction/receipt ID")
     date: Date = Field(description="Date of purchase, ISO format YYYY-MM-DD")
-    time: ReceiptTime | None = Field(default=None, description="Time of purchase, HH:MM 24h format")
+    time: ReceiptTime | None = Field(
+        default=None,
+        description="Local time of purchase: HH:MM or HH:MM:SS, optionally with 1–6 fractional second digits",
+    )
 
     currency: Currency = Field(default="EUR", description="ISO 4217 currency code, e.g. USD, EUR")
     category: Category = Field(

@@ -197,11 +197,13 @@ async def test_foreign_collection_rolls_back_money_children_and_owner_learning(
         assert await conn.fetchval("SELECT count(*) FROM receipt_review_revisions") == 0
 
 
-async def test_stored_minute_time_does_not_become_integrity_failure(workflow_db, tmp_path):
+@pytest.mark.parametrize("time", ["14:30", "14:30:15", "14:30:15.100000", "14:30:00.000001"])
+async def test_stored_local_time_does_not_become_integrity_failure(workflow_db, tmp_path, time):
     w, scope = workflow_db
     row, _, _ = await seed(w, scope, tmp_path)
     async with w.pool.acquire() as conn:
-        await conn.execute("UPDATE receipts SET time='14:30' WHERE id=$1", row.id)
+        from datetime import time as Time
+        await conn.execute("UPDATE receipts SET time=$2 WHERE id=$1", row.id, Time.fromisoformat(time))
     saved = await w._receipts.verify_receipt(row.id, ReviewRequest(), scope=scope)
     assert saved.verified
 
@@ -531,6 +533,98 @@ async def test_http_review_gate_with_real_postgres(workflow_db, tmp_path):
         detail = await client.get(path)
         assert detail.json()["receipt"]["acknowledgements"] == request["acknowledgements"]
         assert (await client.post(path + "/verify")).status_code == 409
+    assert original.read_bytes() == b"original receipt bytes"
+
+
+@pytest.mark.parametrize("stored,input_time,changed", [
+    ("14:30:00", "14:30:00.000000", "14:30:00.000001"),
+    ("14:30:15", "14:30:15.000000", "14:30:16"),
+    ("14:30:15.100000", "14:30:15.1", "14:30:15.100001"),
+    ("14:30:00.000001", "14:30:00.000001", "14:30:00.000002"),
+])
+async def test_http_precise_time_put_verify_cas_and_immutable_history(workflow_db, tmp_path, stored, input_time, changed):
+    from datetime import time as Time
+    from hashlib import sha256
+    import httpx
+    from fastapi import FastAPI
+    from vision_bill.api.helper.helper import get_receipt_service
+    from vision_bill.api.receipts import router
+    from vision_bill.security.dependencies import get_current_user
+    from vision_bill.security.models import User
+    from vision_bill.service.receipt_service import ReceiptService
+
+    w, scope = workflow_db
+    row, body, original = await seed(w, scope, tmp_path, total="10.000001")
+    async with w.pool.acquire() as conn:
+        await conn.execute("UPDATE receipts SET time=$2 WHERE id=$1", row.id, Time.fromisoformat(stored))
+        part = await conn.fetchval("""INSERT INTO image_source_parts(image_id,photo_index,source_sha256,image_path,metadata)
+            VALUES($1,0,$2,$3,'{}') RETURNING part_id""", row.image_id, sha256(original.read_bytes()).hexdigest(), str(original))
+        refs = {f"taxes.{i}.amount": [{"part_id": str(part), "photo_index": 0, "source_sha256": sha256(original.read_bytes()).hexdigest(), "coordinate_space": "original"}] for i in range(2)}
+        await conn.execute("UPDATE receipts SET field_sources=$2::jsonb WHERE id=$1", row.id, json.dumps(refs))
+        for i, name in enumerate(["Z VAT", "A VAT"]):
+            await conn.execute("INSERT INTO taxes(receipt_id,name,rate,amount,position) VALUES($1,$2,0.1,0,$3)", row.id, name, i)
+    service = ReceiptService.__new__(ReceiptService)
+    service._db = w._receipts
+    app = FastAPI()
+    app.include_router(router, prefix="/receipts")
+    app.dependency_overrides[get_receipt_service] = lambda: service
+    app.dependency_overrides[get_current_user] = lambda: User(id=scope.user_id, username="owner", is_admin=False, can_see_all=False)
+    path = f"/receipts/{row.id}"
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        initial = (await client.get(path)).json()
+        assert initial["receipt"]["time"] == stored
+        payload = body.model_dump(mode="json")
+        payload.update(time=input_time, total="12", expected_operation_revision=1,
+                       field_sources=refs, taxes=[{"name": "Z VAT", "rate": 0.1, "amount": "0"}, {"name": "A VAT", "rate": 0.1, "amount": "0"}])
+        payload["line_items"][0]["id"] = initial["line_items"][0]["id"]
+        discrepancy = await client.put(path, json=payload)
+        assert discrepancy.status_code == 200, discrepancy.text
+        assert [f['code'] for f in discrepancy.json()['findings']] == ['amount_discrepancy']
+        old_id = discrepancy.json()['findings'][0]['id']
+        verified = await client.post(path + "/verify", json={'expected_operation_revision':2,'expected_review_revision':2,'acknowledgements':[{'finding_id':old_id,'comment':'Confirmed printed total exception'}]})
+        assert verified.status_code == 200, verified.text
+        async with w.pool.acquire() as conn:
+            history = await conn.fetch("SELECT * FROM receipt_review_revisions WHERE receipt_id=$1 ORDER BY operation_revision", row.id)
+        initial = (await client.get(path)).json()
+        payload.update(category="grocery", expected_operation_revision=3)
+        saved = await client.put(path, json=payload)
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["verified"] and saved.json()["review_revision"] == 2
+        assert saved.json()["operation_revision"] == 4
+        assert saved.json()['findings'][0]['id'] == old_id
+        assert saved.json()['acknowledgements'] == verified.json()['acknowledgements']
+        assert (await client.put(path, json=payload)).status_code == 409
+        after = (await client.get(path)).json()
+        assert after["receipt"]["time"] == stored
+        assert Decimal(after["receipt"]["total"]) == Decimal("12")
+        assert after["receipt"]["subtotal"] == "10.000001"
+        assert after["line_items"] == initial["line_items"]
+        assert [(t["name"], t["rate"], t["amount"]) for t in after["taxes"]] == [(t["name"], t["rate"], t["amount"]) for t in initial["taxes"]]
+        assert after["receipt"]["field_sources"] == initial["receipt"]["field_sources"]
+        async with w.pool.acquire() as conn:
+            assert [tuple(t) for t in await conn.fetch("SELECT name,position FROM taxes WHERE receipt_id=$1 ORDER BY position", row.id)] == [("Z VAT", 0), ("A VAT", 1)]
+            before_invalid = await conn.fetch("SELECT * FROM receipt_review_revisions WHERE receipt_id=$1 ORDER BY operation_revision", row.id)
+        payload["expected_operation_revision"] = 4
+        for invalid in ["24:00", "12:00:60", "14:30:00.0000001", "14:30:00Z"]:
+            payload["time"] = invalid
+            assert (await client.put(path, json=payload)).status_code == 422
+            assert (await client.get(path)).json() == after
+        async with w.pool.acquire() as conn:
+            assert await conn.fetch("SELECT * FROM receipt_review_revisions WHERE receipt_id=$1 ORDER BY operation_revision", row.id) == before_invalid
+        payload["time"] = changed
+        edited = await client.put(path, json=payload)
+        assert edited.status_code == 200, edited.text
+        assert not edited.json()["verified"] and edited.json()["review_revision"] == 3
+        assert [f['code'] for f in edited.json()['findings']] == ['amount_discrepancy']
+        new_id = edited.json()['findings'][0]['id']
+        assert new_id != old_id and edited.json()['acknowledgements'] == []
+        request = {"expected_operation_revision": 5, "expected_review_revision": 3, 'acknowledgements':[{'finding_id':old_id,'comment':'Previous time'}]}
+        assert (await client.post(path + "/verify", json=request)).status_code == 422
+        request['acknowledgements'][0]['finding_id'] = new_id
+        assert (await client.post(path + "/verify", json=request)).status_code == 200
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval("SELECT time FROM receipts WHERE id=$1", row.id) == Time.fromisoformat(changed)
+        assert await conn.fetch("SELECT * FROM receipt_review_revisions WHERE receipt_id=$1 AND operation_revision<=3 ORDER BY operation_revision", row.id) == history
     assert original.read_bytes() == b"original receipt bytes"
 
 

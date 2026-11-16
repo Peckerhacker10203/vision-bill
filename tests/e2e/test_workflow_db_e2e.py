@@ -568,6 +568,62 @@ async def test_upgrade_0010_preserves_legacy_content_paths_and_ambiguity(db):
     await conn.close()
 
 
+async def test_upgrade_0010_preserves_precise_local_times_and_legacy_evidence(db, tmp_path):
+    from datetime import time as Time
+    from vision_bill.provider.db.receipt_db import ReceiptDB
+
+    migrate(db, "0010")
+    conn = await asyncpg.connect(db.pg_dsn)
+    owner = await conn.fetchval("INSERT INTO users(username,hashed_password) VALUES($1,'test') RETURNING id", str(uuid4()))
+    records = []
+    times = [Time(14, 30), Time(14, 30, 15), Time(14, 30, 15, 100000), Time(14, 30, 0, 1)]
+    for index, value in enumerate(times):
+        original = tmp_path / f"legacy-{index}.png"
+        original.write_bytes(f"original legacy {index}".encode())
+        image = await conn.fetchval("INSERT INTO images(user_id,image_path,status) VALUES($1,$2,'analyzed') RETURNING id", owner, str(original))
+        receipt = await conn.fetchval("""INSERT INTO receipts(user_id,image_id,merchant_name,date,time,subtotal,total,tax_total,currency,verified,status)
+            VALUES($1,$2,'Legacy','2020-01-01',$3,12.34,12.34,1.23,'EUR',TRUE,'verified') RETURNING id""", owner, image, value)
+        await conn.execute("UPDATE images SET receipt_id=$2 WHERE id=$1", image, receipt)
+        for position in range(2):
+            await conn.execute("""INSERT INTO line_items(receipt_id,description,original_description,quantity,unit_price,total_price,position)
+                VALUES($1,$2::text,$2::text,1.2345,6.17,6.17,$3)""", receipt, f"line-{position}", position)
+            await conn.execute("INSERT INTO taxes(receipt_id,name,rate,amount) VALUES($1,$2,0.1234,0.615)", receipt, f"tax-{position}")
+        records.append((receipt, image, original))
+    run = await conn.fetchval("""INSERT INTO benchmark_runs(status,model_ids,receipt_ids,dataset_fingerprint,prompt_version,scoring_version,experiment_manifest)
+        VALUES('completed','["legacy"]','[]','frozen','old','3','{"frozen_time":"14:30:15.1"}') RETURNING id""")
+    await conn.execute("""INSERT INTO benchmark_results(run_id,model_id,receipt_id,success,payload)
+        VALUES($1,'legacy',$2,TRUE,'{"time":"14:30:15.1","score":0.875}')""", run, records[0][0])
+    queries = [
+        "SELECT id,user_id,image_id,time,subtotal,total,tax_total,currency,verified,status FROM receipts ORDER BY id",
+        "SELECT id,receipt_id,description,quantity,unit_price,total_price,position FROM line_items ORDER BY receipt_id,position",
+        "SELECT id,receipt_id,name,rate,amount FROM taxes ORDER BY receipt_id,id",
+        "SELECT id,user_id,image_path,receipt_id FROM images ORDER BY id",
+        "SELECT experiment_manifest FROM benchmark_runs WHERE id=$1",
+        "SELECT payload FROM benchmark_results WHERE run_id=$1",
+    ]
+    before = [await conn.fetch(query, *([run] if "$1" in query else [])) for query in queries]
+    await conn.close()
+    migrate(db)
+    conn = await asyncpg.connect(db.pg_dsn)
+    try:
+        assert [await conn.fetch(query, *([run] if "$1" in query else [])) for query in queries] == before
+        reader = ReceiptDB(db)
+        reader._pool = await asyncpg.create_pool(db.pg_dsn, min_size=1, max_size=2)
+        try:
+            for index, (receipt, image, original) in enumerate(records):
+                detail = await reader.get_receipt_with_details(receipt, user_id=owner)
+                assert detail.receipt.time == times[index].isoformat()
+                assert detail.receipt.verification_source == "legacy"
+                assert [item.description for item in detail.line_items] == ["line-0", "line-1"]
+                assert original.read_bytes() == f"original legacy {index}".encode()
+                assert await conn.fetchval("SELECT image_path FROM images WHERE id=$1", image) == str(original)
+        finally:
+            await reader.destroy_db()
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0017"
+    finally:
+        await conn.close()
+
+
 async def test_bind_legacy_parts_is_fenced_stable_and_cannot_rewrite(workflow_db):
     from vision_bill.model import workflow
 

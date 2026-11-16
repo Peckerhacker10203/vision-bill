@@ -154,6 +154,21 @@ def test_stable_ids_bind_whole_material_document_but_ignore_classification():
     assert first.findings[0].id == evaluate(document(total="12", category="grocery")).findings[0].id
 
 
+@pytest.mark.parametrize("first,equivalent,different", [
+    ("14:30", "14:30:00.0", "14:30:01"),
+    ("14:30:15.1", "14:30:15.100000", "14:30:15.100001"),
+    ("14:30:00.000001", "14:30:00.000001", "14:30:00.000002"),
+])
+def test_time_canonicalization_keeps_material_and_finding_ids_stable(first, equivalent, different):
+    left = document(total="12", time=first)
+    right = document(total="12", time=equivalent)
+    changed = document(total="12", time=different)
+    assert review.material_document(left) == review.material_document(right)
+    assert [f.id for f in evaluate(left).findings] == [f.id for f in evaluate(right).findings]
+    assert review.material_document(left) != review.material_document(changed)
+    assert evaluate(left).findings[0].id != evaluate(changed).findings[0].id
+
+
 def test_acknowledgements_exact_and_integrity_not_acknowledgeable():
     assert hasattr(review, "validate_acknowledgements"), "acknowledgement gate missing"
     result = evaluate(document(total="12"))
