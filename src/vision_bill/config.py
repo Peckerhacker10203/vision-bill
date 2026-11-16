@@ -101,6 +101,8 @@ class OcrSettings(BaseModel):
     required: bool = False
     allow_vision_fallback: bool = False
     vision_fallback_model_id: str | None = None
+    coordination_path: Path = Field(default_factory=lambda: get_config_path().parent / "gpu-handoff.lock")
+    manage_model_lifecycle: bool = True
 
     @model_validator(mode="after")
     def required_needs_enabled(self) -> Self:

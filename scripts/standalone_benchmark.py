@@ -152,11 +152,12 @@ def get_pg_settings(args: argparse.Namespace) -> PGSettings:
 
 def get_ocr_settings(args: argparse.Namespace) -> OcrSettings:
     """Build OcrSettings from environment or command-line args."""
-    return OcrSettings(
-        enabled=True,
-        service_url=args.ocr_url or os.getenv("OCR__SERVICE_URL", "http://localhost:8082"),
-        timeout_seconds=int(os.getenv("OCR__TIMEOUT_SECONDS", "300")),
-    )
+    from vision_bill.config import settings
+    return settings.ocr.model_copy(update={
+        "enabled": True,
+        "service_url": args.ocr_url or os.getenv("OCR__SERVICE_URL", "http://localhost:8082"),
+        "timeout_seconds": int(os.getenv("OCR__TIMEOUT_SECONDS", "300")),
+    })
 
 
 def get_llm_settings(args: argparse.Namespace) -> LLMSettings:
@@ -371,7 +372,8 @@ async def execute_photos(
 
 
 async def execution_identity(
-    provider: LLMProvider, ocr: OcrProvider, pg: PGSettings, settings: OcrSettings, model_id: str
+    provider: LLMProvider, ocr: OcrProvider, pg: PGSettings, settings: OcrSettings, model_id: str,
+    *, qualify: bool = False,
 ) -> dict[str, Any]:
     from vision_bill.provider.llm.experiment import endpoint_fingerprint
     from vision_bill.service.experiment_execution import pipeline_identity
@@ -386,7 +388,7 @@ async def execution_identity(
     if model is None:
         raise ValueError("formatter_model_unavailable")
     return {
-        "pipeline": await pipeline_identity(service, options),
+        "pipeline": await pipeline_identity(service, options, qualify=qualify, managed_model_ids=[model_id]),
         "provider": type(provider).__name__,
         "endpoint_fingerprint": endpoint_fingerprint(provider),
         "requested_model": {"id": model.id, "digest": model.digest},
@@ -459,7 +461,8 @@ async def run_benchmark(args: argparse.Namespace) -> BenchmarkSummary:
         if not references:
             raise ValueError("No current qualified Gold references found")
         identity = await execution_identity(
-            llm_provider, ocr_provider, pg_settings, ocr_settings, llm_settings.model_name
+            llm_provider, ocr_provider, pg_settings, ocr_settings, llm_settings.model_name,
+            qualify=True,
         )
         manifest = {
             "version": 1,

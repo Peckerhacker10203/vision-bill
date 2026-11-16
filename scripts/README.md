@@ -13,6 +13,17 @@ reachable connection/network; template ports do not publish one. Keep credential
 in private files, not ARGS or shell history. Reports and traces may contain receipt
 text and must remain private. See [upgrade/roles/recovery](../UPGRADE_AND_VERIFY.md).
 
+Build/install targets and ordinary startup do not run these tools, historical
+colleague/Gemma comparisons, or real model benchmarks. Invoke only the desired
+diagnostic explicitly; you can build first and test your own receipts through the UI.
+For native shared-GPU work, all supported clients must use the application's same
+Ollama endpoint spelling, OCR settings and underlying `OCR__COORDINATION_PATH` file.
+A host-side path must refer to the same file mounted at `/app/config` in Compose.
+Managed standalone/forced OCR also requires production `OCR__ENABLED=true` and
+`OCR__MANAGE_MODEL_LIFECYCLE=true`; it is rejected before load when ordinary app
+LLM work would not participate. Explicit unmanaged CPU/replay modes are separate.
+See [model ownership and recovery](../paddleocr-service/README.md#internal-model-ownership).
+
 ## Context-budget diagnostic
 
 ```bash
@@ -30,6 +41,8 @@ can supply context if tags metadata does not. It counts image/reserved output on
 projected tag growth is an estimate. `--output-budget` defaults 2000 and `--tag-probe`
 defaults 250. These diagnostic values do not set the app's formatter 8192, OCR 4096 or
 model context window and do not automatically alter resolution/precision/limits.
+With managed OCR enabled, generation probes use the shared handoff and release
+their exact selected model before another OCR phase.
 
 ## Create an API benchmark
 
@@ -64,9 +77,10 @@ make script-standalone-benchmark ARGS="--user-id 125b2a52-60ac-4e1f-b9bf-d223f15
 actual selection/connection flags. Prefer private `PG__PASSWORD` over
 `--db-password`. `LLM__MODEL_NAME`, `LLM__HOST`, `OCR__SERVICE_URL`, `OCR__TIMEOUT_SECONDS` and
 `PG__*` provide defaults. The script explicitly enables OCR and always selects
-the OCR pipeline; it does not adopt every application `OCR__*` policy setting.
+the OCR pipeline, preserving configured coordination/lifecycle settings.
 It reads an owner-scoped, repeatable-read read-only snapshot, without row locks,
-DB mutation, API startup or qualification writes. Every selected case, including
+DB mutation, API startup or human-reference qualification writes. Explicit run
+creation loads/qualifies/parks native OCR to freeze real runtime identity. Every selected case, including
 changed/missing sources and extraction failures, stays in the v4 denominator.
 
 Output includes manifest hash and model/source/profile/prompt/schema/output/context
@@ -98,7 +112,9 @@ this command against an unrelated endpoint or assume an unqualified image is rea
 
 `--timeout`/`OCR__TIMEOUT_SECONDS` defaults 300. Effective requests are bounded at
 600 seconds; increasing it cannot extend the app whole-attempt deadline. This
-explicit diagnostic activates its OCR provider, calls no LLM/API, and treats empty
+explicit diagnostic activates its OCR provider and performs no LLM generation.
+Managed mode also unloads/verifies Vision Bill's configured LLM before native OCR,
+using the same coordination path and dedicated endpoint as the app. It treats empty
 transcription as failure even with HTTP200. Current native v2 JSON includes text,
 working-coordinate blocks, profile/runtime identity and actual working PNG payload;
 raw output can contain pixels and receipt text. `--quiet` suppresses raw console

@@ -35,6 +35,7 @@ import os
 import sys
 from pathlib import Path
 from statistics import mean
+from time import monotonic
 
 import httpx
 
@@ -282,13 +283,25 @@ class Budget:
         }
         if image_b64:
             payload["images"] = [image_b64]
-        data = self._post("/api/generate", payload)
+        from vision_bill.config import settings
+        if settings.ocr.enabled and settings.ocr.manage_model_lifecycle:
+            data = asyncio.run(self._managed_generate(payload))
+        else:
+            data = self._post("/api/generate", payload)
         count = data.get("prompt_eval_count")
         if type(count) is not int or count <= 0:
             raise ValueError("Prompt token count is unavailable")
         if count >= num_ctx - 1 or data.get("truncated") is True:
             raise ValueError("Prompt may be truncated at the diagnostic context cap; no complete count")
         return count
+
+    async def _managed_generate(self, payload: dict) -> dict:
+        from vision_bill.provider.llm.ollama import OllamaProvider
+        provider = OllamaProvider(self.host, analysis_timeout_seconds=self.timeout)
+        async with provider.handoff.session(monotonic() + min(600, self.timeout)) as owner:
+            await owner.llm_phase(self.model)
+            result: dict = await owner.model_call(asyncio.to_thread(self._post, "/api/generate", payload))
+            return result
 
     def measure(self, provider: LLMProvider, tag_probe: int, image_b64: str | None) -> None:
         self.context_length()

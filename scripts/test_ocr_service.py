@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Send local receipt images to the PaddleOCR service and print its raw output.
 
-This script exercises ONLY the OCR service (paddleocr-service). It does not
-touch the LLM provider at all. For every image in the data directory it POSTs
+This script performs OCR inference only. Managed handoff also releases and
+verifies Vision Bill's LLM residency. For every image in the data directory it POSTs
 the file to the service's /ocr endpoint (via the same PaddleOcrProvider the
 application uses) and prints the raw JSON the service returns.
 
@@ -81,11 +81,12 @@ def parse_args() -> argparse.Namespace:
 
 def get_ocr_settings(args: argparse.Namespace) -> OcrSettings:
     """Build OcrSettings from environment or command-line args."""
-    return OcrSettings(
-        enabled=True,
-        service_url=args.ocr_url or os.getenv("OCR__SERVICE_URL", "http://localhost:8082"),
-        timeout_seconds=args.timeout or int(os.getenv("OCR__TIMEOUT_SECONDS", "300")),
-    )
+    from vision_bill.config import settings
+    return settings.ocr.model_copy(update={
+        "enabled": True,
+        "service_url": args.ocr_url or os.getenv("OCR__SERVICE_URL", "http://localhost:8082"),
+        "timeout_seconds": args.timeout or int(os.getenv("OCR__TIMEOUT_SECONDS", "300")),
+    })
 
 
 def find_images(data_dir: Path) -> list[Path]:

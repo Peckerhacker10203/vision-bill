@@ -95,7 +95,7 @@ class BenchmarkService:
         if request.experiment.think is not None and not self._provider.supports_thinking_control:
             raise ValueError("Thinking override is supported only by the Ollama provider")
         if request.experiment.pipeline == ExtractionPipeline.OCR and not self.capabilities()["ocr_available"]:
-            raise ValueError("OCR extension is not configured; choose normal upload or direct vision")
+            raise ValueError("OCR extension is unavailable; managed OCR requires production OCR enabled with model lifecycle management")
         tags = await self._receipts.list_tags()
         inputs = [await self._capture_input(receipt_id, scope=scope) for receipt_id in selected_ids]
         expected = [Receipt.model_validate(item["expected"]) for item in inputs]
@@ -104,7 +104,7 @@ class BenchmarkService:
         counts = {len(item["images"]) for item in inputs}
         for item in inputs:
             item["pipeline"] = options.pipeline.value
-        manifest = {"identity": await pipeline_identity(self._receipts, options), "options": options.model_dump(mode="json"), "tags": tags, "inputs": inputs,
+        manifest = {"identity": await pipeline_identity(self._receipts, options, qualify=True, managed_model_ids=selected_models), "options": options.model_dump(mode="json"), "tags": tags, "inputs": inputs,
                     "provider": type(self._provider).__name__,
                     "endpoint_fingerprint": endpoint_fingerprint(self._provider),
                     "ocr_fingerprint": ocr_fingerprint(getattr(self._receipts, "_ocr_provider", None)),
@@ -328,7 +328,10 @@ class BenchmarkService:
             return int(await conn.fetchval("SELECT request_timeout_seconds FROM benchmark_runs WHERE id=$1", run.id))
 
     def capabilities(self) -> dict[str, bool]:
-        return {"ocr_available": bool(self._receipts._ocr_settings.service_url),
+        from .gpu_handoff import managed_ocr_enabled
+        ocr = self._receipts._ocr_settings
+        return {"ocr_available": bool(ocr.service_url) and (
+                    not ocr.manage_model_lifecycle or managed_ocr_enabled()),
                 "ocr_enabled": self._receipts._ocr_settings.enabled,
                 "thinking_control": self._provider.supports_thinking_control}
 
@@ -373,9 +376,19 @@ class BenchmarkService:
                 raise ValueError("Receipt image changed since run creation")
         options = ExperimentOptions.model_validate(manifest["options"])
         current_identity = await pipeline_identity(self._receipts, options)
-        _, settings, effective_options = effective_policy(self._receipts, options)
+        ocr, settings, effective_options = effective_policy(self._receipts, options)
         uses_ocr = settings.enabled and options.pipeline != ExtractionPipeline.DIRECT
         runtime = current_identity.get("ocr_runtime") or {}
+        if ocr is not None and getattr(ocr, "managed_lifecycle", False):
+            available = await ocr.get_capabilities()
+            if uses_ocr and available.can_load and not runtime.get("runtime_fingerprint"):
+                # After a sidecar restart, only an explicit queued execution may
+                # establish missing identity; passive readiness never loads OCR.
+                current_identity = await pipeline_identity(
+                    self._receipts, options, qualify=True, managed_model_ids=[model_id]
+                )
+                runtime = current_identity.get("ocr_runtime") or {}
+            runtime = {**runtime, "ready": available.ready or available.can_load}
         if uses_ocr and not runtime.get("ready") and (
             settings.required or not settings.allow_vision_fallback or not effective_options.allow_ocr_fallback
         ):

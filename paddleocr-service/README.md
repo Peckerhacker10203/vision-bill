@@ -122,7 +122,13 @@ file `sha256`. Use five distinct real inputs. For `table` and `formula`, also se
 that structure. Keep the upright input at `fixtures/upright.png` for the default
 startup path, or explicitly change `OCR_QUALIFICATION_IMAGE_PATH`.
 
-Use `make ocr-qualify-cuda` or `make ocr-qualify-rocm`. These commands run only the
+Use `make ocr-qualify-cuda` or `make ocr-qualify-rocm`. This is an explicit offline
+hardware gate, never a build prerequisite or automatic comparative benchmark.
+First stop/drain the application's analysis, benchmark and standalone workers and
+stop its OCR sidecar. Release only Vision Bill's model IDs on its dedicated Ollama
+endpoint and verify their absence with `/api/ps` before starting the gate; stopping
+the app alone does not unload Ollama. Leave unrelated GPU applications alone.
+These commands run only the
 sidecar, with the runtime input/output volume writable for this gate. For Radeon,
 set `OCR_RENDER_NODE`, `OCR_RENDER_GID` and `OCR_VIDEO_GID` to the actual host node
 and groups; only KFD and the selected render node are passed. For NVIDIA,
@@ -174,15 +180,20 @@ to `qualified_targets`; repeat the release gate on each physical target.
 
 Use the generated `qualification.runtime.json`, the sealed manifest, exact model
 bytes and exact upright image for deployment. Compose mounts runtime inputs
-read-only and exposes no OCR host port. `/health` is liveness; `/ready` becomes
-healthy only after fresh startup qualification. `/info` reports readiness,
-profile/runtime and qualification identity; liveness alone is not model readiness.
+read-only and exposes no OCR host port. The service starts parked with no native
+child or loaded models. Build targets only build/install; service startup and
+`/health`, `/ready`, `/info` polling never start a benchmark or initially load OCR.
+Healthchecks use `/health`. `/ready` stays false with `ocr_parked` until an explicit
+processing/qualification request loads and qualifies the native child. `/info`
+also exposes the last qualified identity as historical evidence, not GPU readiness.
 A model/package/image/source/target change invalidates the seal and requires fresh
-qualification, never an automatic backend/precision fallback. Readiness/capability
-polling observes an idle worker death and schedules one coordinated bounded
+qualification, never an automatic backend/precision fallback. While OCR is loaded,
+readiness/capability polling observes an idle worker death and schedules one coordinated bounded
 replacement, waiting for in-flight ownership/retirement. Failed replacement
 qualification stays unready without an endless retry loop; shutdown does not revive
-workers. The application can wait on OCR/provider/model startup without spending
+workers. Parking disables recovery until a new explicit load. The application
+distinguishes parked availability (`can_load`) from qualified readiness and can
+wait on OCR/provider/model startup without spending
 an analysis attempt. The base stack keeps OCR optional
 under profile `ocr`; explicitly select a CUDA/ROCm overlay and configure the
 application OCR enabled/required/fallback policy. Never silently activate OCR or
@@ -201,6 +212,62 @@ a text formatter may require `OCR__VISION_FALLBACK_MODEL_ID`. Model/digest and
 alternate identity are frozen, not silently changed. The default sidecar Dockerfile
 intentionally fails: base Compose alone is not a CPU runtime. For upgrades, first
 follow [owner migrations/worker drain](../UPGRADE_AND_VERIFY.md).
+
+## Internal model ownership
+
+With `OCR__MANAGE_MODEL_LIFECYCLE=true` (default), Linux app processes, uploads,
+benchmarks including direct vision, and supported standalone clients share one
+advisory lock and durable journal. `OCR__COORDINATION_PATH` defaults to
+`gpu-handoff.lock` beside `VISION_BILL_CONFIG_PATH`; Compose uses its existing
+`/app/config` bind mount. Every process must use the **same underlying file**,
+even when host/container paths differ, and the same spelling of the LLM endpoint.
+Keep the directory private to Vision Bill and use local storage supporting flock.
+
+One owner releases and verifies its exact Ollama model IDs, loads OCR, processes
+every receipt photo, then parks OCR and confirms native child death. Only then can
+formatting, repairs and classification run; the owner unloads and verifies its LLM
+before releasing ownership. `/lifecycle/claim`, `/load` and `/park` (all under the
+`/lifecycle` prefix) and `/ocr` use generation-fenced owner tokens; stale requests
+cannot park/reload a successor. These internal routes must stay on the private
+application network. No device-exclusive mode, foreign process termination, or
+unloading of every model returned by Ollama discovery is used.
+
+Use a **dedicated Vision Bill Ollama endpoint** when other clients might use the
+same model ID: Ollama cannot identify which client owns a shared resident model.
+Unrelated GPU programs and unrelated model IDs remain allowed; their memory use can
+still cause capacity failures. OpenAI-compatible inference has no standard unload
+contract and is rejected for managed sharing. Direct OpenAI deployments without
+OCR remain supported. `OCR__MANAGE_MODEL_LIFECYCLE=false` is an explicit CPU-only or
+separate-resource policy, used by software E2E stubs; it makes no GPU handoff claim
+and cannot activate the shipped parked native sidecar without ownership.
+
+Managed forced-OCR benchmarks, standalone OCR and frozen OCR-enabled uploads
+require current production `OCR__ENABLED=true` and
+`OCR__MANAGE_MODEL_LIFECYCLE=true` on every app worker. Otherwise ordinary direct
+LLM work would not share their ownership. Forced qualification/execution fails
+before any load; previously frozen managed uploads wait before claim without
+spending attempts or rewriting their saved intent. Benchmark capabilities mark
+managed OCR unavailable in this configuration. Pure LLM deployments and explicitly
+unmanaged CPU/replay modes remain supported.
+
+An explicitly requested OCR benchmark qualifies and parks OCR when freezing its
+identity. Readiness polling does not. The frozen identity omits transient residency
+but includes the actual qualified profile/runtime, checked again against execution.
+Recreate old benchmark manifests after changing this lifecycle contract.
+
+Failed teardown or unconfirmed unload blocks the next phase. A crashed/cancelled
+or failed Ollama request whose completion is unknown leaves `unsettled=true` in
+the journal, even if a momentary `/api/ps` looks empty. The attempt deadline remains
+600 seconds including cleanup. Cleanup uses at most 30 seconds of the remaining
+absolute attempt budget; when none remains, pending/unsettled state stays durable
+for the next owner's confirmed claim/release barrier. Expiry never becomes a
+successful result. A late response cannot clear a successor's journal.
+For manual recovery, stop/drain all Vision Bill app/standalone workers and its
+sidecar, then establish that the dedicated Ollama endpoint has no outstanding
+requests (restart only that dedicated endpoint if necessary). Unload/verify only
+the journal's owned model IDs. Only after those checks, with all owners stopped,
+archive/remove the lock and adjacent `.json` journal and restart parked services.
+Never reset ownership while workers are active or restart a shared foreign runtime.
 
 The historical CPU PP-OCR comparator has an independent hashed build target in
 `scripts/ocr_harness/Dockerfile`, selected with

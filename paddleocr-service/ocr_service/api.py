@@ -17,6 +17,7 @@ from uuid import UUID
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from PIL import Image
+from pydantic import BaseModel, Field
 
 from vision_bill.model.ocr import OcrResponse
 
@@ -33,6 +34,10 @@ SOURCE_FORMATS = {
     "image/heif": "HEIF",
     "image/gif": "GIF",
 }
+
+
+class LifecycleRequest(BaseModel):
+    owner_token: str = Field(pattern=r"^[1-9][0-9]*:[a-zA-Z0-9-]+$", max_length=100)
 
 
 def configured_worker() -> OcrWorkerManager:
@@ -122,7 +127,6 @@ def create_app(
                 if closing:
                     await asyncio.to_thread(worker.stop)
                     return
-                await asyncio.to_thread(worker.start)
             except Exception:  # noqa: BLE001 - safe lifecycle failure boundary
                 startup_failed = True
 
@@ -166,6 +170,7 @@ def create_app(
             "contract_version": 2,
             "profile": load_profile(Path(__file__).parents[1] / "profile.json").model_dump(),
             "worker": ready_body(),
+            "last_qualified_identity": getattr(worker, "last_identity", {}),
             "max_upload_bytes": max_upload_bytes,
             "max_pending": 4,
             "max_timeout_ms": 600000,
@@ -178,6 +183,7 @@ def create_app(
         photo_index: Annotated[int, Form(ge=0)],
         source_sha256: Annotated[str, Form(pattern=r"^[0-9a-f]{64}$")],
         timeout_ms: Annotated[int, Form(gt=0, le=600000)],
+        owner_token: Annotated[str | None, Form()] = None,
     ) -> OcrResponse:
         deadline = time.monotonic() + timeout_ms / 1000
         if worker is None:
@@ -196,6 +202,7 @@ def create_app(
             result = worker.infer(
                 OcrRequest(request_id, path, photo_index, source_sha256),
                 deadline_monotonic=deadline,
+                owner=owner_token,
             )
             validate_result(result)
             return result
@@ -205,5 +212,17 @@ def create_app(
         finally:
             if cleanup_safe:
                 path.unlink(missing_ok=True)
+
+    @app.post("/lifecycle/{action}")
+    def lifecycle(action: str, body: LifecycleRequest) -> dict[str, object]:
+        if worker is None or closing:
+            raise HTTPException(503, "ocr_unavailable")
+        if action not in ("claim", "load", "park"):
+            raise HTTPException(404, "ocr_unknown_lifecycle_action")
+        try:
+            getattr(worker, action)(body.owner_token)
+        except OcrWorkerError as exc:
+            raise HTTPException(exc.status_code, exc.code) from None
+        return ready_body()
 
     return app

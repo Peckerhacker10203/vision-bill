@@ -1,7 +1,8 @@
+import hashlib
 import logging
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from time import perf_counter
+from time import monotonic, perf_counter
 from typing import Any
 
 import httpx
@@ -45,6 +46,24 @@ class OllamaProvider(LLMProvider):
         )
         self._temperature = temperature
         self.supports_thinking_control = True
+        self.supports_model_release = True
+        self.lifecycle_identity = "ollama:" + hashlib.sha256(host.rstrip("/").encode()).hexdigest()
+        from ...service.gpu_handoff import configure_handoff
+        configure_handoff(self)
+
+    async def release_model(self, model_id: str) -> None:
+        """Unload precisely the requested ID and verify absence, preserving others."""
+        from ...service.gpu_handoff import current_owner
+        owner = current_owner()
+        call = self._client.generate(model=model_id, keep_alive=0)
+        if owner is not None:
+            await owner.model_call(call)
+        else:
+            await call
+        canonical = model_id if ":" in model_id.rsplit("/", 1)[-1] else model_id + ":latest"
+        running = await self._client.ps()
+        if any(item.model in (model_id, canonical) for item in running.models):
+            raise RuntimeError("model_release_unconfirmed")
 
     def update_runtime_settings(self, *, temperature: float) -> None:
         self._temperature = temperature
@@ -124,17 +143,31 @@ class OllamaProvider(LLMProvider):
         )
 
     async def send_message(self, model_id: str, messages: Sequence[Mapping[str, Any]]) -> str:
+        from ...service.gpu_handoff import current_owner
+        owner = current_owner()
+        if owner is not None:
+            await owner.llm_phase(model_id)
+        elif self.handoff is not None:
+            async with self.handoff.session(monotonic() + self.analysis_timeout_seconds) as owner:
+                await owner.llm_phase(model_id)
+                return await self._send_message(model_id, messages)
+        return await self._send_message(model_id, messages)
+
+    async def _send_message(self, model_id: str, messages: Sequence[Mapping[str, Any]]) -> str:
+        from ...service.gpu_handoff import current_owner
         started = perf_counter()
         extra: dict[str, Any] = {}
         if self.experiment_options and self.experiment_options.think is not None:
             extra["think"] = self.experiment_options.think
-        response = await self._client.chat(
+        call = self._client.chat(
             model=model_id,
             # format=Receipt.model_json_schema(),
             messages=messages,
             options={"temperature": self._temperature, "num_predict": self.max_output_tokens},
             **extra,
         )
+        owner = current_owner()
+        response = await owner.model_call(call) if owner is not None else await call
         if self.experiment_trace is not None:
             self.experiment_trace.append(
                 chat_telemetry(response, messages, (perf_counter() - started) * 1000)

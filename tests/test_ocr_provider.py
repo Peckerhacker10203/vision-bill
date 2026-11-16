@@ -81,7 +81,7 @@ async def test_readiness_requires_info_and_ready(monkeypatch):
         )
 
     calls = http_client(monkeypatch, handler)
-    provider = PaddleOcrProvider("http://local")
+    provider = PaddleOcrProvider("http://local", managed_lifecycle=False)
     assert hasattr(provider, "get_capabilities"), "typed readiness is missing"
     capabilities = await provider.get_capabilities()
     assert not capabilities.ready and capabilities.reachable
@@ -107,7 +107,7 @@ async def test_original_png_bytes_mime_hash_and_remaining_deadline(monkeypatch, 
         return httpx.Response(200, json=wire_page(digest=digest, request_id=request_id))
 
     calls = http_client(monkeypatch, handler)
-    provider = PaddleOcrProvider("http://local")
+    provider = PaddleOcrProvider("http://local", managed_lifecycle=False)
     assert hasattr(provider, "extract_page"), "typed page extraction is missing"
     page = await provider.extract_page(
         path,
@@ -145,7 +145,7 @@ async def test_rejects_malformed_or_reordered_result(monkeypatch, tmp_path, chan
         return httpx.Response(200, json=page)
 
     http_client(monkeypatch, handler)
-    provider = PaddleOcrProvider("http://local")
+    provider = PaddleOcrProvider("http://local", managed_lifecycle=False)
     assert hasattr(provider, "extract_page"), "typed page extraction is missing"
     with pytest.raises(ValueError):
         await provider.extract_page(
@@ -161,7 +161,7 @@ async def test_paddleocr_extract_text_http_failure(monkeypatch, tmp_path):
     path = image_file(tmp_path)
     http_client(monkeypatch, lambda request: httpx.Response(500))
     with pytest.raises(httpx.HTTPStatusError):
-        await PaddleOcrProvider("http://local").extract_text(path)
+        await PaddleOcrProvider("http://local", managed_lifecycle=False).extract_text(path)
 
 
 @pytest.mark.parametrize("body", [[], {"contract_version": 2, "profile": {}, "worker": "bad"}])
@@ -175,7 +175,7 @@ async def test_malformed_info_is_unready_instead_of_crashing(monkeypatch, body):
         )
 
     http_client(monkeypatch, handler)
-    result = await PaddleOcrProvider("http://local").get_capabilities()
+    result = await PaddleOcrProvider("http://local", managed_lifecycle=False).get_capabilities()
     assert not result.ready and result.reason_code == "ocr_unavailable"
 
 
@@ -195,7 +195,7 @@ async def test_ocr_limit_comes_from_matching_ready_profile(monkeypatch):
         )
 
     http_client(monkeypatch, handler)
-    capabilities = await PaddleOcrProvider("http://local").get_capabilities()
+    capabilities = await PaddleOcrProvider("http://local", managed_lifecycle=False).get_capabilities()
     assert capabilities.ready
     assert getattr(capabilities, "ocr_max_new_tokens", None) == 4096
 
@@ -225,7 +225,7 @@ async def test_original_byte_preparation_is_bounded_before_http(monkeypatch, tmp
     began = time.monotonic()
     try:
         with pytest.raises(TimeoutError):
-            await PaddleOcrProvider("http://local").extract_page(
+            await PaddleOcrProvider("http://local", managed_lifecycle=False).extract_page(
                 path, photo_index=0, source_sha256=digest, deadline=began + 0.08
             )
         assert entered.is_set()
@@ -256,5 +256,5 @@ async def test_capabilities_exposes_qualified_live_runtime(monkeypatch):
 
     http_client(monkeypatch, handler)
     assert (
-        await PaddleOcrProvider("http://local").get_capabilities()
+        await PaddleOcrProvider("http://local", managed_lifecycle=False).get_capabilities()
     ).runtime_fingerprint == "qualified-runtime"

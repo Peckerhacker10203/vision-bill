@@ -299,7 +299,7 @@ async def test_ocr_transport_keeps_every_original_format(monkeypatch, tmp_path, 
         return httpx.Response(200, json=wire_page(digest=digest, request_id=request_id))
 
     http_client(monkeypatch, handler)
-    result = await PaddleOcrProvider("http://local").extract_page(
+    result = await PaddleOcrProvider("http://local", managed_lifecycle=False).extract_page(
         path, photo_index=0, source_sha256=digest, deadline=time.monotonic() + 2
     )
     assert result.source_sha256 == digest and path.read_bytes() == raw

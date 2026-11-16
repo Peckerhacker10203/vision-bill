@@ -18,7 +18,7 @@ def test_separate_digest_pinned_native_images_and_cuda_lock():
         assert re.search(r"FROM \S+@sha256:[0-9a-f]{64}", text)
         assert "COPY paddleocr-service/ocr_service/" in text
         assert "COPY src/vision_bill/model/ocr.py" in text
-        assert "/ready" in text
+        assert "/health" in text
     cuda = (SERVICE / "requirements.cuda.lock").read_text()
     assert "paddlepaddle_gpu-3.3.1" in cuda and "cu126" in cuda
     if "UNRESOLVED" in cuda:
@@ -56,7 +56,7 @@ def test_sidecar_root_context_cache_and_internal_readiness():
     assert not service.get("ports")
     assert service["environment"]["PADDLE_PDX_CACHE_HOME"] == "/var/cache/paddlex"
     assert any("/var/cache/paddlex" in volume for volume in service["volumes"])
-    assert "/ready" in str(service["healthcheck"])
+    assert "/health" in str(service["healthcheck"])
     ignore = (ROOT / ".dockerignore").read_text().splitlines()
     assert "*" in ignore and "!paddleocr-service/ocr_service/*.py" in ignore
     assert "!paddleocr-service/**" not in ignore

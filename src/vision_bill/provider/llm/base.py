@@ -5,6 +5,7 @@ import json
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from copy import copy
 from dataclasses import dataclass
 from decimal import Decimal
@@ -81,6 +82,12 @@ class LLMProvider(ABC):
     experiment_options: ExperimentOptions | None = None
     experiment_trace: list[dict[str, Any]] | None = None
     max_output_tokens: int = 8192
+    supports_model_release: bool = False
+    lifecycle_identity: str = "unsupported"
+    handoff: Any = None
+
+    async def release_model(self, model_id: str) -> None:
+        raise ValueError("model_release_unsupported")
 
     def for_experiment(self, options: ExperimentOptions) -> "LLMProvider":
         """Copy request settings; never mutate the live upload provider."""
@@ -213,6 +220,15 @@ class LLMProvider(ABC):
         self, model_id: str, messages: list[dict[str, Any]], *, image_count: int = 1
     ) -> AnalysisResult:
         """Explicit compatibility/replay path for historical Receipt-only responses."""
+        deadline = monotonic() + self.analysis_timeout_seconds
+        async with asyncio.timeout(self.analysis_timeout_seconds), (
+            self.handoff.session(deadline) if self.handoff is not None else nullcontext()
+        ):
+            return await self._legacy_analysis_owned(model_id, messages, image_count=image_count)
+
+    async def _legacy_analysis_owned(
+        self, model_id: str, messages: list[dict[str, Any]], *, image_count: int = 1
+    ) -> AnalysisResult:
         started = perf_counter()
         attempts: list[dict[str, Any]] = []
 
@@ -245,6 +261,14 @@ class LLMProvider(ABC):
         self, model_id: str, input: ReceiptInput, *, tags: Sequence[str], deadline: float
     ) -> InferenceEnvelope:
         """Extract observations first; classification is an independent enrichment call."""
+        async with asyncio.timeout(max(0, deadline - monotonic())), (
+            self.handoff.session(deadline) if self.handoff is not None else nullcontext()
+        ):
+            return await self._extract_receipt_input_owned(model_id, input, tags=tags, deadline=deadline)
+
+    async def _extract_receipt_input_owned(
+        self, model_id: str, input: ReceiptInput, *, tags: Sequence[str], deadline: float
+    ) -> InferenceEnvelope:
         started = perf_counter()
         probe = copy(self)
         probe.experiment_trace = []

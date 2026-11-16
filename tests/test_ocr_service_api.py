@@ -38,16 +38,18 @@ def test_health_does_not_imply_readiness_and_metadata_is_safe():
     context = FakeContext(init_fail=True, init_blocked=True)
     worker = OcrWorkerManager(mp_context=context, startup_timeout=2)
     with TestClient(create_app(worker_factory=lambda: worker)) as client:
-        assert context.started.wait(1)
+        deadline = time.monotonic() + 1
+        while client.get("/ready").json()["reason_code"] == "ocr_starting":
+            assert time.monotonic() < deadline
+        assert not context.started.is_set()
         assert client.get("/health").status_code == 200
         ready = client.get("/ready")
         assert ready.status_code == 503
-        assert ready.json()["reason_code"] == "ocr_starting"
+        assert ready.json()["reason_code"] == "ocr_parked"
+        assert client.post("/lifecycle/claim", json={"owner_token": "1:test"}).status_code == 200
         context.init_release.set()
-        deadline = time.monotonic() + 1
-        while ready.json()["reason_code"] == "ocr_starting":
-            assert time.monotonic() < deadline, ready.text
-            ready = client.get("/ready")
+        assert client.post("/lifecycle/load", json={"owner_token": "1:test"}).status_code == 503
+        ready = client.get("/ready")
         assert client.get("/health").status_code == 200
         assert ready.status_code == 503
         assert ready.json()["reason_code"] == "ocr_init_failed"
@@ -283,7 +285,7 @@ def test_original_ingress_preserves_raw_identity_and_real_normalization(source_f
         def readiness(self):
             return WorkerReadiness(ready=True, generation=1)
 
-        def infer(self, request, *, deadline_monotonic):
+        def infer(self, request, *, deadline_monotonic, owner=None):
             seen.append(request.original_path.read_bytes())
             with normalize_source(request.original_path, request.source_sha256) as normalized:
                 derived = normalized.path.read_bytes()

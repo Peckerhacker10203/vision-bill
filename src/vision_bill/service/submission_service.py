@@ -111,6 +111,9 @@ class SubmissionService:
             # Claim malformed saved options to record a terminal safe diagnostic.
             return None
         try:
+            from .gpu_handoff import managed_ocr_enabled
+            if ocr.enabled and ocr.manage_model_lifecycle and not managed_ocr_enabled():
+                return "ocr_unavailable"
             if not await self.receipts.check_connection():
                 return "provider_unavailable"
             capability = "vision"
@@ -118,11 +121,11 @@ class SubmissionService:
             selected = image.model_id or self.settings.llm.model_name
             if ocr.enabled:
                 capabilities = await self.receipts.ocr_capabilities(ocr)
-                if not capabilities.ready and (
+                if not (capabilities.ready or capabilities.can_load) and (
                     ocr.required or not ocr.allow_vision_fallback or not permission
                 ):
                     return "ocr_unavailable"
-                if capabilities.ready:
+                if capabilities.ready or capabilities.can_load:
                     capability = "text"
                 else:
                     alternate = ocr.vision_fallback_model_id
@@ -385,7 +388,7 @@ class SubmissionService:
             capabilities = await self.receipts.ocr_capabilities(ocr)
             if (
                 not ocr.enabled
-                or not capabilities.ready
+                or not (capabilities.ready or capabilities.can_load)
                 or not capabilities.runtime_fingerprint
                 or capabilities.profile_id != checkpoint.profile_id
                 or capabilities.runtime_fingerprint != checkpoint.runtime_fingerprint

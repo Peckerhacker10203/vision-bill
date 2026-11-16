@@ -80,6 +80,7 @@ class OcrCapabilities(BaseModel):
     configured: bool
     reachable: bool
     ready: bool
+    can_load: bool = False
     profile_id: str | None = None
     runtime_fingerprint: str | None = None
     reason_code: str | None = None

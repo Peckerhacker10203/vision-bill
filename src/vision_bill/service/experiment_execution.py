@@ -1,12 +1,14 @@
 """Benchmark execution through the same public receipt-service paths as uploads.
 
-Forced OCR uses the configured extension even when production OCR is disabled.
-All policy overrides are local to the experiment.
+Forced managed OCR requires production OCR participation in the shared handoff.
+Unmanaged CPU/replay extensions may be selected independently of production OCR.
+All pipeline policy overrides are local to the experiment.
 """
 
 import asyncio
 import hashlib
 import json
+from collections.abc import Sequence
 from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,8 +87,8 @@ def effective_policy(
                 "allow_ocr_fallback": settings.allow_vision_fallback and options.allow_ocr_fallback
             }
         )
-    else:
-        ocr = None
+    # Direct vision still coordinates with the configured OCR sidecar; it simply
+    # skips its load phase. This also protects direct benchmark jobs.
     return ocr, settings, options
 
 
@@ -161,7 +163,8 @@ async def execute_submission(
 
 
 async def pipeline_identity(
-    service: "ReceiptService", options: ExperimentOptions
+    service: "ReceiptService", options: ExperimentOptions, *, qualify: bool = False,
+    managed_model_ids: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Freeze effective local execution contracts without receipt/reference observations."""
     import inspect
@@ -178,7 +181,25 @@ async def pipeline_identity(
     provider = service._provider.for_experiment(effective_options)
     capabilities = None
     if ocr is not None and options.pipeline != ExtractionPipeline.DIRECT:
-        capabilities = (await ocr.get_capabilities()).model_dump(mode="json")
+        if qualify and getattr(ocr, "managed_lifecycle", False):
+            from .gpu_handoff import ModelHandoff
+            async with ModelHandoff(settings.coordination_path, provider, ocr).session(
+                monotonic() + provider.analysis_timeout_seconds
+            ) as owner:
+                for model_id in managed_model_ids:
+                    owner.track(model_id)
+                await owner.ocr_phase()
+                qualified = await ocr.get_capabilities()
+                if not qualified.ready or not qualified.runtime_fingerprint:
+                    raise ValueError("ocr_qualification_required")
+                capabilities = qualified.model_dump(mode="json")
+        else:
+            capabilities = (await ocr.get_capabilities()).model_dump(mode="json")
+        if getattr(ocr, "managed_lifecycle", False):
+            # Residency and availability are observations, not frozen identity.
+            capabilities = {key: capabilities[key] for key in (
+                "profile_id", "runtime_fingerprint", "ocr_max_new_tokens"
+            )}
     alternate_identity = None
     if (settings.enabled and not settings.required and settings.allow_vision_fallback
             and effective_options.allow_ocr_fallback and settings.vision_fallback_model_id):

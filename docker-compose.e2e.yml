@@ -75,6 +75,8 @@ services:
       OCR__ALLOW_VISION_FALLBACK: ${VB_E2E_OCR_FALLBACK:-false}
       OCR__SERVICE_URL: ${VB_E2E_OCR_SERVICE_URL-}
       OCR__TIMEOUT_SECONDS: "2"
+      # These HTTP stubs are CPU-only and have no resident native/LLM models.
+      OCR__MANAGE_MODEL_LIFECYCLE: "false"
       IMAGES__SAVE_DIR: /app/uploads
       IMAGES__TMP_DIR: /app/uploads_tmp
     volumes:

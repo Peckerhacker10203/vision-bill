@@ -19,9 +19,27 @@ from .base import OcrProvider, compact_ocr_text
 
 
 class PaddleOcrProvider(OcrProvider):
-    def __init__(self, service_url: str, timeout: int = 300):
+    managed_lifecycle = True
+
+    def __init__(self, service_url: str, timeout: int = 300, *, managed_lifecycle: bool = True):
         self.service_url = service_url.rstrip("/")
         self.timeout = timeout
+        self.managed_lifecycle = managed_lifecycle
+
+    async def _lifecycle(self, action: str, token: str, deadline: float) -> None:
+        async with httpx.AsyncClient(timeout=max(.001, deadline - monotonic()), trust_env=False) as client:
+            response = await client.post(f"{self.service_url}/lifecycle/{action}",
+                                         json={"owner_token": token})
+            response.raise_for_status()
+
+    async def claim(self, token: str, deadline: float) -> None:
+        await self._lifecycle("claim", token, deadline)
+
+    async def load(self, token: str, deadline: float) -> None:
+        await self._lifecycle("load", token, deadline)
+
+    async def park(self, token: str, deadline: float) -> None:
+        await self._lifecycle("park", token, deadline)
 
     async def get_capabilities(self) -> OcrCapabilities:
         reachable = False
@@ -52,10 +70,13 @@ class PaddleOcrProvider(OcrProvider):
                 ):
                     raise ValueError("ocr_profile_mismatch")
                 reported_limit = info["profile"].get("max_new_tokens")
+                parked = ready.reason_code == "ocr_parked"
+                identity = info.get("last_qualified_identity", {}) if parked else {}
+                if not isinstance(identity, dict):
+                    raise TypeError("ocr_contract_mismatch")
                 ocr_limit = (
                     reported_limit
-                    if ready.ready
-                    and info_profile == ready.profile_id
+                    if (parked or (ready.ready and info_profile == ready.profile_id))
                     and type(reported_limit) is int
                     and reported_limit > 0
                     else None
@@ -65,12 +86,13 @@ class PaddleOcrProvider(OcrProvider):
                     configured=True,
                     reachable=True,
                     ready=ready.ready,
-                    profile_id=ready.profile_id,
+                    can_load=parked,
+                    profile_id=ready.profile_id or identity.get("profile_id"),
                     reason_code=ready.reason_code,
-                    runtime_fingerprint=ready.runtime_fingerprint if ready.ready else None,
+                    runtime_fingerprint=ready.runtime_fingerprint if ready.ready else identity.get("runtime_fingerprint"),
                     ocr_max_new_tokens=ocr_limit,
                 )
-        except (httpx.HTTPError, OSError, ValueError):
+        except (httpx.HTTPError, OSError, ValueError, TypeError):
             return OcrCapabilities(
                 enabled=True,
                 configured=True,
@@ -95,6 +117,10 @@ class PaddleOcrProvider(OcrProvider):
         if remaining <= 0:
             raise TimeoutError("ocr_deadline")
         request_id = uuid4()
+        from ...service.gpu_handoff import current_owner
+        owner = current_owner()
+        if owner is None and self.managed_lifecycle:
+            raise ValueError("ocr_managed_session_required")
         async with asyncio.timeout(max(0, deadline - monotonic())):
             async with httpx.AsyncClient(timeout=remaining, trust_env=False) as client:
                 response = await client.post(
@@ -105,6 +131,7 @@ class PaddleOcrProvider(OcrProvider):
                         "photo_index": str(photo_index),
                         "source_sha256": source_sha256,
                         "timeout_ms": str(max(1, min(600000, int(remaining * 1000)))),
+                        "owner_token": owner.token if owner is not None else "",
                     },
                 )
                 response.raise_for_status()
@@ -180,10 +207,21 @@ class PaddleOcrProvider(OcrProvider):
         digest = await run_sync_before(
             deadline, lambda: hashlib.sha256(image.read_bytes()).hexdigest()
         )
-        page = await self.extract_page(
-            image, photo_index=0, source_sha256=digest, deadline=deadline
-        )
+        if not self.managed_lifecycle:
+            page = await self.extract_page(image, photo_index=0, source_sha256=digest, deadline=deadline)
+            return await run_sync_before(deadline, page.model_dump, mode="json")
+        from ...config import settings
+        from ...service.gpu_handoff import ModelHandoff
+        from ..factory import get_llm_provider
+        provider = get_llm_provider(settings.llm)
+        async with ModelHandoff(settings.ocr.coordination_path, provider, self).session(deadline) as owner:
+            owner.track(settings.llm.model_name)
+            await owner.ocr_phase()
+            page = await self.extract_page(
+                image, photo_index=0, source_sha256=digest, deadline=deadline
+            )
         return await run_sync_before(deadline, page.model_dump, mode="json")
 
     async def check_connection(self) -> bool:
-        return (await self.get_capabilities()).ready
+        capabilities = await self.get_capabilities()
+        return capabilities.ready or capabilities.can_load

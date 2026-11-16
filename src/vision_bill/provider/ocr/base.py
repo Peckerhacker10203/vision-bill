@@ -34,6 +34,7 @@ def compact_ocr_text(result: dict[str, Any]) -> str:
 
 class OcrProvider(ABC):
     """Abstract base class for OCR providers."""
+    managed_lifecycle = False
 
     async def get_capabilities(self) -> OcrCapabilities:
         """Legacy replay providers must opt into typed readiness explicitly."""

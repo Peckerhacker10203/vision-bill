@@ -42,6 +42,7 @@ def get_ocr_provider(ocr_settings: OcrSettings) -> OcrProvider | None:
         return PaddleOcrProvider(
             service_url=ocr_settings.service_url,
             timeout=ocr_settings.timeout_seconds,
+            managed_lifecycle=ocr_settings.manage_model_lifecycle,
         )
 
     raise ValueError(f"Unsupported OCR provider: {ocr_settings.provider}")

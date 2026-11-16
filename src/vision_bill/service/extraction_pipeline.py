@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import nullcontext
 from pathlib import Path
 from time import monotonic, perf_counter
 
@@ -21,6 +22,7 @@ from ..model.ocr import OcrPageMetadata, OcrResponse, SourceRef
 from ..model.review import ReviewFinding
 from ..provider.llm.base import LLMProvider, ModelInfo
 from ..provider.ocr.base import OcrProvider, compact_ocr_text
+from .gpu_handoff import ModelHandoff, current_owner
 
 
 def select_vision_model(models: Sequence[ModelInfo], requested_id: str, alternate_id: str | None = None) -> ModelInfo | None:
@@ -62,7 +64,14 @@ class ExtractionPipeline:
         source_refs: Sequence[SourceRef] = (),
         max_output_tokens: int | None = None,
     ) -> InferenceEnvelope:
-        async with asyncio.timeout(max(0, deadline - monotonic())):
+        handoff = getattr(self.provider, "handoff", None)
+        if self.ocr is not None and getattr(self.ocr, "managed_lifecycle", False):
+            handoff = ModelHandoff(self.settings.coordination_path, self.provider, self.ocr)
+        async with asyncio.timeout(max(0, deadline - monotonic())), (
+            handoff.session(deadline) if handoff is not None else nullcontext()
+        ) as owner:
+            if owner is not None:
+                owner.track(model_id)
             result = await self._extract(
                 model_id,
                 tuple(paths),
@@ -146,6 +155,9 @@ class ExtractionPipeline:
                 if self.ocr is None:
                     reason = "ocr_unavailable"
                 else:
+                    owner = current_owner()
+                    if owner is not None:
+                        await owner.ocr_phase()
                     capabilities = await self.ocr.get_capabilities()
                     if not capabilities.ready or not capabilities.profile_id:
                         reason = capabilities.reason_code or "ocr_unavailable"
@@ -207,6 +219,9 @@ class ExtractionPipeline:
                                 await checkpoint(page)
                         result.telemetry.stage_ms["ocr"] = (perf_counter() - ocr_started) * 1000
                 if reason is None:
+                    owner = current_owner()
+                    if owner is not None:
+                        await owner.llm_phase(model_id)
                     models = await provider.get_available_models(capability="text")
                     model = next((m for m in models if m.id == model_id), None)
                     if model is None:

@@ -91,6 +91,8 @@ class OpenAIProvider(LLMProvider):
             http_client=DefaultAsyncHttpxClient(trust_env=False),
         )
         self._temperature = temperature
+        from ...service.gpu_handoff import configure_handoff
+        configure_handoff(self)
 
     def update_runtime_settings(self, *, temperature: float) -> None:
         self._temperature = temperature
@@ -209,6 +211,8 @@ class OpenAIProvider(LLMProvider):
         return result
 
     async def send_message(self, model_id: str, messages: Sequence[Mapping[str, Any]]) -> str:
+        if self.handoff is not None:
+            raise ValueError("model_release_unsupported: managed OCR requires an unload-capable provider")
         # Plain dicts are exactly what the SDK serializes (verified against
         # the live server); cast() satisfies the TypedDict-parameter overloads.
         started = perf_counter()

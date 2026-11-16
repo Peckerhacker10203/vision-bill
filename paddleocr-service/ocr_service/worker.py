@@ -182,7 +182,11 @@ class OcrWorkerManager:
         self._generation = 0
         self._idle_recovery_generation: int | None = None
         self._recovery_attempted_generation: int | None = None
-        self._reason: str | None = "ocr_starting"
+        self._reason: str | None = "ocr_parked"
+        self._parked = True
+        self._owner: str | None = None
+        self._owner_generation = 0
+        self.last_identity: dict[str, str | None] = {}
         self._profile_id: str | None = None
         self._runtime_fingerprint: str | None = None
         self._ready = False
@@ -209,7 +213,7 @@ class OcrWorkerManager:
             reason = self._reason if not ready else None
             if self._stopped.is_set():
                 reason = "ocr_stopped"
-            elif self._ready and not alive:
+            elif self._ready and not alive and not self._parked:
                 reason = "ocr_worker_crashed"
                 self._ready, self._reason = False, reason
                 if self._idle_recovery_generation != self._generation:
@@ -242,7 +246,7 @@ class OcrWorkerManager:
     def _restart_generation(self, generation: int) -> None:
         with self._control:
             if (
-                self._stopped.is_set()
+                self._stopped.is_set() or self._parked
                 or generation != self._generation
                 or self._recovery_attempted_generation == generation
             ):
@@ -266,6 +270,7 @@ class OcrWorkerManager:
         with self._control:
             if self._stopped.is_set() or self.readiness().ready:
                 return
+            self._parked = False
             self._set_unready("ocr_starting")
             if self._proc is not None:
                 self._teardown()
@@ -311,6 +316,8 @@ class OcrWorkerManager:
                             self._reason = None if self._ready else "ocr_stopped"
                             self._profile_id = message["profile_id"]
                             self._runtime_fingerprint = message.get("runtime_fingerprint")
+                            self.last_identity = {"profile_id": self._profile_id,
+                                                  "runtime_fingerprint": self._runtime_fingerprint}
                         if self._ready:
                             return
                     self._set_unready("ocr_init_failed")
@@ -363,7 +370,36 @@ class OcrWorkerManager:
             daemon=True,
         ).start()
 
-    def infer(self, request: OcrRequest, *, deadline_monotonic: float) -> OcrResponse:
+    def claim(self, owner: str) -> None:
+        """Fence old HTTP requests only after their native child is reaped."""
+        with self._active, self._control:
+            generation = int(owner.split(":", 1)[0])
+            if generation <= self._owner_generation:
+                raise OcrWorkerError("ocr_stale_owner", 409)
+            self._parked = True
+            self._teardown()
+            self._set_unready("ocr_parked")
+            self._owner = owner
+            self._owner_generation = generation
+
+    def load(self, owner: str) -> None:
+        with self._control:
+            if self._owner != owner:
+                raise OcrWorkerError("ocr_stale_owner", 409)
+            self.start()
+            ready = self.readiness()
+            if not ready.ready:
+                raise OcrWorkerError(ready.reason_code or "ocr_not_ready", 503)
+
+    def park(self, owner: str) -> None:
+        with self._active, self._control:
+            if self._owner != owner:
+                raise OcrWorkerError("ocr_stale_owner", 409)
+            self._parked = True
+            self._teardown()
+            self._set_unready("ocr_parked")
+
+    def infer(self, request: OcrRequest, *, deadline_monotonic: float, owner: str | None = None) -> OcrResponse:
         if time.monotonic() >= deadline_monotonic:
             raise OcrWorkerError("ocr_deadline_exceeded", 504)
         with self._state:
@@ -382,6 +418,8 @@ class OcrWorkerManager:
             with self._control:
                 # The earlier readiness observation is advisory. This check and
                 # dispatch share ownership with stop's channel/process retirement.
+                if self._owner != owner:
+                    raise OcrWorkerError("ocr_stale_owner", 409)
                 if self._stopped.is_set():
                     raise OcrWorkerError("ocr_stopped", 503)
                 ready = self.readiness()

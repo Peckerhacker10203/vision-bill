@@ -175,7 +175,7 @@ async def test_preclaim_ocr_text_model_is_eligible_but_missing_model_waits(setti
     from vision_bill.provider.llm.base import ModelInfo
 
     service, receipts, _db, claim, _part = context(settings, tmp_path)
-    claim.image.effective_options["ocr"] = OcrSettings(enabled=True, required=True).model_dump(
+    claim.image.effective_options["ocr"] = OcrSettings(enabled=True, required=True, manage_model_lifecycle=False).model_dump(
         mode="json"
     )
     receipts.check_connection = AsyncMock(return_value=True)
@@ -282,7 +282,7 @@ async def test_saved_fallback_permission_used_in_readiness_and_execution(
 
     service, receipts, db, claim, _ = context(settings, tmp_path)
     claim.image.effective_options["ocr"] = OcrSettings(
-        enabled=True, allow_vision_fallback=True
+        enabled=True, allow_vision_fallback=True, manage_model_lifecycle=False
     ).model_dump(mode="json")
     if permission is not None:
         claim.image.effective_options["allow_ocr_fallback"] = permission
@@ -313,9 +313,9 @@ async def test_saved_fallback_permission_used_in_readiness_and_execution(
 async def test_readiness_selects_same_vision_model_as_execution(settings,tmp_path,vision,alternate,expected):
     from vision_bill.model.ocr import OcrCapabilities
     from vision_bill.provider.llm.base import ModelInfo
-    service, receipts, db, claim, _ = context(settings,tmp_path)
+    service, receipts, _db, claim, _ = context(settings,tmp_path)
     claim.image.effective_options.update(allow_ocr_fallback=True,
-        ocr=OcrSettings(enabled=True,allow_vision_fallback=True,vision_fallback_model_id="alternate").model_dump(mode="json"))
+        ocr=OcrSettings(enabled=True,allow_vision_fallback=True,vision_fallback_model_id="alternate",manage_model_lifecycle=False).model_dump(mode="json"))
     receipts.check_connection = AsyncMock(return_value=True)
     receipts.ocr_capabilities = AsyncMock(return_value=OcrCapabilities(enabled=True,configured=True,reachable=False,ready=False))
     requested=ModelInfo("saved-model");requested.capabilities=["vision"] if vision else ["completion"]
