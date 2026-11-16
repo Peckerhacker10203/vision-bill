@@ -706,6 +706,10 @@ class WorkflowDB:
                             "extraction_id": str(extraction_id),
                             "document": envelope.receipt.model_dump(mode="json"),
                             "field_sources": payload["field_sources"],
+                            "collection_ids": [str(link["collection_id"]) for link in await conn.fetch(
+                                "SELECT collection_id FROM receipt_collections WHERE receipt_id=$1 ORDER BY collection_id",
+                                receipt.id,
+                            )],
                         }
                     ),
                 )
@@ -1087,6 +1091,10 @@ class WorkflowDB:
                         "draft_revision": row["revision"],
                         "document": receipt.model_dump(mode="json"),
                         "request_key": request.request_key,
+                        "collection_ids": [str(link["collection_id"]) for link in await conn.fetch(
+                            "SELECT collection_id FROM receipt_collections WHERE receipt_id=$1 ORDER BY collection_id",
+                            result.id,
+                        )],
                     }
                 ),
             )

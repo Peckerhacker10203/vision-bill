@@ -572,6 +572,7 @@ async def test_upgrade_0010_preserves_legacy_content_paths_and_ambiguity(db):
 
 async def test_upgrade_0010_preserves_precise_local_times_and_legacy_evidence(db, tmp_path):
     from datetime import time as Time
+
     from vision_bill.provider.db.receipt_db import ReceiptDB
 
     migrate(db, "0010")
@@ -1381,3 +1382,275 @@ async def test_draft_validates_nested_metadata_before_typed_projection(workflow_
         await w.patch_draft(image.id, DraftPatch(expected_revision=1, changes={'field_sources':{'total':[ref]},'total':'9'}), scope=scope)
     current = await w.get_draft(image.id, scope=scope)
     assert current.revision == 1 and current.document.total is None
+
+
+async def capture_collection(w, owner, *, active=True):
+    async with w.pool.acquire() as conn:
+        return await conn.fetchval(
+            "INSERT INTO collections(user_id,name,active) VALUES($1,'capture',$2) RETURNING id",
+            owner, active,
+        )
+
+
+async def capture_creation(w, scope, path, tmp_path):
+    """Prepare either real workflow creation path; return a replayable operation."""
+    if path == "complete":
+        image = await enqueue(w, scope)
+        claim = await w.claim_next()
+
+        async def create():
+            result = await w.finish_attempt(claim, complete())
+            return result.receipt
+    else:
+        from vision_bill.model.review import OriginalAvailability
+        from vision_bill.model.workflow import DraftFinalize, DraftPatch
+
+        image = await partial_draft(w, scope, tmp_path / "capture-original.png")
+        await w.patch_draft(
+            image.id,
+            DraftPatch(expected_revision=1, changes=complete().envelope.receipt.model_dump(mode="json")),
+            scope=scope,
+        )
+        originals = [
+            OriginalAvailability(part_id=p.part_id, available=True, sha256_matches=True)
+            for p in await w.get_source_parts(image.id, scope=scope)
+        ]
+        # An administrator acts for the owner; capture must still use image ownership.
+        admin = uuid4()
+        async with w.pool.acquire() as conn:
+            await conn.execute("INSERT INTO users(id,username,hashed_password,is_admin) VALUES($1,$2,'test',TRUE)", admin, str(admin))
+        await capture_collection(w, admin)
+
+        async def create():
+            return await w.finalize_draft(
+                image.id, DraftFinalize(expected_revision=2, request_key="capture-final"),
+                scope=AccessScope(user_id=admin, can_see_all=True), originals=originals,
+            )
+    return image, create
+
+
+@pytest.mark.parametrize("path", ["complete", "draft"])
+@pytest.mark.parametrize("ownership", ["owner", "inactive", "ownerless"])
+async def test_workflow_creation_captures_only_owner_active_collection(
+    workflow_db, tmp_path, path, ownership
+):
+    import json
+
+    w, scope = workflow_db
+    own = await capture_collection(w, scope.user_id, active=ownership != "inactive")
+    foreign = uuid4()
+    async with w.pool.acquire() as conn:
+        await conn.execute("INSERT INTO users(id,username,hashed_password) VALUES($1,$2,'test')", foreign, str(foreign))
+    await capture_collection(w, foreign)
+    image, create = await capture_creation(w, scope, path, tmp_path)
+    if ownership == "ownerless":
+        async with w.pool.acquire() as conn:
+            await conn.execute("UPDATE images SET user_id=NULL WHERE id=$1", image.id)
+    first = await create()
+    assert first is not None and not first.verified
+    replay = await create()
+    if path == "complete":
+        assert replay is None
+    else:
+        assert replay.id == first.id
+    expected = [own] if ownership == "owner" else []
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM receipts") == 1
+        links = await conn.fetch("SELECT collection_id FROM receipt_collections WHERE receipt_id=$1", first.id)
+        assert [r["collection_id"] for r in links] == expected
+        revisions = await conn.fetch("SELECT * FROM receipt_review_revisions WHERE receipt_id=$1", first.id)
+        assert len(revisions) == 1
+        revision = revisions[0]
+        assert revision["event_kind"] == ("extracted" if path == "complete" else "draft_finalized")
+        assert revision["operation_revision"] == revision["review_revision"] == 1
+        snapshot = json.loads(revision["snapshot"])
+        assert snapshot["collection_ids"] == [str(cid) for cid in expected]
+        assert snapshot["receipt"]["id"] == str(first.id)
+        assert snapshot["document"]["merchant_name"] == "Merchant"
+
+
+@pytest.mark.parametrize("path", ["complete", "draft"])
+async def test_capture_rolls_back_with_receipt_creation(workflow_db, tmp_path, monkeypatch, path):
+    w, scope = workflow_db
+    await capture_collection(w, scope.user_id)
+    image, create = await capture_creation(w, scope, path, tmp_path)
+    insert = w._receipts.insert_receipt
+
+    async def interrupted(*args, **kwargs):
+        receipt = await insert(*args, **kwargs)
+        conn = args[0]
+        assert await conn.fetchval("SELECT count(*) FROM receipt_collections WHERE receipt_id=$1", receipt.id) == 1
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(w._receipts, "insert_receipt", interrupted)
+    with pytest.raises(asyncio.CancelledError):
+        await create()
+    async with w.pool.acquire() as conn:
+        for table in ("receipts", "receipt_collections", "receipt_review_revisions"):
+            assert await conn.fetchval(f"SELECT count(*) FROM {table}") == 0
+        assert await conn.fetchval("SELECT receipt_id FROM images WHERE id=$1", image.id) is None
+
+
+@pytest.mark.parametrize("path", ["complete", "draft"])
+async def test_optional_capture_integrity_error_does_not_abort_receipt(workflow_db, tmp_path, path, caplog):
+    import json
+
+    w, scope = workflow_db
+    await capture_collection(w, scope.user_id)
+    _, create = await capture_creation(w, scope, path, tmp_path)
+    async with w.pool.acquire() as conn:
+        await conn.execute("ALTER TABLE receipt_collections ADD CONSTRAINT capture_rejected CHECK(FALSE) NOT VALID")
+    receipt = await create()
+    assert receipt is not None
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM receipt_collections") == 0
+        snapshot = await conn.fetchval("SELECT snapshot FROM receipt_review_revisions WHERE receipt_id=$1", receipt.id)
+        assert json.loads(snapshot)["collection_ids"] == []
+    assert "Active collection capture rejected" in caplog.text
+    assert "capture_rejected" not in caplog.text
+
+
+async def test_capture_serializes_collection_deletion_and_records_later_removal(workflow_db, tmp_path, monkeypatch):
+    import json
+
+    from vision_bill.provider.db.collection_db import CollectionDB
+
+    w, scope = workflow_db
+    collection = await capture_collection(w, scope.user_id)
+    _, create = await capture_creation(w, scope, "complete", tmp_path)
+    inserted, release = asyncio.Event(), asyncio.Event()
+    insert = w._receipts.insert_receipt
+
+    async def pause_after_capture(*args, **kwargs):
+        receipt = await insert(*args, **kwargs)
+        assert await args[0].fetchval("SELECT count(*) FROM receipt_collections WHERE receipt_id=$1", receipt.id) == 1
+        inserted.set()
+        await release.wait()
+        return receipt
+
+    monkeypatch.setattr(w._receipts, "insert_receipt", pause_after_capture)
+    creation = asyncio.create_task(create())
+    deletion = None
+    try:
+        await asyncio.wait_for(inserted.wait(), 3)
+        deletion = asyncio.create_task(CollectionDB(w.pool).delete(collection, scope.user_id, False))
+        async with asyncio.timeout(3):
+            async with w.pool.acquire() as conn:
+                while not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event='advisory')"):
+                    await asyncio.sleep(0)
+        assert not deletion.done()
+        release.set()
+        receipt = await creation
+        assert await deletion
+        async with w.pool.acquire() as conn:
+            revisions = await conn.fetch("SELECT event_kind,snapshot,operation_revision FROM receipt_review_revisions WHERE receipt_id=$1 ORDER BY operation_revision", receipt.id)
+            assert [r["event_kind"] for r in revisions] == ["extracted", "collections_changed"]
+            assert [r["operation_revision"] for r in revisions] == [1, 2]
+            assert [json.loads(r["snapshot"])["collection_ids"] for r in revisions] == [[str(collection)], []]
+            assert await conn.fetchval("SELECT count(*) FROM receipt_collections") == 0
+    finally:
+        release.set()
+        for task in (creation, deletion):
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(*(t for t in (creation, deletion) if t is not None), return_exceptions=True)
+
+
+@pytest.mark.parametrize("path, interruption", [
+    ("complete", "deadline"), ("complete", "cancel"),
+    ("draft", "cancel"), ("complete", "connection"),
+])
+async def test_capture_blocked_lock_propagates_interruption(
+    workflow_db, tmp_path, path, interruption, caplog
+):
+    from vision_bill.provider.db.receipt_db import MEMBERSHIP_LOCK_SQL
+
+    w, scope = workflow_db
+    await capture_collection(w, scope.user_id)
+    if interruption == "deadline":
+        image = await enqueue(w, scope)
+        claim = await w.claim_next()
+        deadline = asyncio.get_running_loop().time() + 2
+
+        async def create():
+            return await w.finish_attempt(claim, complete(), deadline=deadline)
+    else:
+        image, create = await capture_creation(w, scope, path, tmp_path)
+    async with w.pool.acquire() as blocker, blocker.transaction():
+        await blocker.execute(MEMBERSHIP_LOCK_SQL)
+        task = asyncio.create_task(create())
+        try:
+            # Observe the actual blocked capture query before interrupting it.
+            async with asyncio.timeout(1):
+                async with w.pool.acquire() as observer:
+                    while not (pid := await observer.fetchval(
+                        "SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND wait_event='advisory' LIMIT 1"
+                    )):
+                        await asyncio.sleep(0)
+            assert not task.done()
+            if interruption == "cancel":
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            elif interruption == "connection":
+                async with w.pool.acquire() as observer:
+                    assert await observer.fetchval("SELECT pg_terminate_backend($1)", pid)
+                with pytest.raises(asyncpg.InterfaceError, match="connection is closed"):
+                    await task
+            else:
+                with pytest.raises(TimeoutError):
+                    await task
+                assert asyncio.get_running_loop().time() < deadline + 0.35
+            assert "Active collection capture rejected" not in caplog.text
+            # The blocker remains held: a swallowed error cannot fake progress.
+            async with w.pool.acquire() as observer:
+                for table in ("receipts", "receipt_collections", "receipt_review_revisions"):
+                    assert await observer.fetchval(f"SELECT count(*) FROM {table}") == 0
+                assert await observer.fetchval("SELECT receipt_id FROM images WHERE id=$1", image.id) is None
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_capture_serializes_concurrent_activation(workflow_db, tmp_path, monkeypatch):
+    from vision_bill.provider.db.collection_db import CollectionDB
+
+    w, scope = workflow_db
+    old = await capture_collection(w, scope.user_id)
+    new = await capture_collection(w, scope.user_id, active=False)
+    _, create = await capture_creation(w, scope, "complete", tmp_path)
+    inserted, release = asyncio.Event(), asyncio.Event()
+    insert = w._receipts.insert_receipt
+
+    async def pause_after_capture(*args, **kwargs):
+        receipt = await insert(*args, **kwargs)
+        inserted.set()
+        await release.wait()
+        return receipt
+
+    monkeypatch.setattr(w._receipts, "insert_receipt", pause_after_capture)
+    creation = asyncio.create_task(create())
+    activation = None
+    try:
+        await asyncio.wait_for(inserted.wait(), 3)
+        activation = asyncio.create_task(CollectionDB(w.pool).activate(new, scope.user_id, False))
+        async with asyncio.timeout(3):
+            async with w.pool.acquire() as conn:
+                while not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock')"):
+                    await asyncio.sleep(0)
+        assert not activation.done()
+        release.set()
+        first = await creation
+        assert (await activation).id == new
+        monkeypatch.setattr(w._receipts, "insert_receipt", insert)
+        _, create_next = await capture_creation(w, scope, "complete", tmp_path)
+        second = await create_next()
+        async with w.pool.acquire() as conn:
+            assert await conn.fetchval("SELECT collection_id FROM receipt_collections WHERE receipt_id=$1", first.id) == old
+            assert await conn.fetchval("SELECT collection_id FROM receipt_collections WHERE receipt_id=$1", second.id) == new
+    finally:
+        release.set()
+        for task in (creation, activation):
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(*(t for t in (creation, activation) if t is not None), return_exceptions=True)

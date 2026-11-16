@@ -453,7 +453,41 @@ class ReceiptDB:
             ),
         ) for item in receipt.line_items]
         await self._insert_children(conn, row["id"], receipt, decisions)
+        await self._capture_initial_collection(conn, row["id"], user_id)
         return self._receipt_row_from_record(row)
+
+    @staticmethod
+    async def _capture_initial_collection(
+        conn: asyncpg.Connection, receipt_id: UUID, owner_id: UUID | None,
+    ) -> None:
+        if owner_id is None:
+            return
+        # Explicit savepoint operations avoid async-context cleanup awaiting
+        # rollback after cancellation. Fatal errors go straight to the caller's
+        # outer transaction/deadline adapter, which owns full rollback/discard.
+        savepoint = conn.transaction()
+        await savepoint.start()
+        try:
+            # Serialize with deletion's membership enumeration/history.
+            # This receipt is new and cannot yet be locked by another caller.
+            await conn.execute(MEMBERSHIP_LOCK_SQL)
+            collection_id = await conn.fetchval(
+                "SELECT id FROM collections WHERE user_id=$1 AND active=TRUE FOR SHARE",
+                owner_id,
+            )
+            if collection_id is not None:
+                await conn.execute(
+                    """INSERT INTO receipt_collections(receipt_id,collection_id)
+                    VALUES($1,$2) ON CONFLICT(receipt_id,collection_id) DO NOTHING""",
+                    receipt_id, collection_id,
+                )
+        except asyncpg.IntegrityConstraintViolationError:
+            # These operations remain inside the caller's bounded body; a
+            # cancellation or unusable transaction during rollback propagates.
+            await savepoint.rollback()
+            logger.warning("Active collection capture rejected")
+        else:
+            await savepoint.commit()
 
     async def persist_receipt(
         self,
