@@ -543,3 +543,126 @@ async def test_ollama_serializes_exact_prepared_png_after_temporary_cleanup(
     assert [view.source_sha256 for view in result.input_views] == [
         hashlib.sha256(path.read_bytes()).hexdigest() for path in photos
     ]
+
+
+@pytest.mark.parametrize("count", [1, 2])
+async def test_resume_prefix_uses_live_runtime_and_all_originals(photos, count):
+    from uuid import uuid4
+
+    from vision_bill.model.ocr import SourceRef
+
+    ocr, llm = sidecar(), formatter(False)
+    ocr.get_capabilities.return_value.runtime_fingerprint = "runtime"
+    hashes = [hashlib.sha256(p.read_bytes()).hexdigest() for p in photos]
+    pages = [OcrResponse.model_validate(wire_page(i, hashes[i])) for i in range(count)]
+    refs = [
+        SourceRef(part_id=uuid4(), photo_index=i, source_sha256=h, coordinate_space="original")
+        for i, h in enumerate(hashes)
+    ]
+    callback = AsyncMock()
+    result = await pipeline(llm, ocr).extract(
+        "fixture",
+        photos,
+        options=ExperimentOptions(pipeline="ocr", include_classification=False),
+        deadline=time.monotonic() + 2,
+        tags=[],
+        resume_pages=pages,
+        source_refs=refs,
+        checkpoint=callback,
+    )
+    assert len(result.ocr_pages) == 2
+    assert ocr.extract_page.await_count == 2 - count
+    assert callback.await_count == 2 - count
+    assert result.provenance.runtime_fingerprint == "runtime"
+    prompt = llm._client.chat.call_args.kwargs["messages"][0]["content"]
+    assert "PHOTO 0" in prompt and "PHOTO 1" in prompt
+    assert str(refs[0].part_id) in prompt
+
+
+@pytest.mark.parametrize("runtime", [None, "other"])
+async def test_resume_never_trusts_unknown_or_changed_live_runtime(photos, runtime):
+    ocr = sidecar()
+    ocr.get_capabilities.return_value.runtime_fingerprint = runtime
+    page = OcrResponse.model_validate(
+        wire_page(0, hashlib.sha256(photos[0].read_bytes()).hexdigest())
+    )
+    with pytest.raises(ValueError, match="resume"):
+        await pipeline(formatter(False), ocr).extract(
+            "fixture",
+            photos,
+            options=ExperimentOptions(pipeline="ocr"),
+            deadline=time.monotonic() + 2,
+            tags=[],
+            resume_pages=[page],
+        )
+    ocr.extract_page.assert_not_awaited()
+
+
+async def test_changed_runtime_between_readiness_and_page_never_falls_back(photos):
+    ocr = sidecar()
+    ocr.get_capabilities.return_value.runtime_fingerprint = "other"
+    llm = formatter()
+    with pytest.raises(ValueError, match="runtime_changed"):
+        await pipeline(llm, ocr, allow_vision_fallback=True).extract(
+            "fixture",
+            photos,
+            options=ExperimentOptions(pipeline="ocr", allow_ocr_fallback=True),
+            deadline=time.monotonic() + 2,
+            tags=[],
+        )
+    llm._client.chat.assert_not_awaited()
+
+
+async def test_saved_formatter_controls_repair_and_enrichment_without_shared_mutation(photos):
+    llm = formatter()
+    llm.update_runtime_settings(temperature=0.99)
+    llm.max_output_tokens = 9999
+    valid = llm._client.chat.return_value
+
+    async def reply(**kwargs):
+        if llm._client.chat.await_count == 1:
+            return ChatResponse(message={"role": "assistant", "content": "invalid JSON"})
+        return valid
+
+    llm._client.chat.side_effect = reply
+    result = await pipeline(llm).extract(
+        "fixture",
+        photos,
+        options=ExperimentOptions(
+            pipeline="direct_vision", temperature=0.13, include_classification=True
+        ),
+        deadline=time.monotonic() + 2,
+        tags=["food"],
+        max_output_tokens=1234,
+    )
+    assert result.receipt is not None
+    assert llm._client.chat.await_count >= 3  # formatter, repair, enrichment
+    for call in llm._client.chat.call_args_list:
+        assert call.kwargs["options"] == {"temperature": 0.13, "num_predict": 1234}
+    assert llm._temperature == 0.99 and llm.max_output_tokens == 9999
+    assert llm.experiment_options is None and llm.experiment_trace is None
+
+
+async def test_changed_original_binding_is_explicit_integrity_error(photos):
+    from uuid import uuid4
+
+    import vision_bill.service.extraction_pipeline as module
+    from vision_bill.model.ocr import SourceRef
+
+    refs = [
+        SourceRef(
+            part_id=uuid4(), photo_index=i, source_sha256="a" * 64, coordinate_space="original"
+        )
+        for i in range(2)
+    ]
+    with pytest.raises(ValueError) as failure:
+        await pipeline(formatter()).extract(
+            "fixture",
+            photos,
+            options=ExperimentOptions(pipeline="direct_vision"),
+            deadline=time.monotonic() + 2,
+            tags=[],
+            source_refs=refs,
+        )
+    assert hasattr(module, "OriginalSourceChangedError")
+    assert isinstance(failure.value, module.OriginalSourceChangedError)

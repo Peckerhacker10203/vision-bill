@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse
 from .api.auth import router as auth_router
 from .api.benchmarks import router as benchmark_router
 from .api.collections import router as collections_router
+from .api.drafts import router as draft_router
 from .api.images import router as image_router
 from .api.receipts import router as receipt_router
 from .api.search import router as search_router
@@ -28,6 +29,7 @@ from .service.benchmark_service import BenchmarkService
 from .service.collection_service import CollectionService
 from .service.image_service import ImageService
 from .service.receipt_service import ReceiptService
+from .service.submission_service import SubmissionService
 
 setup_logging()
 
@@ -95,12 +97,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.exception("Failed to run authentication bootstrap")
 
     image_service = ImageService(settings.images)
+    submission_service = SubmissionService(settings, receipt_service, image_service)
     scheduler = AnalysisScheduler(
         settings=settings,
         provider=provider,
         receipt_service=receipt_service,
         image_db=receipt_service.image_db,
         image_service=image_service,
+        submission_service=submission_service,
     )
     benchmark_service = (
         BenchmarkService(provider, receipt_service) if receipt_service.db_ready else None
@@ -109,6 +113,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if collection_service is not None:
         receipt_service.set_collection_db(CollectionDB(receipt_service.pool))
 
+    app.state.submission_service = submission_service
     app.state.receipt_service = receipt_service
     app.state.image_service = image_service
     app.state.llm_provider = provider
@@ -138,6 +143,7 @@ app = FastAPI(title="Receipt Tracker API", lifespan=lifespan)
 # JSON API routes
 app.include_router(auth_router, prefix="/api/v1/auth", tags=["Auth"])
 app.include_router(receipt_router, prefix="/api/v1/receipts", tags=["Receipts"])
+app.include_router(draft_router, prefix="/api/v1/images", tags=["Drafts"])
 app.include_router(image_router, prefix="/api/v1/images", tags=["Images"])
 app.include_router(search_router, prefix="/api/v1/search", tags=["Search"])
 app.include_router(statistics_router, prefix="/api/v1/statistics", tags=["Statistics"])

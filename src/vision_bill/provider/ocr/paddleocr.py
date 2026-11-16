@@ -67,6 +67,7 @@ class PaddleOcrProvider(OcrProvider):
                     ready=ready.ready,
                     profile_id=ready.profile_id,
                     reason_code=ready.reason_code,
+                    runtime_fingerprint=ready.runtime_fingerprint if ready.ready else None,
                     ocr_max_new_tokens=ocr_limit,
                 )
         except (httpx.HTTPError, OSError, ValueError):

@@ -3,11 +3,7 @@ import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
-from test_analysis_scheduler import _make_receipt, _pending_image, _receipt_row
-from test_analysis_scheduler import (
-    scheduler_context as scheduler_context,  # noqa: PLC0414 - re-export imported pytest fixture
-)
+from test_analysis_scheduler import context
 from test_receipts_api import (
     IMAGE_ID,
     IMAGES_URL,
@@ -18,9 +14,6 @@ from test_receipts_api import (
 from test_receipts_api import (
     api_context as api_context,  # noqa: PLC0414 - re-export imported pytest fixture
 )
-
-from vision_bill.model.db.image import ImagePart
-from vision_bill.provider.llm.errors import AnalysisTimeoutError, UnreadableReceiptError
 
 
 def test_multi_upload_persists_order_and_wakes_worker_without_calling_llm(api_context, monkeypatch):
@@ -70,8 +63,8 @@ def test_additional_photo_can_be_viewed(api_context, tmp_path):
     assert api_context.client.get(f"{IMAGES_URL}/{IMAGE_ID}/file?part=2").status_code == 404
 
 
-async def test_worker_trigger_does_not_wait_for_interval(scheduler_context):
-    scheduler, *_ = scheduler_context
+async def test_worker_trigger_does_not_wait_for_interval(settings):
+    scheduler, *_ = context(settings)
     ran = asyncio.Event()
 
     async def process():
@@ -87,35 +80,3 @@ async def test_worker_trigger_does_not_wait_for_interval(scheduler_context):
         await asyncio.wait_for(ran.wait(), 1)
     finally:
         await scheduler.stop()
-
-
-@pytest.mark.parametrize(
-    "error,status",
-    [
-        (AnalysisTimeoutError("Timed out"), "timed_out"),
-        (UnreadableReceiptError("Blurry"), "unreadable"),
-    ],
-)
-async def test_worker_records_terminal_errors(scheduler_context, tmp_path, error, status):
-    scheduler, _, service, db = scheduler_context
-    photo = tmp_path / "top.jpg"
-    photo.write_bytes(JPEG_BYTES)
-    db.mark_terminal = AsyncMock()
-    service.analyse_receipt_with_ocr.side_effect = error
-    result = await scheduler._analyze_one(_pending_image(IMAGE_ID, photo), "test")
-    assert result.status == status
-    db.mark_terminal.assert_awaited_once_with(IMAGE_ID, status, str(error))
-    db.mark_failed.assert_not_awaited()
-
-
-async def test_worker_passes_all_photos_in_order(scheduler_context, tmp_path):
-    scheduler, _, service, _db = scheduler_context
-    photo = tmp_path / "top.jpg"
-    photo.write_bytes(JPEG_BYTES)
-    image = _pending_image(IMAGE_ID, photo)
-    image.additional_images = [ImagePart(image_path="bottom.jpg")]
-    service.analyse_receipt_from_path.return_value = _make_receipt()
-    service.persist_receipt.return_value = _receipt_row()
-    result = await scheduler._analyze_one(image, "test")
-    assert result.status == "analyzed"
-    service.analyse_receipt_from_path.assert_awaited_once_with("test", [photo, Path("bottom.jpg")])

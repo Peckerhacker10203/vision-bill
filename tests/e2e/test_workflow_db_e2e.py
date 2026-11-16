@@ -979,3 +979,141 @@ async def test_reference_validation_preserves_real_references_and_ordinary_telem
         outcome.envelope.ocr_pages = [page]
         outcome.persisted_views = [view]
         assert not (await w.finish_attempt(claim, outcome)).stale
+
+
+async def partial_draft(w, scope):
+    from vision_bill.model.extraction import ExtractionDraft
+
+    image = await enqueue(w, scope)
+    outcome = complete()
+    outcome.envelope.draft = ExtractionDraft(merchant_name="observed", total=None)
+    outcome.envelope.receipt = None
+    await w.finish_attempt(
+        await w.claim_next(), AttemptOutcome(kind="partial", envelope=outcome.envelope)
+    )
+    return image
+
+
+async def test_draft_null_cas_human_edit_and_owner_scope(workflow_db):
+    from vision_bill.model.workflow import DraftPatch
+
+    w, scope = workflow_db
+    image = await partial_draft(w, scope)
+    draft = await w.get_draft(image.id, scope=scope)
+    assert draft.document.total is None and draft.revision == 1
+    assert await w.get_draft(image.id, scope=AccessScope(user_id=uuid4())) is None
+    patched = await w.patch_draft(
+        image.id, DraftPatch(expected_revision=1, changes={"merchant_name": None}), scope=scope
+    )
+    assert patched.revision == 2 and patched.document.merchant_name is None
+    assert (await w.get_draft(image.id, scope=scope)).document.merchant_name is None
+    with pytest.raises(ValueError, match="revision"):
+        await w.patch_draft(
+            image.id, DraftPatch(expected_revision=1, changes={"total": "1.20"}), scope=scope
+        )
+    with pytest.raises(ValueError, match="edited"):
+        await w.retry_submission(
+            image.id, RetryRequest(expected_generation=1, request_key="retry"), scope=scope
+        )
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT human_edited FROM receipt_drafts WHERE image_id=$1", image.id
+        )
+
+
+async def test_clear_checkpoint_is_fenced_and_retains_immutable_views(workflow_db):
+    from vision_bill.model.workflow import OcrCheckpoint
+
+    w, scope = workflow_db
+    image = await enqueue(w, scope)
+    claim = await w.claim_next()
+    page = wire_page()
+    view = await saved_view(w, scope, image, page)
+    await w.save_ocr_checkpoint(
+        claim,
+        OcrCheckpoint(
+            ordered_source_sha256=["a" * 64],
+            profile_id="profile",
+            runtime_fingerprint="runtime",
+            pages=[page],
+            persisted_views=[view],
+        ),
+    )
+    assert not await w.clear_ocr_checkpoint(claim.model_copy(update={"claim_token": uuid4()}))
+    assert await w.get_ocr_checkpoint(claim) is not None
+    assert await w.clear_ocr_checkpoint(claim)
+    assert await w.get_ocr_checkpoint(claim) is None
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM extraction_working_views") == 1
+
+
+async def test_draft_finalize_missing_then_once_unverified_and_rollback(workflow_db):
+    from vision_bill.model.review import OriginalAvailability
+    from vision_bill.model.workflow import DraftFinalize, DraftPatch
+
+    w, scope = workflow_db
+    image = await partial_draft(w, scope)
+    parts = await w.get_source_parts(image.id, scope=scope)
+    originals = [
+        OriginalAvailability(part_id=p.part_id, available=True, sha256_matches=True) for p in parts
+    ]
+    request = DraftFinalize(expected_revision=1, request_key="final")
+    with pytest.raises(ValueError, match="incomplete"):
+        await w.finalize_draft(image.id, request, scope=scope, originals=originals)
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM receipts") == 0
+    document = complete().envelope.receipt.model_dump(mode="json")
+    await w.patch_draft(image.id, DraftPatch(expected_revision=1, changes=document), scope=scope)
+    request = DraftFinalize(expected_revision=2, request_key="final")
+    with pytest.raises(ValueError, match="original"):
+        await w.finalize_draft(image.id, request, scope=scope, originals=[])
+    first, repeated = await asyncio.gather(
+        *(w.finalize_draft(image.id, request, scope=scope, originals=originals) for _ in range(2))
+    )
+    assert first.id == repeated.id and not first.verified and first.status == "unverified"
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM receipts") == 1
+        assert await conn.fetchval("SELECT count(*) FROM receipt_review_revisions") == 1
+        assert (
+            await conn.fetchval("SELECT receipt_id FROM images WHERE id=$1", image.id) == first.id
+        )
+
+
+async def test_draft_finalization_rolls_back_after_receipt_insert(workflow_db, monkeypatch):
+    from vision_bill.model.review import OriginalAvailability
+    from vision_bill.model.workflow import DraftFinalize, DraftPatch
+
+    w, scope = workflow_db
+    image = await partial_draft(w, scope)
+    document = complete().envelope.receipt.model_dump(mode="json")
+    await w.patch_draft(image.id, DraftPatch(expected_revision=1, changes=document), scope=scope)
+    originals = [
+        OriginalAvailability(part_id=p.part_id, available=True, sha256_matches=True)
+        for p in await w.get_source_parts(image.id, scope=scope)
+    ]
+    insert = w._receipts.insert_receipt
+
+    async def interrupted(*args, **kwargs):
+        await insert(*args, **kwargs)
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(w._receipts, "insert_receipt", interrupted)
+    with pytest.raises(asyncio.CancelledError):
+        await w.finalize_draft(
+            image.id,
+            DraftFinalize(expected_revision=2, request_key="final"),
+            scope=scope,
+            originals=originals,
+        )
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM receipts") == 0
+        assert await conn.fetchval("SELECT count(*) FROM receipt_review_revisions") == 0
+        assert (
+            await conn.fetchval(
+                "SELECT finalized_receipt_id FROM receipt_drafts WHERE image_id=$1", image.id
+            )
+            is None
+        )
+        assert (
+            await conn.fetchval("SELECT status FROM images WHERE id=$1", image.id) == "needs_review"
+        )

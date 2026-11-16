@@ -235,3 +235,26 @@ async def test_original_byte_preparation_is_bounded_before_http(monkeypatch, tmp
         timer.cancel()
     assert await asyncio.to_thread(finished.wait, 0.5)
     assert calls == []
+
+
+async def test_capabilities_exposes_qualified_live_runtime(monkeypatch):
+    def handler(request):
+        ready = {
+            "ready": True,
+            "generation": 2,
+            "profile_id": "fixed-profile",
+            "runtime_fingerprint": "qualified-runtime",
+        }
+        return httpx.Response(
+            200,
+            json=(
+                {"contract_version": 2, "profile": {}, "worker": ready}
+                if request.url.path == "/info"
+                else ready
+            ),
+        )
+
+    http_client(monkeypatch, handler)
+    assert (
+        await PaddleOcrProvider("http://local").get_capabilities()
+    ).runtime_fingerprint == "qualified-runtime"

@@ -10,7 +10,7 @@ from .db.image import ImagePart, ImageRow
 from .db.receipt import ReceiptRow
 from .extraction import InferenceEnvelope
 from .ocr import OcrPageMetadata, OcrResponse, Sha256, WorkingImageMetadata
-from .review import FindingAcknowledgement, ReviewEvaluation
+from .review import FindingAcknowledgement, ReviewEvaluation, SourceView
 
 TERMINAL_STATES = frozenset({"analyzed", "needs_review", "failed", "timed_out", "unreadable"})
 
@@ -94,6 +94,8 @@ class SubmissionStatus(BaseModel):
     result_code: str | None = None
     wait_reason: str | None = None
     draft_available: bool = False
+    latest_extraction_id: UUID | None = None
+    source_views: list[SourceView] = Field(default_factory=list)
 
     @computed_field  # type: ignore[prop-decorator]
     @property

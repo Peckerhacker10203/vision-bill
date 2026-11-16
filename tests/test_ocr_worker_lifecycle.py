@@ -83,7 +83,14 @@ class FakeProcess:
             out_q.put({"generation": generation, "kind": "init_failed"})
             self.dead.set()
             return
-        out_q.put({"generation": generation, "kind": "ready", "profile_id": "profile"})
+        out_q.put(
+            {
+                "generation": generation,
+                "kind": "ready",
+                "profile_id": "profile",
+                "runtime_fingerprint": "runtime",
+            }
+        )
         while not self.dead.is_set():
             try:
                 request = in_q.get(timeout=0.005)
@@ -333,6 +340,7 @@ def test_native_entrypoint_qualifies_before_predict(tmp_path, monkeypatch):
 
     adapter = SimpleNamespace(
         profile_id="qualified",
+        runtime_fingerprint="qualified-runtime",
         qualify=lambda image: calls.append("qualify"),
         predict=predict,
     )
@@ -350,7 +358,9 @@ def test_native_entrypoint_qualifies_before_predict(tmp_path, monkeypatch):
         tmp_path,
     )
     assert calls == ["qualify", "predict"]
-    assert outgoing.get()["kind"] == "ready"
+    ready = outgoing.get()
+    assert ready["kind"] == "ready"
+    assert ready["runtime_fingerprint"] == "qualified-runtime"
     completion = outgoing.get()
     assert completion["kind"] == "result"
     assert read_result(tmp_path, completion["artifact"]).request_id == item.request_id
@@ -621,3 +631,10 @@ def test_active_process_probe_holds_lifecycle_ownership_against_stop(tmp_path, m
         if shutdown.ident is not None:
             shutdown.join(1)
         worker.stop()
+
+
+def test_runtime_readiness_belongs_to_live_generation_only():
+    worker = manager(FakeContext())
+    assert worker.readiness().runtime_fingerprint == "runtime"
+    worker.stop()
+    assert worker.readiness().runtime_fingerprint is None

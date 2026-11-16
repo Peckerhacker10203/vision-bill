@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends
 
@@ -10,7 +10,7 @@ router = APIRouter(tags=["LLM", "AI", "Model Evaluation"], dependencies=[Depends
 
 
 @router.get("/models")
-async def list_models() -> list[dict[str, Any]]:
+async def list_models(capability: Literal["vision", "text"] = "vision") -> list[dict[str, Any]]:
     provider = get_llm_provider(settings.llm)
-    models = await provider.get_available_models()
+    models = await provider.get_available_models(capability=capability)
     return [m.__dict__ for m in models]

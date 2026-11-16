@@ -193,6 +193,7 @@ def api_context(
     conn = AsyncMock()
     conn.fetchrow = AsyncMock(return_value={"missing": False})
     conn.fetch = AsyncMock(return_value=[])
+    conn.fetchval = AsyncMock(return_value=None)
     conn.execute = AsyncMock()
     provider = _make_provider()
     _patch_app(monkeypatch, settings, conn, provider)
@@ -211,6 +212,7 @@ def broken_context(
     conn = AsyncMock()
     conn.fetchrow = AsyncMock(return_value={"missing": False})
     conn.fetch = AsyncMock(return_value=[])
+    conn.fetchval = AsyncMock(return_value=None)
     conn.execute = AsyncMock()
     provider = _make_provider()
     provider.check_connection = AsyncMock(return_value=False)
@@ -540,45 +542,37 @@ def test_analyze_images_manual_trigger(api_context: ApiContext) -> None:
 
 
 def test_analyze_images_success(api_context: ApiContext, tmp_path: Path) -> None:
-    """POST /images/analyze analyzes a queued image whose file exists on disk."""
+    """The manual route runs the same fenced worker as the scheduled path."""
+    from types import SimpleNamespace
+
+    from vision_bill.model.db.image import ImageRow
+    from vision_bill.model.workflow import CommitResult, SubmissionStatus
+
     ctx = api_context
     queued_file = tmp_path / "queued.png"
     queued_file.write_bytes(b"queued-image-bytes")
-
-    # Both list_pending_images and the tag lookup for the prompt use fetch, so
-    # dispatch on the SQL to keep the two from clobbering each other.
-    def fetch_side_effect(sql: str, *args: object) -> list[dict[str, object]]:
-        if sql == receipt_db_module.LIST_TAGS_SQL:
-            return [{"name": "coffee"}, {"name": "food"}]
-        return [_image_row(id=IMAGE_ID, status="pending", image_path=str(queued_file))]
-
-    ctx.conn.fetch = AsyncMock(side_effect=fetch_side_effect)
-
-    # list_pending_images uses fetch; claiming the image and persisting the
-    # receipt use fetchrow with different row shapes.
-    def fetchrow_side_effect(sql: str, *args: object) -> dict[str, object] | None:
-        if sql == image_db_module.CLAIM_IMAGE_SQL:
-            return _image_row(id=IMAGE_ID, status="processing", image_path=str(queued_file))
-        if sql == receipt_db_module.GET_RECEIPT_BY_IMAGE_ID_SQL:
-            return None
-        return _receipt_row(id=RECEIPT_ID, image_id=IMAGE_ID)
-
-    ctx.conn.fetchrow = AsyncMock(side_effect=fetchrow_side_effect)
-    ctx.conn.execute = AsyncMock()
-
+    image = ImageRow(id=IMAGE_ID, image_path=str(queued_file))
+    claim = SimpleNamespace(image=image)
+    service = ctx.client.app.state.submission_service
+    service.db.due_candidates = AsyncMock(return_value=[image])
+    service.db.claim_next = AsyncMock(return_value=claim)
+    service.ready_for = AsyncMock(return_value=True)
+    service.process_claim = AsyncMock(
+        return_value=CommitResult(
+            stale=False,
+            submission=SubmissionStatus(id=IMAGE_ID, status="analyzed", receipt_id=RECEIPT_ID),
+        )
+    )
     response = ctx.client.post(f"{IMAGES_URL}/analyze")
-
     assert response.status_code == 200
     results = response.json()["results"]
     assert len(results) == 1
     assert results[0]["image_id"] == str(IMAGE_ID)
     assert results[0]["status"] == "analyzed"
     assert results[0]["receipt_id"] == str(RECEIPT_ID)
-    ctx.conn.execute.assert_awaited()
-    # The tag vocabulary was passed into the extraction prompt.
-    llm_call = ctx.provider.analyse_receipt_from_model.call_args
-    assert llm_call is not None
-    assert llm_call.kwargs.get("tags") == ["coffee", "food"]
+    service.db.claim_next.assert_awaited_once_with(image_id=IMAGE_ID, lease_seconds=900)
+    service.process_claim.assert_awaited_once_with(claim)
+    assert queued_file.read_bytes() == b"queued-image-bytes"
 
 
 # ── Tags (GET /tags, POST /tags) ──────────────────────────────────────

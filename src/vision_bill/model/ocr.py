@@ -87,6 +87,7 @@ class OcrCapabilities(BaseModel):
 
 
 class WorkerReadiness(BaseModel):
+    runtime_fingerprint: str | None = None
     ready: bool
     generation: int = Field(ge=1)
     profile_id: str | None = None

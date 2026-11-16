@@ -23,6 +23,14 @@ from ..provider.llm.base import LLMProvider
 from ..provider.ocr.base import OcrProvider, compact_ocr_text
 
 
+class OriginalSourceChangedError(ValueError):
+    """The current originals no longer match their supplied persisted binding."""
+
+
+class OcrRuntimeChangedError(ValueError):
+    """A cached/live worker identity changed; discard the cache before a bounded restart."""
+
+
 class ExtractionPipeline:
     def __init__(
         self,
@@ -43,6 +51,9 @@ class ExtractionPipeline:
         deadline: float,
         tags: Sequence[str],
         checkpoint: Callable[[OcrResponse], Awaitable[None]] | None = None,
+        resume_pages: Sequence[OcrResponse] = (),
+        source_refs: Sequence[SourceRef] = (),
+        max_output_tokens: int | None = None,
     ) -> InferenceEnvelope:
         async with asyncio.timeout(max(0, deadline - monotonic())):
             result = await self._extract(
@@ -52,6 +63,9 @@ class ExtractionPipeline:
                 deadline=deadline,
                 tags=tuple(tags),
                 checkpoint=checkpoint,
+                resume_pages=tuple(p.model_copy(deep=True) for p in resume_pages),
+                source_refs=tuple(r.model_copy(deep=True) for r in source_refs),
+                max_output_tokens=max_output_tokens,
             )
         check_deadline(deadline)
         return result
@@ -65,16 +79,42 @@ class ExtractionPipeline:
         deadline: float,
         tags: Sequence[str],
         checkpoint: Callable[[OcrResponse], Awaitable[None]] | None,
+        resume_pages: Sequence[OcrResponse],
+        source_refs: Sequence[SourceRef],
+        max_output_tokens: int | None,
     ) -> InferenceEnvelope:
+        if resume_pages and (
+            not self.settings.enabled or options.pipeline.value == "direct_vision"
+        ):
+            raise ValueError("ocr_resume_disabled")
         if not paths:
             raise ValueError("source_images_required")
         started = perf_counter()
         hashes = await run_sync_before(
             deadline, lambda: [hashlib.sha256(path.read_bytes()).hexdigest() for path in paths]
         )
-        # Database part IDs are bound later by photo_index and original hash.
-        refs: list[SourceRef] = []
+        # Optional persisted bindings describe the complete ordered originals.
+        refs = list(source_refs)
+        if refs and (
+            len(refs) != len(paths)
+            or any(
+                ref.photo_index != i
+                or ref.source_sha256 != hashes[i]
+                or ref.coordinate_space != "original"
+                or ref.view_id is not None
+                or ref.block_id is not None
+                or ref.bbox is not None
+                or ref.text_span is not None
+                for i, ref in enumerate(refs)
+            )
+            or len({r.part_id for r in refs}) != len(refs)
+        ):
+            raise OriginalSourceChangedError("source_reference_mismatch")
         provider = self.provider.for_experiment(options)
+        if max_output_tokens is not None:
+            if max_output_tokens <= 0:
+                raise ValueError("invalid_output_limit")
+            provider.max_output_tokens = max_output_tokens
         result = InferenceEnvelope(
             provenance=PipelineProvenance(
                 requested_pipeline=options.pipeline.value,
@@ -105,7 +145,23 @@ class ExtractionPipeline:
                         result.provenance.profile_id = capabilities.profile_id
                         result.telemetry.ocr_max_new_tokens = capabilities.ocr_max_new_tokens
                         ocr_started = perf_counter()
-                        for index, path in enumerate(paths):
+                        runtime = capabilities.runtime_fingerprint
+                        if resume_pages:
+                            if not runtime or len(resume_pages) > len(paths):
+                                raise OcrRuntimeChangedError("ocr_resume_identity_mismatch")
+                            for index, page in enumerate(resume_pages):
+                                compact_ocr_text({"text": page.text})
+                                if (
+                                    page.photo_index != index
+                                    or page.source_sha256 != hashes[index]
+                                    or page.profile_id != capabilities.profile_id
+                                    or page.runtime_fingerprint != runtime
+                                ):
+                                    raise OcrRuntimeChangedError("ocr_resume_identity_mismatch")
+                            result.ocr_pages = list(resume_pages)
+                            result.provenance.runtime_fingerprint = runtime
+                        for index in range(len(resume_pages), len(paths)):
+                            path = paths[index]
                             try:
                                 page = await self.ocr.extract_page(
                                     path,
@@ -115,23 +171,27 @@ class ExtractionPipeline:
                                     expected_profile_id=capabilities.profile_id,
                                 )
                                 compact_ocr_text({"text": page.text})
+                                if runtime and page.runtime_fingerprint != runtime:
+                                    raise OcrRuntimeChangedError("ocr_runtime_changed")
                                 if (
                                     page.photo_index != index
                                     or page.source_sha256 != hashes[index]
                                     or page.profile_id != capabilities.profile_id
-                                    or (
-                                        result.ocr_pages
-                                        and page.runtime_fingerprint
-                                        != result.ocr_pages[0].runtime_fingerprint
-                                    )
                                 ):
                                     raise ValueError("ocr_identity_mismatch")
+                            except OcrRuntimeChangedError:
+                                raise
                             except (httpx.HTTPError, OSError, ValueError) as exc:
                                 # Transport failures share the same whole-receipt policy as blank text.
                                 if isinstance(exc, TimeoutError):
                                     raise
+                                if str(exc) == "ocr_source_hash_mismatch":
+                                    raise OriginalSourceChangedError(
+                                        "ocr_source_hash_mismatch"
+                                    ) from exc
                                 reason = "ocr_page_failed"
                                 break
+                            runtime = page.runtime_fingerprint
                             result.ocr_pages.append(page)
                             result.provenance.runtime_fingerprint = page.runtime_fingerprint
                             if checkpoint is not None:
@@ -199,7 +259,7 @@ class ExtractionPipeline:
                 deadline=deadline,
             )
             if [view.source_sha256 for view in formatted.input_views] != hashes:
-                raise ValueError("vision_source_hash_mismatch")
+                raise OriginalSourceChangedError("vision_source_hash_mismatch")
             result.provenance.fallback_used = use_ocr
             result.provenance.model_digest = available[vision_id].digest
             formatted.telemetry.context_window_tokens = available[vision_id].context_window_tokens

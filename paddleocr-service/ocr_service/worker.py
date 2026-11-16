@@ -123,7 +123,12 @@ def _worker_main(
         adapter = build_pipeline(load_profile(profile_path), runtime)
         adapter.qualify(smoke_path)
         output_channel.put(
-            {"kind": "ready", "generation": generation, "profile_id": adapter.profile_id}
+            {
+                "kind": "ready",
+                "generation": generation,
+                "profile_id": adapter.profile_id,
+                "runtime_fingerprint": adapter.runtime_fingerprint,
+            }
         )
     except Exception:  # noqa: BLE001 - native boundary must hide exception details
         output_channel.put({"kind": "init_failed", "generation": generation})
@@ -173,6 +178,7 @@ class OcrWorkerManager:
         self._generation = 0
         self._reason: str | None = "ocr_starting"
         self._profile_id: str | None = None
+        self._runtime_fingerprint: str | None = None
         self._ready = False
         self._admitted = 0
         self._proc: Any = None
@@ -203,11 +209,13 @@ class OcrWorkerManager:
                 generation=max(1, self._generation),
                 profile_id=self._profile_id,
                 reason_code=reason,
+                runtime_fingerprint=self._runtime_fingerprint if ready else None,
             )
 
     def _set_unready(self, reason: str) -> None:
         with self._state:
             self._ready, self._reason, self._profile_id = False, reason, None
+            self._runtime_fingerprint = None
 
     def start(self) -> None:
         """Bounded initialization, called off the HTTP event loop."""
@@ -258,6 +266,7 @@ class OcrWorkerManager:
                             self._ready = not self._stopped.is_set()
                             self._reason = None if self._ready else "ocr_stopped"
                             self._profile_id = message["profile_id"]
+                            self._runtime_fingerprint = message.get("runtime_fingerprint")
                         if self._ready:
                             return
                     self._set_unready("ocr_init_failed")
@@ -271,6 +280,7 @@ class OcrWorkerManager:
         with self._state:
             self._ready = False
             self._profile_id = None
+            self._runtime_fingerprint = None
         proc = self._proc
         if proc is not None:
             try:

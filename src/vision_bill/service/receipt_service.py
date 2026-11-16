@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -17,6 +17,7 @@ from ..config import ImageSettings, OcrSettings, PGSettings, WorkerSettings
 from ..model.db.image import ImagePart, ImageRow
 from ..model.db.receipt import ReceiptRow, ReceiptWithDetails
 from ..model.extraction import InferenceEnvelope
+from ..model.ocr import OcrCapabilities, OcrResponse, SourceRef
 from ..model.receipt import Receipt
 from ..model.search import ProductSearchResponse
 from ..model.statistics import ReceiptStatistics
@@ -381,9 +382,9 @@ class ReceiptService:
 
     # ── Extraction methods ───────────────────────────────────────────
 
-    async def get_available_models(self) -> list[ModelInfo]:
+    async def get_available_models(self, *, capability: str = "vision") -> list[ModelInfo]:
         logger.debug("Requesting available models from provider")
-        return await self._provider.get_available_models()
+        return await self._provider.get_available_models(capability=capability)
 
     async def check_connection(self) -> bool:
         """Return True if the LLM backend is reachable, False otherwise."""
@@ -395,13 +396,30 @@ class ReceiptService:
             return list(self._experiment_tags)
         return await self._db.list_tags() if self.db_ready else []
 
-    async def extract_receipt(self, model_id: str, paths: Sequence[Path], *,
-                              options: "ExperimentOptions", deadline: float,
-                              tags: Sequence[str]) -> InferenceEnvelope:
-        """Shared typed entry point for uploads, workers and experiments."""
+    async def ocr_capabilities(self, settings: OcrSettings) -> OcrCapabilities:
+        from ..provider.factory import get_ocr_provider
+        provider = get_ocr_provider(settings)
+        if provider is None:
+            return OcrCapabilities(enabled=False, configured=False, reachable=False, ready=False)
+        return await provider.get_capabilities()
+
+    async def extract_receipt(
+        self, model_id: str, paths: Sequence[Path], *, options: "ExperimentOptions",
+        deadline: float, tags: Sequence[str],
+        checkpoint: Callable[[OcrResponse], Awaitable[None]] | None = None,
+        resume_pages: Sequence[OcrResponse] = (), source_refs: Sequence[SourceRef] = (),
+        ocr_settings: OcrSettings | None = None, max_output_tokens: int | None = None,
+    ) -> InferenceEnvelope:
+        """Explicit per-attempt snapshots; never inject state into shared providers."""
+        from ..provider.factory import get_ocr_provider
         from .extraction_pipeline import ExtractionPipeline
-        return await ExtractionPipeline(self._provider, self._ocr_provider, self._ocr_settings).extract(
-            model_id, paths, options=options, deadline=deadline, tags=tags)
+        selected = ocr_settings if ocr_settings is not None else self._ocr_settings
+        ocr = get_ocr_provider(selected) if ocr_settings is not None else self._ocr_provider
+        return await ExtractionPipeline(self._provider, ocr, selected).extract(
+            model_id, paths, options=options, deadline=deadline, tags=tags,
+            checkpoint=checkpoint, resume_pages=resume_pages, source_refs=source_refs,
+            max_output_tokens=max_output_tokens,
+        )
 
     async def analyse_receipt_with_ocr(self, model_id: str, image_path: Path) -> Receipt:
         """Compatibility wrapper: unwrap a complete shared pipeline result only."""

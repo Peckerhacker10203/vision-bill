@@ -15,12 +15,17 @@ from pydantic import TypeAdapter
 
 from ...config import PGSettings, WorkerSettings
 from ...model.db.image import ImageRow
+from ...model.db.receipt import ReceiptRow
+from ...model.extraction import DraftView, ExtractionDraft
 from ...model.ocr import OcrPageMetadata, Sha256, SourceRef, WorkingImageMetadata
+from ...model.review import OriginalAvailability, SourceView
 from ...model.workflow import (
     AccessScope,
     AnalysisClaim,
     AttemptOutcome,
     CommitResult,
+    DraftFinalize,
+    DraftPatch,
     EnqueueResult,
     OcrCheckpoint,
     PersistedSourcePart,
@@ -31,6 +36,7 @@ from ...model.workflow import (
     SubmissionStatus,
     assert_metadata_only,
 )
+from ...service.receipt_review import admission_review, receipt_from_draft
 from .receipt_db import ReceiptDB
 
 
@@ -115,7 +121,15 @@ class WorkflowDB:
                 scope.user_id,
                 scope.can_see_all,
             )
-        return _status(row) if row else None
+            if row is None:
+                return None
+            status = _status(row)
+            status.source_views = await self._source_views(conn, image_id)
+            status.latest_extraction_id = await conn.fetchval(
+                "SELECT id FROM receipt_extractions WHERE image_id=$1 ORDER BY generation DESC,attempt_number DESC LIMIT 1",
+                image_id,
+            )
+            return status
 
     async def get_source_parts(
         self,
@@ -265,16 +279,21 @@ class WorkflowDB:
                 )
             return EnqueueResult(submission=_status(row), created=True)
 
-    async def claim_next(self, *, lease_seconds: int = 900) -> AnalysisClaim | None:
+    async def claim_next(
+        self, *, lease_seconds: int = 900, image_id: UUID | None = None
+    ) -> AnalysisClaim | None:
         if lease_seconds <= self._worker.attempt_timeout_seconds:
             raise ValueError("claim lease must exceed the complete attempt deadline")
         async with self.pool.acquire() as conn, conn.transaction():
             while True:
-                row = await conn.fetchrow("""SELECT * FROM images WHERE receipt_id IS NULL AND
+                row = await conn.fetchrow(
+                    """SELECT * FROM images WHERE ($1::uuid IS NULL OR id=$1) AND receipt_id IS NULL AND
                     NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id) AND
                     ((status='pending' AND (retry_at IS NULL OR retry_at<=clock_timestamp())) OR
                      (status='processing' AND lease_expires_at<=clock_timestamp()))
-                    ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1""")
+                    ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1""",
+                    image_id,
+                )
                 if row is None:
                     return None
                 if row["status"] == "processing":
@@ -450,6 +469,57 @@ class WorkflowDB:
             if row is None or row["ocr_checkpoint"] is None:
                 return None
             return OcrCheckpoint.model_validate(_decoded(row["ocr_checkpoint"]))
+
+    async def clear_ocr_checkpoint(self, claim: AnalysisClaim) -> bool:
+        """Invalidate only the cache pointer, retaining immutable views and history."""
+        async with self.pool.acquire() as conn, conn.transaction():
+            if await self._lock_claim(conn, claim) is None:
+                return False
+            await conn.execute("UPDATE images SET ocr_checkpoint=NULL WHERE id=$1", claim.image.id)
+            return True
+
+    async def ensure_execution_snapshot(
+        self,
+        claim: AnalysisClaim,
+        *,
+        model_id: str,
+        effective_options: dict[str, Any],
+    ) -> ImageRow | None:
+        """Resolve an uninitialized legacy job once, under the original claim fence."""
+        async with self.pool.acquire() as conn, conn.transaction():
+            row = await self._lock_claim(conn, claim)
+            if row is None:
+                return None
+            if not _decoded(row["effective_options"]):
+                # Only migrated jobs lack a request fingerprint. Never repair a malformed upload.
+                if row["request_fingerprint"] is not None:
+                    raise ValueError("execution_snapshot_invalid")
+                row = await conn.fetchrow(
+                    """UPDATE images SET effective_options=$2::jsonb,model_id=$3,
+                    legacy_events=legacy_events || '[{"event":"legacy_execution_resolved"}]'::jsonb
+                    WHERE id=$1 RETURNING *""",
+                    claim.image.id,
+                    _json(effective_options),
+                    model_id,
+                )
+            return ImageRow.model_validate(dict(row))
+
+    async def due_candidates(self) -> list[ImageRow]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""SELECT * FROM images WHERE receipt_id IS NULL AND
+                NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id) AND
+                ((status='pending' AND (retry_at IS NULL OR retry_at<=clock_timestamp())) OR
+                (status='processing' AND lease_expires_at<=clock_timestamp()))
+                ORDER BY created_at,id""")
+        return [ImageRow.model_validate(dict(row)) for row in rows]
+
+    async def next_wake_delay(self, maximum: float) -> float:
+        async with self.pool.acquire() as conn:
+            delay = await conn.fetchval("""SELECT EXTRACT(EPOCH FROM min(due)-clock_timestamp())
+                FROM (SELECT retry_at AS due FROM images WHERE status='pending' AND retry_at>clock_timestamp()
+                UNION ALL SELECT lease_expires_at FROM images WHERE status='processing'
+                AND lease_expires_at>clock_timestamp()) candidates""")
+        return min(maximum, max(0.0, float(delay))) if delay is not None else maximum
 
     async def save_ocr_checkpoint(self, claim: AnalysisClaim, checkpoint: OcrCheckpoint) -> bool:
         async with self.pool.acquire() as conn, conn.transaction():
@@ -717,3 +787,262 @@ class WorkflowDB:
                 result.model_dump_json(),
             )
             return result
+
+    @staticmethod
+    def _public_view(image_id: UUID, photo_index: int, raw: Any) -> SourceView:
+        metadata = WorkingImageMetadata.model_validate(_decoded(raw))
+        return SourceView(
+            **metadata.model_dump(exclude={"media_type"}),
+            photo_index=photo_index,
+            coordinate_space="working",
+            url=f"/api/v1/images/{image_id}/views/{metadata.view_id}",
+        )
+
+    async def _source_views(self, conn: asyncpg.Connection, image_id: UUID) -> list[SourceView]:
+        rows = await conn.fetch(
+            """SELECT v.metadata,p.photo_index FROM extraction_working_views v
+            JOIN image_source_parts p ON p.part_id=v.part_id WHERE v.image_id=$1
+            ORDER BY p.photo_index,v.created_at,v.view_id""",
+            image_id,
+        )
+        return [self._public_view(image_id, r["photo_index"], r["metadata"]) for r in rows]
+
+    async def get_working_view(
+        self,
+        image_id: UUID,
+        view_id: UUID,
+        *,
+        scope: AccessScope,
+    ) -> PersistedWorkingView | None:
+        """Internal file manifest, accessible only through the owning submission."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT v.*,p.photo_index,p.source_sha256
+                FROM extraction_working_views v JOIN images i ON i.id=v.image_id
+                JOIN image_source_parts p ON p.part_id=v.part_id
+                WHERE i.id=$1 AND v.view_id=$2 AND (i.user_id=$3 OR $4)""",
+                image_id,
+                view_id,
+                scope.user_id,
+                scope.can_see_all,
+            )
+        if row is None:
+            return None
+        return PersistedWorkingView(
+            part_id=row["part_id"],
+            photo_index=row["photo_index"],
+            source_sha256=row["source_sha256"],
+            artifact_path=row["artifact_path"],
+            metadata=WorkingImageMetadata.model_validate(_decoded(row["metadata"])),
+        )
+
+    async def get_extraction(
+        self,
+        image_id: UUID,
+        extraction_id: UUID,
+        *,
+        scope: AccessScope,
+    ) -> dict[str, Any] | None:
+        """Public immutable snapshot: no internal artifact paths or transport payloads."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT e.* FROM receipt_extractions e
+                JOIN images i ON i.id=e.image_id WHERE i.id=$1 AND e.id=$2
+                AND (i.user_id=$3 OR $4)""",
+                image_id,
+                extraction_id,
+                scope.user_id,
+                scope.can_see_all,
+            )
+        if row is None:
+            return None
+        payload = dict(row)
+        payload["envelope"] = _decoded(payload["envelope"])
+        payload["review"] = _decoded(payload["review"])
+        views = [PersistedWorkingView.model_validate(v) for v in _decoded(payload["source_views"])]
+        public = [
+            self._public_view(image_id, v.photo_index, v.metadata.model_dump()).model_dump(
+                mode="json"
+            )
+            for v in views
+        ]
+        payload["source_views"] = public
+        if payload["envelope"] is not None:
+            payload["envelope"]["input_views"] = public
+        return payload
+
+    async def _draft_view(self, conn: asyncpg.Connection, row: Any) -> DraftView:
+        return DraftView(
+            image_id=row["image_id"],
+            revision=row["revision"],
+            document=ExtractionDraft.model_validate(_decoded(row["document"])),
+            amount_policy=_decoded(row["amount_policy"]),
+            findings=_decoded(row["findings"]),
+            finalized_receipt_id=row["finalized_receipt_id"],
+            source_views=await self._source_views(conn, row["image_id"]),
+        )
+
+    async def get_draft(self, image_id: UUID, *, scope: AccessScope) -> DraftView | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT d.* FROM receipt_drafts d JOIN images i ON i.id=d.image_id
+                WHERE i.id=$1 AND (i.user_id=$2 OR $3)""",
+                image_id,
+                scope.user_id,
+                scope.can_see_all,
+            )
+            return await self._draft_view(conn, row) if row else None
+
+    async def patch_draft(
+        self,
+        image_id: UUID,
+        patch: DraftPatch,
+        *,
+        scope: AccessScope,
+    ) -> DraftView | None:
+        async with self.pool.acquire() as conn, conn.transaction():
+            # Same lock order as finish/retry/finalize prevents worker/human races.
+            image = await conn.fetchrow(
+                """SELECT * FROM images WHERE id=$1
+                AND (user_id=$2 OR $3) FOR UPDATE""",
+                image_id,
+                scope.user_id,
+                scope.can_see_all,
+            )
+            if image is None:
+                return None
+            row = await conn.fetchrow(
+                "SELECT * FROM receipt_drafts WHERE image_id=$1 FOR UPDATE", image_id
+            )
+            if row is None:
+                return None
+            if row["revision"] != patch.expected_revision:
+                raise ValueError("draft_revision_conflict")
+            if row["finalized_receipt_id"] is not None or image["receipt_id"] is not None:
+                raise ValueError("draft_already_finalized")
+            if image["status"] == "processing":
+                raise ValueError("draft_processing_conflict")
+            if set(patch.changes) - set(ExtractionDraft.model_fields):
+                raise ValueError("draft_unknown_field")
+            assert_metadata_only(patch.changes)
+            document = ExtractionDraft.model_validate(
+                {**_decoded(row["document"]), **patch.changes}
+            )
+            row = await conn.fetchrow(
+                """UPDATE receipt_drafts SET document=$2::jsonb,
+                revision=revision+1,human_edited=TRUE WHERE image_id=$1 RETURNING *""",
+                image_id,
+                document.model_dump_json(),
+            )
+            # Editing a draft retained during a pending explicit retry prevents later claims.
+            await conn.execute(
+                """UPDATE images SET status='needs_review',retry_at=NULL,
+                draft_available=TRUE WHERE id=$1""",
+                image_id,
+            )
+            return await self._draft_view(conn, row)
+
+    async def finalize_draft(
+        self,
+        image_id: UUID,
+        request: DraftFinalize,
+        *,
+        scope: AccessScope,
+        originals: list[OriginalAvailability],
+    ) -> ReceiptRow | None:
+        async with self.pool.acquire() as conn, conn.transaction():
+            image = await conn.fetchrow(
+                """SELECT * FROM images WHERE id=$1
+                AND (user_id=$2 OR $3) FOR UPDATE""",
+                image_id,
+                scope.user_id,
+                scope.can_see_all,
+            )
+            if image is None:
+                return None
+            row = await conn.fetchrow(
+                "SELECT * FROM receipt_drafts WHERE image_id=$1 FOR UPDATE", image_id
+            )
+            if row is None:
+                return None
+            if row["revision"] != request.expected_revision:
+                raise ValueError("draft_revision_conflict")
+            if row["finalized_receipt_id"] is not None:
+                saved = await conn.fetchrow(
+                    "SELECT * FROM receipts WHERE id=$1", row["finalized_receipt_id"]
+                )
+                return self._receipts._receipt_row_from_record(saved)
+            if image["status"] == "processing" or image["receipt_id"] is not None:
+                raise ValueError("draft_state_conflict")
+            view = await self._draft_view(conn, row)
+            receipt = receipt_from_draft(view.document)
+            parts = await self._parts(conn, image_id)
+            if (
+                not parts
+                or len(originals) != len(parts)
+                or {o.part_id for o in originals} != {p.part_id for p in parts}
+                or not all(o.available and o.sha256_matches for o in originals)
+            ):
+                raise ValueError("original_integrity_failed")
+            review = admission_review(view.document, originals_valid=True, findings=view.findings)
+            if not review.can_finalize:
+                raise ValueError("draft_integrity_failed")
+            saved_receipt = await self._receipts.insert_receipt(
+                conn,
+                receipt,
+                image_id=image_id,
+                user_id=image["user_id"],
+                status="unverified",
+                verified=False,
+            )
+            saved = await conn.fetchrow(
+                """UPDATE receipts SET extraction_id=$2,amount_policy=$3::jsonb,
+                findings=$4::jsonb,field_sources=$5::jsonb,checks_version=$6 WHERE id=$1 RETURNING *""",
+                saved_receipt.id,
+                row["extraction_id"],
+                row["amount_policy"],
+                row["findings"],
+                row["field_sources"],
+                review.checks_version,
+            )
+            result = self._receipts._receipt_row_from_record(saved)
+            await conn.execute(
+                """INSERT INTO receipt_review_revisions(receipt_id,operation_revision,
+                review_revision,event_kind,actor_user_id,snapshot) VALUES($1,1,1,'draft_finalized',$2,$3::jsonb)""",
+                result.id,
+                scope.user_id,
+                _json(
+                    {
+                        "receipt": result.model_dump(mode="json"),
+                        "draft_revision": row["revision"],
+                        "request_key": request.request_key,
+                    }
+                ),
+            )
+            await conn.execute(
+                "UPDATE receipt_drafts SET finalized_receipt_id=$2 WHERE image_id=$1",
+                image_id,
+                result.id,
+            )
+            await conn.execute(
+                """UPDATE images SET receipt_id=$2,status='analyzed',draft_available=FALSE,
+                retry_at=NULL,result_code=NULL,error=NULL,analyzed_at=clock_timestamp() WHERE id=$1""",
+                image_id,
+                result.id,
+            )
+            return result
+
+    async def unreferenced_views(
+        self,
+        image_id: UUID,
+        views: list[PersistedWorkingView],
+    ) -> list[PersistedWorkingView]:
+        """Wait for any in-flight commit before authorizing caller-owned orphan cleanup."""
+        async with self.pool.acquire() as conn, conn.transaction():
+            await conn.fetchrow("SELECT id FROM images WHERE id=$1 FOR UPDATE", image_id)
+            saved = await conn.fetch(
+                "SELECT view_id FROM extraction_working_views WHERE view_id=ANY($1::uuid[])",
+                [v.metadata.view_id for v in views],
+            )
+            ids = {r["view_id"] for r in saved}
+            return [view for view in views if view.metadata.view_id not in ids]

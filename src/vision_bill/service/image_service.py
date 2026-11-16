@@ -1,9 +1,13 @@
+import asyncio
+import base64
 import logging
 import os
 import shutil
+import stat
 import tempfile
 import uuid
 from hashlib import sha256
+from io import BytesIO
 from pathlib import Path
 from uuid import UUID
 
@@ -12,8 +16,10 @@ import pillow_heif
 from PIL import Image, ImageOps
 
 from ..config import ImageSettings
+from ..helper.deadline import check_deadline
 from ..model.db.image import ImagePart
 from ..model.image import ImageInfo
+from ..model.ocr import WorkingImage, WorkingImageMetadata
 
 pillow_heif.register_heif_opener()  # type: ignore[attr-defined]
 
@@ -220,3 +226,116 @@ class ImageService:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Thumbnail generation failed for %s: %s", src_path, exc)
             return None
+
+    def _working_path(self, image_id: UUID, view_id: UUID) -> Path:
+        root = (self._save_dir / "working").absolute()
+        target = root / str(image_id) / f"{view_id}.png"
+        if not target.resolve().is_relative_to(root.resolve()):
+            raise ValueError("invalid_working_artifact_path")
+        return target
+
+    @staticmethod
+    def _validate_working_png(raw: bytes, metadata: WorkingImageMetadata) -> None:
+        if len(raw) > 64 * 1024 * 1024 or sha256(raw).hexdigest() != metadata.sha256:
+            raise ValueError("invalid_working_artifact_hash")
+        try:
+            with Image.open(BytesIO(raw)) as decoded:
+                if (
+                    decoded.format != "PNG"
+                    or decoded.size != (metadata.width, metadata.height)
+                    or getattr(decoded, "n_frames", 1) != 1
+                ):
+                    raise ValueError("invalid_working_artifact_dimensions")
+                decoded.load()
+        except (OSError, SyntaxError) as exc:
+            raise ValueError("invalid_working_artifact_png") from exc
+
+    def read_working_image(
+        self,
+        image_id: UUID,
+        artifact_path: str,
+        metadata: WorkingImageMetadata,
+    ) -> bytes:
+        expected = self._working_path(image_id, metadata.view_id)
+        if Path(artifact_path).absolute() != expected or expected.is_symlink():
+            raise ValueError("invalid_working_artifact_path")
+        fd = os.open(expected, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024 * 1024:
+                raise ValueError("invalid_working_artifact_type")
+            raw = handle.read(64 * 1024 * 1024 + 1)
+        self._validate_working_png(raw, metadata)
+        return raw
+
+    async def save_working_image(
+        self,
+        image_id: UUID,
+        working: WorkingImage,
+        *,
+        deadline: float,
+    ) -> Path:
+        """Isolated immutable publication; cancelled writers clean only their own file."""
+        from time import monotonic
+
+        metadata = WorkingImageMetadata.model_validate(working.model_dump())
+        encoded = working.png_base64
+
+        def save() -> tuple[Path, bool]:
+            target = self._working_path(image_id, metadata.view_id)
+            raw = base64.b64decode(encoded, validate=True)
+            self._validate_working_png(raw, metadata)
+            check_deadline(deadline)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            created = False
+            try:
+                with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as handle:
+                    temporary = Path(handle.name)
+                    try:
+                        handle.write(raw)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                        check_deadline(deadline)
+                        os.link(temporary, target)
+                        created = True
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                for parent in (target.parent, target.parent.parent, self._save_dir):
+                    fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                check_deadline(deadline)
+                return target, created
+            except BaseException:
+                if created:
+                    target.unlink(missing_ok=True)
+                raise
+
+        def discard(task: asyncio.Task[tuple[Path, bool]]) -> None:
+            if not task.cancelled() and task.exception() is None:
+                target, created = task.result()
+                if created:
+                    target.unlink(missing_ok=True)
+
+        task = asyncio.create_task(asyncio.to_thread(save))
+        try:
+            async with asyncio.timeout(max(0, deadline - monotonic())):
+                target, _ = await asyncio.shield(task)
+            return target
+        except BaseException:
+            task.add_done_callback(discard)
+            raise
+
+    def remove_unreferenced_working_image(
+        self,
+        image_id: UUID,
+        artifact_path: str,
+        metadata: WorkingImageMetadata,
+    ) -> None:
+        """Caller must hold DB evidence that its own newly created file is unreferenced."""
+        expected = self._working_path(image_id, metadata.view_id)
+        if Path(artifact_path).absolute() != expected or expected.is_symlink():
+            raise ValueError("invalid_working_artifact_path")
+        expected.unlink(missing_ok=True)

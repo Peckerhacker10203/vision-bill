@@ -1,5 +1,6 @@
 import json
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
@@ -48,6 +49,13 @@ class ImageRow(BaseModel):
     result_code: str | None = None
     wait_reason: str | None = None
     draft_available: bool = False
+    effective_options: dict[str, Any] = Field(default_factory=dict, repr=False, exclude=True)
+
+    @field_validator("effective_options", mode="before")
+    @classmethod
+    def decode_options(cls, value: object) -> object:
+        return json.loads(value) if isinstance(value, str) else value
+
     # Internal fencing/lease fields. Public responses use SubmissionStatus.
     claim_token: UUID | None = Field(default=None, repr=False, exclude=True)
     lease_expires_at: datetime | None = Field(default=None, repr=False, exclude=True)
