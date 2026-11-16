@@ -785,3 +785,79 @@ def test_failed_idle_replacement_is_not_an_infinite_configuration_restart_loop()
         assert worker.readiness().reason_code == 'ocr_init_failed'
     finally:
         worker.stop()
+
+
+@pytest.mark.parametrize("delayed_name", ["ocr-worker-recovery", "ocr-idle-recovery"])
+def test_poll_and_infer_share_one_failed_replacement_when_recovery_is_delayed(tmp_path, monkeypatch, delayed_name):
+    from ocr_service import worker as worker_module
+    from ocr_service.worker import OcrWorkerError
+
+    context = FakeContext('hang')
+    worker = manager(context)
+    item = request(tmp_path)
+    real_thread = threading.Thread
+    release_delayed_recovery = threading.Event()
+    delayed_recovery_scheduled = threading.Event()
+    recovery_threads = []
+    errors = []
+
+    def schedule(*args, **kwargs):
+        if kwargs.get('name') == delayed_name:
+            target, target_args = kwargs['target'], kwargs.get('args', ())
+
+            def delayed():
+                delayed_recovery_scheduled.set()
+                assert release_delayed_recovery.wait(2)
+                target(*target_args)
+
+            kwargs = {**kwargs, 'target': delayed, 'args': ()}
+        thread = real_thread(*args, **kwargs)
+        if kwargs.get('name') in {'ocr-worker-recovery', 'ocr-idle-recovery'}:
+            recovery_threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(worker_module.threading, 'Thread', schedule)
+
+    def infer():
+        try:
+            worker.infer(item, deadline_monotonic=time.monotonic() + 3)
+        except OcrWorkerError as exc:
+            errors.append(str(exc))
+
+    owner = real_thread(target=infer)
+    owner.start()
+    try:
+        assert context.entered.wait(1), 'actual inference did not dispatch'
+        # Arrange detection only: poll observes death while the real request
+        # owner is waiting to enter its recovery critical section.
+        with worker._control:
+            context.init_fail = True
+            context.processes[0].dead.set()
+            context.processes[0].thread.join(1)
+            assert not worker.readiness().ready
+        assert delayed_recovery_scheduled.wait(1)
+        owner.join(1)
+        assert not owner.is_alive()
+        first = next(t for t in recovery_threads if t.name != delayed_name)
+        first.join(1)
+        assert not first.is_alive()
+        assert worker.readiness().generation == 2
+        assert worker.readiness().reason_code == 'ocr_init_failed'
+        assert len(context.processes) == 2
+        # The delayed callback must not treat the failed replacement as another
+        # recovery opportunity for the original death.
+        release_delayed_recovery.set()
+        for thread in recovery_threads:
+            thread.join(1)
+            assert not thread.is_alive()
+        assert worker.readiness().generation == 2
+        assert len(context.processes) == 2
+        assert worker.readiness().reason_code == 'ocr_init_failed'
+        assert errors == ['ocr_worker_crashed']
+        assert context.requests == [item], 'failed request was replayed'
+    finally:
+        release_delayed_recovery.set()
+        worker.stop()
+        owner.join(1)
+        for thread in recovery_threads:
+            thread.join(1)

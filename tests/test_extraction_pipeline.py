@@ -317,6 +317,32 @@ async def test_fallback_preserves_ocr_failure_as_stable_finding(photos):
     )
     assert result.receipt is not None
     assert any(f.code == "ocr_page_failed" for f in result.findings)
+    from pathlib import Path
+
+    from vision_bill.model.review import OriginalAvailability
+    from vision_bill.service.receipt_review import evaluate_receipt, persistent_findings
+
+    # The UI fixture is the actual retained saved-review wire shape. The ID is
+    # material-dependent, so assert its producer/review lifecycle separately.
+    expected = json.loads((Path(__file__).parents[1] / "frontend/src/lib/test-fixtures/retained-ocr-finding.json").read_text())
+    originals = [
+        OriginalAvailability(part_id=None, photo_index=i, available=True, sha256_matches=True)
+        for i in range(len(photos))
+    ]
+    review = evaluate_receipt(
+        result.receipt, result.amount_policy, result.field_sources, result.overlap_decisions,
+        originals,
+        retained_findings=result.findings,
+    )
+    retained = next(f for f in persistent_findings(review.findings) if f.code == "ocr_page_failed")
+    assert retained.model_dump(mode="json", exclude={"id"}) == expected
+    assert len(retained.id) == 64 and retained.id != "ocr_page_failed"
+    repeated = evaluate_receipt(
+        result.receipt, result.amount_policy, result.field_sources, result.overlap_decisions,
+        originals,
+        retained_findings=persistent_findings(review.findings),
+    )
+    assert next(f for f in repeated.findings if f.code == "ocr_page_failed") == retained
 
 
 async def test_ocr_and_formatter_limits_remain_separate(photos):

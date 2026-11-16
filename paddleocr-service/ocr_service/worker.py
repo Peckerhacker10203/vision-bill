@@ -181,6 +181,7 @@ class OcrWorkerManager:
         self._stopped = threading.Event()
         self._generation = 0
         self._idle_recovery_generation: int | None = None
+        self._recovery_attempted_generation: int | None = None
         self._reason: str | None = "ocr_starting"
         self._profile_id: str | None = None
         self._runtime_fingerprint: str | None = None
@@ -235,16 +236,24 @@ class OcrWorkerManager:
         # A polling thread never owns an in-flight request's artifacts. Wait
         # for its owner to finish, then recheck generation under lifecycle lock:
         # request recovery or shutdown may already have retired this process.
-        with self._active, self._control:
-            if self._stopped.is_set() or generation != self._generation:
+        with self._active:
+            self._restart_generation(generation)
+
+    def _restart_generation(self, generation: int) -> None:
+        with self._control:
+            if (
+                self._stopped.is_set()
+                or generation != self._generation
+                or self._recovery_attempted_generation == generation
+            ):
                 return
+            # Poll and request callbacks consume the same recovery right before
+            # teardown/startup. A failed replacement must not grant another try.
+            self._recovery_attempted_generation = generation
             try:
-                self._set_unready("ocr_worker_crashed")
-                self._teardown()
                 self.start()
             except OcrWorkerError:
-                # Teardown preserves ownership and marks unstoppable workers
-                # unready. Polling cannot turn this into a restart loop.
+                # Unconfirmed death preserves ownership and remains unready.
                 pass
 
     def _set_unready(self, reason: str) -> None:
@@ -343,10 +352,16 @@ class OcrWorkerManager:
 
     def _recover(self, reason: str) -> None:
         with self._control:
+            generation = self._generation
             self._set_unready(reason)
             self._teardown()
         # A new generation is qualified separately; never replay the failed request.
-        threading.Thread(target=self.start, name="ocr-worker-recovery", daemon=True).start()
+        threading.Thread(
+            target=self._restart_generation,
+            args=(generation,),
+            name="ocr-worker-recovery",
+            daemon=True,
+        ).start()
 
     def infer(self, request: OcrRequest, *, deadline_monotonic: float) -> OcrResponse:
         if time.monotonic() >= deadline_monotonic:

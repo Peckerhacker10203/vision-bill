@@ -7,5 +7,9 @@ export function diagnosticLabel(
 	code: string
 ): string {
 	if (Object.hasOwn(en.diagnostics[group], code)) return t(`diagnostics.${group}.${code}`);
+	// Saved reviews retain informational provider/fallback reasons alongside
+	// financial checks. Both are known findings, with different dictionaries.
+	if (group === 'checks' && Object.hasOwn(en.diagnostics.reasons, code))
+		return t(`diagnostics.reasons.${code}`);
 	return t('diagnostics.unknown', { values: { label: code.replace(/[_-]+/g, ' ') } });
 }

@@ -107,3 +107,40 @@ it.each(['en', 'de'] as const)(
 		setLocale('en');
 	}
 );
+
+it.each(['en', 'de'] as const)(
+	'explains the retained OCR fallback finding on saved review in %s',
+	async (language) => {
+		const { setLocale } = await import('$lib/i18n');
+		// This serialized shape is checked against the actual pipeline and saved-review
+		// evaluator by test_fallback_preserves_ocr_failure_as_stable_finding.
+		const { default: retained } = await import('$lib/test-fixtures/retained-ocr-finding.json');
+		const saved: ReviewFinding = { ...retained, severity: 'info', id: 'saved-material-finding-id' };
+		const onChange = vi.fn();
+		setLocale(language);
+		try {
+			render(ReviewFindings, { findings: [saved, findings[1]], revision: 9, onChange });
+			expect(
+				screen.getByText(
+					language === 'en'
+						? 'Information: OCR could not read every photo in this receipt.'
+						: 'Information: OCR konnte nicht jedes Foto dieses Belegs lesen.'
+				)
+			).not.toBeNull();
+			expect(
+				screen.queryByText(
+					/Additional diagnostic: ocr page failed|Zusätzliche Diagnose: ocr page failed/
+				)
+			).toBeNull();
+			expect(screen.getAllByRole('textbox')).toHaveLength(1);
+			await fireEvent.input(screen.getByRole('textbox'), { target: { value: 'Checked original' } });
+			expect(onChange).toHaveBeenLastCalledWith([{ finding_id: 'r', comment: 'Checked original' }]);
+			expect(saved).toEqual({ ...retained, id: 'saved-material-finding-id' });
+			expect(
+				screen.getByText(language === 'en' ? 'Expected: 1.00000001' : 'Erwartet: 1.00000001')
+			).not.toBeNull();
+		} finally {
+			setLocale('en');
+		}
+	}
+);
