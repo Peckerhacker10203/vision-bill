@@ -129,6 +129,108 @@ async def test_exhausted_worker_bounds_actual_asyncpg_cleanup_and_preserves_pool
         pool.terminate()
 
 
+@pytest.mark.parametrize("phase", ["read", "body", "start", "rollback", "commit", "setup", "release",
+                                   "read_return", "setup_return", "release_return"])
+@pytest.mark.parametrize("successor_phase", ["public", "connect", "setup"])
+async def test_disconnect_cleanup_never_touches_same_holder_successor(phase, successor_phase):
+    from vision_bill.provider.db.deadline import connection
+    made = []
+    disconnected, unwind, successor_ready, finish_successor = (asyncio.Event() for _ in range(4))
+
+    async def lose_connection(raw):
+        # Installed asyncpg's disconnect callback releases the holder before
+        # the interrupted operation delivers its error to the old borrower.
+        raw.terminate()
+        disconnected.set()
+        await unwind.wait()
+        if not phase.endswith("_return"):
+            raise RuntimeError("original connection lost")
+
+    class DisconnectConnection(WireConnection):
+        async def reset(self, *, timeout=None):
+            if self is made[0] and phase in {"release", "release_return"}:
+                await lose_connection(self)
+            await super().reset(timeout=timeout)
+
+        async def execute(self, sql, *args, **kwargs):
+            target = {"start": "BEGIN;", "rollback": "ROLLBACK;", "commit": "COMMIT;"}.get(phase)
+            if self is made[0] and sql == target:
+                await lose_connection(self)
+            return await super().execute(sql, *args, **kwargs)
+
+    async def connect(*args, **kwargs):
+        raw = DisconnectConnection("responsive")
+        made.append(raw)
+        if len(made) == 2 and successor_phase == "connect":
+            successor_ready.set()
+            await finish_successor.wait()
+        return raw
+
+    async def setup(proxy):
+        if proxy._con is made[0] and phase in {"setup", "setup_return"}:
+            await lose_connection(proxy._con)
+        elif proxy._con is made[-1] and len(made) == 2 and successor_phase == "setup":
+            successor_ready.set()
+            await finish_successor.wait()
+
+    pool = await asyncpg.create_pool(min_size=0, max_size=1, connect=connect,
+                                    connection_class=DisconnectConnection, setup=setup)
+    deadline = asyncio.get_running_loop().time() + 2
+
+    async def original():
+        async with connection(pool, deadline=deadline, transaction=phase not in {"read", "setup", "read_return", "setup_return"}) as proxy:
+            if phase in {"read", "body", "read_return"}:
+                await lose_connection(proxy._con)
+            elif phase == "rollback":
+                raise ValueError("original body failure")
+
+    async def successor():
+        context = pool.acquire() if successor_phase == "public" else connection(pool, deadline=deadline)
+        async with context as proxy:
+            successor_ready.set()
+            await finish_successor.wait()
+            assert not proxy.is_closed()
+
+    first = asyncio.create_task(original())
+    second = None
+    try:
+        async with asyncio.timeout(2):
+            await disconnected.wait()
+            original_holder = pool._holders[0]
+            second = asyncio.create_task(successor())
+            await successor_ready.wait()
+            successor_ownership = original_holder._in_use
+            assert successor_ownership is not None and pool._queue.qsize() == 0
+            unwind.set()
+            if phase in {"read_return", "release_return"}:
+                await first
+            elif phase == "setup_return":
+                with pytest.raises(asyncpg.ConnectionDoesNotExistError, match="connection lost"):
+                    await first
+            else:
+                expected = ValueError if phase == "rollback" else RuntimeError
+                with pytest.raises(expected, match="original"):
+                    await first
+            assert not made[1].terminated, "stale cleanup terminated the successor connection"
+            assert original_holder._in_use is successor_ownership, "stale cleanup returned the successor slot"
+            assert pool._queue.qsize() == 0
+            finish_successor.set()
+            await second
+            assert pool._queue.qsize() == 1
+            async with pool.acquire() as reused:
+                assert reused._con is made[1]
+    finally:
+        unwind.set()
+        finish_successor.set()
+        for task in (first, second):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*(task for task in (first, second) if task is not None), return_exceptions=True)
+        pool.terminate()
+        for raw in made:
+            raw.terminate()
+
+
 @pytest.mark.parametrize("operation", ["run", "manifest", "timeout", "digests", "legacy_receipt"])
 async def test_read_preflight_release_uses_its_explicit_deadline(operation, tmp_path):
     from vision_bill.config import ImageSettings, PGSettings
@@ -176,6 +278,29 @@ async def test_bounded_normal_release_reuses_connection_and_detaches_old_proxy()
         async with connection(pool, deadline=asyncio.get_running_loop().time()+1) as second:
             assert second._con is raw and second is not first
         assert second._con is None and len(made) == 1 and pool._queue.qsize() == 1
+    finally:
+        pool.terminate()
+
+
+@pytest.mark.parametrize("reason", ["query_limit", "expired_generation"])
+async def test_bounded_release_retires_connection_at_driver_reuse_limits(reason):
+    from vision_bill.provider.db.deadline import connection
+    made = []
+    async def connect(*args, **kwargs):
+        made.append(WireConnection("responsive"))
+        return made[-1]
+    pool = await asyncpg.create_pool(min_size=0, max_size=1, max_queries=1,
+                                    connect=connect, connection_class=WireConnection)
+    try:
+        async with connection(pool, deadline=asyncio.get_running_loop().time()+1) as proxy:
+            if reason == "query_limit":
+                proxy._con._protocol.queries_count = 1
+            else:
+                await pool.expire_connections()
+        assert made[0].terminated and proxy._con is None and pool._queue.qsize() == 1
+        async with connection(pool, deadline=asyncio.get_running_loop().time()+1) as replacement:
+            assert replacement._con is not made[0]
+        assert len(made) == 2 and pool._queue.qsize() == 1
     finally:
         pool.terminate()
 

@@ -31,17 +31,19 @@ async def _within(deadline: float, operation: Callable[[], Awaitable[T]]) -> T:
         return await operation()
 
 
-def _discard(holder: Any) -> None:
+def _discard(holder: Any, ownership: asyncio.Future[None]) -> None:
     # Connection.terminate() aborts the transport synchronously. Its normal
     # callback detaches the proxy and returns the slot. Explicit release is
     # idempotent, also covering connect/init failures before a proxy exists.
+    if holder._in_use is not ownership:
+        return  # Disconnect already returned this lease; a successor may own it.
     if holder._con is not None:
         with suppress(Exception):
             holder._con.terminate()
     holder._release_on_close()
 
 
-async def _acquire(pool: asyncpg.Pool, deadline: float) -> Any:
+async def _acquire(pool: asyncpg.Pool, deadline: float) -> tuple[Any, asyncio.Future[None]]:
     if asyncpg.__version__ != "0.31.0" or not isinstance(pool, asyncpg.Pool):
         raise RuntimeError("Unsupported asyncpg deadline adapter; review locked lifecycle")
     pool._check_init()
@@ -53,7 +55,8 @@ async def _acquire(pool: asyncpg.Pool, deadline: float) -> Any:
         raise TypeError("Unsupported asyncpg pool holder")
     # Own the slot during connect/init/setup as well as during queries. No
     # other borrower or whole-pool state is terminated on this task's timeout.
-    holder._in_use = pool._loop.create_future()
+    ownership: asyncio.Future[None] = pool._loop.create_future()
+    holder._in_use = ownership
     holder._maybe_cancel_inactive_callback()
     try:
         async with asyncio.timeout_at(deadline):
@@ -80,10 +83,40 @@ async def _acquire(pool: asyncpg.Pool, deadline: float) -> Any:
             if holder._setup is not None:
                 await holder._setup(holder._proxy)
             _remaining(deadline)
-            return holder
+            if holder._in_use is not ownership:
+                raise asyncpg.ConnectionDoesNotExistError("connection lost during acquisition")
+            return holder, ownership
     except BaseException:
-        _discard(holder)
+        _discard(holder, ownership)
         raise
+
+
+async def _release(holder: Any, ownership: asyncio.Future[None], raw: Any, deadline: float) -> None:
+    # PoolConnectionHolder.release reads mutable holder._con again after its
+    # awaits, including in its error handler. A disconnect can return the slot
+    # during those awaits. Keep every I/O operation on the original raw connection
+    # and touch holder state only while the captured lease is still current.
+    holder._timeout = None
+    if raw.is_closed():
+        _discard(holder, ownership)
+        return
+    if raw._protocol.queries_count >= holder._max_queries or holder._generation != holder._pool._generation:
+        await raw.close(timeout=_remaining(deadline))
+        return
+    if raw._protocol._is_cancelling():
+        await raw._protocol._wait_for_cancellation()
+    if holder._in_use is not ownership:
+        return
+    if holder._pool._reset is not None:
+        await raw._reset()
+        if holder._in_use is not ownership:
+            return
+        await holder._pool._reset(raw)
+    else:
+        await raw.reset(timeout=_remaining(deadline))
+    if holder._in_use is ownership:
+        holder._release()
+        holder._setup_inactive_callback()
 
 
 @asynccontextmanager
@@ -99,7 +132,7 @@ async def connection(
                 yield conn
         return
 
-    holder = await _acquire(pool, deadline)
+    holder, ownership = await _acquire(pool, deadline)
     conn = holder._proxy
     failed = False
     try:
@@ -108,22 +141,23 @@ async def connection(
             try:
                 await _within(deadline, tx.start)
             except BaseException:
-                _discard(holder)
+                _discard(holder, ownership)
                 raise
             try:
                 async with asyncio.timeout_at(deadline):
                     yield conn
             except BaseException:
                 try:
-                    await _within(deadline, tx.rollback)
+                    if holder._in_use is ownership:
+                        await _within(deadline, tx.rollback)
                 except BaseException:  # noqa: BLE001 - discard, preserve original body error
-                    _discard(holder)
+                    _discard(holder, ownership)
                 raise  # Keep the original cancellation/error, never a closed-tx error.
             else:
                 try:
                     await _within(deadline, tx.commit)
                 except BaseException:
-                    _discard(holder)
+                    _discard(holder, ownership)
                     raise
         else:
             async with asyncio.timeout_at(deadline):
@@ -132,14 +166,13 @@ async def connection(
         failed = True
         raise
     finally:
-        if holder._in_use is not None:
+        if holder._in_use is ownership:
             try:
                 _remaining(deadline)
                 conn._con._on_release()
-                # Same reset/generation/query-limit bookkeeping as Pool.release,
-                # awaited directly: cancellation leaves no shielded task behind.
-                await _within(deadline, lambda: holder.release(_remaining(deadline)))
+                # No shielded task; all release I/O stays on the original lease.
+                await _within(deadline, lambda: _release(holder, ownership, conn._con, deadline))
             except BaseException:
-                _discard(holder)
+                _discard(holder, ownership)
                 if not failed:
                     raise
