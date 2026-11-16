@@ -11,6 +11,7 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 
+from vision_bill.helper.document_image import document_rgb
 from vision_bill.model.receipt import Receipt
 
 
@@ -80,7 +81,8 @@ def prepare(root: Path, directory: Path) -> None:
         if image.suffix not in (".png", ".jpg", ".jpeg"):
             continue
         buffer = BytesIO()
-        ImageOps.exif_transpose(Image.open(image)).convert("RGB").save(buffer, format="PNG")
+        with Image.open(image) as source:
+            document_rgb(ImageOps.exif_transpose(source)).save(buffer, format="PNG")
         identity = {
             "source_sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
             "normalized_sha256": hashlib.sha256(buffer.getvalue()).hexdigest(),

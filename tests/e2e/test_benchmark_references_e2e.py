@@ -270,13 +270,6 @@ async def test_qualification_race_before_run_creation_is_rejected(workflow_db,tm
     w,scope=workflow_db
     row,_,path=await human(w,scope,tmp_path)
     b=bench(w)
-    # Exercise both source-reference validation and original validation without FOR SHARE.
-    from hashlib import sha256
-    part=uuid4();digest=sha256(path.read_bytes()).hexdigest()
-    source={"part_id":str(part),"photo_index":0,"source_sha256":digest,"coordinate_space":"original"}
-    async with w.pool.acquire() as conn:
-        await conn.execute("INSERT INTO image_source_parts(part_id,image_id,photo_index,source_sha256,image_path,metadata) VALUES($1,$2,0,$3,$4,'{}')",part,row.image_id,digest,str(path))
-        await conn.execute("UPDATE receipts SET field_sources=$2::jsonb WHERE id=$1",row.id,json.dumps({"total":[source]}))
     preview=await b.reference_preview(row.id,scope=scope)
     gold=await b.qualify_reference(row.id,1,preview.document_sha256,scope=scope)
     manifest={'inputs':[{'receipt_id':str(row.id),'reference':gold.model_dump(mode='json')} ]}

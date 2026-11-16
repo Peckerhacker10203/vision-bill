@@ -216,3 +216,31 @@ def test_ocr_http_multipart_barrier_blank_failure_and_timeout():
         httpd.shutdown()
         httpd.server_close()
         thread.join()
+
+
+def test_transparent_generic_alias_matches_production_pixels_and_rejects_unknown(tmp_path, monkeypatch):
+    from prepare_fixtures import prepare
+    from vision_bill.provider.llm.ollama import OllamaProvider
+    prepare(ROOT, tmp_path)
+    path = tmp_path / 'fixtures/generic.png'
+    original = path.read_bytes()
+    digest = hashlib.sha256(original).hexdigest()
+    source = SourceRef(part_id=uuid4(), photo_index=0, source_sha256=digest, coordinate_space='original')
+    input = ReceiptInput(mode='direct_vision', image_paths=[str(path)], source_refs=[source])
+    _, _, views = OllamaProvider('http://unused-local')._prepare_receipt_input(input)
+    normalized = base64.b64decode(views[0].working_image.png_base64)
+    assert Image.open(BytesIO(normalized)).getpixel((0, 0)) == (255, 255, 255)
+    aliases = json.loads((tmp_path / 'aliases.json').read_text())
+    assert aliases['generic'] == {'source_sha256': digest, 'normalized_sha256': hashlib.sha256(normalized).hexdigest()}
+    assert path.read_bytes() == original
+    monkeypatch.setenv('VB_E2E_FIXTURES_DIR', str(tmp_path / 'fixtures'))
+    monkeypatch.setenv('VB_E2E_REPLIES_DIR', str(tmp_path / 'replies'))
+    monkeypatch.setenv('VB_E2E_ALIASES', str(tmp_path / 'aliases.json'))
+    server = module('transparent_alias_test', 'e2e/llm_stub/server.py')
+    server.configure_scenario({'scenario': 'complete'})
+    image = {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + base64.b64encode(normalized).decode()}}
+    body = {'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': source_extraction_prompt(input)}, image]}]}
+    assert json.loads(server._content_for(body))['merchant_name'] == 'E2E Generic Store'
+    image['image_url']['url'] = 'data:image/png;base64,' + base64.b64encode(b'unknown input').decode()
+    with pytest.raises(ValueError, match='unregistered'):
+        server._content_for(body)
