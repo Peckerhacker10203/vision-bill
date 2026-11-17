@@ -31,8 +31,8 @@ const variants = [
   "app",
   "ocr-cuda",
   "ocr-rocm",
-  "combined-cuda",
-  "combined-rocm",
+  "app-ocr-cuda",
+  "app-ocr-rocm",
 ];
 const immutable = (value) =>
   typeof value === "string" &&
@@ -88,71 +88,35 @@ export function releaseRequest(env) {
   };
 }
 export function validateReleaseInputs(plan, request) {
+  check(variants.includes(request.variant), "Unknown distribution variant");
+  const app =
+    request.variant === "app" || request.variant.startsWith("app-ocr-");
+  const allowed = [
+    "schema_version",
+    "source",
+    "version",
+    "platform",
+    ...(app ? ["postgres"] : []),
+    ...(request.variant.endsWith("rocm") ? ["rocm"] : []),
+  ];
   check(
-    plan &&
-      Object.keys(plan).every((key) =>
-        [
-          "schema_version",
-          "source",
-          "version",
-          "platform",
-          "postgres",
-          "ollama_base",
-          "llm",
-          "rocm",
-        ].includes(key),
-      ),
+    plan && Object.keys(plan).every((key) => allowed.includes(key)),
     "Unknown release input",
   );
   check(
-    plan.schema_version === 1 &&
+    plan.schema_version === 2 &&
       plan.version === request.version &&
       plan.platform === "linux/amd64" &&
       plan.source?.repository === request.repository &&
-      plan.source?.commit === request.sha,
+      plan.source?.commit === request.sha &&
+      Object.keys(plan.source).sort().join(",") === "commit,repository",
     "Release inputs must match exact dispatch source/version/platform",
   );
-  const app =
-    request.variant === "app" || request.variant.startsWith("combined");
   if (app)
     check(
       immutable(plan.postgres),
       "Immutable single-platform PostgreSQL manifest required",
     );
-  if (request.variant.startsWith("combined")) {
-    check(
-      plan.ollama_base &&
-        Object.keys(plan.ollama_base).every((key) =>
-          ["accelerator", "reference"].includes(key),
-        ) &&
-        immutable(plan.ollama_base.reference) &&
-        plan.ollama_base.accelerator === request.variant.split("-").at(-1),
-      "Immutable accelerator-specific upstream Ollama base required",
-    );
-    const probe = {
-      schema_version: 1,
-      source: plan.source,
-      version: plan.version,
-      platform: plan.platform,
-      images: {
-        postgres: {
-          reference: plan.postgres,
-          config_digest: `sha256:${hash("validation")}`,
-        },
-      },
-      llm: plan.llm,
-      assets: {
-        "checks.json": { sha256: hash("checks"), size_bytes: 1 },
-        [plan.llm?.license?.file]: { sha256: hash("license"), size_bytes: 1 },
-      },
-      verification: { app_checks: "checks.json" },
-    };
-    check(
-      plan.llm,
-      "Actual bundled model identity/license/provenance required",
-    );
-    validateArtifacts(probe);
-  }
   if (request.variant.endsWith("rocm")) {
     check(
       plan.rocm &&
@@ -265,7 +229,7 @@ function build(request, inputs, output) {
   check(!lstatExists(output), "Candidate output already exists");
   mkdirSync(output, { recursive: true });
   const manifest = {
-      schema_version: 1,
+      schema_version: 2,
       version: request.version,
       source: plan.source,
       platform: plan.platform,
@@ -274,8 +238,8 @@ function build(request, inputs, output) {
       verification: { app_checks: "checks.json" },
     },
     records = {};
-  const combined = request.variant.startsWith("combined"),
-    app = request.variant === "app" || combined;
+  const appOcr = request.variant.startsWith("app-ocr"),
+    app = request.variant === "app" || appOcr;
   const accelerator =
     request.variant === "app" ? null : request.variant.split("-").at(-1);
   const ownedTags = [];
@@ -345,7 +309,7 @@ function build(request, inputs, output) {
           "python",
           tag,
           "-c",
-          "from pathlib import Path; import vision_bill.distribution.bootstrap, vision_bill.distribution.models; assert Path('/app/src/vision_bill/static/index.html').is_file()",
+          "from pathlib import Path; import vision_bill.distribution.bootstrap; assert Path('/app/src/vision_bill/static/index.html').is_file()",
         ],
         { stdio: "inherit" },
       );
@@ -363,76 +327,6 @@ function build(request, inputs, output) {
       manifest.images.postgres = {
         reference: plan.postgres,
         config_digest: postgres.config.digest,
-      };
-    }
-    if (combined) {
-      const tag = candidate(
-        `ollama-${accelerator}`,
-        "distribution/ollama/Dockerfile",
-        ".",
-        ["--build-arg", `OLLAMA_BASE=${plan.ollama_base.reference}`],
-      );
-      manifest.llm = plan.llm;
-      check(
-        plan.llm.license.file.startsWith("llm/"),
-        "Model license asset must be inside llm directory",
-      );
-      copyAssets(join(inputs, "llm"), join(output, "llm"));
-      run(
-        "docker",
-        [
-          "run",
-          "--rm",
-          "--network",
-          "none",
-          "--entrypoint",
-          "sh",
-          tag,
-          "-c",
-          "command -v python3 && command -v flock && test -x /bin/ollama && test -x /opt/ocr/entrypoint.sh && test -f /opt/ocr/supervision.py",
-        ],
-        { stdio: "inherit" },
-      );
-      const gpu =
-        accelerator === "cuda"
-          ? ["--gpus", "all"]
-          : [
-              "--device",
-              "/dev/kfd:/dev/kfd",
-              "--device",
-              `${plan.rocm.render_node}:/dev/dri/renderD128`,
-            ];
-      const capability = JSON.parse(
-        run("docker", [
-          "run",
-          "--rm",
-          "--init=false",
-          "--network",
-          "none",
-          ...gpu,
-          "--entrypoint",
-          "python3",
-          tag,
-          "/opt/ocr/probe.py",
-          "--accelerator",
-          accelerator,
-          ...(accelerator === "rocm"
-            ? plan.rocm.targets.flatMap((target) => ["--target", target])
-            : []),
-        ]),
-      );
-      Object.assign(capability, {
-        base_reference: plan.ollama_base.reference,
-        image_identity: manifest.images[`ollama-${accelerator}`].reference,
-        config_digest: manifest.images[`ollama-${accelerator}`].config_digest,
-      });
-      const capabilityPath = `llm/${accelerator}-backend.json`;
-      save(join(output, capabilityPath), capability);
-      manifest.ollama = {
-        [accelerator]: {
-          base: plan.ollama_base.reference,
-          capability: capabilityPath,
-        },
       };
     }
     if (accelerator) {
@@ -669,26 +563,21 @@ function qualify(request, output, env) {
     ...(accelerator
       ? assetsIn(join(output, accelerator), `${accelerator}/`)
       : {}),
-    ...(request.variant.startsWith("combined")
-      ? assetsIn(join(output, "llm"), "llm/")
-      : {}),
   };
   save(join(output, "manifest.json"), manifest);
   const validated = join(output, "verified-bundle");
   writeBundle(manifest, request.variant, validated, output);
   const envForConfig = {
     ...env,
-    LLM_PROVIDER: "ollama",
-    LLM_HOST: "http://operator-llm:11434",
-    LLM_MODEL: "operator-selected-model",
+    COMPOSE_PROJECT_NAME: "vision-bill-release-validation",
     OCR_RENDER_GID: "109",
     OCR_VIDEO_GID: "44",
   };
-  run(
-    "docker",
-    ["compose", "-f", join(validated, "compose.yaml"), "config", "--quiet"],
-    { env: envForConfig, stdio: "inherit" },
-  );
+  writeFileSync(join(validated, "runtime.env"), "", { mode: 0o600 });
+  run("sh", [join(validated, "check-compose.sh")], {
+    env: envForConfig,
+    stdio: "inherit",
+  });
 }
 async function publish(request, output, env) {
   check(

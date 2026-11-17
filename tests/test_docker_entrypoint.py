@@ -68,7 +68,6 @@ def test_installed_migration_precedes_exec_without_package_resolution(tmp_path, 
     "mode,module",
     [
         ("init", "vision_bill.distribution.bootstrap"),
-        ("provision-model", "vision_bill.distribution.models"),
     ],
 )
 def test_prepared_modes_bypass_migrations(tmp_path, mode, module):
@@ -90,3 +89,16 @@ def test_prepared_modes_bypass_migrations(tmp_path, mode, module):
     )
     assert result.returncode == 0, result.stderr
     assert events.read_text().splitlines() == ["-m", module, "--help"]
+
+
+def test_retired_provision_model_fails_without_any_command(tmp_path):
+    result = subprocess.run(
+        [str(ENTRYPOINT), "provision-model", "--bundled-model", "old-model"],
+        env={"PATH": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 64
+    assert "external Ollama or OpenAI endpoint" in result.stderr
+    assert not list(tmp_path.iterdir())

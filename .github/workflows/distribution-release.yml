@@ -16,7 +16,7 @@ on:
         description: Installation variant; native choices require the actual GPU runner
         required: true
         type: choice
-        options: [app, ocr-cuda, ocr-rocm, combined-cuda, combined-rocm]
+        options: [app, ocr-cuda, ocr-rocm, app-ocr-cuda, app-ocr-rocm]
       inputs_run_id:
         description: Successful same-fork same-SHA maintainer run containing private distribution-inputs artifact
         required: true
@@ -78,7 +78,7 @@ jobs:
     needs: [guard, verify]
     # Dedicated, ephemeral runners must carry the actual selected CUDA/Radeon GPU,
     # Docker/buildx, skopeo, uv and sufficient build/archive space. No GPU in CI.
-    runs-on: ${{ inputs.variant == 'app' && fromJSON('["ubuntu-latest"]') || inputs.variant == 'ocr-cuda' && fromJSON('["self-hosted","linux","x64","vision-bill-cuda"]') || inputs.variant == 'combined-cuda' && fromJSON('["self-hosted","linux","x64","vision-bill-cuda"]') || fromJSON('["self-hosted","linux","x64","vision-bill-rocm"]') }}
+    runs-on: ${{ inputs.variant == 'app' && fromJSON('["ubuntu-latest"]') || inputs.variant == 'ocr-cuda' && fromJSON('["self-hosted","linux","x64","vision-bill-cuda"]') || inputs.variant == 'app-ocr-cuda' && fromJSON('["self-hosted","linux","x64","vision-bill-cuda"]') || fromJSON('["self-hosted","linux","x64","vision-bill-rocm"]') }}
     timeout-minutes: 1440
     permissions:
       contents: read

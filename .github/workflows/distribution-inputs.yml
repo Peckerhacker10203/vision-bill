@@ -17,7 +17,7 @@ on:
         description: Exact prepared input set to validate and upload
         required: true
         type: choice
-        options: [app, ocr-cuda, ocr-rocm, combined-cuda, combined-rocm]
+        options: [app, ocr-cuda, ocr-rocm, app-ocr-cuda, app-ocr-rocm]
 permissions:
   contents: read
 concurrency:

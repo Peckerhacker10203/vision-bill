@@ -14,7 +14,9 @@
     "assets"
   ],
   "properties": {
-    "schema_version": { "const": 1 },
+    "schema_version": {
+      "const": 2
+    },
     "version": {
       "type": "string",
       "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
@@ -28,57 +30,54 @@
           "type": "string",
           "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$"
         },
-        "commit": { "type": "string", "pattern": "^[a-f0-9]{40}$" }
+        "commit": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{40}$"
+        }
       }
     },
-    "platform": { "const": "linux/amd64" },
+    "platform": {
+      "const": "linux/amd64"
+    },
     "images": {
       "type": "object",
       "minProperties": 1,
       "additionalProperties": false,
       "properties": {
-        "app": { "$ref": "#/$defs/image" },
-        "postgres": { "$ref": "#/$defs/image" },
-        "ollama-cuda": { "$ref": "#/$defs/image" },
-        "ollama-rocm": { "$ref": "#/$defs/image" },
-        "ocr-cuda": { "$ref": "#/$defs/image" },
-        "ocr-rocm": { "$ref": "#/$defs/image" }
-      }
-    },
-    "llm": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["model", "digest", "license", "provenance"],
-      "properties": {
-        "model": {
-          "type": "string",
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]*$"
+        "app": {
+          "$ref": "#/$defs/image"
         },
-        "digest": { "$ref": "#/$defs/digest" },
-        "license": { "$ref": "#/$defs/license" },
-        "provenance": { "$ref": "#/$defs/provenance" }
+        "postgres": {
+          "$ref": "#/$defs/image"
+        },
+        "ocr-cuda": {
+          "$ref": "#/$defs/image"
+        },
+        "ocr-rocm": {
+          "$ref": "#/$defs/image"
+        }
       }
     },
     "verification": {
       "type": "object",
       "additionalProperties": false,
       "required": ["app_checks"],
-      "properties": { "app_checks": { "$ref": "#/$defs/path" } }
-    },
-    "ollama": {
-      "type": "object",
-      "additionalProperties": false,
       "properties": {
-        "cuda": { "$ref": "#/$defs/ollama_backend" },
-        "rocm": { "$ref": "#/$defs/ollama_backend" }
+        "app_checks": {
+          "$ref": "#/$defs/path"
+        }
       }
     },
     "native": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "cuda": { "$ref": "#/$defs/native" },
-        "rocm": { "$ref": "#/$defs/native" }
+        "cuda": {
+          "$ref": "#/$defs/native"
+        },
+        "rocm": {
+          "$ref": "#/$defs/native"
+        }
       }
     },
     "assets": {
@@ -89,27 +88,27 @@
         "additionalProperties": false,
         "required": ["sha256", "size_bytes"],
         "properties": {
-          "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
-          "size_bytes": { "type": "integer", "minimum": 1 }
+          "sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "minimum": 1
+          }
         }
       }
     }
   },
   "$defs": {
-    "ollama_backend": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["base", "capability"],
-      "properties": {
-        "base": {
-          "type": "string",
-          "pattern": "^[a-z0-9][a-z0-9.:-]*/[a-z0-9][a-z0-9._/-]*@sha256:[a-f0-9]{64}$"
-        },
-        "capability": { "$ref": "#/$defs/path" }
-      }
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
     },
-    "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
-    "path": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$" },
+    "path": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"
+    },
     "image": {
       "type": "object",
       "additionalProperties": false,
@@ -119,27 +118,9 @@
           "type": "string",
           "pattern": "^[a-z0-9][a-z0-9.:-]*/[a-z0-9][a-z0-9._/-]*@sha256:[a-f0-9]{64}$"
         },
-        "config_digest": { "$ref": "#/$defs/digest" }
-      }
-    },
-    "license": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["spdx", "url", "file", "redistribution_allowed"],
-      "properties": {
-        "spdx": { "type": "string", "minLength": 1 },
-        "url": { "type": "string", "pattern": "^https://[^\\s]+$" },
-        "file": { "$ref": "#/$defs/path" },
-        "redistribution_allowed": { "const": true }
-      }
-    },
-    "provenance": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["url", "revision"],
-      "properties": {
-        "url": { "type": "string", "pattern": "^https://[^\\s]+$" },
-        "revision": { "type": "string", "minLength": 1 }
+        "config_digest": {
+          "$ref": "#/$defs/digest"
+        }
       }
     },
     "native": {
@@ -147,11 +128,21 @@
       "additionalProperties": false,
       "required": ["bundle", "image_config", "qualification", "seal"],
       "properties": {
-        "bundle": { "$ref": "#/$defs/path" },
-        "image_config": { "$ref": "#/$defs/path" },
-        "qualification": { "$ref": "#/$defs/path" },
-        "seal": { "$ref": "#/$defs/path" },
-        "cuda_lock": { "$ref": "#/$defs/path" }
+        "bundle": {
+          "$ref": "#/$defs/path"
+        },
+        "image_config": {
+          "$ref": "#/$defs/path"
+        },
+        "qualification": {
+          "$ref": "#/$defs/path"
+        },
+        "seal": {
+          "$ref": "#/$defs/path"
+        },
+        "cuda_lock": {
+          "$ref": "#/$defs/path"
+        }
       }
     }
   }

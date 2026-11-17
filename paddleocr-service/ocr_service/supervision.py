@@ -1,8 +1,8 @@
-"""Pure-stdlib PID-1 supervision and durable fences for the managed native pair.
+"""Pure-stdlib PID-1 supervision and durable fences for managed native OCR.
 
 An uncleared marker requires external recovery after every managed container has
 been positively removed. No timeout, force option or ordinary startup clears one.
-This file can also be copied and executed independently in the Ollama image.
+Legacy Ollama markers remain unconditional recovery fences after runtime removal.
 """
 
 import argparse
@@ -19,8 +19,8 @@ from types import FrameType
 from typing import Literal
 from uuid import uuid4
 
-Role = Literal["initializer", "ocr", "ollama"]
-ROLES = ("initializer", "ocr", "ollama")
+Role = Literal["initializer", "ocr"]
+ROLES = ("initializer", "ocr")
 _ACTIVE = False
 _BASELINE: set[int] = set()
 

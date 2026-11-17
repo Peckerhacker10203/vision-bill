@@ -6,7 +6,6 @@ import argparse
 import fcntl
 import math
 import os
-import re
 import secrets
 import stat
 import sys
@@ -136,12 +135,6 @@ def read_config(path: Path) -> dict[str, Any]:
     return data
 
 
-def digest_value(value: str) -> str:
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
-        raise BootstrapError("Expected model digest must be a full sha256 digest")
-    return value
-
-
 def _fresh_llm_settings(environment: Mapping[str, str]) -> dict[str, Any]:
     for name in ("LLM__PROVIDER", "LLM__HOST", "LLM__MODEL_NAME"):
         if not environment.get(name, "").strip():
@@ -252,16 +245,51 @@ def initialize(
         sync_directory(config_dir)
 
 
+def validate_managed_ocr() -> None:
+    """Reject conflicting prepared-bundle wiring using the application's real precedence."""
+    try:
+        # Deliberately after initialization: config imports eagerly resolve settings.
+        from vision_bill.config import OcrSettings, get_config_path, settings
+
+        saved = OcrSettings.model_validate(read_config(get_config_path()).get("ocr", {}))
+        effective = settings.ocr
+        if saved.enabled and saved.service_url != "http://ocr:8082":
+            raise ValueError("conflicting saved topology")
+        if (
+            not effective.enabled
+            or effective.service_url != "http://ocr:8082"
+            or not effective.manage_model_lifecycle
+            or effective.allow_vision_fallback
+        ):
+            raise ValueError("conflicting effective topology")
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        raise BootstrapError(
+            "Managed OCR bundle requires OCR__ENDPOINT=http://ocr:8082, "
+            "managed model lifecycle and text-only formatting. Resolve conflicting saved "
+            "OCR topology or runtime.env overrides explicitly, or use the app-only bundle."
+        ) from exc
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config-dir", type=Path, default=Path("/app/config"))
-    parser.add_argument("--postgres-password-file", type=Path, required=True)
+    parser.add_argument("--postgres-password-file", type=Path)
+    parser.add_argument("--check-managed-ocr", action="store_true")
     parser.add_argument("--pg-user", default="vision_bill")
     parser.add_argument("--pg-database", default="vision_bill")
     parser.add_argument("--pg-host", default="db")
     args = parser.parse_args()
     try:
-        initialize(**vars(args))
+        if args.check_managed_ocr:
+            validate_managed_ocr()
+        else:
+            if args.postgres_password_file is None:
+                parser.error("--postgres-password-file is required for initialization")
+            options = vars(args).copy()
+            options.pop("check_managed_ocr")
+            initialize(**options)
+            if os.environ.get("VISION_BILL_MANAGED_OCR") == "true":
+                validate_managed_ocr()
     except BootstrapError as exc:
         print(f"Installation initialization failed: {exc}", file=sys.stderr)
         return 1

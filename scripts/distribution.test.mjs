@@ -7,6 +7,8 @@ import {
   writeFileSync,
   readFileSync,
   readdirSync,
+  chmodSync,
+  renameSync,
   rmSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -24,12 +26,6 @@ const image = (name) => ({
   reference: `ghcr.io/maintainer/vision-bill-${name}@${digest(name)}`,
   config_digest: digest(`${name}-config`),
 });
-const license = {
-  spdx: "Apache-2.0",
-  url: "https://www.apache.org/licenses/LICENSE-2.0",
-  file: "llm/LICENSE",
-  redistribution_allowed: true,
-};
 function fixture() {
   const assets = {};
   const bytes = {};
@@ -43,7 +39,7 @@ function fixture() {
     return path;
   }
   const manifest = {
-    schema_version: 1,
+    schema_version: 2,
     version: "1.2.3",
     platform: "linux/amd64",
     source: {
@@ -53,23 +49,11 @@ function fixture() {
     images: {
       app: image("app"),
       postgres: image("postgres"),
-      "ollama-cuda": image("ollama-cuda"),
-      "ollama-rocm": image("ollama-rocm"),
       "ocr-cuda": image("ocr-cuda"),
       "ocr-rocm": image("ocr-rocm"),
     },
-    llm: {
-      model: "llama3.2-vision:11b",
-      digest: digest("actual-model"),
-      license,
-      provenance: {
-        url: "https://ollama.com/library/llama3.2-vision",
-        revision: hash("model-revision"),
-      },
-    },
     verification: { app_checks: "checks.json" },
     native: {},
-    ollama: {},
     assets,
   };
   asset("checks.json", {
@@ -77,30 +61,7 @@ function fixture() {
     source_commit: manifest.source.commit,
     checks: ["backend", "frontend", "e2e-backend", "e2e-frontend"],
   });
-  asset("llm/LICENSE", "synthetic test-only license text");
   for (const accelerator of ["cuda", "rocm"]) {
-    const selected = manifest.images[`ollama-${accelerator}`],
-      base = image(`ollama-base-${accelerator}`).reference;
-    manifest.ollama[accelerator] = {
-      base,
-      capability: asset(`llm/${accelerator}-backend.json`, {
-        scope: "backend-package-only",
-        accelerator,
-        base_reference: base,
-        image_identity: selected.reference,
-        config_digest: selected.config_digest,
-        backend_libraries: {
-          [`/usr/lib/ollama/${accelerator}/libggml-${accelerator === "cuda" ? "cuda" : "hip"}.so`]:
-            hash(`${accelerator}-elf`),
-        },
-        dependencies_resolved: true,
-        target_markers: accelerator === "rocm" ? ["gfx1030"] : [],
-        target_files:
-          accelerator === "rocm"
-            ? { "/usr/lib/ollama/rocm/libggml-hip.so": hash("rocm-elf") }
-            : {},
-      }),
-    };
     const config = JSON.stringify({
       architecture: "amd64",
       os: "linux",
@@ -263,8 +224,8 @@ const variants = [
   "app",
   "ocr-cuda",
   "ocr-rocm",
-  "combined-cuda",
-  "combined-rocm",
+  "app-ocr-cuda",
+  "app-ocr-rocm",
 ];
 function temp(t) {
   const path = mkdtempSync(join(tmpdir(), "vb-distribution-"));
@@ -293,8 +254,8 @@ test("artifact validation rejects absent, mutable, placeholder and contradictory
         "ghcr.io/maintainer/app@sha256:" + "0".repeat(64)),
     (m) => delete m.native.cuda.qualification,
     (m) => delete m.native.cuda.cuda_lock,
-    (m) => (m.llm.digest = "sha256:REPLACE_ME"),
-    (m) => (m.llm.license.spdx = "TBD"),
+    (m) => (m.llm = {}),
+    (m) => (m.images["ollama-cuda"] = image("retired")),
     (m) => (m.assets["../outside"] = { sha256: hash("x"), size_bytes: 1 }),
     (m) => (m.images.app.password = "secret"),
     (m) => (m.unexpected = true),
@@ -341,22 +302,17 @@ test("bundles are deterministic, isolated, immutable and contain only prebuilt i
         "config-init",
         "db",
       ]);
-      assert.match(content, /LLM_HOST:\?/);
-      assert.match(content, /LLM_MODEL:\?/);
-      assert.equal(
-        compose.services.app.environment.OCR__ENDPOINT,
-        "${OCR_ENDPOINT:-}",
-      );
+      assert.equal(compose.services.app.environment.OCR__ENDPOINT, undefined);
       assert.doesNotMatch(content, /ollama:11434|installation.lock/);
     } else {
-      const combined = variant.startsWith("combined");
+      const appOcr = variant.startsWith("app-ocr");
       assert.equal(
         compose.services.ocr.environment.OCR_SERVICE_MODE,
-        combined ? "managed" : "${OCR_SERVICE_MODE:-standalone}",
+        appOcr ? "managed" : "${OCR_SERVICE_MODE:-standalone}",
       );
-      assert.equal(!!compose.services.ocr.ports, !combined);
-      assert.equal(!!compose.services.app, combined);
-      assert.equal(!!compose.services.ollama, combined);
+      assert.equal(!!compose.services.ocr.ports, !appOcr);
+      assert.equal(!!compose.services.app, appOcr);
+      assert.equal(compose.services.ollama, undefined);
       assert.equal(compose.services["ocr-init"].restart, "no");
       assert.equal(compose.services["ocr-init"].init, false);
       assert.equal(compose.services.ocr.init, false);
@@ -377,46 +333,6 @@ test("bundles are deterministic, isolated, immutable and contain only prebuilt i
         compose.services.ocr.environment.OCR_INSTALLATION_LOCK_PATH,
         "/coord/installation.lock",
       );
-      if (combined) {
-        assert.equal(
-          compose.services.ollama.image,
-          manifest.images[`ollama-${variant.split("-").at(-1)}`].reference,
-        );
-        assert.equal(compose.services.ollama.group_add, undefined);
-        assert.equal(compose.services.ollama.init, false);
-        assert.deepEqual(compose.services.ollama.depends_on["ocr-init"], {
-          condition: "service_completed_successfully",
-        });
-        assert.equal(
-          compose.services.ollama.environment.OCR_INSTALLATION_LOCK_PATH,
-          "/coord/installation.lock",
-        );
-        assert.equal(compose.services.ollama.ports, undefined);
-        assert.equal(compose.services.app.depends_on.ollama, undefined);
-        assert.deepEqual(compose.services.app.depends_on["model-init"], {
-          condition: "service_completed_successfully",
-        });
-        assert.match(
-          compose.services["model-init"].command.join(" "),
-          new RegExp(`--expected-digest ${manifest.llm.digest}`),
-        );
-        assert.match(
-          compose.services["model-init"].command.join(" "),
-          new RegExp(`--bundled-model ${manifest.llm.model}`),
-        );
-        const modelArgs = compose.services["model-init"].command;
-        assert.equal(
-          modelArgs[modelArgs.indexOf("--bundled-model") + 1],
-          manifest.llm.model,
-        );
-        assert.ok(
-          !compose.services["config-init"].command.includes("--bundled-model"),
-        );
-        assert.equal(
-          compose.services.app.environment.OCR__ENDPOINT,
-          "http://ocr:8082",
-        );
-      }
       assert.ok(
         rendered.assets.every(
           (name) =>
@@ -433,7 +349,7 @@ test("materialization verifies raw OCI config and qualification before atomic co
   const { manifest, bytes } = fixture();
   seed(directory, bytes);
   const output = join(directory, "out");
-  writeBundle(manifest, "combined-rocm", output, directory);
+  writeBundle(manifest, "app-ocr-rocm", output, directory);
   const checksums = readFileSync(join(output, "SHA256SUMS"), "utf8");
   for (const line of checksums.trim().split("\n")) {
     const [expected, path] = line.split("  ");
@@ -441,10 +357,8 @@ test("materialization verifies raw OCI config and qualification before atomic co
   }
   const metadata = JSON.parse(readFileSync(join(output, "release.json")));
   assert.equal(metadata.source.commit, manifest.source.commit);
-  assert.equal(metadata.variant, "combined-rocm");
-  assert.throws(() =>
-    writeBundle(manifest, "combined-rocm", output, directory),
-  );
+  assert.equal(metadata.variant, "app-ocr-rocm");
+  assert.throws(() => writeBundle(manifest, "app-ocr-rocm", output, directory));
   writeFileSync(join(directory, "rocm/image-config.json"), "{}");
   const failed = join(directory, "failed");
   assert.throws(
@@ -536,9 +450,7 @@ test("CLI generates every variant and Docker Compose validates effective config 
   writeFileSync(join(directory, "artifacts.json"), JSON.stringify(manifest));
   const env = {
     ...process.env,
-    LLM_PROVIDER: "ollama",
-    LLM_HOST: "http://operator-llm:11434",
-    LLM_MODEL: "operator-model",
+    COMPOSE_PROJECT_NAME: "vb-distribution-test",
   };
   delete env.OCR_RENDER_GID;
   delete env.OCR_VIDEO_GID;
@@ -559,6 +471,7 @@ test("CLI generates every variant and Docker Compose validates effective config 
       { encoding: "utf8", env },
     );
     assert.equal(generated.status, 0, generated.stderr);
+    writeFileSync(join(output, "runtime.env"), "", { mode: 0o600 });
     const composed = spawnSync(
       "docker",
       [
@@ -576,7 +489,7 @@ test("CLI generates every variant and Docker Compose validates effective config 
     if (effective.services.ocr)
       assert.equal(
         effective.services.ocr.environment.OCR_SERVICE_MODE,
-        variant.startsWith("combined") ? "managed" : "standalone",
+        variant.startsWith("app-ocr") ? "managed" : "standalone",
       );
     if (variant.startsWith("ocr-")) {
       const managed = spawnSync(
@@ -604,247 +517,6 @@ test("CLI generates every variant and Docker Compose validates effective config 
       !Object.values(effective.services).some((service) => service.build),
     );
   }
-});
-
-test("derived Ollama PID1 supervisor blocks live and crash-marked initialization until confirmed cleanup", async (t) => {
-  const dockerfile = readFileSync("distribution/ollama/Dockerfile", "utf8");
-  assert.match(dockerfile, /python3/);
-  assert.match(dockerfile, /ocr_service\/supervision.py/);
-  assert.match(dockerfile, /apt-get install[^\n]*util-linux/);
-  assert.match(dockerfile, /command -v flock/);
-  const directory = mkdtempSync(join(tmpdir(), "vb-distribution-lock-"));
-  const containers = new Set();
-  const coord = join(directory, "coord"),
-    runtime = join(directory, "runtime");
-  mkdirSync(coord);
-  mkdirSync(runtime);
-  t.after(() => {
-    for (const id of containers) spawnSync("docker", ["rm", "-f", id]);
-    rmSync(directory, { recursive: true, force: true });
-  });
-  writeFileSync(
-    join(runtime, "entrypoint.sh"),
-    readFileSync("distribution/ollama/entrypoint.sh"),
-  );
-  writeFileSync(
-    join(runtime, "supervision.py"),
-    readFileSync("paddleocr-service/ocr_service/supervision.py"),
-  );
-  writeFileSync(join(runtime, "ollama"), "#!/bin/sh\nexec sleep 300\n", {
-    mode: 0o755,
-  });
-  const docker = (args) => {
-    const result = spawnSync("docker", args, {
-      encoding: "utf8",
-      timeout: 60000,
-    });
-    assert.equal(result.error, undefined, result.error?.message);
-    return result;
-  };
-  const success = (args) => {
-    const result = docker(args);
-    assert.equal(result.status, 0, result.stderr || result.stdout);
-    return result.stdout.trim();
-  };
-  const image = "python:3.12-slim";
-  if (docker(["image", "inspect", image]).status !== 0)
-    success(["pull", image]);
-  const mounts = [
-    "--init=false",
-    "--mount",
-    `type=bind,src=${coord},dst=/coord`,
-    "--mount",
-    `type=bind,src=${runtime},dst=/runtime,readonly`,
-    "--mount",
-    `type=bind,src=${runtime}/ollama,dst=/bin/ollama,readonly`,
-  ];
-  const marker = join(coord, "installation.active-ollama.json");
-  const waitFor = async (condition) => {
-    const until = Date.now() + 5000;
-    while (!condition()) {
-      assert.ok(Date.now() < until, "supervisor state timed out");
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-  };
-  const start = async () => {
-    const id = success([
-      "create",
-      ...mounts,
-      image,
-      "sh",
-      "/runtime/entrypoint.sh",
-      "serve",
-    ]);
-    assert.match(id, /^[a-f0-9]{64}$/);
-    containers.add(id);
-    success(["start", id]);
-    await waitFor(
-      () =>
-        spawnSync("docker", [
-          "exec",
-          id,
-          "test",
-          "-f",
-          "/coord/installation.active-ollama.json",
-        ]).status === 0,
-    );
-    return id;
-  };
-  const runOwned = (command) => {
-    const id = success(["create", ...mounts, image, ...command]);
-    containers.add(id);
-    try {
-      return docker(["start", "--attach", id]);
-    } finally {
-      success(["rm", "-f", id]);
-      containers.delete(id);
-    }
-  };
-  const attemptInit = () =>
-    runOwned([
-      "python3",
-      "/runtime/supervision.py",
-      "--role",
-      "initializer",
-      "--lock",
-      "/coord/installation.lock",
-      "--",
-      "sh",
-      "-c",
-      "touch /coord/should-not-run",
-    ]);
-  const { existsSync } = await import("node:fs");
-  let id = await start();
-  assert.notEqual(attemptInit().status, 0);
-  assert.ok(!existsSync(join(coord, "should-not-run")));
-  assert.notEqual(
-    docker([
-      "run",
-      "--rm",
-      ...mounts,
-      image,
-      "flock",
-      "--exclusive",
-      "--nonblock",
-      "/coord/installation.lock",
-      "true",
-    ]).status,
-    0,
-  );
-  success(["stop", "--time", "10", id]);
-  assert.ok(
-    !existsSync(marker),
-    "ordinary termination must reap before clearing marker",
-  );
-  success(["rm", id]);
-  containers.delete(id);
-  id = await start();
-  success(["kill", "--signal", "KILL", id]);
-  success(["wait", id]);
-  assert.ok(existsSync(marker), "hard death must leave durable marker");
-  assert.notEqual(attemptInit().status, 0);
-  assert.notEqual(
-    runOwned(["sh", "/runtime/entrypoint.sh", "serve"]).status,
-    0,
-  );
-  assert.ok(!existsSync(join(coord, "should-not-run")));
-  success(["rm", id]);
-  containers.delete(id);
-  assert.notEqual(
-    docker(["inspect", id]).status,
-    0,
-    "positive external removal evidence precedes test-only recovery",
-  );
-  // Only this isolated test's known container existed. Production never clears
-  // markers automatically; operator recovery requires all owned peers removed.
-  success([
-    "run",
-    "--rm",
-    ...mounts,
-    image,
-    "rm",
-    "/coord/installation.active-ollama.json",
-  ]);
-  id = await start();
-  success(["stop", "--time", "10", id]);
-  assert.ok(!existsSync(marker));
-  success(["rm", id]);
-  containers.delete(id);
-  const peer = success([
-    "create",
-    ...mounts,
-    image,
-    "python3",
-    "/runtime/supervision.py",
-    "--role",
-    "ocr",
-    "--lock",
-    "/coord/installation.lock",
-    "--",
-    "sleep",
-    "300",
-  ]);
-  containers.add(peer);
-  success(["start", peer]);
-  await waitFor(() => existsSync(join(coord, "installation.active-ocr.json")));
-  id = await start(); // A genuinely live OCR peer can share serving ownership.
-  success(["stop", "--time", "10", id]);
-  success(["rm", id]);
-  containers.delete(id);
-  success(["kill", "--signal", "KILL", peer]);
-  success(["wait", peer]);
-  assert.notEqual(
-    runOwned(["sh", "/runtime/entrypoint.sh", "serve"]).status,
-    0,
-    "stale peer marker must block Ollama",
-  );
-  assert.notEqual(attemptInit().status, 0);
-  success(["rm", peer]);
-  containers.delete(peer);
-  assert.notEqual(docker(["inspect", peer]).status, 0);
-  success([
-    "run",
-    "--rm",
-    ...mounts,
-    image,
-    "rm",
-    "/coord/installation.active-ocr.json",
-  ]);
-});
-
-test("derived Docker context includes exact canonical supervisor and entrypoint without a native build", (t) => {
-  const output = join(temp(t), "context");
-  const probe = spawnSync(
-    "docker",
-    [
-      "buildx",
-      "build",
-      "--file",
-      "-",
-      "--output",
-      `type=local,dest=${output}`,
-      ".",
-    ],
-    {
-      encoding: "utf8",
-      input:
-        "FROM scratch\nCOPY distribution/ollama/entrypoint.sh /entrypoint.sh\nCOPY paddleocr-service/ocr_service/supervision.py /supervision.py\nCOPY distribution/ollama/probe.py /probe.py\n",
-      timeout: 60000,
-    },
-  );
-  assert.equal(probe.status, 0, probe.stderr);
-  assert.equal(
-    hash(readFileSync(join(output, "supervision.py"))),
-    hash(readFileSync("paddleocr-service/ocr_service/supervision.py")),
-  );
-  assert.equal(
-    hash(readFileSync(join(output, "entrypoint.sh"))),
-    hash(readFileSync("distribution/ollama/entrypoint.sh")),
-  );
-  assert.equal(
-    hash(readFileSync(join(output, "probe.py"))),
-    hash(readFileSync("distribution/ollama/probe.py")),
-  );
 });
 
 test("manual distribution workflow gates fork/exact-SHA, native qualification, publication and assets in order", () => {
@@ -880,11 +552,11 @@ test("maintainer request rejects foreign forks, events, mutable source and missi
     GITHUB_SHA: hash("source").slice(0, 40),
     DISTRIBUTION_SOURCE_SHA: hash("source").slice(0, 40),
     DISTRIBUTION_VERSION: "1.2.3",
-    DISTRIBUTION_VARIANT: "combined-rocm",
+    DISTRIBUTION_VARIANT: "app-ocr-rocm",
     GITHUB_RUN_ID: "123",
   };
   const request = release.releaseRequest(env);
-  assert.equal(request.variant, "combined-rocm");
+  assert.equal(request.variant, "app-ocr-rocm");
   for (const change of [
     { GITHUB_EVENT_NAME: "push" },
     { DISTRIBUTION_FORK_REPOSITORY: "" },
@@ -895,16 +567,11 @@ test("maintainer request rejects foreign forks, events, mutable source and missi
   ])
     assert.throws(() => release.releaseRequest({ ...env, ...change }));
   const plan = {
-    schema_version: 1,
+    schema_version: 2,
     source: { repository: request.repository, commit: request.sha },
     version: request.version,
     platform: "linux/amd64",
     postgres: image("postgres").reference,
-    ollama_base: {
-      accelerator: "rocm",
-      reference: image("ollama-base-rocm").reference,
-    },
-    llm: fixture().manifest.llm,
     rocm: {
       targets: ["gfx1030"],
       render_node: "/dev/dri/renderD128",
@@ -914,9 +581,9 @@ test("maintainer request rejects foreign forks, events, mutable source and missi
   };
   assert.equal(release.validateReleaseInputs(plan, request), plan);
   for (const mutate of [
-    (p) => (p.ollama_base = "ollama/ollama:latest"),
-    (p) => (p.ollama_base.accelerator = "cuda"),
-    (p) => delete p.llm.digest,
+    (p) => (p.ollama_base = image("retired").reference),
+    (p) => (p.llm = {}),
+    (p) => (p.schema_version = 1),
     (p) => (p.rocm.targets = ["any"]),
     (p) => (p.rocm.render_node = "/dev"),
     (p) => (p.source.commit = hash("old").slice(0, 40)),
@@ -931,36 +598,7 @@ test("maintainer request rejects foreign forks, events, mutable source and missi
   assert.equal(release.validateReleaseInputs(rootPlan, request), rootPlan);
 });
 
-test("combined bundles reject cross-accelerator or unsupported-target Ollama evidence and non-root native config", (t) => {
-  for (const mutate of [
-    (p) => (p.accelerator = "cuda"),
-    (p) => (p.base_reference = image("foreign-base").reference),
-    (p) => (p.dependencies_resolved = false),
-    (p) => (p.target_markers = []),
-    (p) =>
-      (p.target_files = {
-        "/usr/lib/ollama/cuda/libggml-cuda.so": hash("foreign"),
-      }),
-    (p) =>
-      (p.backend_libraries = {
-        "/usr/lib/ollama/cuda/libggml-cuda.so": hash("foreign"),
-      }),
-  ]) {
-    const directory = temp(t),
-      { manifest, bytes } = fixture(),
-      name = manifest.ollama.rocm.capability;
-    const proof = JSON.parse(bytes[name]);
-    mutate(proof);
-    bytes[name] = JSON.stringify(proof);
-    manifest.assets[name] = {
-      sha256: hash(bytes[name]),
-      size_bytes: bytes[name].length,
-    };
-    seed(directory, bytes);
-    assert.throws(() =>
-      writeBundle(manifest, "combined-rocm", join(directory, "out"), directory),
-    );
-  }
+test("native bundles reject non-root image config", (t) => {
   const directory = temp(t),
     { manifest, bytes } = fixture(),
     native = manifest.native.rocm;
@@ -994,7 +632,7 @@ test("publication cannot create assets after qualification, upload or pullabilit
       calls.push(method);
       if (method === failure) throw Error("gate failed");
     };
-    const promise = publishVerified(manifest, "combined-cuda", {
+    const promise = publishVerified(manifest, "app-ocr-cuda", {
       verify: op("verify"),
       image: op("image"),
       pull: op("pull"),
@@ -1079,73 +717,6 @@ test("partial publication can reuse only the exact already-qualified image diges
     /denied/,
   );
   assert.deepEqual(copied, ["copy"]);
-});
-
-test("Ollama package probe verifies ELF backend and refuses wrong accelerator or absent AMD target without inference", () => {
-  const probe = resolve("distribution/ollama/probe.py");
-  const command =
-    'mkdir -p /usr/lib/ollama/cuda /usr/lib/ollama/rocm; cp /lib/x86_64-linux-gnu/libc.so.6 /usr/lib/ollama/cuda/libggml-cuda.so; cp /lib/x86_64-linux-gnu/libc.so.6 /usr/lib/ollama/rocm/libggml-hip.so; python3 /probe.py "$@"';
-  const execute = (args, source = command) =>
-    spawnSync(
-      "docker",
-      [
-        "run",
-        "--rm",
-        "--network",
-        "none",
-        "--mount",
-        `type=bind,src=${probe},dst=/probe.py,readonly`,
-        "python:3.12-slim",
-        "sh",
-        "-c",
-        source,
-        "probe",
-        ...args,
-      ],
-      { encoding: "utf8", timeout: 30000 },
-    );
-  const inspected = execute(["--accelerator", "cuda"]);
-  assert.equal(inspected.status, 0, inspected.stderr);
-  const report = JSON.parse(inspected.stdout);
-  assert.equal(report.accelerator, "cuda");
-  assert.equal(report.scope, "backend-package-only");
-  assert.equal(report.dependencies_resolved, true);
-  assert.ok(Object.keys(report.backend_libraries).length > 0);
-  const missingTarget = execute([
-    "--accelerator",
-    "rocm",
-    "--target",
-    "gfx1030",
-  ]);
-  assert.equal(missingTarget.status, 1);
-  const missingBackend = execute(
-    ["--accelerator", "rocm"],
-    command.replace(
-      "cp /lib/x86_64-linux-gnu/libc.so.6 /usr/lib/ollama/rocm/libggml-hip.so;",
-      "",
-    ),
-  );
-  assert.equal(missingBackend.status, 1);
-  const foreignTarget = execute(
-    ["--accelerator", "rocm", "--target", "gfx1030"],
-    command.replace(
-      "python3 /probe.py",
-      "printf gfx1030 >> /usr/lib/ollama/cuda/libggml-cuda.so; python3 /probe.py",
-    ),
-  );
-  assert.equal(
-    foreignTarget.status,
-    1,
-    "an unrelated CUDA library cannot attest the HIP target",
-  );
-  const hipTarget = execute(
-    ["--accelerator", "rocm", "--target", "gfx1030"],
-    command.replace(
-      "python3 /probe.py",
-      "printf gfx1030 >> /usr/lib/ollama/rocm/libggml-hip.so; python3 /probe.py",
-    ),
-  );
-  assert.equal(hipTarget.status, 0, hipTarget.stderr);
 });
 
 test("CPU PID1 gate selects current Python minor and read-only environment without a shell or init process", async () => {
@@ -1332,7 +903,7 @@ test("producer stages only approved exact-version inputs and consumer verifies a
       repository: "maintainer/vision-bill",
       sha: hash("source").slice(0, 40),
       version: "1.2.3",
-      variant: "combined-rocm",
+      variant: "app-ocr-rocm",
       run: "123",
     };
   const selected = join(
@@ -1343,20 +914,17 @@ test("producer stages only approved exact-version inputs and consumer verifies a
     ),
     { manifest, bytes } = fixture();
   const plan = {
-    schema_version: 1,
+    schema_version: 2,
     source: manifest.source,
     version: request.version,
     platform: manifest.platform,
     postgres: manifest.images.postgres.reference,
-    ollama_base: { accelerator: "rocm", reference: manifest.ollama.rocm.base },
-    llm: manifest.llm,
     rocm: { targets: ["gfx1030"], render_node: "/dev/dri/renderD128" },
   };
   mkdirSync(selected, { recursive: true, mode: 0o700 });
   seed(selected, {
     "release-inputs.json": JSON.stringify(plan),
     "rocm/bundle.json": bytes["rocm/bundle.json"],
-    "llm/LICENSE": bytes["llm/LICENSE"],
     "private-extra.txt": "must not upload",
   });
   const output = join(directory, "artifact");
@@ -1444,7 +1012,7 @@ test("producer stages only approved exact-version inputs and consumer verifies a
   assert.throws(() =>
     verifyStagedInputs(output, request, { actor: "foreign", run: "123" }),
   );
-  writeFileSync(join(output, "llm/LICENSE"), "changed");
+  writeFileSync(join(output, "release-inputs.json"), "changed");
   assert.throws(() =>
     verifyStagedInputs(output, request, { actor: "maintainer", run: "123" }),
   );
@@ -1457,9 +1025,9 @@ test("producer stages only approved exact-version inputs and consumer verifies a
     ),
   );
   const { symlinkSync, linkSync } = await import("node:fs");
-  rmSync(join(selected, "llm/LICENSE"));
+  rmSync(join(selected, "release-inputs.json"));
   writeFileSync(join(directory, "outside"), "private");
-  linkSync(join(directory, "outside"), join(selected, "llm/LICENSE"));
+  linkSync(join(directory, "outside"), join(selected, "release-inputs.json"));
   assert.throws(() =>
     stageInputs(
       request,
@@ -1468,8 +1036,11 @@ test("producer stages only approved exact-version inputs and consumer verifies a
       join(directory, "hardlink"),
     ),
   );
-  rmSync(join(selected, "llm/LICENSE"));
-  symlinkSync(join(directory, "outside"), join(selected, "llm/LICENSE"));
+  rmSync(join(selected, "release-inputs.json"));
+  symlinkSync(
+    join(directory, "outside"),
+    join(selected, "release-inputs.json"),
+  );
   writeFileSync(join(directory, "outside"), "private");
   assert.throws(() =>
     stageInputs(
@@ -1493,4 +1064,272 @@ test("producer stages only approved exact-version inputs and consumer verifies a
   assert.match(consumer, /--check-run/);
   assert.match(consumer, /--verify/);
   assert.match(consumer, /DISTRIBUTION_INPUTS_ACTOR/);
+});
+
+const externalFixture = fixture;
+const externalVariants = [
+  "app",
+  "ocr-cuda",
+  "ocr-rocm",
+  "app-ocr-cuda",
+  "app-ocr-rocm",
+];
+function resolveExternal(t, variant, root, project = "vb-upgrade-stable") {
+  const { manifest, bytes } = externalFixture();
+  seed(root, bytes);
+  writeBundle(manifest, variant, root + "/bundle", root);
+  const directory = root + "/bundle";
+  const syntheticLiteralKey =
+    'synthetic$HOME${NOT_EXPANDED}#hash "quotes" \\literal';
+  const environment =
+    `LLM__PROVIDER=openai\nLLM__HOST=http://host.docker.internal:1234/v1\nLLM__MODEL_NAME=operator-model\nLLM__API_KEY=${syntheticLiteralKey}\n` +
+    (variant.startsWith("app-ocr") ? "OCR__ENDPOINT=http://ocr:8082\n" : "");
+  writeFileSync(join(directory, "runtime.env"), environment, { mode: 0o600 });
+  const env = { ...process.env, COMPOSE_PROJECT_NAME: project };
+  const command = ["compose", "-f", join(directory, "compose.yaml"), "config"];
+  const quiet = spawnSync("docker", [...command, "--quiet"], {
+    encoding: "utf8",
+    env,
+  });
+  assert.equal(quiet.status, 0, "quiet Compose resolution failed");
+  assert.equal(quiet.stdout, "");
+  const result = spawnSync("docker", [...command, "--format", "json"], {
+    encoding: "utf8",
+    env,
+  });
+  assert.equal(result.status, 0, "Compose JSON resolution failed");
+  return {
+    effective: JSON.parse(result.stdout),
+    syntheticLiteralKey,
+    directory,
+  };
+}
+test("external_only_variants_preserve_graph", () => {
+  const { manifest } = externalFixture();
+  for (const variant of externalVariants) {
+    const rendered = renderBundle(manifest, variant);
+    const compose = JSON.parse(rendered.files["compose.yaml"]);
+    assert.equal(
+      compose.name,
+      "${COMPOSE_PROJECT_NAME:?Set a stable project name and reuse it for upgrades}",
+    );
+    assert.equal(compose.services.ollama, undefined);
+    assert.equal(compose.services["model-init"], undefined);
+    assert.equal(compose.volumes["ollama-data"], undefined);
+    assert.doesNotMatch(rendered.files["release.json"], /"llm"|"ollama"/);
+    assert.equal(JSON.parse(rendered.files["release.json"]).schema_version, 2);
+    assert.equal(
+      !!compose.services.app,
+      variant === "app" || variant.startsWith("app-ocr"),
+    );
+    assert.equal(!!compose.services.ocr, variant !== "app");
+    assert.match(rendered.files["runtime.env.example"], /LLM__MODEL_NAME/);
+  }
+});
+test("canonical_runtime_env_reaches_init_and_app", (t) => {
+  for (const variant of externalVariants) {
+    const { effective, syntheticLiteralKey } = resolveExternal(
+      t,
+      variant,
+      temp(t),
+    );
+    if (effective.services.app) {
+      for (const name of ["app", "config-init"]) {
+        // Compose serializes literal dollars as $$ for its round-trip config output.
+        const actual = effective.services[
+          name
+        ].environment.LLM__API_KEY.replaceAll("$$", "$");
+        assert.ok(actual === syntheticLiteralKey, "literal API key changed");
+        assert.equal(
+          effective.services[name].environment.LLM__MODEL_NAME,
+          "operator-model",
+        );
+        assert.ok(
+          effective.services[name].extra_hosts.includes(
+            "host.docker.internal=host-gateway",
+          ),
+        );
+      }
+      assert.ok(
+        !effective.services["config-init"].command.includes("--provider"),
+      );
+    }
+  }
+});
+test("missing_optional_ocr_does_not_override_yaml", (t) => {
+  const { effective } = resolveExternal(t, "app", temp(t));
+  assert.equal(effective.services.app.environment.OCR__ENDPOINT, undefined);
+});
+test("v1_combined_inputs_rejected", async () => {
+  const { manifest } = externalFixture();
+  manifest.schema_version = 1;
+  assert.throws(() => validateArtifacts(manifest));
+  assert.throws(() =>
+    renderBundle(externalFixture().manifest, "combined-rocm"),
+  );
+  const { validateReleaseInputs } = await import("./distribution-release.mjs");
+  assert.throws(() =>
+    validateReleaseInputs({ schema_version: 1 }, { variant: "app" }),
+  );
+});
+test("bundle_rename_keeps_explicit_project_volumes", (t) => {
+  const root = temp(t);
+  const original = resolveExternal(t, "app-ocr-rocm", root);
+  const first = original.effective;
+  const renamed = join(root, "different-bundle-name");
+  renameSync(original.directory, renamed);
+  const result = spawnSync(
+    "docker",
+    [
+      "compose",
+      "-f",
+      join(renamed, "compose.yaml"),
+      "config",
+      "--format",
+      "json",
+    ],
+    {
+      encoding: "utf8",
+      env: { ...process.env, COMPOSE_PROJECT_NAME: "vb-upgrade-stable" },
+    },
+  );
+  assert.equal(result.status, 0, "renamed bundle failed Compose resolution");
+  const second = JSON.parse(result.stdout);
+  assert.deepEqual(
+    Object.values(second.volumes).map((v) => v.name),
+    Object.values(first.volumes).map((v) => v.name),
+  );
+  assert.equal(first.name, "vb-upgrade-stable");
+  assert.equal(
+    first.volumes["app-config"].name,
+    "vb-upgrade-stable_app-config",
+  );
+});
+
+test("raw Compose minimum version and runtime privacy fail before config resolution", (t) => {
+  const directory = temp(t);
+  const bin = join(directory, "bin");
+  mkdirSync(bin);
+  const script = renderBundle(fixture().manifest, "app").files[
+    "check-compose.sh"
+  ];
+  writeFileSync(join(directory, "check-compose.sh"), script);
+  writeFileSync(join(directory, "runtime.env"), "", { mode: 0o600 });
+  writeFileSync(
+    join(bin, "docker"),
+    '#!/bin/sh\nif [ "$2" = "version" ]; then echo "$TEST_COMPOSE_VERSION"; else touch "$TEST_CONFIG_CALLED"; fi\n',
+    { mode: 0o700 },
+  );
+  const env = {
+    ...process.env,
+    PATH: `${bin}:${process.env.PATH}`,
+    TEST_CONFIG_CALLED: join(directory, "called"),
+  };
+  const old = spawnSync("sh", [join(directory, "check-compose.sh")], {
+    encoding: "utf8",
+    env: { ...env, TEST_COMPOSE_VERSION: "2.29.7" },
+  });
+  assert.notEqual(old.status, 0);
+  assert.match(old.stderr, /Compose >=2.30/);
+  assert.ok(!readdirSync(directory).includes("called"));
+  const supported = spawnSync("sh", [join(directory, "check-compose.sh")], {
+    encoding: "utf8",
+    env: { ...env, TEST_COMPOSE_VERSION: "v2.30.0" },
+  });
+  assert.equal(supported.status, 0, supported.stderr);
+  assert.ok(readdirSync(directory).includes("called"));
+  rmSync(join(directory, "called"));
+  chmodSync(join(directory, "runtime.env"), 0o644);
+  const unsafe = spawnSync("sh", [join(directory, "check-compose.sh")], {
+    encoding: "utf8",
+    env: { ...env, TEST_COMPOSE_VERSION: "2.40.3" },
+  });
+  assert.notEqual(unsafe.status, 0);
+  assert.match(unsafe.stderr, /mode 0600/);
+  assert.ok(!readdirSync(directory).includes("called"));
+});
+
+test("v2 producers stage and verify every external-only variant while native bundles retain v1", async (t) => {
+  const { stageInputs, verifyStagedInputs } =
+    await import("./distribution-inputs.mjs");
+  for (const variant of externalVariants) {
+    const root = temp(t);
+    const { manifest, bytes } = fixture();
+    const request = {
+      repository: manifest.source.repository,
+      sha: manifest.source.commit,
+      version: manifest.version,
+      variant,
+      run: "123",
+    };
+    const accelerator = variant === "app" ? null : variant.split("-").at(-1);
+    const app = variant === "app" || variant.startsWith("app-ocr-");
+    const plan = {
+      schema_version: 2,
+      source: manifest.source,
+      version: manifest.version,
+      platform: manifest.platform,
+      ...(app ? { postgres: manifest.images.postgres.reference } : {}),
+      ...(accelerator === "rocm"
+        ? { rocm: { targets: ["gfx1030"], render_node: "/dev/dri/renderD128" } }
+        : {}),
+    };
+    const selected = join(root, request.sha, request.version, variant);
+    mkdirSync(selected, { recursive: true, mode: 0o700 });
+    seed(selected, {
+      "release-inputs.json": JSON.stringify(plan),
+      ...(accelerator
+        ? {
+            [`${accelerator}/bundle.json`]: bytes[`${accelerator}/bundle.json`],
+          }
+        : {}),
+      "llm/LICENSE": "retired delivery must never be staged",
+    });
+    const output = join(root, "artifact");
+    stageInputs(
+      request,
+      { actor: "maintainer", role: "maintain" },
+      root,
+      output,
+    );
+    verifyStagedInputs(output, request, { actor: "maintainer", run: "123" });
+    assert.ok(!readdirSync(output).includes("llm"));
+    const receiptPath = join(output, "input-receipt.json");
+    const receipt = JSON.parse(readFileSync(receiptPath));
+    assert.equal(receipt.schema_version, 2);
+    if (accelerator)
+      assert.equal(
+        JSON.parse(readFileSync(join(output, accelerator, "bundle.json")))
+          .schema_version,
+        1,
+      );
+    receipt.schema_version = 1;
+    writeFileSync(receiptPath, JSON.stringify(receipt));
+    assert.throws(() =>
+      verifyStagedInputs(output, request, { actor: "maintainer", run: "123" }),
+    );
+    plan.schema_version = 1;
+    writeFileSync(join(selected, "release-inputs.json"), JSON.stringify(plan));
+    assert.throws(() =>
+      stageInputs(
+        request,
+        { actor: "maintainer", role: "maintain" },
+        root,
+        join(root, "old-artifact"),
+      ),
+    );
+  }
+});
+
+test("app source context excludes retired runtime while native source retains its supervisor", () => {
+  const appIgnore = readFileSync(".dockerignore", "utf8");
+  assert.doesNotMatch(
+    appIgnore,
+    /!distribution\/ollama|!paddleocr-service\/ocr_service/,
+  );
+  const nativeDockerfile = readFileSync(
+    "paddleocr-service/Dockerfile.cuda",
+    "utf8",
+  );
+  assert.match(nativeDockerfile, /ocr_service/);
 });

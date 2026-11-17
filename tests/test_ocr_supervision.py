@@ -131,7 +131,7 @@ def test_supervisor_reaps_detached_child_before_clean_marker_removal(cpu_contain
 
 
 @pytest.mark.parametrize("marker", ["initializer", "ocr", "ollama"])
-@pytest.mark.parametrize("role", ["initializer", "ocr", "ollama"])
+@pytest.mark.parametrize("role", ["initializer", "ocr"])
 def test_uncleared_markers_block_all_competing_native_roles(cpu_containers, marker, role):
     coord, start = cpu_containers
     evidence = coord / f"installation.active-{marker}.json"
@@ -146,7 +146,7 @@ def test_uncleared_markers_block_all_competing_native_roles(cpu_containers, mark
     assert evidence.read_bytes() == before
 
 
-def test_live_peer_is_allowed_but_same_role_is_excluded(cpu_containers):
+def test_live_same_role_is_excluded(cpu_containers):
     coord, start = cpu_containers
     ocr = start(
         [
@@ -156,19 +156,10 @@ def test_live_peer_is_allowed_but_same_role_is_excluded(cpu_containers):
         ]
     )
     wait_file(coord / "ocr-ready")
-    peer = start(
-        [
-            "python",
-            "-c",
-            "from pathlib import Path;Path('/coord/ollama-ready').touch();import time;time.sleep(60)",
-        ],
-        role="ollama",
-    )
-    wait_file(coord / "ollama-ready")
     same = start(["python", "-c", "from pathlib import Path;Path('/coord/wrong-ocr').touch()"])
     assert exit_code(same) != 0
     assert not (coord / "wrong-ocr").exists()
-    for name in (peer, ocr):
+    for name in (ocr,):
         subprocess.run(["docker", "stop", "--time", "5", name], check=True, capture_output=True)
         assert exit_code(name) != 0
     assert not list(coord.glob("*.json"))
@@ -243,3 +234,53 @@ def test_ocr_entrypoint_retains_pid1_and_manual_paths(cpu_containers):
     subprocess.run(["docker", "kill", "--signal", "HUP", name], check=True, capture_output=True)
     assert exit_code(name) == 129
     assert not (coord / "installation.active-ocr.json").exists()
+
+
+def test_retired_ollama_supervisor_role_rejects_before_native_command(tmp_path):
+    started = tmp_path / "started"
+    result = subprocess.run(
+        [
+            os.sys.executable,
+            str(HELPER),
+            "--role",
+            "ollama",
+            "--lock",
+            str(tmp_path / "installation.lock"),
+            "--",
+            os.sys.executable,
+            "-c",
+            f"from pathlib import Path; Path({str(started)!r}).touch()",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "invalid choice" in result.stderr
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("role", ["initializer", "ocr"])
+@pytest.mark.parametrize("live", [False, True])
+def test_legacy_ollama_marker_blocks_host_without_mutation(tmp_path, role, live):
+    from contextlib import nullcontext
+
+    from ocr_service.supervision import (
+        UncleanInstallation,
+        installation_lock,
+        managed_installation,
+        role_lock_path,
+    )
+
+    lock = tmp_path / "installation.lock"
+    marker = tmp_path / "installation.active-ollama.json"
+    marker.write_text('{"run_id":"legacy-private"}')
+    os.utime(marker, (1, 1))
+    before = marker.read_bytes(), marker.stat().st_mtime_ns
+    peer = (
+        installation_lock(role_lock_path(lock, "ollama"), exclusive=True) if live else nullcontext()
+    )
+    with peer, pytest.raises(UncleanInstallation), managed_installation(role, lock):
+        pytest.fail("Legacy Ollama ownership cannot authorize any native work")
+    assert before == (marker.read_bytes(), marker.stat().st_mtime_ns)
+    assert not (tmp_path / f"installation.active-{role}.json").exists()

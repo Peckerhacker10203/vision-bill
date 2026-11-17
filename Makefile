@@ -54,7 +54,7 @@ test-e2e: ## Run backend E2E in a unique owned stack
 fe-test-e2e: ## Run Playwright in a unique owned stack
 	$(NODE) uv run python e2e/run.py run --policy fallback $(E2E_OVERRIDE_ARG) -- npm --prefix frontend run test:e2e
 
-PYTHON_CHECK_PATHS := src paddleocr-service/ocr_contract paddleocr-service/ocr_service paddleocr-service/server.py distribution/ollama/probe.py \
+PYTHON_CHECK_PATHS := src paddleocr-service/ocr_contract paddleocr-service/ocr_service paddleocr-service/server.py \
 	paddleocr-service/build e2e scripts/ocr_harness \
 	scripts/receipt_split_experiment.py scripts/standalone_benchmark.py scripts/test_ocr_service.py
 

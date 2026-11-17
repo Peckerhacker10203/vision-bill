@@ -19,10 +19,14 @@ case "${1:-}" in
         exec python -m vision_bill.distribution.bootstrap "$@"
         ;;
     provision-model)
-        shift
-        exec python -m vision_bill.distribution.models "$@"
+        echo "Bundled model provisioning was removed; configure an external Ollama or OpenAI endpoint and explicit model in runtime.env." >&2
+        exit 64
         ;;
 esac
+
+if [ "${VISION_BILL_MANAGED_OCR:-}" = "true" ]; then
+    python -m vision_bill.distribution.bootstrap --check-managed-ocr
+fi
 
 # Dependencies are installed during the image build. Startup must not resolve
 # or rebuild packages before running the migrations from that locked environment.

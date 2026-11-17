@@ -28,8 +28,8 @@ const variants = [
   "app",
   "ocr-cuda",
   "ocr-rocm",
-  "combined-cuda",
-  "combined-rocm",
+  "app-ocr-cuda",
+  "app-ocr-rocm",
 ];
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const canonical = (value) =>
@@ -153,14 +153,6 @@ export function validateArtifacts(manifest) {
     check(Object.hasOwn(manifest.assets, path), `Missing asset: ${path}`);
   };
   requireAsset(manifest.verification.app_checks);
-  if (manifest.llm) requireAsset(manifest.llm.license.file);
-  for (const [accelerator, backend] of Object.entries(manifest.ollama ?? {})) {
-    check(
-      manifest.images[`ollama-${accelerator}`],
-      "Missing accelerator-specific Ollama image",
-    );
-    requireAsset(backend.capability);
-  }
   for (const [accelerator, native] of Object.entries(manifest.native ?? {})) {
     check(
       manifest.images[`ocr-${accelerator}`],
@@ -212,33 +204,58 @@ const device = (accelerator) =>
         ],
       };
 
+const composeCheck = `#!/bin/sh
+set -eu
+version=$(docker compose version --short) || exit 1
+version=\${version#v}
+major=\${version%%.*}
+rest=\${version#*.}
+minor=\${rest%%.*}
+case "$major:$minor" in *[!0-9:]*|:*) echo 'Docker Compose >=2.30 is required for literal runtime.env delivery.' >&2; exit 1;; esac
+if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 30 ]; }; then
+  echo 'Docker Compose >=2.30 is required for literal runtime.env delivery; upgrade the Compose plugin.' >&2
+  exit 1
+fi
+runtime="$(dirname "$0")/runtime.env"
+if [ -e "$runtime" ] && { [ -L "$runtime" ] || [ "$(stat -c %a "$runtime")" != "600" ]; }; then
+  echo 'runtime.env must be a regular private file with mode 0600; run chmod 0600 runtime.env.' >&2
+  exit 1
+fi
+exec docker compose -f "$(dirname "$0")/compose.yaml" config --quiet
+`;
+function runtimeExample(managed) {
+  return `# Requires Docker Compose >=2.30 (raw env_file support).
+# Copy to runtime.env and chmod 0600 runtime.env before running check-compose.sh.
+# Values are literal: do not add quoting, export, or shell interpolation.
+# Set COMPOSE_PROJECT_NAME separately in the shell or .env; reuse the old project
+# name and volumes for upgrades, even when moving or renaming this bundle folder.
+# Fresh config requires all three explicit values below. Restored config needs no seeds.
+# LLM__PROVIDER=ollama
+# LLM__HOST=http://host.docker.internal:11434
+# LLM__MODEL_NAME=your-explicit-model
+# Optional: LLM__API_KEY=literal-key
+# Optional: LLM__TEMPERATURE=0
+# Optional OpenAI owned-router control: LLM__MODEL_LIFECYCLE=llamacpp
+${managed ? "OCR__ENDPOINT=http://ocr:8082\nOCR__TIMEOUT_SECONDS=600\nOCR__ALLOW_VISION_FALLBACK=false\n" : "# Optional OCR__ENDPOINT: omit to preserve YAML; set blank only to explicitly disable.\n"}`;
+}
+
 export function renderBundle(manifest, variant) {
   validateArtifacts(manifest);
   check(variants.includes(variant), "Unknown distribution variant");
-  const combined = variant.startsWith("combined-");
-  const app = variant === "app" || combined;
+  const appOcr = variant.startsWith("app-ocr-");
+  const app = variant === "app" || appOcr;
   const accelerator = variant === "app" ? null : variant.split("-").at(-1);
   const names = [
     ...(app ? ["app", "postgres"] : []),
-    ...(combined ? [`ollama-${accelerator}`] : []),
     ...(accelerator ? [`ocr-${accelerator}`] : []),
   ];
   for (const name of names)
     check(manifest.images[name], `Missing ${name} image`);
-  if (combined) {
-    check(manifest.llm, "Missing bundled model identity");
-    check(
-      manifest.ollama?.[accelerator],
-      "Missing accelerator-specific Ollama backend evidence",
-    );
-  }
   if (accelerator)
     check(manifest.native?.[accelerator], "Missing native qualification");
   const services = {},
     volumes = {};
   const assets = new Set([manifest.verification.app_checks]);
-  if (combined) assets.add(manifest.llm.license.file);
-  if (combined) assets.add(manifest.ollama[accelerator].capability);
   function service(name, imageName, fields) {
     services[name] = {
       image: manifest.images[imageName].reference,
@@ -256,34 +273,20 @@ export function renderBundle(manifest, variant) {
       "logs",
     ])
       volumes[name] = {};
-    const llm = combined
-      ? [
-          "--provider",
-          "ollama",
-          "--llm-host",
-          "http://ollama:11434",
-          "--model",
-          manifest.llm.model,
-          "--expected-model-digest",
-          manifest.llm.digest,
-        ]
-      : [
-          "--provider",
-          "${LLM_PROVIDER:?Set LLM_PROVIDER}",
-          "--llm-host",
-          "${LLM_HOST:?Set LLM_HOST}",
-          "--model",
-          "${LLM_MODEL:?Set LLM_MODEL}",
-        ];
     service("config-init", "app", {
       restart: "no",
+      env_file: [{ path: "./runtime.env", format: "raw" }],
+      extra_hosts: ["host.docker.internal:host-gateway"],
+      environment: {
+        VISION_BILL_CONFIG_PATH: "/app/config/config.yaml",
+        ...(appOcr ? { VISION_BILL_MANAGED_OCR: "true" } : {}),
+      },
       command: [
         "init",
         "--config-dir",
         "/app/config",
         "--postgres-password-file",
         "/run/pg-secret/password",
-        ...llm,
       ],
       volumes: [
         volume("app-config", "/app/config"),
@@ -318,10 +321,10 @@ export function renderBundle(manifest, variant) {
       },
       environment: {
         VISION_BILL_CONFIG_PATH: "/app/config/config.yaml",
-        OCR__ENDPOINT: combined ? "http://ocr:8082" : "${OCR_ENDPOINT:-}",
-        OCR__TIMEOUT_SECONDS: "600",
-        OCR__ALLOW_VISION_FALLBACK: "false",
+        ...(appOcr ? { VISION_BILL_MANAGED_OCR: "true" } : {}),
       },
+      env_file: [{ path: "./runtime.env", format: "raw" }],
+      extra_hosts: ["host.docker.internal:host-gateway"],
       ports: ["${APP_BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-8080}:8080"],
       volumes: [
         volume("app-config", "/app/config"),
@@ -378,57 +381,19 @@ export function renderBundle(manifest, variant) {
       depends_on: done("ocr-init"),
       environment: {
         ...lock,
-        OCR_SERVICE_MODE: combined
+        OCR_SERVICE_MODE: appOcr
           ? "managed"
           : "${OCR_SERVICE_MODE:-standalone}",
       },
       volumes: mounts,
-      ...(!combined
+      ...(!appOcr
         ? { ports: ["${OCR_BIND_ADDRESS:-127.0.0.1}:${OCR_PORT:-8082}:8082"] }
         : {}),
       ...device(accelerator),
     });
-    if (combined) {
-      volumes["ollama-data"] = {};
-      service("ollama", `ollama-${accelerator}`, {
-        init: false,
-        restart: "unless-stopped",
-        command: ["serve"],
-        depends_on: done("ocr-init"),
-        environment: {
-          OLLAMA_HOST: "0.0.0.0:11434",
-          OCR_INSTALLATION_LOCK_PATH: "/coord/installation.lock",
-        },
-        volumes: [
-          volume("ollama-data", "/root/.ollama"),
-          volume("coordination", "/coord"),
-        ],
-        ...device(accelerator),
-      });
-      service("model-init", "app", {
-        restart: "on-failure",
-        command: [
-          "provision-model",
-          "--config-dir",
-          "/app/config",
-          "--expected-digest",
-          manifest.llm.digest,
-          "--bundled-model",
-          manifest.llm.model,
-        ],
-        depends_on: {
-          ...done("config-init"),
-          ollama: { condition: "service_started" },
-        },
-        volumes: [volume("app-config", "/app/config")],
-      });
-      services.app.depends_on["model-init"] = {
-        condition: "service_completed_successfully",
-      };
-    }
   }
   const metadata = {
-    schema_version: 1,
+    schema_version: 2,
     version: manifest.version,
     source: manifest.source,
     platform: manifest.platform,
@@ -436,10 +401,6 @@ export function renderBundle(manifest, variant) {
     images: Object.fromEntries(
       names.map((name) => [name, manifest.images[name]]),
     ),
-    ...(combined ? { llm: manifest.llm } : {}),
-    ...(combined
-      ? { ollama: { [accelerator]: manifest.ollama[accelerator] } }
-      : {}),
     verification: manifest.verification,
     ...(accelerator
       ? { native: { [accelerator]: manifest.native[accelerator] } }
@@ -450,7 +411,13 @@ export function renderBundle(manifest, variant) {
   };
   return {
     files: {
-      "compose.yaml": json({ services, volumes }),
+      "compose.yaml": json({
+        name: "${COMPOSE_PROJECT_NAME:?Set a stable project name and reuse it for upgrades}",
+        services,
+        volumes,
+      }),
+      "runtime.env.example": runtimeExample(appOcr),
+      "check-compose.sh": composeCheck,
       "release.json": json(metadata),
     },
     assets: [...assets].sort(),
@@ -514,32 +481,6 @@ function verifyEvidence(manifest, variant, contents) {
   const accelerator = variant.split("-").at(-1),
     native = manifest.native[accelerator],
     image = manifest.images[`ocr-${accelerator}`];
-  if (variant.startsWith("combined")) {
-    const expected = manifest.images[`ollama-${accelerator}`],
-      backend = manifest.ollama[accelerator],
-      proof = read(backend.capability);
-    check(
-      proof.scope === "backend-package-only" &&
-        proof.accelerator === accelerator &&
-        proof.base_reference === backend.base &&
-        proof.image_identity === expected.reference &&
-        proof.config_digest === expected.config_digest &&
-        proof.dependencies_resolved === true,
-      "Ollama accelerator/image capability identity mismatch",
-    );
-    const libraries = Object.entries(proof.backend_libraries ?? {}),
-      library = accelerator === "cuda" ? "cuda" : "hip";
-    check(
-      libraries.length > 0 &&
-        libraries.every(
-          ([path, digest]) =>
-            new RegExp(
-              `^/usr/lib/ollama/.*/?libggml-${library}\\.so(?:\\.[0-9]+)*$`,
-            ).test(path) && /^[a-f0-9]{64}$/.test(digest),
-        ),
-      "Selected Ollama native backend library evidence missing",
-    );
-  }
   const bundle = read(native.bundle),
     config = read(native.image_config),
     report = read(native.qualification);
@@ -714,20 +655,6 @@ function verifyEvidence(manifest, variant, contents) {
     "Native qualification evidence seal mismatch",
   );
   const target = report.device?.gfx_target || report.device?.name;
-  if (variant === "combined-rocm") {
-    const proof = read(manifest.ollama.rocm.capability);
-    check(
-      proof.target_markers?.includes(target) &&
-        Object.values(proof.target_files ?? {}).length > 0 &&
-        Object.entries(proof.target_files).every(
-          ([path, digest]) =>
-            /^\/usr\/lib\/ollama\/.*\/?libggml-hip\.so(?:\.[0-9]+)*$/.test(
-              path,
-            ) && /^[a-f0-9]{64}$/.test(digest),
-        ),
-      "Actual AMD target absent from Ollama package evidence",
-    );
-  }
   check(
     target && report.qualified_targets?.includes(target),
     "Actual qualified device target missing",
@@ -809,7 +736,10 @@ export function writeBundle(manifest, variant, output, base) {
   try {
     const identities = {};
     for (const [path, bytes] of Object.entries(rendered.files)) {
-      writeFileSync(join(temporary, path), bytes, { mode: 0o644, flag: "wx" });
+      writeFileSync(join(temporary, path), bytes, {
+        mode: path.endsWith(".sh") ? 0o755 : 0o644,
+        flag: "wx",
+      });
       identities[path] = hash(bytes);
     }
     for (const [path, source] of Object.entries(contents)) {

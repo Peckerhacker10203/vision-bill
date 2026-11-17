@@ -1,0 +1,109 @@
+"""Managed bundle wiring validates actual Settings precedence without contacting services."""
+
+import os
+import subprocess
+import sys
+
+import pytest
+import yaml
+
+
+@pytest.mark.parametrize(
+    "saved,runtime,expected",
+    [
+        ({}, {"OCR__ENDPOINT": "http://ocr:8082"}, 0),
+        ({"endpoint": "http://ocr:8082"}, {}, 0),
+        ({"enabled": True, "service_url": "http://ocr:8082"}, {}, 0),
+        ({}, {}, 1),
+        ({}, {"OCR__ENDPOINT": ""}, 1),
+        ({}, {"OCR__ENDPOINT": "http://external:8082"}, 1),
+        ({"endpoint": "http://external:8082"}, {"OCR__ENDPOINT": "http://ocr:8082"}, 1),
+        (
+            {"enabled": True, "service_url": "http://external:8082"},
+            {"OCR__ENDPOINT": "http://ocr:8082"},
+            1,
+        ),
+        ({}, {"OCR__ENDPOINT": "http://ocr:8082", "OCR__MANAGE_MODEL_LIFECYCLE": "false"}, 1),
+    ],
+)
+def test_managed_runtime_guard_uses_effective_and_saved_topology(
+    tmp_path, saved, runtime, expected
+):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "llm": {
+                    "provider": "openai",
+                    "host": "http://localhost:1234/v1",
+                    "api_key": "secret-do-not-log",
+                    "model_name": "explicit",
+                    "temperature": 0,
+                },
+                "pg": {"host": "db", "user": "user", "password": "pw", "db": "db"},
+                "auth": {"secret_key": "secret-do-not-log"},
+                "ocr": saved,
+            }
+        )
+    )
+    config.chmod(0o600)
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("LLM__", "OCR__", "PG__", "AUTH__"))
+    }
+    env.update(runtime)
+    env["VISION_BILL_CONFIG_PATH"] = str(config)
+    result = subprocess.run(
+        [sys.executable, "-m", "vision_bill.distribution.bootstrap", "--check-managed-ocr"],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == expected
+    assert "secret-do-not-log" not in result.stdout + result.stderr
+    if expected:
+        assert "Managed OCR bundle" in result.stderr
+
+
+def test_managed_initialization_reuses_valid_restored_config_without_seeds(tmp_path):
+    config_dir = tmp_path / "config"
+    config_path = config_dir / "config.yaml"
+    command = [
+        sys.executable,
+        "-m",
+        "vision_bill.distribution.bootstrap",
+        "--config-dir",
+        str(config_dir),
+        "--postgres-password-file",
+        str(tmp_path / "pg-secret" / "password"),
+    ]
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("LLM__", "OCR__", "PG__", "AUTH__"))
+    }
+    env.update(
+        {
+            "VISION_BILL_CONFIG_PATH": str(config_path),
+            "VISION_BILL_MANAGED_OCR": "true",
+            "LLM__PROVIDER": "openai",
+            "LLM__HOST": "http://localhost:1234/v1",
+            "LLM__MODEL_NAME": "explicit",
+            "OCR__ENDPOINT": "http://ocr:8082",
+        }
+    )
+    first = subprocess.run(
+        command, env=env, cwd=tmp_path, capture_output=True, text=True, check=False
+    )
+    assert first.returncode == 0, first.stderr
+    before = config_path.read_bytes()
+    for name in ("LLM__PROVIDER", "LLM__HOST", "LLM__MODEL_NAME"):
+        env.pop(name)
+    second = subprocess.run(
+        command, env=env, cwd=tmp_path, capture_output=True, text=True, check=False
+    )
+    assert second.returncode == 0, second.stderr
+    assert config_path.read_bytes() == before

@@ -42,13 +42,9 @@ function selection(request) {
       /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(
         request.version,
       ) &&
-      [
-        "app",
-        "ocr-cuda",
-        "ocr-rocm",
-        "combined-cuda",
-        "combined-rocm",
-      ].includes(request.variant),
+      ["app", "ocr-cuda", "ocr-rocm", "app-ocr-cuda", "app-ocr-rocm"].includes(
+        request.variant,
+      ),
     "Invalid exact input selection",
   );
   return join(request.sha, request.version, request.variant);
@@ -92,8 +88,8 @@ function approvedFiles(directory, request) {
     equal(Object.keys(plan.source).sort(), ["commit", "repository"]),
     "Unknown source metadata",
   );
-  const combined = request.variant.startsWith("combined"),
-    app = request.variant === "app" || combined,
+  const appOcr = request.variant.startsWith("app-ocr"),
+    app = request.variant === "app" || appOcr,
     accelerator =
       request.variant === "app" ? null : request.variant.split("-").at(-1);
   const allowed = [
@@ -102,7 +98,6 @@ function approvedFiles(directory, request) {
     "version",
     "platform",
     ...(app ? ["postgres"] : []),
-    ...(combined ? ["ollama_base", "llm"] : []),
     ...(accelerator === "rocm" ? ["rocm"] : []),
   ];
   check(
@@ -110,11 +105,6 @@ function approvedFiles(directory, request) {
     "Input metadata outside selected variant",
   );
   const files = new Map([["release-inputs.json", null]]);
-  if (combined) {
-    const license = safe(plan.llm.license.file);
-    check(license.startsWith("llm/"), "License outside model input directory");
-    files.set(license, null);
-  }
   if (accelerator) {
     const name = `${accelerator}/bundle.json`,
       bundle = read(trusted(join(directory, name), true));
@@ -224,7 +214,7 @@ export function stageInputs(request, maintainer, root, output) {
     join(output, "input-receipt.json"),
     JSON.stringify(
       {
-        schema_version: 1,
+        schema_version: 2,
         source: { repository: request.repository, commit: request.sha },
         version: request.version,
         variant: request.variant,
@@ -256,7 +246,7 @@ function inventory(directory, prefix = "") {
 export function verifyStagedInputs(directory, request, producer) {
   const receipt = read(trusted(join(directory, "input-receipt.json"), true));
   check(
-    receipt.schema_version === 1 &&
+    receipt.schema_version === 2 &&
       receipt.source?.repository === request.repository &&
       receipt.source?.commit === request.sha &&
       receipt.version === request.version &&

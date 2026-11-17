@@ -49,14 +49,3 @@ frontend/playwright-report/**
 **/__pycache__/**
 **/*.pyc
 **/*.pyo
-
-# Derived managed Ollama context: never include distribution artifacts/weights.
-!distribution/
-distribution/**
-!distribution/ollama/
-!distribution/ollama/Dockerfile
-!distribution/ollama/entrypoint.sh
-!distribution/ollama/probe.py
-!paddleocr-service/ocr_service/
-paddleocr-service/ocr_service/**
-!paddleocr-service/ocr_service/supervision.py
