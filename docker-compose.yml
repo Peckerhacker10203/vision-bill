@@ -28,6 +28,7 @@ services:
 
   paddleocr-service:
     profiles: [ocr]
+    init: false
     build:
       context: ./paddleocr-service
       dockerfile: Dockerfile
@@ -37,12 +38,14 @@ services:
       OMP_NUM_THREADS: "4"
       OCR_PORT: "8082"
       PADDLE_PDX_CACHE_HOME: /var/cache/paddlex
+      OCR_INSTALLATION_LOCK_PATH: /coord/installation.lock
       OCR_RUNTIME_SETTINGS_PATH: /var/lib/ocr/qualification.runtime.json
       OCR_QUALIFICATION_IMAGE_PATH: /var/lib/ocr/fixtures/upright.png
       OCR_STARTUP_TIMEOUT_SECONDS: "600"
     volumes:
       - ./server_data/ocr-cache:/var/cache/paddlex
       - ./server_data/ocr-runtime:/var/lib/ocr:ro
+      - ./server_data/ocr-runtime/coord:/coord
     networks:
       - postgres_net
     healthcheck:

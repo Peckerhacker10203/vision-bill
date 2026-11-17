@@ -148,11 +148,19 @@ ocr-build-cuda: ## Build candidate CUDA image after official lock resolution
 ocr-build-rocm: ## Build native full-SDK RDNA2 candidate (large build; no support claim)
 	docker compose --profile ocr -f docker-compose.yml -f docker-compose.rocm.yml build paddleocr-service
 
-ocr-qualify-cuda: ## Run physical CUDA release gate against local cases/runtime JSON
-	docker compose --profile ocr -f docker-compose.yml -f docker-compose.cuda.yml run --rm --no-deps -v "$$(pwd)/server_data/ocr-runtime:/var/lib/ocr" paddleocr-service python -m ocr_service.qualify --accelerator cuda --runtime /var/lib/ocr/candidate.runtime.json --cases /var/lib/ocr/fixtures.toml --output /var/lib/ocr/qualification.json
-
-ocr-qualify-rocm: ## Run physical Radeon release gate for the actual selected GFX target
-	docker compose --profile ocr -f docker-compose.yml -f docker-compose.rocm.yml run --rm --no-deps -v "$$(pwd)/server_data/ocr-runtime:/var/lib/ocr" paddleocr-service python -m ocr_service.qualify --accelerator rocm --runtime /var/lib/ocr/candidate.runtime.json --cases /var/lib/ocr/fixtures.toml --output /var/lib/ocr/qualification.json
+ocr-qualify-cuda ocr-qualify-rocm: ## Run an explicit supervised CUDA/ROCm source qualification
+	@set -eu; \
+		accelerator="$(@:ocr-qualify-%=%)"; \
+		intent="$${OCR_MAINTENANCE_INTENT:?Set OCR_MAINTENANCE_INTENT for this invocation}"; \
+		handoff="$${OCR_APP_HANDOFF_LOCK:?Set OCR_APP_HANDOFF_LOCK to the original /app/config lock path}"; \
+		compose=(docker compose --profile ocr -f docker-compose.yml -f "docker-compose.$$accelerator.yml"); \
+		running="$$("$${compose[@]}" ps --status running --status restarting --quiet vision_bill paddleocr-service)"; \
+		if test -n "$$running"; then echo "Stop the source app and OCR sidecar before qualification" >&2; exit 1; fi; \
+		"$${compose[@]}" run --rm --no-deps --no-build --pull never \
+			-v "$$PWD/server_data/ocr-runtime:/var/lib/ocr" -v "$$PWD/server_data/config:/app/config" \
+			paddleocr-service python -m ocr_service.source_maintenance --accelerator "$$accelerator" \
+			--runtime /var/lib/ocr/candidate.runtime.json --cases /var/lib/ocr/fixtures.toml \
+			--output /var/lib/ocr/qualification.json --maintenance-intent "$$intent" --handoff-lock "$$handoff"
 
 .PHONY: distribution-test
 distribution-test: ## Test prebuilt bundle generation/Compose and release gates on CPU (no publication)
