@@ -5,12 +5,30 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from test_ocr_provision import NAMES, sha
 from test_ocr_provision import release as _release
 
 release = _release
+
+DEVICE = {
+    "accelerator": "cuda",
+    "gpu_index": 0,
+    "name": "CPU-DOUBLE",
+    "uuid": "000102030405060708090a0b0c0d0e0f",
+    "pci_bus_id": "0000:01:00.0",
+    "driver_version": 12000,
+    "compute_capability": [8, 0],
+}
+
+
+@pytest.fixture(autouse=True)
+def metadata_only_device(monkeypatch):
+    monkeypatch.setattr(
+        "ocr_service.initialize.inspect_device_identity", lambda *args: DEVICE.copy(), raising=False
+    )
 
 
 @pytest.fixture
@@ -39,7 +57,7 @@ settings=json.loads(runtime.read_text())
 success=sys.argv[4]=='yes'
 manifest=pathlib.Path(settings['qualification_manifest'])
 manifest.write_text(json.dumps({'image_identity':settings['image_identity'],'model_content':{},'qualified_target':{'name':'CPU-TEST-ONLY'}}))
-report={'qualified':success,'stage':'complete' if success else 'native_collection','accelerator':settings['accelerator'],'image_identity':settings['image_identity'],'runtime_fingerprint':'cpu-test-only','profile_id':'cpu-test-only','manifest_sha256':__import__('hashlib').sha256(manifest.read_bytes()).hexdigest(),'cases':[{'kind':kind,'fresh_worker':repetition} for kind in ['upright','rotated','warped','table','formula'] for repetition in range(2)]}
+report={'device':json.loads(sys.argv[5]),'qualified':success,'stage':'complete' if success else 'native_collection','accelerator':settings['accelerator'],'image_identity':settings['image_identity'],'runtime_fingerprint':'cpu-test-only','profile_id':'cpu-test-only','manifest_sha256':__import__('hashlib').sha256(manifest.read_bytes()).hexdigest(),'cases':[{'kind':kind,'fresh_worker':repetition} for kind in ['upright','rotated','warped','table','formula'] for repetition in range(2)]}
 output.write_text(json.dumps(report))
 if success: output.with_suffix('.runtime.json').write_text(json.dumps(settings))
 sys.exit(0 if success else 1)
@@ -53,6 +71,7 @@ sys.exit(0 if success else 1)
                 str(cases),
                 str(output),
                 "yes" if success else "no",
+                json.dumps(DEVICE),
             ],
             **kwargs,
         )
@@ -65,7 +84,12 @@ def initialize_release(tmp_path, release, **kwargs):
 
     bundle, _, config = release
     return initialize(
-        bundle, tmp_path / "state", config, "sha256:" + sha(config.read_bytes()), **kwargs
+        bundle,
+        tmp_path / "state",
+        config,
+        "sha256:" + sha(config.read_bytes()),
+        maintenance_intent="external-llm-quiesced",
+        **kwargs,
     )
 
 
@@ -107,7 +131,15 @@ def test_success_publishes_verified_settings_then_cached_start_never_spawns_or_r
 
     monkeypatch.setattr(supervision.subprocess, "Popen", forbidden)
     with installation_lock(tmp_path / "installation.lock", exclusive=False):
-        assert initialize_release(tmp_path, release) == result
+        bundle, _, config = release
+        from ocr_service.initialize import check_installation
+
+        assert (
+            check_installation(
+                bundle, tmp_path / "state", config, "sha256:" + sha(config.read_bytes())
+            )
+            == result
+        )
     assert before == {path: path.lstat().st_mtime_ns for path in before}
 
 
@@ -177,7 +209,9 @@ def test_actual_image_configuration_identity_required_before_native(
         data["image_config_sha256"] = sha(config.read_bytes())
         bundle.write_text(json.dumps(data))
     with pytest.raises(ValueError):
-        initialize(bundle, tmp_path / "state", config, image_id)
+        initialize(
+            bundle, tmp_path / "state", config, image_id, maintenance_intent="external-llm-quiesced"
+        )
     assert not (tmp_path / "state/selected").exists()
 
 
@@ -228,37 +262,314 @@ def test_uncleared_marker_blocks_actual_initialization_including_force(
 
 
 @pytest.mark.usefixtures("native_pid1")
-def test_cpu_cache_read_survives_unclean_marker_without_clearing_it(tmp_path, release, monkeypatch):
+@pytest.mark.parametrize("role", ["initializer", "ocr", "ollama", "unknown"])
+def test_cache_hit_still_honors_crash_fences(tmp_path, release, monkeypatch, role):
+    from ocr_service.initialize import check_installation
     from ocr_service.supervision import UncleanInstallation
 
     lock = tmp_path / "installation.lock"
     monkeypatch.setenv("OCR_INSTALLATION_LOCK_PATH", str(lock))
     external_qualifier(monkeypatch)
-    root = initialize_release(tmp_path, release)
-    marker = tmp_path / "installation.active-initializer.json"
+    initialize_release(tmp_path, release)
+    marker = tmp_path / f"installation.active-{role}.json"
     marker.write_text('{"run_id":"unclean-test"}')
-    before = marker.read_bytes(), marker.stat().st_mtime_ns
-    assert initialize_release(tmp_path, release) == root
-    assert before == (marker.read_bytes(), marker.stat().st_mtime_ns)
-    with pytest.raises(UncleanInstallation):
-        initialize_release(tmp_path, release, force=True)
-    # A non-PID-1 process can still verify this complete cache without native work.
-    monkeypatch.undo()
+    original_marker = marker.read_bytes()
     bundle, _, config = release
-    code = "import sys;from pathlib import Path;from ocr_service.initialize import initialize;print(initialize(Path(sys.argv[1]),Path(sys.argv[2]),Path(sys.argv[3]),sys.argv[4]))"
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            code,
-            str(bundle),
-            str(tmp_path / "state"),
-            str(config),
-            "sha256:" + sha(config.read_bytes()),
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
+    with pytest.raises(UncleanInstallation):
+        check_installation(bundle, tmp_path / "state", config, "sha256:" + sha(config.read_bytes()))
+    assert marker.read_bytes() == original_marker
+
+
+def test_cache_miss_never_qualifies_on_check(tmp_path, release, monkeypatch):
+    from ocr_service import initialize as module
+
+    monkeypatch.setenv("OCR_INSTALLATION_LOCK_PATH", str(tmp_path / "installation.lock"))
+    qualify_mock = Mock(side_effect=AssertionError("check must never qualify"))
+    monkeypatch.setattr(module, "owned_qualification_process", qualify_mock)
+    monkeypatch.setattr(module, "provision_bundle", qualify_mock)
+    bundle, _, config = release
+    with pytest.raises(module.InitializationFailed) as cache_miss:
+        module.check_installation(
+            bundle, tmp_path / "state", config, "sha256:" + sha(config.read_bytes())
+        )
+    assert cache_miss.value.reason_code == "native_initialization_required"
+    qualify_mock.assert_not_called()
+    assert not (tmp_path / "state").exists()
+
+
+def test_maintenance_intent_bound_to_invocation(tmp_path, release, monkeypatch):
+    from ocr_service.initialize import initialize
+
+    monkeypatch.setenv("OCR_MAINTENANCE_INTENT", "external-llm-quiesced")
+    bundle, _, config = release
+    args = bundle, tmp_path / "state", config, "sha256:" + sha(config.read_bytes())
+    with pytest.raises(TypeError, match="maintenance_intent"):
+        initialize(*args)
+    with pytest.raises(ValueError, match="maintenance"):
+        initialize(*args, maintenance_intent="api-unreachable")
+    assert not (tmp_path / "state").exists()
+
+
+def test_app_lock_blocks_maintenance(tmp_path, release, monkeypatch):
+    from ocr_service.initialize import initialize
+    from ocr_service.supervision import InstallationBusy, installation_lock
+
+    handoff = tmp_path / "gpu-handoff.lock"
+    inode = None
+    monkeypatch.setenv("OCR_INSTALLATION_LOCK_PATH", str(tmp_path / "installation.lock"))
+    bundle, _, config = release
+    with installation_lock(handoff, exclusive=True):
+        inode = handoff.stat().st_ino
+        with pytest.raises(InstallationBusy):
+            initialize(
+                bundle,
+                tmp_path / "state",
+                config,
+                "sha256:" + sha(config.read_bytes()),
+                maintenance_intent="external-llm-quiesced",
+                handoff_lock=handoff,
+            )
+    assert inode == handoff.stat().st_ino
+    assert not (tmp_path / "installation.lock").exists()
+
+
+@pytest.mark.parametrize("accelerator", ["cuda", "rocm"])
+def test_metadata_probe_uses_driver_only(tmp_path, monkeypatch, accelerator):
+    import builtins
+    import ctypes
+    from types import SimpleNamespace
+
+    from ocr_service import device_inventory
+
+    real_import = builtins.__import__
+
+    def no_native_import(name, *args, **kwargs):
+        assert name.split(".")[0] not in {"paddle", "paddleocr", "paddlex"}
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_native_import)
+    expected = {**DEVICE, "accelerator": accelerator}
+    if accelerator == "rocm":
+        expected = {key: value for key, value in expected.items() if key != "compute_capability"}
+        expected["gfx_target"] = "gfx1030"
+
+        def run(command, **kwargs):
+            assert command == ["/opt/ocr/bin/hip-device-info", "0"]
+            return SimpleNamespace(stdout=json.dumps(expected))
+
+        monkeypatch.setattr(device_inventory.subprocess, "run", run)
+    else:
+
+        def integer(value):
+            def call(*args):
+                ctypes.cast(args[-1], ctypes.POINTER(ctypes.c_int))[0] = value
+                return 0
+
+            return call
+
+        def text_value(value):
+            def call(buffer, *args):
+                ctypes.memmove(buffer, value.encode() + b"\0", len(value) + 1)
+                return 0
+
+            return call
+
+        def capability(major, minor, device):
+            ctypes.cast(major, ctypes.POINTER(ctypes.c_int))[0] = 8
+            ctypes.cast(minor, ctypes.POINTER(ctypes.c_int))[0] = 0
+            return 0
+
+        def uuid(buffer, device):
+            ctypes.memmove(buffer, bytes(range(16)), 16)
+            return 0
+
+        driver = SimpleNamespace(
+            cuInit=lambda flags: 0,
+            cuDeviceGet=lambda ptr, index: integer(0)(ptr),
+            cuDriverGetVersion=integer(12000),
+            cuDeviceGetName=text_value("CPU-DOUBLE"),
+            cuDeviceGetPCIBusId=text_value("0000:01:00.0"),
+            cuDeviceComputeCapability=capability,
+            cuDeviceGetUuid_v2=uuid,
+        )
+        monkeypatch.setattr(device_inventory.ctypes, "CDLL", lambda name: driver)
+        expected["uuid"] = "000102030405060708090a0b0c0d0e0f"
+    assert device_inventory.inspect_device_identity(accelerator, 0) == expected
+
+
+@pytest.mark.parametrize("accelerator", ["cuda", "rocm"])
+def test_metadata_unavailable_is_specific_safe_failure(monkeypatch, accelerator):
+    from ocr_service import device_inventory
+
+    monkeypatch.setattr(
+        device_inventory.ctypes, "CDLL", Mock(side_effect=OSError("missing driver"))
     )
-    assert result.stdout.strip() == str(root)
-    assert before == (marker.read_bytes(), marker.stat().st_mtime_ns)
+    monkeypatch.setattr(
+        device_inventory.subprocess,
+        "run",
+        lambda *a, **k: type("Result", (), {"stdout": "not-json"})(),
+    )
+    with pytest.raises(device_inventory.DeviceIdentityUnavailable) as error:
+        device_inventory.inspect_device_identity(accelerator, 0)
+    assert error.value.reason_code == "native_device_identity_unavailable"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        None,
+        {"version": 1},
+        {"models": ["owned-model"]},
+        {"unsettled": True},
+        {"ocr_pending": True},
+        {"resources": {"llm": "", "ocr": "native"}},
+        {"generation": True},
+        {"extra": False},
+    ],
+)
+def test_maintenance_handoff_journal_strict_clean_v2_only(tmp_path, release, monkeypatch, change):
+    from contextlib import contextmanager
+
+    from ocr_service import initialize as module
+
+    handoff = tmp_path / "gpu-handoff.lock"
+    journal = handoff.with_suffix(".json")
+    state = {
+        "version": 2,
+        "coordinator": "vision-bill-model-handoff-v2",
+        "resources": {"llm": "explicit-test-llm", "ocr": "explicit-test-ocr"},
+        "generation": 1,
+        "models": [],
+        "unsettled": False,
+        "ocr_pending": False,
+    }
+    if change:
+        state.update(change)
+    journal.write_text(json.dumps(state))
+    journal.chmod(0o600)
+    before = journal.read_bytes(), journal.stat().st_mtime_ns
+    monkeypatch.setenv("OCR_INSTALLATION_LOCK_PATH", str(tmp_path / "installation.lock"))
+
+    # Stop before actual PID1/native work: entering the native scope proves the
+    # strict read-only handoff gate accepted; no process boundary is simulated.
+    @contextmanager
+    def stop_before_native(*args):
+        raise RuntimeError("accepted clean journal")
+        yield
+
+    monkeypatch.setattr(module, "managed_installation", stop_before_native)
+    bundle, _, config = release
+    with pytest.raises(RuntimeError, match="handoff" if change else "accepted clean journal"):
+        module.initialize(
+            bundle,
+            tmp_path / "state",
+            config,
+            "sha256:" + sha(config.read_bytes()),
+            maintenance_intent="separate-ocr-device",
+            handoff_lock=handoff,
+        )
+    assert before == (journal.read_bytes(), journal.stat().st_mtime_ns)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"models":[]}',
+        "not-json",
+        '{"version":2,"coordinator":"vision-bill-model-handoff-v2","resources":{"llm":"test","ocr":"test"},"generation":1,"models":[],"unsettled":true,"unsettled":false,"ocr_pending":false}',
+    ],
+)
+def test_maintenance_preserves_legacy_malformed_duplicate_journals(tmp_path, raw):
+    from ocr_service.initialization_lock import maintenance_handoff
+
+    journal = tmp_path / "gpu-handoff.json"
+    journal.write_text(raw)
+    journal.chmod(0o600)
+    before = journal.read_bytes()
+    with (
+        pytest.raises(RuntimeError, match="handoff"),
+        maintenance_handoff(journal.with_suffix(".lock")),
+    ):
+        pytest.fail("Unsafe journal must fence maintenance")
+    assert journal.read_bytes() == before
+
+
+@pytest.mark.usefixtures("native_pid1")
+def test_maintenance_holds_both_locks_through_drain_and_bound_publication(
+    tmp_path, release, monkeypatch
+):
+    from ocr_service import initialize as module
+    from ocr_service import supervision
+    from ocr_service.supervision import InstallationBusy, installation_lock
+
+    handoff, native = tmp_path / "gpu-handoff.lock", tmp_path / "installation.lock"
+    monkeypatch.setenv("OCR_INSTALLATION_LOCK_PATH", str(native))
+    external_qualifier(monkeypatch)
+    original_drain = supervision._drain_owned
+    drains = []
+
+    def verify_drain():
+        for lock in (handoff, native):
+            with pytest.raises(InstallationBusy), installation_lock(lock, exclusive=True):
+                pytest.fail("Maintenance exclusion released before child drain")
+        drains.append(True)
+        original_drain()
+
+    monkeypatch.setattr(supervision, "_drain_owned", verify_drain)
+    bundle, _, config = release
+    # Fresh daemon volumes mount with root-owned 0755 directories.
+    (tmp_path / "state").mkdir(mode=0o755)
+    root = module.initialize(
+        bundle,
+        tmp_path / "state",
+        config,
+        "sha256:" + sha(config.read_bytes()),
+        maintenance_intent="separate-ocr-device",
+        handoff_lock=handoff,
+    )
+    assert len(drains) >= 2
+    evidence = json.loads((root / "maintenance.json").read_bytes())
+    assert evidence["intent"] == "separate-ocr-device"
+    assert evidence["device_identity"] == DEVICE
+    assert evidence["image_id"] == "sha256:" + sha(config.read_bytes())
+    assert evidence["bundle_id"] == json.loads((root / "complete.json").read_bytes())["bundle_id"]
+    assert evidence["invocation_id"]
+    for path in (tmp_path / "state", root.parent, root):
+        assert path.stat().st_mode & 0o777 == 0o700
+    monkeypatch.setattr(module, "inspect_device_identity", lambda *a: {**DEVICE, "uuid": "changed"})
+    with pytest.raises(module.InitializationFailed, match="native_initialization_required"):
+        module.check_installation(
+            bundle, tmp_path / "state", config, "sha256:" + sha(config.read_bytes())
+        )
+
+
+def test_paired_maintenance_requires_explicit_original_handoff_path(
+    tmp_path, release, monkeypatch, capsys
+):
+    from ocr_service import initialize as module
+
+    bundle, _, config = release
+    monkeypatch.setenv("OCR_MAINTENANCE_REQUIRE_HANDOFF", "true")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ocr-init",
+            "maintain",
+            "--bundle",
+            str(bundle),
+            "--image-config",
+            str(config),
+            "--image-id",
+            "sha256:" + sha(config.read_bytes()),
+            "--maintenance-intent",
+            "external-llm-quiesced",
+        ],
+    )
+    native = Mock(side_effect=AssertionError("paired CLI must fail before native work"))
+    monkeypatch.setattr(module, "initialize", native)
+    with pytest.raises(SystemExit) as error:
+        module.main()
+    assert error.value.code == 2
+    assert "original app --handoff-lock" in capsys.readouterr().err
+    native.assert_not_called()

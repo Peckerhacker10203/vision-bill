@@ -10,10 +10,11 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
-from .initialization_lock import lock_path
+from .device_inventory import inspect_device_identity
+from .initialization_lock import lock_path, maintenance_handoff
 from .provision import (
     KINDS,
     ProvisionedRuntime,
@@ -28,11 +29,13 @@ from .provision import (
     verify_tree,
 )
 from .supervision import ManagedInterrupted as InitializationInterrupted
-from .supervision import managed_installation, run_owned
+from .supervision import check_fences, installation_lock, managed_installation, run_owned
 
 
 class InitializationFailed(RuntimeError):
     """Native qualification did not commit a complete release gate result."""
+
+    reason_code = "native_initialization_required"
 
 
 def owned_qualification_process(command: list[str]) -> int:
@@ -116,7 +119,9 @@ def verify_qualification(root: Path, bundle: ReleaseBundle, assets: ProvisionedR
         raise ValueError("Selected smoke fixture differs from qualified release")
 
 
-def cached_installation(state: Path, bundle: ReleaseBundle, image_id: str) -> Path | None:
+def cached_installation(
+    state: Path, bundle: ReleaseBundle, image_id: str, device: dict[str, Any]
+) -> Path | None:
     selected = state / "selected"
     if not selected.is_symlink():
         if selected.exists():
@@ -128,6 +133,8 @@ def cached_installation(state: Path, bundle: ReleaseBundle, image_id: str) -> Pa
     completion = json.loads((root / "complete.json").read_bytes())
     if completion.get("bundle_id") != bundle.identity or completion.get("image_id") != image_id:
         return None
+    if completion.get("device_identity") != device:
+        return None
     files = completion.get("files", {})
     required = {
         "bundle.json",
@@ -137,6 +144,7 @@ def cached_installation(state: Path, bundle: ReleaseBundle, image_id: str) -> Pa
         "qualification.runtime.json",
         "manifest.json",
         "selection.json",
+        "maintenance.json",
     }
     if set(files) != required:
         raise ValueError("Selected completion inventory is incomplete")
@@ -148,22 +156,70 @@ def cached_installation(state: Path, bundle: ReleaseBundle, image_id: str) -> Pa
         raise ValueError("Selected bundle identity changed")
     assets = _asset_paths(bundle, state)
     verify_qualification(root, bundle, assets)
+    verify_device(root, device)
     return root
 
 
-def initialize(
-    bundle_path: Path, state_dir: Path, image_config: Path, image_id: str, *, force: bool = False
+def verify_device(root: Path, device: dict[str, Any]) -> None:
+    report = json.loads((root / "qualification.json").read_bytes())
+    if any(report.get("device", {}).get(key) != value for key, value in device.items()):
+        raise ValueError("Qualified device differs from verified metadata")
+
+
+def check_installation(
+    bundle_path: Path, state_dir: Path, image_config: Path, image_id: str
 ) -> Path:
+    """Validate an existing installation without provisioning or loading native models."""
+    with installation_lock(lock_path(), exclusive=False):
+        check_fences(lock_path(), "check")
+        bundle = load_release_bundle(bundle_path)
+        verify_image(bundle, image_config, image_id)
+        state = state_dir.resolve()
+        if not (state / "selected").exists():
+            raise InitializationFailed(
+                "native_initialization_required: run explicit maintain with --maintenance-intent after stopping managed OCR and attesting external LLM quiescence or a separate OCR device"
+            )
+        device = inspect_device_identity(bundle.accelerator, bundle.gpu_index)
+        if (cached := cached_installation(state, bundle, image_id, device)) is None:
+            raise InitializationFailed(
+                "native_initialization_required: selected bundle/image/device changed; run explicit maintain"
+            )
+        return cached
+
+
+def initialize(
+    bundle_path: Path,
+    state_dir: Path,
+    image_config: Path,
+    image_id: str,
+    *,
+    maintenance_intent: Literal["external-llm-quiesced", "separate-ocr-device"],
+    handoff_lock: Path | None = None,
+    force: bool = False,
+) -> Path:
+    if maintenance_intent not in {"external-llm-quiesced", "separate-ocr-device"}:
+        raise ValueError("Explicit maintenance intent is required for this invocation")
     bundle = load_release_bundle(bundle_path)
     verify_image(bundle, image_config, image_id)
-    state = state_dir.resolve()
-    if not force and (cached := cached_installation(state, bundle, image_id)) is not None:
-        return cached  # CPU-verified success: no native work or selected-state writes.
-    with managed_installation("initializer", lock_path()):
-        # Another initializer may have finished before this exclusive acquisition.
-        if not force and (cached := cached_installation(state, bundle, image_id)) is not None:
+    # Use the app's original lock inode; hold it until the native scope has drained.
+    with (
+        maintenance_handoff(handoff_lock),
+        managed_installation("initializer", lock_path()),
+    ):
+        bundle = load_release_bundle(bundle_path)
+        verify_image(bundle, image_config, image_id)
+        device = inspect_device_identity(bundle.accelerator, bundle.gpu_index)
+        state = state_dir.resolve()
+        if (
+            not force
+            and (cached := cached_installation(state, bundle, image_id, device)) is not None
+        ):
             return cached
+        state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Tighten only this owned native state root, including fresh daemon volumes.
+        state.chmod(0o700)
         assets = provision_bundle(bundle, state)
+        (state / "installations").mkdir(exist_ok=True, mode=0o700)
         root = state / "installations" / uuid4().hex
         root.mkdir(parents=True, mode=0o700)
         try:
@@ -179,6 +235,16 @@ def initialize(
             }
             write_json(root / "bundle.json", bundle.model_dump(mode="json"))
             write_json(root / "candidate.runtime.json", runtime)
+            write_json(
+                root / "maintenance.json",
+                {
+                    "invocation_id": uuid4().hex,
+                    "intent": maintenance_intent,
+                    "bundle_id": bundle.identity,
+                    "image_id": image_id,
+                    "device_identity": device,
+                },
+            )
             output = root / "qualification.json"
             command = [
                 sys.executable,
@@ -205,10 +271,18 @@ def initialize(
             verify_sources(bundle)
             _asset_paths(bundle, state)
             verify_qualification(root, bundle, assets)
+            if inspect_device_identity(bundle.accelerator, bundle.gpu_index) != device:
+                raise ValueError("Native device changed during maintenance")
+            verify_device(root, device)
             files = {path.name: file_digest(path) for path in root.iterdir() if path.is_file()}
             write_json(
                 root / "complete.json",
-                {"bundle_id": bundle.identity, "image_id": image_id, "files": files},
+                {
+                    "bundle_id": bundle.identity,
+                    "image_id": image_id,
+                    "device_identity": device,
+                    "files": files,
+                },
             )
             temporary = state / (".selected-" + uuid4().hex)
             try:
@@ -224,6 +298,7 @@ def initialize(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("operation", nargs="?", choices=("check", "maintain"), default="check")
     parser.add_argument("--bundle", type=Path)
     parser.add_argument(
         "--state-dir", type=Path, default=Path(os.environ.get("OCR_STATE_DIR", "/var/lib/ocr"))
@@ -231,9 +306,19 @@ def main() -> None:
     parser.add_argument("--image-config", type=Path)
     parser.add_argument("--image-id")
     parser.add_argument(
+        "--maintenance-intent",
+        choices=("external-llm-quiesced", "separate-ocr-device"),
+        help="Invocation-local operator attestation: external LLM is quiesced, or OCR uses a separate GPU; metadata checks do not prove this",
+    )
+    parser.add_argument(
+        "--handoff-lock",
+        type=Path,
+        help="Operator-supplied original app gpu-handoff.lock path on its original shared mount (required by paired maintenance); quiescence attestation remains required",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
-        help="Requalify only after both managed serving processes have stopped",
+        help="Requalify in maintain; never bypasses locks or retained crash fences",
     )
     parser.add_argument("--print-source-identities", action="store_true")
     args = parser.parse_args()
@@ -242,8 +327,29 @@ def main() -> None:
         return
     if not args.bundle or not args.image_config or not args.image_id:
         parser.error("--bundle, --image-config and actual --image-id are required")
+    if args.operation == "maintain" and not args.maintenance_intent:
+        parser.error("maintain requires invocation-local --maintenance-intent")
+    if (
+        args.operation == "maintain"
+        and os.environ.get("OCR_MAINTENANCE_REQUIRE_HANDOFF") == "true"
+        and not args.handoff_lock
+    ):
+        parser.error("Paired maintenance requires the original app --handoff-lock path explicitly")
+    if args.operation == "check" and (args.force or args.maintenance_intent or args.handoff_lock):
+        parser.error("--force, --maintenance-intent and --handoff-lock require maintain")
     try:
-        initialize(args.bundle, args.state_dir, args.image_config, args.image_id, force=args.force)
+        if args.operation == "check":
+            check_installation(args.bundle, args.state_dir, args.image_config, args.image_id)
+        else:
+            initialize(
+                args.bundle,
+                args.state_dir,
+                args.image_config,
+                args.image_id,
+                maintenance_intent=args.maintenance_intent,
+                handoff_lock=args.handoff_lock,
+                force=args.force,
+            )
     except InitializationInterrupted:
         raise SystemExit(143) from None
 

@@ -313,6 +313,17 @@ test("bundles are deterministic, isolated, immutable and contain only prebuilt i
       assert.equal(!!compose.services.ocr.ports, !appOcr);
       assert.equal(!!compose.services.app, appOcr);
       assert.equal(compose.services.ollama, undefined);
+      assert.equal(compose.services["ocr-init"].command[0], "check");
+      const maintenance = compose.services["ocr-maintenance"];
+      assert.deepEqual(maintenance.profiles, ["ocr-maintenance"]);
+      assert.equal(maintenance.depends_on, undefined);
+      assert.equal(maintenance.command[0], "maintain");
+      assert.ok(!maintenance.command.includes("--maintenance-intent"));
+      assert.ok(!maintenance.command.includes("--handoff-lock"));
+      assert.equal(
+        maintenance.environment.OCR_MAINTENANCE_REQUIRE_HANDOFF,
+        appOcr ? "true" : undefined,
+      );
       assert.equal(compose.services["ocr-init"].restart, "no");
       assert.equal(compose.services["ocr-init"].init, false);
       assert.equal(compose.services.ocr.init, false);
@@ -1332,4 +1343,104 @@ test("app source context excludes retired runtime while native source retains it
     "utf8",
   );
   assert.match(nativeDockerfile, /ocr_service/);
+});
+
+test("qualification scratch uses only verified daemon-owned volumes and preserves primary errors", async () => {
+  const { withOwnedVolumes } = await import("./distribution-release.mjs");
+  const calls = [],
+    labels = { "vision-bill.release.nonce": "test-nonce" };
+  const driver = {
+    create: (kind, expected) => {
+      assert.deepEqual(expected, labels);
+      const name = hash(kind);
+      calls.push(["create", name]);
+      return name;
+    },
+    inspect: (name) => ({ Name: name, Labels: labels }),
+    remove: (name) => {
+      calls.push(["remove", name]);
+    },
+  };
+  assert.equal(
+    withOwnedVolumes(driver, labels, ({ state, coord }) => {
+      assert.equal(state, hash("state"));
+      assert.equal(coord, hash("coord"));
+      calls.push(["container-removed"]);
+      return "root-wrote-private-state";
+    }),
+    "root-wrote-private-state",
+  );
+  assert.deepEqual(calls.slice(-3), [
+    ["container-removed"],
+    ["remove", hash("coord")],
+    ["remove", hash("state")],
+  ]);
+  const primary = Error("qualification failed");
+  assert.throws(
+    () =>
+      withOwnedVolumes(
+        {
+          ...driver,
+          remove(name) {
+            throw Error(`busy ${name}`);
+          },
+        },
+        labels,
+        () => {
+          throw primary;
+        },
+      ),
+    (error) =>
+      error === primary &&
+      error.cleanupFailures.length === 2 &&
+      error.cleanupFailures[0].resource === hash("coord"),
+  );
+  const removed = [];
+  assert.throws(
+    () =>
+      withOwnedVolumes(
+        {
+          ...driver,
+          create: (kind) => {
+            if (kind === "coord") throw Error("second create failed");
+            return hash(kind);
+          },
+          remove: (name) => removed.push(name),
+        },
+        labels,
+        () => {},
+      ),
+    /second create failed/,
+  );
+  assert.deepEqual(removed, [hash("state")]);
+  assert.throws(
+    () =>
+      withOwnedVolumes(
+        {
+          ...driver,
+          inspect: (name) => ({ Name: name, Labels: {} }),
+          remove: (name) => {
+            throw Error("must not remove foreign volume");
+          },
+        },
+        labels,
+        () => {},
+      ),
+    /cleanup/,
+  );
+});
+
+test("native release dispatch requires explicit operator maintenance attestation", () => {
+  const workflow = readFileSync(
+    new URL("../.github/workflows/distribution-release.yml", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    workflow,
+    /maintenance_intent:[\s\S]*options: \[not-applicable, external-llm-quiesced, separate-ocr-device\]/,
+  );
+  assert.match(
+    workflow,
+    /DISTRIBUTION_MAINTENANCE_INTENT: \$\{\{ inputs.maintenance_intent \}\}/,
+  );
 });

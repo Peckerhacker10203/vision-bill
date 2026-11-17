@@ -3,6 +3,59 @@
 import { execFileSync } from "node:child_process";
 import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { randomUUID } from "node:crypto";
+import {
+  withOwnedContainer,
+  withOwnedVolumes,
+  dockerVolumeDriver,
+} from "./distribution-release.mjs";
+
+export function ownedVolumeFixture(image, execute = execFileSync) {
+  process.stdout.write(
+    `CPU owned-volume fixture host uid: ${process.getuid()}\n`,
+  );
+  const labels = { "vision-bill.release.nonce": randomUUID() };
+  const volumes = [];
+  withOwnedVolumes(dockerVolumeDriver(execute), labels, ({ state, coord }) => {
+    volumes.push(state, coord);
+    withOwnedContainer(
+      {
+        create: () =>
+          execute(
+            "docker",
+            [
+              "create",
+              "--network",
+              "none",
+              "--mount",
+              `type=volume,src=${state},dst=/state`,
+              "--mount",
+              `type=volume,src=${coord},dst=/coord`,
+              image,
+              "python",
+              "-c",
+              "import os,pathlib; assert os.getuid()==0; p=pathlib.Path('/state/private'); p.mkdir(mode=0o700); (p/'owned').write_text('root-only'); pathlib.Path('/coord/lock').touch(mode=0o600); print('CPU owned-volume fixture: root wrote private state')",
+            ],
+            { encoding: "utf8" },
+          ).trim(),
+        remove: (id) =>
+          execute("docker", ["rm", "-f", id], { stdio: "inherit" }),
+      },
+      (id) =>
+        execute("docker", ["start", "--attach", id], { stdio: "inherit" }),
+    );
+  });
+  for (const name of volumes) {
+    let exists = false;
+    try {
+      execute("docker", ["volume", "inspect", name], { stdio: "pipe" });
+      exists = true;
+    } catch (error) {
+      if (!error.stderr?.toString().includes("no such volume")) throw error;
+    }
+    if (exists) throw Error(`Owned fixture volume was not removed: ${name}`);
+  }
+}
 export function pid1Command(environment, root) {
   if (
     !/^3\.[0-9]+$/.test(environment.version) ||
@@ -65,6 +118,7 @@ if (
     execFileSync("docker", pid1Command(environment, root), {
       stdio: "inherit",
     });
+    ownedVolumeFixture(`python:${environment.version}-slim`);
   } catch {
     process.stderr.write("CPU PID1 distribution test gate failed\n");
     process.exitCode = 1;

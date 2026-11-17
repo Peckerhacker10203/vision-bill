@@ -163,7 +163,7 @@ def test_hip_device_inventory_missing_kernel_fails(tmp_path, monkeypatch):
         version=SimpleNamespace(full_version="3.3.1"),
     )
     monkeypatch.setattr(
-        module.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="gfx1030\n")
+        module, "inspect_device_identity", lambda *a: {"gfx_target": "gfx1030", "name": "Radeon", "gpu_index": 0}
     )
     monkeypatch.setattr(
         Path,
@@ -277,7 +277,7 @@ def test_unverified_kernel_inventory_cannot_be_empty(tmp_path, monkeypatch):
         version=SimpleNamespace(full_version="3.3.1"),
     )
     monkeypatch.setattr(
-        module.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="gfx1030\n")
+        module, "inspect_device_identity", lambda *a: {"gfx_target": "gfx1030", "name": "Radeon", "gpu_index": 0}
     )
     monkeypatch.setattr(
         Path,

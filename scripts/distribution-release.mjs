@@ -170,10 +170,108 @@ export function withOwnedContainer(driver, operation) {
     /^[a-f0-9]{64}$/.test(id),
     "Docker did not return an owned container ID",
   );
+  let primary;
   try {
     return operation(id);
+  } catch (error) {
+    primary = error;
+    throw error;
   } finally {
-    driver.remove(id);
+    try {
+      driver.remove(id);
+    } catch (error) {
+      if (!primary) {
+        const cleanup = Error(`Owned container cleanup failed: ${id}`);
+        cleanup.cleanupFailures = [{ resource: id, error }];
+        throw cleanup;
+      }
+      primary.cleanupFailures = [
+        ...(primary.cleanupFailures ?? []),
+        { resource: id, error },
+      ];
+    }
+  }
+}
+export function dockerVolumeDriver(execute = run) {
+  return {
+    create(_role, labels) {
+      return execute(
+        "docker",
+        [
+          "volume",
+          "create",
+          ...Object.entries(labels).flatMap(([key, value]) => [
+            "--label",
+            `${key}=${value}`,
+          ]),
+        ],
+        { encoding: "utf8" },
+      ).trim();
+    },
+    inspect(name) {
+      return JSON.parse(
+        execute("docker", ["volume", "inspect", name], { encoding: "utf8" }),
+      )[0];
+    },
+    remove(name) {
+      execute("docker", ["volume", "rm", name], { stdio: "inherit" });
+    },
+  };
+}
+export function withOwnedVolumes(driver, labels, operation) {
+  check(
+    typeof labels?.["vision-bill.release.nonce"] === "string" &&
+      labels["vision-bill.release.nonce"].length > 0,
+    "Owned scratch requires an exact nonce label",
+  );
+  const owned = [],
+    volumes = {};
+  let primary;
+  try {
+    for (const role of ["state", "coord"]) {
+      const name = driver.create(role, labels);
+      check(
+        /^[a-f0-9]{64}$/.test(name),
+        "Docker did not return a daemon-generated volume name",
+      );
+      owned.push(name);
+      volumes[role] = name;
+    }
+    return operation(volumes);
+  } catch (error) {
+    primary = error;
+    throw error;
+  } finally {
+    const failures = [];
+    for (const name of owned.reverse()) {
+      try {
+        const record = driver.inspect(name);
+        check(
+          record?.Name === name &&
+            Object.entries(labels).every(
+              ([key, value]) => record.Labels?.[key] === value,
+            ),
+          "Owned volume label differs; preserved resource",
+        );
+        driver.remove(name);
+      } catch (error) {
+        failures.push({ resource: name, error });
+      }
+    }
+    if (failures.length) {
+      if (primary)
+        primary.cleanupFailures = [
+          ...(primary.cleanupFailures ?? []),
+          ...failures,
+        ];
+      else {
+        const error = Error(
+          `Owned volume cleanup failed: ${failures.map(({ resource }) => resource).join(", ")}`,
+        );
+        error.cleanupFailures = failures;
+        throw error;
+      }
+    }
   }
 }
 function assetsIn(directory, prefix = "") {
@@ -450,6 +548,12 @@ function qualify(request, output, env) {
   const accelerator =
     request.variant === "app" ? null : request.variant.split("-").at(-1);
   if (accelerator) {
+    check(
+      ["external-llm-quiesced", "separate-ocr-device"].includes(
+        env.DISTRIBUTION_MAINTENANCE_INTENT,
+      ),
+      "Native qualification requires explicit operator maintenance intent",
+    );
     const name = `ocr-${accelerator}`,
       record = records[name],
       archive = join(output, record.archive);
@@ -463,9 +567,6 @@ function qualify(request, output, env) {
       ["copy", `oci-archive:${archive}`, `docker-daemon:${record.tag}`],
       { stdio: "inherit" },
     );
-    const scratch = mkdtempSync(join(tmpdir(), `vb-release-${request.run}-`));
-    mkdirSync(join(scratch, "state"));
-    mkdirSync(join(scratch, "coord"));
     const gpu =
       accelerator === "cuda"
         ? ["--gpus", "all"]
@@ -481,74 +582,98 @@ function qualify(request, output, env) {
               ? []
               : ["--group-add", String(plan.rocm.video_gid)]),
           ];
+    let primary;
     try {
-      withOwnedContainer(
-        {
-          create: () =>
-            run(
-              "docker",
-              [
-                "create",
-                "--init=false",
-                ...gpu,
-                "--mount",
-                `type=bind,src=${resolve(output, accelerator)},dst=/release,readonly`,
-                "--mount",
-                `type=bind,src=${scratch}/state,dst=/var/lib/ocr`,
-                "--mount",
-                `type=bind,src=${scratch}/coord,dst=/coord`,
-                "--entrypoint",
-                "python",
-                record.tag,
-                "-m",
-                "ocr_service.initialize",
-                "--bundle",
-                "/release/bundle.json",
-                "--state-dir",
-                "/var/lib/ocr",
-                "--image-config",
-                "/release/image-config.json",
-                "--image-id",
-                manifest.images[name].config_digest,
-              ],
-              { encoding: "utf8" },
-            ).trim(),
-          remove: (id) => run("docker", ["rm", "-f", id], { stdio: "inherit" }),
-        },
-        (container) => {
-          run("docker", ["start", "--attach", container], { stdio: "inherit" });
-          // /selected is a symlink; dereference the selected immutable report explicitly.
-          run(
-            "docker",
-            [
-              "cp",
-              "-L",
-              `${container}:/var/lib/ocr/selected/qualification.json`,
-              join(output, accelerator, "qualification.json"),
-            ],
-            { stdio: "inherit" },
-          );
-          run(
-            "docker",
-            [
-              "cp",
-              "-L",
-              `${container}:/var/lib/ocr/selected/manifest.json`,
-              join(output, accelerator, "qualification-manifest.json"),
-            ],
-            { stdio: "inherit" },
-          );
-          const report = read(join(output, accelerator, "qualification.json"));
-          if (accelerator === "rocm")
-            check(
-              plan.rocm.targets.includes(report.device?.gfx_target),
-              "Actual AMD board was not among selected build targets",
-            );
-        },
+      withOwnedVolumes(
+        dockerVolumeDriver(),
+        { "vision-bill.release.nonce": randomUUID() },
+        (volumes) =>
+          withOwnedContainer(
+            {
+              create: () =>
+                run(
+                  "docker",
+                  [
+                    "create",
+                    "--init=false",
+                    ...gpu,
+                    "--mount",
+                    `type=bind,src=${resolve(output, accelerator)},dst=/release,readonly`,
+                    "--mount",
+                    `type=volume,src=${volumes.state},dst=/var/lib/ocr`,
+                    "--mount",
+                    `type=volume,src=${volumes.coord},dst=/coord`,
+                    "--entrypoint",
+                    "python",
+                    record.tag,
+                    "-m",
+                    "ocr_service.initialize",
+                    "maintain",
+                    "--maintenance-intent",
+                    env.DISTRIBUTION_MAINTENANCE_INTENT,
+                    "--bundle",
+                    "/release/bundle.json",
+                    "--state-dir",
+                    "/var/lib/ocr",
+                    "--image-config",
+                    "/release/image-config.json",
+                    "--image-id",
+                    manifest.images[name].config_digest,
+                  ],
+                  { encoding: "utf8" },
+                ).trim(),
+              remove: (id) =>
+                run("docker", ["rm", "-f", id], { stdio: "inherit" }),
+            },
+            (container) => {
+              run("docker", ["start", "--attach", container], {
+                stdio: "inherit",
+              });
+              // /selected is a symlink; dereference the selected immutable report explicitly.
+              run(
+                "docker",
+                [
+                  "cp",
+                  "-L",
+                  `${container}:/var/lib/ocr/selected/qualification.json`,
+                  join(output, accelerator, "qualification.json"),
+                ],
+                { stdio: "inherit" },
+              );
+              run(
+                "docker",
+                [
+                  "cp",
+                  "-L",
+                  `${container}:/var/lib/ocr/selected/manifest.json`,
+                  join(output, accelerator, "qualification-manifest.json"),
+                ],
+                { stdio: "inherit" },
+              );
+              const report = read(
+                join(output, accelerator, "qualification.json"),
+              );
+              if (accelerator === "rocm")
+                check(
+                  plan.rocm.targets.includes(report.device?.gfx_target),
+                  "Actual AMD board was not among selected build targets",
+                );
+            },
+          ),
       );
+    } catch (error) {
+      primary = error;
+      throw error;
     } finally {
-      run("docker", ["image", "rm", record.tag], { stdio: "inherit" });
-      rmSync(scratch, { recursive: true, force: true });
+      try {
+        run("docker", ["image", "rm", record.tag], { stdio: "inherit" });
+      } catch (error) {
+        if (!primary) throw error;
+        primary.cleanupFailures = [
+          ...(primary.cleanupFailures ?? []),
+          { resource: record.tag, error },
+        ];
+      }
     }
   }
   save(join(output, "checks.json"), {
@@ -779,6 +904,10 @@ if (
     else throw Error("Unknown phase");
   } catch (error) {
     process.stderr.write(`Distribution release stopped: ${error.message}\n`);
+    for (const { resource, error: cleanup } of error.cleanupFailures ?? [])
+      process.stderr.write(
+        `Owned resource cleanup failed: ${resource}: ${cleanup.message}\n`,
+      );
     process.exitCode = 1;
   }
 }

@@ -5,6 +5,7 @@
   "flash_attention": false,
   "hipblaslt_empty_target_fallback": "gfx1100",
   "input_sha256": {
+    "build/hip-device-info.cpp": "a56d4111b7117bc540f7d88fefc2455db112bb8725dd0d6ef0d0825d851f1204",
     "build/hip-rdna2-v1.patch": "017f955eb5a9d2adec5e416ab0dc17b58a9fd128e4665da28af2e730eba6306a",
     "ocr_contract/__init__.py": "d87c51b68d0594f0bc022f0ae65a40bc86735c93a07dfdf5721430e937bf1f5c",
     "ocr_contract/document_image.py": "f5949c08bc03b0a168619bbfce19ac26fc009e4319227856bf5779c5562128c7",

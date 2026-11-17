@@ -47,7 +47,7 @@ def lock_path() -> Path:
 
 @contextmanager
 def installation_lock(path: Path, *, exclusive: bool, inheritable: bool = False) -> Iterator[int]:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
         try:
@@ -78,7 +78,7 @@ def _sync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _check_fences(lock: Path, role: Role) -> None:
+def check_fences(lock: Path, role: Literal["initializer", "ocr", "check"]) -> None:
     for marker in lock.parent.glob(lock.stem + ".active-*.json"):
         marker_role = marker.name.removeprefix(lock.stem + ".active-").removesuffix(".json")
         if (
@@ -147,7 +147,7 @@ def managed_installation(role: Role, lock: Path) -> Iterator[None]:
         installation_lock(lock, exclusive=role == "initializer"),
         installation_lock(role_lock_path(lock, role), exclusive=True),
     ):
-        _check_fences(lock, role)
+        check_fences(lock, role)
         if os.getpid() != 1:
             raise RuntimeError(
                 "Automatic native work requires the managed container supervisor as PID 1"

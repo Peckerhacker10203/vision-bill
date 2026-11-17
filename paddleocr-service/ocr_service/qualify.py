@@ -29,6 +29,7 @@ from .bootstrap import (
     parameter_bindings,
     seal_dependencies,
 )
+from .device_inventory import inspect_device_identity
 from .fp32 import audit_dynamic_model, floating_dtype, require_gpu
 from .images import normalize_source
 from .pipeline import PipelineAdapter, build_pipeline, construct_native, tree_identity
@@ -140,20 +141,10 @@ def run_stage(stage: str, payload: dict[str, Any], directory: Path) -> dict[str,
 def device_identity(paddle: Any, runtime: RuntimeSettings, *, compute: bool = True) -> dict[str, Any]:
     if os.environ.get("HSA_OVERRIDE_GFX_VERSION"):
         raise ValueError("Architecture spoofing is forbidden")
-    result = {
-        "name": str(paddle.device.cuda.get_device_name(runtime.gpu_index)),
-        "gpu_index": runtime.gpu_index,
-        "paddle_build": str(paddle.version.full_version),
-    }
+    result = inspect_device_identity(runtime.accelerator, runtime.gpu_index)
+    result["paddle_build"] = str(paddle.version.full_version)
     if runtime.accelerator == "rocm":
-        completed = subprocess.run(
-            ["/opt/ocr/bin/hip-device-info", str(runtime.gpu_index)],
-            capture_output=True,
-            check=True,
-            timeout=30,
-            text=True,
-        )
-        target = completed.stdout.strip().split(":", 1)[0]
+        target = result["gfx_target"]
         kernels = json.loads(Path("/opt/ocr/build-evidence/kernels.json").read_text())
         profile = validate_profile(kernels.get("target_profile"))
         if target not in profile["candidate_targets"]:
@@ -173,10 +164,6 @@ def device_identity(paddle: Any, runtime: RuntimeSettings, *, compute: bool = Tr
         result["kernel_inventory_sha256"] = content_identity(kernels)
         if compute:
             result["compute_probe"] = compute_probe(paddle, runtime.gpu_index)
-    else:
-        result["compute_capability"] = list(
-            paddle.device.cuda.get_device_capability(runtime.gpu_index)
-        )
     return result
 
 

@@ -361,6 +361,7 @@ export function renderBundle(manifest, variant) {
       restart: "no",
       entrypoint: ["python", "-m", "ocr_service.initialize"],
       command: [
+        "check",
         "--bundle",
         "/release/bundle.json",
         "--state-dir",
@@ -373,6 +374,19 @@ export function renderBundle(manifest, variant) {
       environment: lock,
       volumes: mounts,
       ...device(accelerator),
+    });
+    service("ocr-maintenance", `ocr-${accelerator}`, {
+      ...services["ocr-init"],
+      profiles: ["ocr-maintenance"],
+      command: ["maintain", ...services["ocr-init"].command.slice(1)],
+      environment: {
+        ...lock,
+        ...(appOcr ? { OCR_MAINTENANCE_REQUIRE_HANDOFF: "true" } : {}),
+      },
+      volumes: [
+        ...mounts,
+        ...(appOcr ? [volume("app-config", "/app/config")] : []),
+      ],
     });
     service("ocr", `ocr-${accelerator}`, {
       init: false,

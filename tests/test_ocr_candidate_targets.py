@@ -49,7 +49,7 @@ def test_newer_observed_target_requires_selected_inventory_and_changes_seal(tmp_
     kernels = {'target_profile': profile, **{name: {'files': {str(lib): file_digest(lib)}, 'targets': ['gfx1100'], 'offline_status': 'verified'} for name in ('paddle', 'rocblas', 'miopen')}}
     real_read = Path.read_text
     monkeypatch.setattr(Path, 'read_text', lambda path, *a, **k: json.dumps(kernels) if str(path) == '/opt/ocr/build-evidence/kernels.json' else real_read(path, *a, **k))
-    monkeypatch.setattr(qualify.subprocess, 'run', lambda *a, **k: SimpleNamespace(stdout='gfx1100:xnack-\n'))
+    monkeypatch.setattr(qualify, 'inspect_device_identity', lambda *a: {'gfx_target': 'gfx1100', 'name': 'candidate', 'gpu_index': 0})
     probes = []
     monkeypatch.setattr(qualify, 'compute_probe', lambda *a: probes.append('probe') or {'synthetic': True})
     paddle = SimpleNamespace(device=SimpleNamespace(cuda=SimpleNamespace(get_device_name=lambda i: 'candidate')), version=SimpleNamespace(full_version='pinned'))

@@ -21,6 +21,12 @@ on:
         description: Successful same-fork same-SHA maintainer run containing private distribution-inputs artifact
         required: true
         type: string
+      maintenance_intent:
+        description: Native runner operator attestation for this invocation (app uses not-applicable)
+        required: true
+        default: not-applicable
+        type: choice
+        options: [not-applicable, external-llm-quiesced, separate-ocr-device]
 permissions:
   contents: read
 concurrency:
@@ -32,6 +38,7 @@ env:
   DISTRIBUTION_SOURCE_SHA: ${{ inputs.source_sha }}
   DISTRIBUTION_VERSION: ${{ inputs.version }}
   DISTRIBUTION_VARIANT: ${{ inputs.variant }}
+  DISTRIBUTION_MAINTENANCE_INTENT: ${{ inputs.maintenance_intent }}
 
 jobs:
   guard:
