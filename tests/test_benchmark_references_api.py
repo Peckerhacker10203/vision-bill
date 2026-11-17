@@ -19,7 +19,7 @@ from vision_bill.security.models import User
     ('GET', '/{id}', 'get_status', None),
     ('GET', '/{id}/results', 'results', None),
     ('POST', '/{id}/reevaluate', 'reevaluate', {'receipt_id': str(uuid4()), 'model_id': 'm'}),
-    ('POST', '', 'create_run', {}),
+    ('POST', '', 'create_run', {'model_ids': ['m']}),
 ])
 async def test_every_benchmark_read_write_receives_real_admin_scope(method, suffix, name, body):
     user = User(id=uuid4(), username='restricted-admin', is_admin=True, can_see_all=False)
@@ -45,7 +45,9 @@ async def test_create_rejects_ineligible_selection_as_unprocessable(message):
     service = SimpleNamespace(create_run=AsyncMock(side_effect=ValueError(message)))
     app.dependency_overrides[get_benchmark_service] = lambda: service
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
-        response = await client.post('/benchmarks', json={'receipt_ids':[str(uuid4()),str(uuid4())]})
+        response = await client.post(
+            '/benchmarks', json={'model_ids': ['m'], 'receipt_ids': [str(uuid4()), str(uuid4())]}
+        )
     assert response.status_code == 422 and response.json()['detail'] == message
     assert len(service.create_run.call_args.args[0].receipt_ids) == 2
     assert service.create_run.call_args.kwargs['scope'].user_id == user.id
