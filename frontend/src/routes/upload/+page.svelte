@@ -10,7 +10,13 @@
 	import { queryKeys } from '$lib/query/keys';
 	import { session } from '$lib/auth';
 	import { captureSessionActor, isCurrentSessionActor } from '$lib/session-lifetime';
-	import { prepareUpload, readPendingUpload, clearPendingUpload } from '$lib/api/upload';
+	import {
+		prepareUpload,
+		readPendingUpload,
+		clearPendingUpload,
+		matchPendingUpload,
+		type PendingUpload
+	} from '$lib/api/upload';
 	import Icon from '$lib/ui/Icon.svelte';
 	import SubmissionStatus from '$lib/ui/SubmissionStatus.svelte';
 	import ExtractionDraftEditor from '$lib/ui/ExtractionDraftEditor.svelte';
@@ -30,10 +36,10 @@
 		photos.forEach((photo) => URL.revokeObjectURL(photo.url));
 	});
 	let dragging = $state(false);
-	let bypassReview = $state(false);
-	let bypassReviewDefaultApplied = $state(false);
 	let uploading = $state(false);
-	let bypassTouched = $state(false);
+	let bypassChoice = $state<boolean>();
+	let recoveredUpload = $state.raw<PendingUpload | null>(null);
+	let checkingRecovery = $state(false);
 	let recoveryOwner = $state('');
 	let recovering = $state(false);
 	let uploadError = $state('');
@@ -47,38 +53,73 @@
 		() => queryClient
 	);
 
+	const bypassReview = $derived(
+		bypassChoice ??
+			recoveredUpload?.options.bypass_review ??
+			uiConfig.data?.bypass_review_default ??
+			false
+	);
+
 	$effect(() => {
 		if ($session && $session !== 'loading' && recoveryOwner !== $session.id) {
 			recoveryOwner = $session.id;
 			recovering = !!readPendingUpload($session.id);
-			bypassTouched = false;
-			bypassReviewDefaultApplied = false;
-		}
-		if (!bypassReviewDefaultApplied && uiConfig.data && !bypassTouched) {
-			bypassReview = uiConfig.data.bypass_review_default;
-			bypassReviewDefaultApplied = true;
+			bypassChoice = undefined;
 		}
 	});
 
+	function setPhotos(next: typeof photos) {
+		photos = next;
+		const selection = photos;
+		const origin = jobId;
+		recoveredUpload = null;
+		checkingRecovery = false;
+		if (origin || !selection.length || !isCurrentSessionActor(actor)) return;
+		if (!readPendingUpload(actor.userId)) return;
+
+		const sameSelection = () => alive && photos === selection && isCurrentSessionActor(actor);
+		const current = () => sameSelection() && jobId === origin;
+		checkingRecovery = true;
+		void matchPendingUpload(
+			actor.userId,
+			selection.map((photo) => photo.file),
+			() => {
+				if (!current()) throw new DOMException('Upload selection changed', 'AbortError');
+			}
+		).then(
+			(pending) => {
+				if (!sameSelection()) return;
+				if (current()) {
+					recoveredUpload = pending;
+					if (pending) recovering = true;
+				}
+				checkingRecovery = false;
+			},
+			() => {
+				if (sameSelection()) checkingRecovery = false;
+			}
+		);
+	}
+
 	function addFiles(next: File[]) {
-		if (uploading) return;
+		if (uploading || !next.length) return;
 		if (photos.length + next.length > 10 || next.some((file) => file.size > 20 * 1024 * 1024)) {
 			uploadError = translate('submission.limits');
 			return;
 		}
-		photos = [...photos, ...next.map((file) => ({ file, url: URL.createObjectURL(file) }))];
+		setPhotos([...photos, ...next.map((file) => ({ file, url: URL.createObjectURL(file) }))]);
 		uploadError = '';
 	}
 
 	function removePhoto(index: number) {
 		URL.revokeObjectURL(photos[index].url);
-		photos = photos.filter((_, i) => i !== index);
+		setPhotos(photos.filter((_, i) => i !== index));
 	}
 
 	function movePhoto(index: number, direction: number) {
 		const next = [...photos];
 		[next[index], next[index + direction]] = [next[index + direction], next[index]];
-		photos = next;
+		setPhotos(next);
 	}
 
 	function onFileChange(input: HTMLInputElement) {
@@ -94,35 +135,37 @@
 
 	function onBypassChange(event: Event) {
 		const checkbox = event.currentTarget as HTMLInputElement;
-		bypassReview = checkbox.checked;
-		bypassTouched = true;
+		bypassChoice = checkbox.checked;
 	}
 
 	async function upload() {
-		if (!alive || !file || uploading || !isCurrentSessionActor(actor)) return;
+		if (!alive || jobId || !file || uploading || checkingRecovery || !isCurrentSessionActor(actor))
+			return;
 		const owner = actor.userId;
-		const origin = jobId;
-		const current = () => alive && jobId === origin && isCurrentSessionActor(actor);
+		const selection = photos;
+		const current = () => alive && !jobId && photos === selection && isCurrentSessionActor(actor);
 		uploading = true;
 		uploadError = '';
 		try {
-			const files = photos.map((photo) => photo.file);
-			const pending = await prepareUpload(
-				owner,
-				files,
-				bypassTouched ? { bypass_review: bypassReview } : undefined,
-				() => {
-					if (!current()) throw new DOMException('Upload view changed', 'AbortError');
-				}
-			);
+			const files = selection.map((photo) => photo.file);
+			const recovery = recoveredUpload;
+			const options = { ...recovery?.options };
+			if (bypassChoice !== undefined) options.bypass_review = bypassChoice;
+			const pending =
+				recovery && options.bypass_review === recovery.options.bypass_review
+					? recovery
+					: await prepareUpload(owner, files, options, () => {
+							if (!current()) throw new DOMException('Upload view changed', 'AbortError');
+						});
 			if (!current()) return;
+			recoveredUpload = pending;
 			const result = await api.uploadImages(files, pending.options, pending.key, actor);
 			if (!current()) return;
 			// Treat a malformed successful response as ambiguous, retaining the key/options.
 			if (!result.id) throw new ApiError(202, 'Response did not include a submission ID');
 			clearPendingUpload(owner, pending.key);
 			photos.forEach((photo) => URL.revokeObjectURL(photo.url));
-			photos = [];
+			setPhotos([]);
 			void queryClient.invalidateQueries({ queryKey: ['images'] });
 			void queryClient.invalidateQueries({ queryKey: ['receipts'] });
 			await goto(resolve(`/upload?job=${result.id}`));
@@ -277,7 +320,7 @@
 					type="checkbox"
 					class="mt-1 size-4"
 					checked={bypassReview}
-					disabled={uploading}
+					disabled={uploading || checkingRecovery}
 					onchange={onBypassChange}
 				/>
 				<span>
@@ -290,7 +333,7 @@
 		<button
 			type="button"
 			class="mt-4 w-full rounded-lg bg-primary px-4 py-3 text-sm font-medium text-on-primary hover:opacity-90 disabled:opacity-50"
-			disabled={!file || uploading || !$session || $session === 'loading'}
+			disabled={!file || uploading || checkingRecovery || !$session || $session === 'loading'}
 			onclick={upload}
 		>
 			{#if uploading}

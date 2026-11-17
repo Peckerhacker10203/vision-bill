@@ -80,6 +80,36 @@ function fileBytes(file: File): Promise<ArrayBuffer> {
 	});
 }
 
+async function hashFiles(files: File[], checkCurrent?: () => void): Promise<string[]> {
+	const hashes: string[] = [];
+	for (const file of files) {
+		const bytes = await fileBytes(file);
+		checkCurrent?.();
+		hashes.push(bytesToHex(sha256(new Uint8Array(bytes))));
+	}
+	return hashes;
+}
+
+function uploadIdentity(owner: string, hashes: string[], options: UploadOptions): string {
+	return bytesToHex(sha256(utf8ToBytes(JSON.stringify({ owner, hashes, options }))));
+}
+
+/** Find a replay for the selected photos without creating a request or changing storage. */
+export async function matchPendingUpload(
+	owner: string,
+	files: File[],
+	checkCurrent?: () => void
+): Promise<PendingUpload | null> {
+	const records = pendingRecords(owner);
+	if (records.length === 0) return null;
+	const hashes = await hashFiles(files, checkCurrent);
+	// The full identity also works for legacy single-slot records without a photo digest.
+	return (
+		records.find(({ upload }) => uploadIdentity(owner, hashes, upload.options) === upload.identity)
+			?.upload ?? null
+	);
+}
+
 /** Call only after an explicit upload click, never on recovery/mount. */
 export async function prepareUpload(
 	owner: string,
@@ -87,15 +117,9 @@ export async function prepareUpload(
 	explicitOptions?: UploadOptions,
 	checkCurrent?: () => void
 ): Promise<PendingUpload> {
-	const hashes: string[] = [];
-	for (const file of files) {
-		const bytes = await fileBytes(file);
-		checkCurrent?.();
-		hashes.push(bytesToHex(sha256(new Uint8Array(bytes))));
-	}
+	const hashes = await hashFiles(files, checkCurrent);
 	const photos = bytesToHex(sha256(utf8ToBytes(JSON.stringify(hashes))));
-	const identityOf = (options: UploadOptions) =>
-		bytesToHex(sha256(utf8ToBytes(JSON.stringify({ owner, hashes, options }))));
+	const identityOf = (options: UploadOptions) => uploadIdentity(owner, hashes, options);
 	const records = pendingRecords(owner);
 
 	// A legacy single-slot record lacks a separate photo hash. Its opaque identity

@@ -74,6 +74,9 @@ it('reload recovery never posts automatically or adopts changed defaults as expl
 	await fireEvent.change(container.querySelector('input[type=file]')!, {
 		target: { files: [file] }
 	});
+	await waitFor(() =>
+		expect((screen.getByRole('checkbox') as HTMLInputElement).checked).toBe(false)
+	);
 	await fireEvent.click(screen.getByRole('button', { name: 'Upload' }));
 	await waitFor(() =>
 		expect(upload).toHaveBeenCalledWith(
@@ -120,7 +123,7 @@ it('does not submit under a different authenticated owner if the session changes
 	expect(localStorage.getItem('vb-upload:owner')).toBeNull();
 });
 
-it('offers no fallback choice and preserves the exact recovered legacy options', async () => {
+it('preserves hidden legacy options when the user edits the matched review choice', async () => {
 	const { prepareUpload } = await import('$lib/api/upload');
 	session.set({ id: 'owner', username: 'test', is_admin: false, can_see_all: false });
 	const file = new File(['same bytes'], 'photo.png');
@@ -141,17 +144,83 @@ it('offers no fallback choice and preserves the exact recovered legacy options',
 	const upload = vi.spyOn(api, 'uploadImages').mockRejectedValue(new Error('lost response'));
 	const { container } = render(Upload);
 	await screen.findByText(/unknown outcome/);
+	const checkbox = screen.getByRole<HTMLInputElement>('checkbox');
+	await waitFor(() => expect(checkbox.checked).toBe(true));
 	await fireEvent.change(container.querySelector('input[type=file]')!, {
 		target: { files: [file] }
 	});
+	await waitFor(() => expect(checkbox.checked).toBe(false));
+	await fireEvent.click(checkbox);
 	await fireEvent.click(screen.getByRole('button', { name: 'Upload' }));
 	await waitFor(() =>
 		expect(upload).toHaveBeenCalledWith(
 			[file],
-			{ model_id: 'saved-model', bypass_review: false, allow_ocr_fallback: true },
+			{ model_id: 'saved-model', bypass_review: true, allow_ocr_fallback: true },
 			expect.any(String),
 			expect.objectContaining({ userId: 'owner' })
 		)
 	);
 	expect(screen.queryByRole('checkbox', { name: 'Allow vision analysis if OCR fails' })).toBeNull();
+});
+
+it('does not adopt a later pending preference that was never shown for this selection', async () => {
+	const { prepareUpload } = await import('$lib/api/upload');
+	session.set({ id: 'owner', username: 'test', is_admin: false, can_see_all: false });
+	const file = new File(['current bytes'], 'photo.png');
+	await prepareUpload('owner', [new File(['different bytes'], 'photo.png')], {
+		bypass_review: true
+	});
+	vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:current');
+	vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+	vi.spyOn(api, 'getUiConfig').mockResolvedValue({
+		bypass_review_default: false,
+		registration_open: true
+	});
+	const upload = vi.spyOn(api, 'uploadImages').mockRejectedValue(new Error('lost response'));
+	const { container } = render(Upload);
+	await screen.findByText(/unknown outcome/);
+	await fireEvent.change(container.querySelector('input[type=file]')!, {
+		target: { files: [file] }
+	});
+	const button = screen.getByRole<HTMLButtonElement>('button', { name: 'Upload' });
+	await waitFor(() => expect(button.disabled).toBe(false));
+	expect(screen.getByRole<HTMLInputElement>('checkbox').checked).toBe(false);
+
+	// A second tab records a pending upload of these bytes after this form is ready.
+	const later = await prepareUpload('owner', [file], { bypass_review: true });
+	await fireEvent.click(button);
+	await waitFor(() => expect(upload).toHaveBeenCalledTimes(1));
+	expect(upload.mock.calls[0][1]).toEqual({});
+	expect(upload.mock.calls[0][2]).not.toBe(later.key);
+});
+
+it('resets the recovered review choice when the selected photos are reordered', async () => {
+	const { prepareUpload } = await import('$lib/api/upload');
+	session.set({ id: 'owner', username: 'test', is_admin: false, can_see_all: false });
+	const top = new File(['top bytes'], 'top.png');
+	const bottom = new File(['bottom bytes'], 'bottom.png');
+	const pending = await prepareUpload('owner', [top, bottom], { bypass_review: true });
+	let preview = 0;
+	vi.spyOn(URL, 'createObjectURL').mockImplementation(() => `blob:reorder-${preview++}`);
+	vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+	vi.spyOn(api, 'getUiConfig').mockResolvedValue({
+		bypass_review_default: false,
+		registration_open: true
+	});
+	const upload = vi.spyOn(api, 'uploadImages').mockRejectedValue(new Error('lost response'));
+	const { container } = render(Upload);
+	await fireEvent.change(container.querySelector('input[type=file]')!, {
+		target: { files: [top, bottom] }
+	});
+	const checkbox = screen.getByRole<HTMLInputElement>('checkbox');
+	await waitFor(() => expect(checkbox.checked).toBe(true));
+	const moveDown = screen.getAllByRole<HTMLButtonElement>('button', { name: 'Move photo down' })[0];
+	await fireEvent.click(moveDown);
+	const button = screen.getByRole<HTMLButtonElement>('button', { name: 'Upload' });
+	await waitFor(() => expect(button.disabled).toBe(false));
+	expect(checkbox.checked).toBe(false);
+	await fireEvent.click(button);
+	await waitFor(() => expect(upload).toHaveBeenCalledTimes(1));
+	expect(upload.mock.calls[0].slice(0, 2)).toEqual([[bottom, top], {}]);
+	expect(upload.mock.calls[0][2]).not.toBe(pending.key);
 });

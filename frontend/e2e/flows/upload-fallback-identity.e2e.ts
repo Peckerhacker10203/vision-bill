@@ -56,25 +56,28 @@ test.describe('historical requested fallback permission recovery', () => {
 		await page.reload();
 		const permission = page.getByLabel('Allow vision analysis if OCR fails', { exact: true });
 		await expect(permission).toHaveCount(0);
-		await expect(page.getByLabel(/Skip review/)).toBeChecked();
+		const bypassReview = page.getByLabel(/Skip review/);
+		await expect(bypassReview).not.toBeChecked();
 		const select = async () =>
 			page
 				.locator('input[type="file"]')
 				.first()
 				.setInputFiles({ name: 'a.png', mimeType: fixture.mimeType, buffer: fixture.bytes });
 		await select();
+		await expect(bypassReview).toBeChecked();
 		await page.getByRole('button', { name: 'Upload', exact: true }).click();
 		await expect(
 			page.getByText('Response did not include a submission ID', { exact: true })
 		).toBeVisible();
 		await page.reload();
 		await expect(permission).toHaveCount(0);
-		await expect(page.getByLabel(/Skip review/)).toBeChecked();
+		await expect(bypassReview).not.toBeChecked();
 		await select();
+		await expect(bypassReview).toBeChecked();
 		await page.getByRole('button', { name: 'Upload', exact: true }).click();
 		await expect.poll(() => attempts.length).toBe(2);
 		expect(attempts[1]).toEqual(attempts[0]);
-		await page.getByLabel(/Skip review/).uncheck();
+		await bypassReview.uncheck();
 		await page.getByRole('button', { name: 'Upload', exact: true }).click();
 		await expect(page).toHaveURL(/\/upload\?job=/);
 		expect(attempts).toHaveLength(3);
