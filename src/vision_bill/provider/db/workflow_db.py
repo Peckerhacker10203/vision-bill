@@ -617,14 +617,18 @@ class WorkflowDB:
         """Commit all-photo observations and their saved artifact references together."""
         if claim.purpose != "inference":
             return False
+        # Check raw metadata before JSON conversion and revalidate every nested value
+        # using the same representation recovery reads back from PostgreSQL.
+        assert_metadata_only(checkpoint)
+        checkpoint = ObservationCheckpoint.model_validate(checkpoint.model_dump(mode="json"))
+        payload = checkpoint.model_dump(mode="json")
+        encoded_payload = _json(payload)
         try:
             async with connection(self.pool, deadline=deadline, transaction=True) as conn:
                 row = await self._lock_claim(conn, claim)
                 if row is None:
                     return False
                 await self._lock_unedited_submission(conn, row)
-                # Revalidate nested objects even if the caller constructed a typed DTO.
-                checkpoint = ObservationCheckpoint.model_validate(checkpoint)
                 if (
                     checkpoint.producer_generation != claim.generation
                     or checkpoint.eligible_generation != claim.generation
@@ -633,7 +637,6 @@ class WorkflowDB:
                     raise ValueError("observation checkpoint producer claim mismatch")
                 parts = await self._parts(conn, row["id"])
                 self._validate_observation_binding(row, parts, checkpoint)
-                payload = checkpoint.model_dump(mode="json")
                 old = _decoded(row["observation_checkpoint"])
                 if old is not None and old["producer_generation"] == claim.generation:
                     if old != payload:
@@ -651,14 +654,14 @@ class WorkflowDB:
 
                 views = await self._save_views(conn, row["id"], parts, checkpoint.persisted_views)
                 await self._validate_metadata_refs(
-                    conn, row["id"], parts, payload["envelope"], checkpoint_view_ids=set(views),
+                    conn, row["id"], parts, payload, checkpoint_view_ids=set(views),
                 )
                 if not await conn.fetchval(
                     """UPDATE images SET observation_checkpoint=$2::jsonb WHERE id=$1
                     AND status='processing' AND claim_purpose='inference'
                     AND generation=$3 AND attempt_count=$4 AND claim_token=$5
                     AND lease_expires_at>clock_timestamp() RETURNING id""",
-                    row["id"], _json(payload), claim.generation, claim.attempt_number, claim.claim_token,
+                    row["id"], encoded_payload, claim.generation, claim.attempt_number, claim.claim_token,
                 ):
                     raise _ExpiredClaim
                 return True

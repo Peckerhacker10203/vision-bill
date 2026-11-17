@@ -62,6 +62,19 @@ async def claimed_checkpoint(w, scope, *, ocr=False, max_attempts=3):
 async def test_save_is_fenced_immutable_and_public_projection_is_safe(workflow_db, ocr):
     w, scope = workflow_db
     claim, checkpoint = await claimed_checkpoint(w, scope, ocr=ocr)
+    if not ocr:
+        view = checkpoint.persisted_views[0]
+        view.metadata.transforms.append(
+            {
+                "source": {
+                    "part_id": str(view.part_id),
+                    "photo_index": view.photo_index,
+                    "source_sha256": view.source_sha256,
+                    "view_id": str(view.metadata.view_id),
+                    "coordinate_space": "working",
+                },
+            }
+        )
 
     for invalid_claim in (
         claim.model_copy(update={"claim_token": uuid4()}),
@@ -99,6 +112,10 @@ async def test_save_is_fenced_immutable_and_public_projection_is_safe(workflow_d
         ("source", "source manifest"),
         ("foreign_ref", "bind to a real source"),
         ("unlisted_view", "checkpoint working view"),
+        ("view_artifact_path", "artifact_path"),
+        ("backend_identity", "inference_identity"),
+        ("view_foreign_ref", "bind to a real source"),
+        ("view_unlisted_view", "checkpoint working view"),
         ("snapshot", "execution policy"),
         ("missing_observation", "draft_incomplete"),
         ("payload", "belongs in saved artifacts"),
@@ -119,8 +136,19 @@ async def test_rejected_checkpoint_keeps_no_artifacts_or_pointer(workflow_db, co
                 }
             }
         )
-    if corruption == "unlisted_view":
-        # A historical view from this image is not part of this checkpoint's manifest.
+    if corruption == "view_artifact_path":
+        checkpoint.persisted_views[0].artifact_path = ""
+    if corruption == "backend_identity":
+        identity = checkpoint.execution_identity.model_copy(
+            update={"inference_identity": "invalid-endpoint-identity"}
+        )
+        checkpoint = checkpoint.model_copy(update={"execution_identity": identity})
+    if corruption == "view_foreign_ref":
+        checkpoint.persisted_views[0].metadata.transforms.append(
+            {"source": {"part_id": str(uuid4()), "photo_index": 0, "source_sha256": "a" * 64}}
+        )
+    if corruption in {"unlisted_view", "view_unlisted_view"}:
+        # A historical view from this image is outside this checkpoint's manifest.
         view = checkpoint.persisted_views[0]
         meta = view.metadata.model_copy(update={"view_id": uuid4()})
         async with w.pool.acquire() as conn:
@@ -133,7 +161,12 @@ async def test_rejected_checkpoint_keeps_no_artifacts_or_pointer(workflow_db, co
                 "/private/previous.png",
                 meta.model_dump_json(),
             )
-        checkpoint.envelope.overlap_decisions.append({"view_id": str(meta.view_id)})
+        references = (
+            checkpoint.persisted_views[0].metadata.transforms
+            if corruption == "view_unlisted_view"
+            else checkpoint.envelope.overlap_decisions
+        )
+        references.append({"view_id": str(meta.view_id)})
     if corruption == "snapshot":
         identity = checkpoint.execution_identity.model_copy(
             update={"semantic_policy_sha256": "0" * 64}
@@ -144,9 +177,18 @@ async def test_rejected_checkpoint_keeps_no_artifacts_or_pointer(workflow_db, co
     if corruption == "payload":
         checkpoint.envelope.telemetry.calls.append({"working": {"png_base64": "Ynl0ZXM="}})
 
-    with pytest.raises(ValueError, match=message):
-        await w.save_observation_checkpoint(claim, checkpoint)
+    before = await w.get_submission(claim.image.id, scope=scope)
+    async with w.pool.acquire() as conn:
+        row_query = "SELECT * FROM images WHERE id=$1"
+        claim_before = await conn.fetchrow(row_query, claim.image.id)
+        with pytest.raises(ValueError, match=message):
+            await w.save_observation_checkpoint(claim, checkpoint)
+        assert await conn.fetchrow(row_query, claim.image.id) == claim_before
+        assert not await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM receipt_extractions WHERE image_id=$1)", claim.image.id
+        )
 
+    assert await w.get_submission(claim.image.id, scope=scope) == before
     assert await w.get_observation_checkpoint(claim) is None
     assert await w.unreferenced_views(claim.image.id, checkpoint.persisted_views) == (
         checkpoint.persisted_views
