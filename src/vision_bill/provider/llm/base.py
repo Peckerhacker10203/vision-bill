@@ -15,6 +15,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic, perf_counter
 from typing import Any, TypeVar
+from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
 from PIL import Image, ImageOps
@@ -44,6 +45,21 @@ from .experiment import extraction_prompt, source_extraction_prompt
 TEXT_CAPABILITIES = {"completion", "text", "chat", "vision", "multimodal"}
 
 T = TypeVar("T")
+
+
+def inference_endpoint_identity(provider: str, endpoint: str) -> str:
+    """Fingerprint routing identity without copying credentials or URL secrets."""
+    parts = urlsplit(endpoint if "://" in endpoint else "http://" + endpoint)
+    scheme = parts.scheme.lower()
+    hostname = (parts.hostname or "").lower()
+    if not hostname or scheme not in ("http", "https"):
+        raise ValueError("inference_endpoint_invalid")
+    port = parts.port
+    host = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None and (scheme, port) not in (("http", 80), ("https", 443)):
+        host += f":{port}"
+    canonical = urlunsplit((scheme, host, parts.path.rstrip("/"), "", ""))
+    return provider + ":" + hashlib.sha256(canonical.encode()).hexdigest()
 
 
 @dataclass
@@ -84,10 +100,14 @@ class LLMProvider(ABC):
     max_output_tokens: int = 8192
     supports_model_release: bool = False
     lifecycle_identity: str = "unsupported"
+    inference_identity: str = "unsupported"
     handoff: Any = None
 
     async def release_model(self, model_id: str) -> None:
         raise ValueError("model_release_unsupported")
+
+    async def resident_model_ids(self, *, deadline: float) -> frozenset[str]:
+        raise ValueError("model_residency_unsupported")
 
     def for_experiment(self, options: ExperimentOptions) -> "LLMProvider":
         """Copy request settings; never mutate the live upload provider."""
@@ -222,7 +242,7 @@ class LLMProvider(ABC):
         """Explicit compatibility/replay path for historical Receipt-only responses."""
         deadline = monotonic() + self.analysis_timeout_seconds
         async with asyncio.timeout(self.analysis_timeout_seconds), (
-            self.handoff.session(deadline) if self.handoff is not None else nullcontext()
+            self.handoff.session(deadline, model_id=model_id) if self.handoff is not None else nullcontext()
         ):
             return await self._legacy_analysis_owned(model_id, messages, image_count=image_count)
 
@@ -262,7 +282,7 @@ class LLMProvider(ABC):
     ) -> InferenceEnvelope:
         """Extract observations first; classification is an independent enrichment call."""
         async with asyncio.timeout(max(0, deadline - monotonic())), (
-            self.handoff.session(deadline) if self.handoff is not None else nullcontext()
+            self.handoff.session(deadline, model_id=model_id) if self.handoff is not None else nullcontext()
         ):
             return await self._extract_receipt_input_owned(model_id, input, tags=tags, deadline=deadline)
 

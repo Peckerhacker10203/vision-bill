@@ -7,6 +7,12 @@ import pytest
 from PIL import Image
 
 
+@pytest.fixture(autouse=True)
+def owned_fixture_bindings(monkeypatch):
+    from handoff_fixtures import install_owned_bindings
+    install_owned_bindings(monkeypatch)
+
+
 @pytest.fixture
 def photos(tmp_path):
     paths = [tmp_path / f"{index}.png" for index in range(2)]
@@ -28,6 +34,9 @@ class Llm:
     def __init__(self, events):
         self.events = events
         self.fail = False
+
+    async def resident_model_ids(self, *, deadline):
+        return frozenset()
 
     async def release_model(self, model):
         self.events.append(("unload", model))
@@ -93,7 +102,7 @@ async def test_ocr_pending_is_durable_before_load_and_failed_park_retains_it(tmp
     async def park(token, deadline):
         raise RuntimeError("ocr_worker_unstoppable")
     ocr.load, ocr.park = load, park
-    with pytest.raises(RuntimeError, match="ocr_worker_unstoppable"):
+    with pytest.raises(ConnectionError, match="load response lost"):
         async with ModelHandoff(tmp_path / "handoff", Llm(events), ocr).session(monotonic() + 1) as owner:
             await owner.ocr_phase()
     assert events == ["claim_park", "load_ocr"]
@@ -412,7 +421,7 @@ async def test_ollama_unloads_only_exact_owned_id_and_verifies_foreign_models():
     from vision_bill.provider.llm.ollama import OllamaProvider
     provider = OllamaProvider("http://local")
     provider._client.generate = AsyncMock()
-    provider._client.ps = AsyncMock(return_value=SimpleNamespace(models=[SimpleNamespace(model="foreign:latest")]))
+    provider._client.ps = AsyncMock(return_value=SimpleNamespace(model_fields_set={"models"}, models=[SimpleNamespace(model="foreign:latest")]))
     await provider.release_model("own")
     provider._client.generate.assert_awaited_once_with(model="own", keep_alive=0)
     provider._client.ps.return_value.models.append(SimpleNamespace(model="own:latest"))
@@ -427,7 +436,7 @@ async def test_ambiguous_model_call_blocks_successor_ocr(tmp_path):
     handoff = ModelHandoff(tmp_path / "handoff", Llm(events), Ocr(events))
     async def ambiguous():
         raise ConnectionError("response lost")
-    with pytest.raises(RuntimeError, match="model_request_unsettled"):
+    with pytest.raises(ConnectionError, match="response lost"):
         async with handoff.session(monotonic() + 2) as owner:
             await owner.llm_phase("own")
             await owner.model_call(ambiguous())
@@ -816,7 +825,7 @@ async def test_review_cleanup_passes_remaining_absolute_deadline_on_body_error(t
     ocr.park = slow_park
     started = monotonic()
     deadline = started + .04
-    with pytest.raises(TimeoutError):
+    with pytest.raises(ValueError, match="body failed"):
         async with ModelHandoff(tmp_path / "handoff", llm, ocr).session(deadline) as owner:
             await owner.llm_phase("own")
             raise ValueError("body failed")

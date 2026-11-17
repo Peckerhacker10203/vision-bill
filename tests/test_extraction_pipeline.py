@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from ollama import ChatResponse
+from ollama import ChatResponse, ProcessResponse
 from PIL import Image
 from test_experiment_scoring import receipt
 from test_ocr_provider import wire_page
@@ -31,6 +31,7 @@ def photos(tmp_path):
 
 def formatter(vision=True, payload=None):
     provider = OllamaProvider("http://local")
+    provider._client.ps = AsyncMock(return_value=ProcessResponse(models=[]))
     model = ModelInfo("fixture")
     model.capabilities = ["completion", "vision"] if vision else ["completion"]
     provider.get_available_models = AsyncMock(return_value=[model])

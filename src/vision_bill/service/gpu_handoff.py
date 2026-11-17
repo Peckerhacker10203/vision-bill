@@ -13,21 +13,21 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from time import monotonic
-from typing import Annotated, Any, Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from ..model.handoff import (
+    DispatchDisposition,
+    HandoffBinding,
+    HandoffResources,
+    HandoffStatus,
+    HandoffWait,
+    ResourceIdentity,
+)
+
 _current: ContextVar["HandoffOwner | None"] = ContextVar("model_handoff", default=None)
-
-ResourceIdentity = Annotated[str, Field(min_length=1)]
-
-
-class HandoffResources(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    llm: ResourceIdentity
-    ocr: ResourceIdentity
-
 
 class HandoffJournal(BaseModel):
     """No legacy endpoint key: old coordinators must fail before dispatch."""
@@ -73,12 +73,15 @@ def handoff_resource_identity(resource: Any, name: str) -> str:
 class HandoffOwner:
     def __init__(self, coordinator: "ModelHandoff", deadline: float):
         self.coordinator = coordinator
+        self.resources = coordinator.resources
+        self.binding: HandoffBinding | None = None
         self.deadline = deadline
         self.token = uuid4().hex
         self.task = asyncio.current_task()
         self.models: list[str] = []
         self.generation = 1
         self.unsettled = False
+        self.dispatch_disposition: DispatchDisposition = "not_dispatched"
         self.ocr_loaded = False
         self.ocr_phase_closed = False
         self.ocr_pending = True  # Claim has not yet confirmed an abandoned worker parked.
@@ -90,7 +93,7 @@ class HandoffOwner:
             os.chmod(temporary, 0o600)
             json.dump(HandoffJournal(
                 version=2, coordinator="vision-bill-model-handoff-v2",
-                resources=self.coordinator.resources, models=self.models,
+                resources=self.resources, models=self.models,
                 generation=self.generation, unsettled=self.unsettled,
                 ocr_pending=self.ocr_pending,
             ).model_dump(), stream)
@@ -107,6 +110,7 @@ class HandoffOwner:
         if self.unsettled:
             raise RuntimeError("model_request_unsettled: reconcile the dedicated endpoint before recovery")
         for model in tuple(self.models):
+            self.require_model(model)
             await self.coordinator.provider.release_model(model)
             self.models.remove(model)
             self.save()
@@ -115,6 +119,7 @@ class HandoffOwner:
         if self.ocr_phase_closed:
             raise RuntimeError("model_handoff_ocr_phase_closed: start a fresh session for further OCR")
         await self.release_models()
+        await self.coordinator.require_residency(self.models, self.deadline)
         if not self.ocr_loaded:
             self.ocr_pending = True
             self.save()  # Durable before load HTTP can create native residency.
@@ -122,6 +127,7 @@ class HandoffOwner:
             self.ocr_loaded = True
 
     async def llm_phase(self, model: str) -> None:
+        self.require_model(model)
         if self.unsettled:
             raise RuntimeError("model_request_unsettled")
         self.ocr_phase_closed = True
@@ -133,11 +139,27 @@ class HandoffOwner:
         self.track(model)
 
     def track(self, model: str) -> None:
+        self.require_model(model)
         if model not in self.models:
             self.models.append(model)
             self.save()  # Durable before the request can reach Ollama.
 
+    def require_model(self, model: str) -> None:
+        if self.binding is None or model not in self.binding.model_ids:
+            raise HandoffWait(HandoffStatus(
+                state="configuration_required", reason_code="model_handoff_model_not_adopted",
+            ))
+
+    def require_release(self, model: str) -> None:
+        self.require_model(model)
+        if self.unsettled:
+            raise RuntimeError("model_request_unsettled")
+        if model not in self.models:
+            raise ValueError("model_handoff_model_not_recorded")
+        self.dispatch_disposition = "not_dispatched"
+
     async def model_call(self, call: Coroutine[Any, Any, Any]) -> Any:
+        self.dispatch_disposition = "unknown"
         self.unsettled = True
         self.save()
         task = asyncio.create_task(call)
@@ -152,9 +174,11 @@ class HandoffOwner:
                 task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
                 raise
             self.unsettled = False
+            self.dispatch_disposition = "settled"
             self.save()
             raise
         self.unsettled = False
+        self.dispatch_disposition = "settled"
         self.save()
         return result
 
@@ -163,6 +187,7 @@ class ModelHandoff:
     def __init__(self, path: Path, provider: Any, ocr: Any):
         self.path = Path(path)
         self.journal = self.path.with_suffix(".json")
+        self.binding_path = self.path.with_suffix(".binding.json")
         self.provider = provider
         self.ocr = ocr
 
@@ -174,15 +199,124 @@ class ModelHandoff:
         )
 
     @asynccontextmanager
-    async def session(self, deadline: float) -> AsyncIterator[HandoffOwner]:
+    async def exclusion(self, deadline: float, *, wait: bool = True) -> AsyncIterator[None]:
+        """Use the original lock inode for inspection, adoption and sessions."""
+        import fcntl
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        path_identity = self.path.resolve()
+        resources = self.resources
+        descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        acquired = False
+        try:
+            while not acquired:
+                if monotonic() >= deadline:
+                    raise HandoffWait(HandoffStatus(state="busy", reason_code="model_handoff_busy"))
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                except BlockingIOError:
+                    if not wait:
+                        raise HandoffWait(HandoffStatus(state="busy", reason_code="model_handoff_busy")) from None
+                    await asyncio.sleep(min(.05, max(0, deadline - monotonic())))
+            current, opened = self.path.stat(), os.fstat(descriptor)
+            if ((current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+                    or self.path.resolve() != path_identity or self.resources != resources):
+                raise ValueError("model_handoff_identity_changed")
+            yield
+        finally:
+            if acquired:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    def read_journal(self) -> HandoffJournal | None:
+        if not self.journal.exists():
+            return None
+        try:
+            state = json.loads(self.journal.read_text())
+        except (ValueError, UnicodeError):
+            raise ValueError("model_handoff_invalid_journal: preserve journal and recover managed resources") from None
+        if isinstance(state, dict) and "version" not in state:
+            raise ValueError(
+                "model_handoff_legacy_journal: stop/drain all workers; recover and confirm "
+                "old OCR parked and recorded LLM models released at their old endpoints "
+                "before manually archiving the journal"
+            )
+        try:
+            saved = HandoffJournal.model_validate(state)
+        except ValidationError:
+            raise ValueError("model_handoff_invalid_journal: preserve journal and recover managed resources") from None
+        for name in ("llm", "ocr"):
+            if getattr(saved.resources, name) != getattr(self.resources, name):
+                raise ValueError(f"model_handoff_{name}_resource_changed: recover old resources before switching")
+        return saved
+
+    def read_binding(self) -> HandoffBinding:
+        try:
+            binding = HandoffBinding.model_validate_json(self.binding_path.read_bytes())
+        except FileNotFoundError:
+            raise HandoffWait(HandoffStatus(
+                state="configuration_required", reason_code="model_handoff_binding_required",
+            )) from None
+        except (ValueError, UnicodeError):
+            raise HandoffWait(HandoffStatus(
+                state="recovery_required", reason_code="model_handoff_invalid_binding",
+            )) from None
+        if binding.coordination_path != str(self.path.resolve()) or binding.resources != self.resources:
+            raise HandoffWait(HandoffStatus(
+                state="recovery_required", reason_code="model_handoff_binding_changed",
+            ))
+        return binding
+
+    async def require_residency(self, recorded: list[str], deadline: float) -> None:
+        try:
+            async with asyncio.timeout(max(0, deadline - monotonic())):
+                resident = await self.provider.resident_model_ids(deadline=deadline)
+            if not isinstance(resident, frozenset) or any(
+                not isinstance(model, str) or not model.strip() or model != model.strip() for model in resident
+            ):
+                raise ValueError("invalid_residency")
+        except Exception:  # noqa: BLE001 - unknown provider evidence must remain fenced, without URL/credential output.
+            raise HandoffWait(HandoffStatus(
+                state="recovery_required", reason_code="model_handoff_residency_unknown",
+            )) from None
+        if resident.difference(recorded):
+            raise HandoffWait(HandoffStatus(
+                state="recovery_required", reason_code="model_handoff_foreign_residency",
+            ))
+
+    async def inspect(self, *, model_id: str, deadline: float) -> HandoffStatus:
+        """Read-only admission evidence; never claim, release, or advance a journal."""
+        if not self.provider.supports_model_release:
+            return HandoffStatus(state="configuration_required", reason_code="model_release_unsupported")
+        try:
+            async with self.exclusion(deadline, wait=False):
+                saved = self.read_journal()
+                binding = self.read_binding()
+                if model_id not in binding.model_ids:
+                    return HandoffStatus(state="configuration_required", reason_code="model_handoff_model_not_adopted")
+                if saved is not None and saved.unsettled:
+                    return HandoffStatus(state="recovery_required", reason_code="model_request_unsettled")
+                recorded = saved.models if saved else []
+                if any(model not in binding.model_ids for model in recorded):
+                    return HandoffStatus(state="recovery_required", reason_code="model_handoff_recorded_model_not_adopted")
+                await self.require_residency(recorded, deadline)
+                return HandoffStatus(state="ready")
+        except HandoffWait as exc:
+            return exc.status
+        except (ValueError, OSError):
+            return HandoffStatus(state="recovery_required", reason_code="model_handoff_invalid_configuration")
+
+    @asynccontextmanager
+    async def session(self, deadline: float, *, model_id: str | None = None) -> AsyncIterator[HandoffOwner]:
         async with asyncio.timeout(max(0, deadline - monotonic())):
-            async with self._session(deadline) as owner:
+            async with self._session(deadline, model_id=model_id) as owner:
                 yield owner
             if monotonic() >= deadline:
                 raise TimeoutError("model_handoff_deadline")
 
     @asynccontextmanager
-    async def _session(self, deadline: float) -> AsyncIterator[HandoffOwner]:
+    async def _session(self, deadline: float, *, model_id: str | None) -> AsyncIterator[HandoffOwner]:
         if getattr(self.ocr, "managed_lifecycle", False) and not managed_ocr_enabled():
             raise ValueError(
                 "managed_ocr_requires_production_ocr: enable OCR__ENABLED and "
@@ -194,77 +328,64 @@ class ModelHandoff:
             if (existing.coordinator.path != self.path
                     or existing.coordinator.resources != resources):
                 raise ValueError("model_handoff_identity_changed")
+            if model_id is not None:
+                existing.require_model(model_id)
             yield existing
             return
         if not self.provider.supports_model_release:
             raise ValueError("model_release_unsupported: managed OCR requires an unload-capable provider")
-        import fcntl  # Linux app/standalone contract; no GPU device-wide locks.
-
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-        acquired = False
         token = None
         owner = HandoffOwner(self, deadline)
-        try:
-            while not acquired:
-                if monotonic() >= deadline:
-                    raise TimeoutError("model_handoff_deadline")
-                try:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    acquired = True
-                except BlockingIOError:
-                    await asyncio.sleep(min(.05, max(0, deadline - monotonic())))
-            if self.journal.exists():
-                try:
-                    state = json.loads(self.journal.read_text())
-                except (ValueError, UnicodeError):
-                    raise ValueError("model_handoff_invalid_journal: preserve journal and recover managed resources") from None
-                if isinstance(state, dict) and "version" not in state:
-                    raise ValueError(
-                        "model_handoff_legacy_journal: stop/drain all workers; recover and confirm "
-                        "old OCR parked and recorded LLM models released at their old endpoints "
-                        "before manually archiving the journal"
-                    )
-                try:
-                    saved = HandoffJournal.model_validate(state)
-                except ValidationError:
-                    raise ValueError("model_handoff_invalid_journal: preserve journal and recover managed resources") from None
-                for name in ("llm", "ocr"):
-                    if getattr(saved.resources, name) != getattr(resources, name):
-                        raise ValueError(
-                            f"model_handoff_{name}_resource_changed: recover old resources before switching"
-                        )
+        async with self.exclusion(deadline):
+            if self.resources != resources:
+                raise ValueError("model_handoff_identity_changed")
+            saved = self.read_journal()
+            owner.binding = self.read_binding()
+            if model_id is not None:
+                owner.require_model(model_id)
+            if saved is not None:
                 owner.models = saved.models
                 owner.generation = saved.generation + 1
                 owner.unsettled = saved.unsettled
                 owner.ocr_pending = saved.ocr_pending
+            if owner.unsettled:
+                raise HandoffWait(HandoffStatus(state="recovery_required", reason_code="model_request_unsettled"))
+            for model in owner.models:
+                owner.require_model(model)
+            await self.require_residency(owner.models, deadline)
             owner.token = f"{owner.generation}:{owner.token}"
             owner.save()
             token = _current.set(owner)
-            # Claim parks any abandoned native worker and fences old HTTP requests.
-            await self.ocr.claim(owner.token, deadline)
-            owner.ocr_pending = False
-            owner.save()
-            await owner.release_models()
-            owner.save()
             try:
-                yield owner
+                # Claim parks abandoned native workers and fences old HTTP requests.
+                await self.ocr.claim(owner.token, deadline)
+                owner.ocr_pending = False
+                owner.save()
+                await owner.release_models()
+                owner.save()
+                try:
+                    yield owner
+                except BaseException:
+                    # Cleanup cannot replace the original inference/body failure.
+                    try:
+                        await self._cleanup(owner, deadline)
+                    except BaseException:  # noqa: BLE001, S110 - retain the original error and durable unresolved journal.
+                        pass
+                    raise
+                else:
+                    await self._cleanup(owner, deadline)
             finally:
-                # Cancellation interrupts inference, not the ownership barrier. A
-                # second cancellation can abort cleanup, but the durable journal
-                # and next claim still prevent an unsafe successor.
-                cleanup_deadline = min(deadline, monotonic() + 30)
-                if monotonic() < cleanup_deadline:
-                    owner.deadline = cleanup_deadline
-                    async with asyncio.timeout(max(0, cleanup_deadline - monotonic())):
-                        await self.ocr.park(owner.token, cleanup_deadline)
-                        owner.ocr_loaded = False
-                        owner.ocr_pending = False
-                        owner.save()
-                        await owner.release_models()
-        finally:
-            if token is not None:
-                _current.reset(token)
-            if acquired:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            os.close(descriptor)
+                if token is not None:
+                    _current.reset(token)
+
+    async def _cleanup(self, owner: HandoffOwner, deadline: float) -> None:
+        # Cancellation interrupts inference, not the ownership barrier.
+        cleanup_deadline = min(deadline, monotonic() + 30)
+        if monotonic() < cleanup_deadline:
+            owner.deadline = cleanup_deadline
+            async with asyncio.timeout(max(0, cleanup_deadline - monotonic())):
+                await self.ocr.park(owner.token, cleanup_deadline)
+                owner.ocr_loaded = False
+                owner.ocr_pending = False
+                owner.save()
+                await owner.release_models()

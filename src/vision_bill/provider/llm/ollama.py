@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import logging
 from collections.abc import Mapping, Sequence
@@ -12,7 +13,13 @@ from ...helper.logging_config import setup_logging
 setup_logging()
 
 from ...model.receipt import Receipt
-from ...provider.llm.base import TEXT_CAPABILITIES, AnalysisResult, LLMProvider, ModelInfo
+from ...provider.llm.base import (
+    TEXT_CAPABILITIES,
+    AnalysisResult,
+    LLMProvider,
+    ModelInfo,
+    inference_endpoint_identity,
+)
 from .experiment import chat_telemetry
 
 try:
@@ -48,6 +55,7 @@ class OllamaProvider(LLMProvider):
         self.supports_thinking_control = True
         self.supports_model_release = True
         self.lifecycle_identity = "ollama:" + hashlib.sha256(host.rstrip("/").encode()).hexdigest()
+        self.inference_identity = inference_endpoint_identity("ollama", host)
         from ...service.gpu_handoff import configure_handoff
         configure_handoff(self)
 
@@ -55,15 +63,35 @@ class OllamaProvider(LLMProvider):
         """Unload precisely the requested ID and verify absence, preserving others."""
         from ...service.gpu_handoff import current_owner
         owner = current_owner()
-        call = self._client.generate(model=model_id, keep_alive=0)
+        if owner is not None:
+            if owner.resources.llm != self.lifecycle_identity:
+                raise ValueError("model_handoff_identity_changed")
+            owner.require_release(model_id)
+        call = self._release_model(model_id, owner.deadline if owner else monotonic() + 30)
         if owner is not None:
             await owner.model_call(call)
         else:
             await call
+
+    async def _release_model(self, model_id: str, deadline: float) -> None:
+        await self._client.generate(model=model_id, keep_alive=0)
         canonical = model_id if ":" in model_id.rsplit("/", 1)[-1] else model_id + ":latest"
-        running = await self._client.ps()
-        if any(item.model in (model_id, canonical) for item in running.models):
+        running = await self.resident_model_ids(deadline=deadline)
+        if any(model in (model_id, canonical) for model in running):
             raise RuntimeError("model_release_unconfirmed")
+
+    async def resident_model_ids(self, *, deadline: float) -> frozenset[str]:
+        async with asyncio.timeout(max(0, deadline - monotonic())):
+            running = await self._client.ps()
+        if "models" not in running.model_fields_set:
+            raise RuntimeError("model_residency_unknown")
+        models: list[str] = []
+        for item in running.models:
+            model = item.model
+            if not isinstance(model, str) or not model.strip() or model != model.strip() or model in models:
+                raise RuntimeError("model_residency_unknown")
+            models.append(model)
+        return frozenset(models)
 
     def update_runtime_settings(self, *, temperature: float) -> None:
         self._temperature = temperature
@@ -146,9 +174,11 @@ class OllamaProvider(LLMProvider):
         from ...service.gpu_handoff import current_owner
         owner = current_owner()
         if owner is not None:
+            if owner.resources.llm != self.lifecycle_identity:
+                raise ValueError("model_handoff_identity_changed")
             await owner.llm_phase(model_id)
         elif self.handoff is not None:
-            async with self.handoff.session(monotonic() + self.analysis_timeout_seconds) as owner:
+            async with self.handoff.session(monotonic() + self.analysis_timeout_seconds, model_id=model_id) as owner:
                 await owner.llm_phase(model_id)
                 return await self._send_message(model_id, messages)
         return await self._send_message(model_id, messages)

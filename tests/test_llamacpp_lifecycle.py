@@ -18,12 +18,18 @@ from vision_bill.service.gpu_handoff import ModelHandoff
 REAL_CLIENT = httpx.AsyncClient
 
 
-def model_status(value):
+@pytest.fixture(autouse=True)
+def owned_fixture_bindings(monkeypatch):
+    from handoff_fixtures import install_owned_bindings
+    install_owned_bindings(monkeypatch)
+
+
+def model_status(value, foreign="loaded"):
     return {
         "object": "list",
         "data": [
             {"id": "own", "aliases": [], "status": {"value": value}},
-            {"id": "foreign", "aliases": [], "status": {"value": "loaded"}},
+            {"id": "foreign", "aliases": [], "status": {"value": foreign}},
         ],
     }
 
@@ -152,6 +158,11 @@ async def test_unknown_router_state_blocks_ocr_and_keeps_owned_journal(
 
     async with configured(monkeypatch, handler) as provider:
         handoff = ModelHandoff(tmp_path / "handoff", provider, Ocr(events))
+        handoff.journal.write_text(json.dumps({
+            "version": 2, "coordinator": "vision-bill-model-handoff-v2",
+            "resources": handoff.resources.model_dump(), "models": ["own"],
+            "generation": 1, "unsettled": False, "ocr_pending": False,
+        }))
         with pytest.raises(RuntimeError, match="model_"):
             async with handoff.session(monotonic() + 2) as owner:
                 owner.track("own")
@@ -209,7 +220,7 @@ async def test_openai_direct_and_ocr_calls_use_same_handoff(monkeypatch, tmp_pat
     def handler(request):
         nonlocal state
         if request.url.path == "/llama/models":
-            return httpx.Response(200, json=model_status(state))
+            return httpx.Response(200, json=model_status(state, foreign="unloaded"))
         if request.url.path == "/llama/models/unload":
             assert json.loads(request.content) == {"model": "own"}
             events.append("unload_llm")
@@ -245,11 +256,14 @@ async def test_openai_direct_and_ocr_calls_use_same_handoff(monkeypatch, tmp_pat
 @pytest.mark.asyncio
 async def test_router_never_unloads_blocks_successor_ocr(monkeypatch, tmp_path):
     events = []
+    reads = 0
 
     def handler(request):
+        nonlocal reads
         if request.method == "POST":
             return httpx.Response(200, json={"success": True})
-        return httpx.Response(200, json=model_status("loaded"))
+        reads += 1
+        return httpx.Response(200, json=model_status("unloaded" if reads == 1 else "loaded", foreign="unloaded"))
 
     async with configured(monkeypatch, handler) as provider:
         handoff = ModelHandoff(tmp_path / "handoff", provider, Ocr(events))

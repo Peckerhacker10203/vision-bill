@@ -12,7 +12,13 @@ from ...helper.logging_config import setup_logging
 setup_logging()
 
 from ...model.receipt import Receipt
-from ...provider.llm.base import TEXT_CAPABILITIES, AnalysisResult, LLMProvider, ModelInfo
+from ...provider.llm.base import (
+    TEXT_CAPABILITIES,
+    AnalysisResult,
+    LLMProvider,
+    ModelInfo,
+    inference_endpoint_identity,
+)
 from .experiment import chat_telemetry
 from .llamacpp import LlamaCppLifecycle
 
@@ -85,6 +91,7 @@ class OpenAIProvider(LLMProvider):
         self._lifecycle = LlamaCppLifecycle(host, api_key) if model_lifecycle == "llamacpp" else None
         self.supports_model_release = self._lifecycle is not None
         self.lifecycle_identity = self._lifecycle.identity if self._lifecycle else "unsupported"
+        self.inference_identity = inference_endpoint_identity("openai", host)
         self._vision_model_ids = frozenset(vision_model_ids)
         self.analysis_timeout_seconds = analysis_timeout_seconds
         self.max_output_tokens = max_output_tokens
@@ -105,6 +112,11 @@ class OpenAIProvider(LLMProvider):
         if self._lifecycle is None:
             raise ValueError("model_release_unsupported")
         await self._lifecycle.release_model(model_id)
+
+    async def resident_model_ids(self, *, deadline: float) -> frozenset[str]:
+        if self._lifecycle is None:
+            raise ValueError("model_residency_unsupported")
+        return await self._lifecycle.resident_model_ids(deadline=deadline)
 
     def update_runtime_settings(self, *, temperature: float) -> None:
         self._temperature = temperature
@@ -229,11 +241,11 @@ class OpenAIProvider(LLMProvider):
             raise ValueError("model_release_unsupported: managed OCR requires an unload-capable provider")
         owner = current_owner()
         if owner is not None:
-            if owner.coordinator.provider.lifecycle_identity != self.lifecycle_identity:
+            if owner.resources.llm != self.lifecycle_identity:
                 raise ValueError("model_handoff_identity_changed")
             await owner.llm_phase(model_id)
         elif self.handoff is not None:
-            async with self.handoff.session(monotonic() + self.analysis_timeout_seconds) as owner:
+            async with self.handoff.session(monotonic() + self.analysis_timeout_seconds, model_id=model_id) as owner:
                 await owner.llm_phase(model_id)
                 return await self._send_message(model_id, messages)
         return await self._send_message(model_id, messages)
