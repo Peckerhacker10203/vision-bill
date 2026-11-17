@@ -24,6 +24,66 @@ import yaml
             1,
         ),
         ({}, {"OCR__ENDPOINT": "http://ocr:8082", "OCR__MANAGE_MODEL_LIFECYCLE": "false"}, 1),
+        pytest.param(
+            {},
+            {"OCR__ENDPOINT": "http://ocr:8082", "OCR__SERVICE_URL": "http://external:8082"},
+            1,
+            id="runtime-canonical-endpoint-cannot-hide-foreign-service-url",
+        ),
+        pytest.param(
+            {},
+            {"OCR__ENDPOINT": "http://ocr:8082", "OCR__ENABLED": "false"},
+            1,
+            id="runtime-canonical-endpoint-cannot-hide-disabled-ocr",
+        ),
+        pytest.param(
+            {"endpoint": "http://ocr:8082", "manage_model_lifecycle": False},
+            {"OCR__MANAGE_MODEL_LIFECYCLE": "true"},
+            1,
+            id="runtime-lifecycle-cannot-hide-saved-unmanaged-policy",
+        ),
+        pytest.param(
+            {"endpoint": "http://ocr:8082", "allow_vision_fallback": True},
+            {"OCR__ALLOW_VISION_FALLBACK": "false"},
+            1,
+            id="runtime-text-only-cannot-hide-saved-vision-fallback-policy",
+        ),
+        pytest.param(
+            {"endpoint": "http://ocr:8082", "service_url": "http://external:8082"},
+            {},
+            1,
+            id="saved-canonical-endpoint-cannot-hide-foreign-service-url",
+        ),
+        pytest.param(
+            {"endpoint": "http://ocr:8082", "enabled": False},
+            {},
+            1,
+            id="saved-canonical-endpoint-cannot-hide-disabled-ocr",
+        ),
+        pytest.param(
+            {},
+            {
+                "OCR__ENDPOINT": "http://ocr:8082",
+                "OCR__SERVICE_URL": "http://ocr:8082",
+                "OCR__ENABLED": "1",
+                "OCR__MANAGE_MODEL_LIFECYCLE": "on",
+                "OCR__ALLOW_VISION_FALLBACK": "off",
+            },
+            0,
+            id="aligned-runtime-aliases-preserve-normal-boolean-parsing",
+        ),
+        pytest.param(
+            {
+                "endpoint": "http://ocr:8082",
+                "enabled": True,
+                "service_url": "http://ocr:8082",
+                "manage_model_lifecycle": True,
+                "allow_vision_fallback": False,
+            },
+            {},
+            0,
+            id="aligned-restored-local-topology-with-explicit-policy",
+        ),
     ],
 )
 def test_managed_runtime_guard_uses_effective_and_saved_topology(
@@ -54,6 +114,7 @@ def test_managed_runtime_guard_uses_effective_and_saved_topology(
     }
     env.update(runtime)
     env["VISION_BILL_CONFIG_PATH"] = str(config)
+    before = config.read_bytes()
     result = subprocess.run(
         [sys.executable, "-m", "vision_bill.distribution.bootstrap", "--check-managed-ocr"],
         env=env,
@@ -63,6 +124,7 @@ def test_managed_runtime_guard_uses_effective_and_saved_topology(
         check=False,
     )
     assert result.returncode == expected
+    assert config.read_bytes() == before
     assert "secret-do-not-log" not in result.stdout + result.stderr
     if expected:
         assert "Managed OCR bundle" in result.stderr

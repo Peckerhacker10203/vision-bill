@@ -248,10 +248,38 @@ def initialize(
 def validate_managed_ocr() -> None:
     """Reject conflicting prepared-bundle wiring using the application's real precedence."""
     try:
-        # Deliberately after initialization: config imports eagerly resolve settings.
-        from vision_bill.config import OcrSettings, get_config_path, settings
+        from pydantic import TypeAdapter
+        from pydantic_settings import EnvSettingsSource
 
-        saved = OcrSettings.model_validate(read_config(get_config_path()).get("ocr", {}))
+        # Deliberately after initialization: config imports eagerly resolve settings.
+        from vision_bill.config import OcrSettings, Settings, get_config_path, settings
+
+        saved_ocr = read_config(get_config_path()).get("ocr", {})
+        runtime_ocr = EnvSettingsSource(Settings)().get("ocr", {})
+        for explicit in (saved_ocr, runtime_ocr):
+            # Endpoint normalization overwrites aliases. Inspect each supplied
+            # instruction independently so neither normalization nor an override
+            # can conceal contradictory managed-bundle wiring or policy.
+            if not isinstance(explicit, Mapping):
+                raise BootstrapError("conflicting explicit OCR section")
+            if "endpoint" in explicit and (
+                not isinstance(explicit["endpoint"], str)
+                or explicit["endpoint"].strip() != "http://ocr:8082"
+            ):
+                raise ValueError("conflicting explicit endpoint")
+            if "service_url" in explicit and explicit["service_url"] != "http://ocr:8082":
+                raise ValueError("conflicting explicit service URL")
+            for name, expected in (
+                ("enabled", True),
+                ("manage_model_lifecycle", True),
+                ("allow_vision_fallback", False),
+            ):
+                if (
+                    name in explicit
+                    and TypeAdapter(bool).validate_python(explicit[name]) != expected
+                ):
+                    raise ValueError("conflicting explicit managed policy")
+        saved = OcrSettings.model_validate(saved_ocr)
         effective = settings.ocr
         if saved.enabled and saved.service_url != "http://ocr:8082":
             raise ValueError("conflicting saved topology")
