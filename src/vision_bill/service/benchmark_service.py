@@ -21,6 +21,7 @@ from ..model.benchmark import (
     BenchmarkStatus,
     GoldSnapshot,
     ReferencePreview,
+    require_selected_models,
 )
 from ..model.experiment import ExperimentOptions, ExtractionPipeline
 from ..model.handoff import HandoffStatus, HandoffWait
@@ -82,14 +83,12 @@ class BenchmarkService:
             self._worker = None
 
     async def create_run(self, request: BenchmarkCreate, *, scope: AccessScope) -> BenchmarkRun:
+        selected_models = require_selected_models(getattr(request, "model_ids", None))
         use_ocr = request.experiment.pipeline == ExtractionPipeline.OCR or (
             request.experiment.pipeline == ExtractionPipeline.UPLOAD and self._receipts._ocr_settings.enabled
         )
         models = await self._provider.get_available_models(capability="text" if use_ocr else "vision")
         available = {m.id: m for m in models}
-        selected_models = request.model_ids or list(available)
-        if not selected_models:
-            raise ValueError("No vision models are available")
         unknown = set(selected_models) - set(available)
         if unknown:
             raise ValueError(f"Selected model(s) unavailable: {', '.join(sorted(unknown))}")
@@ -118,7 +117,7 @@ class BenchmarkService:
                     "thinking_default": "server-controlled" if options.think is None else "explicit"}
         return await self._db.create_run(
             model_ids=selected_models, receipt_ids=selected_ids, fingerprint=dataset_fingerprint(expected),
-            model_digests={m.id: m.digest for m in models}, timeout=request.request_timeout_seconds,
+            model_digests={model_id: available[model_id].digest for model_id in selected_models}, timeout=request.request_timeout_seconds,
             policy=request.council_policy, absolute=request.council_absolute_threshold,
             relative=request.council_relative_threshold, apply_flags=request.apply_council_flags,
             prompt_version=PROMPT_VERSION, scoring_version=DETAIL_SCORING_VERSION, manifest=manifest, owner_id=scope.user_id, scope=scope,

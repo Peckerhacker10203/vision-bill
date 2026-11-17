@@ -4,7 +4,7 @@ from enum import Enum
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .experiment import ExperimentOptions
 
@@ -15,11 +15,21 @@ class CouncilPolicy(str, Enum):
     CUSTOM = "custom"
 
 
+def require_selected_models(model_ids: list[str] | None) -> list[str]:
+    if not isinstance(model_ids, list) or not model_ids or any(
+        not isinstance(model_id, str) or not model_id.strip() for model_id in model_ids
+    ):
+        raise ValueError("Select at least one explicit benchmark model")
+    if len(set(model_ids)) != len(model_ids):
+        raise ValueError("Selected benchmark models must be unique")
+    return model_ids
+
+
 class BenchmarkCreate(BaseModel):
     """A durable, local-only benchmark request."""
 
     experiment: ExperimentOptions = Field(default_factory=ExperimentOptions)
-    model_ids: list[str] | None = None
+    model_ids: list[str] = Field(min_length=1)
     receipt_ids: list[UUID] | None = None
     category: str | None = None
     max_source_confidence: int | None = Field(default=None, ge=0, le=100)
@@ -29,6 +39,11 @@ class BenchmarkCreate(BaseModel):
     council_absolute_threshold: Decimal | None = Field(default=None, ge=0)
     council_relative_threshold: Decimal | None = Field(default=None, ge=0)
     apply_council_flags: bool = False
+
+    @field_validator("model_ids")
+    @classmethod
+    def explicit_model_selection(cls, model_ids: list[str]) -> list[str]:
+        return require_selected_models(model_ids)
 
 
 class BenchmarkRun(BaseModel):

@@ -391,7 +391,10 @@ async def test_effective_pipeline_identity_binds_profile_runtime_budgets_and_fal
     )
 
 
-async def test_run_manifest_preserves_upload_policy_instead_of_forcing_configured_ocr(settings):
+@pytest.mark.parametrize("requested", [["fixture"], ["second", "fixture"]])
+async def test_run_manifest_preserves_upload_policy_instead_of_forcing_configured_ocr(
+    settings, requested,
+):
     from types import SimpleNamespace
 
     from test_experiment_scoring import receipt
@@ -403,6 +406,12 @@ async def test_run_manifest_preserves_upload_policy_instead_of_forcing_configure
 
     service = object.__new__(BenchmarkService)
     service._provider = formatter()
+    from vision_bill.provider.llm.base import ModelInfo
+
+    fixture = service._provider.get_available_models.return_value[0]
+    second = ModelInfo("second")
+    second.capabilities = ["vision"]
+    service._provider.get_available_models.return_value = [fixture, second]
     service._receipts = SimpleNamespace(
         _provider=service._provider,
         _ocr_provider=sidecar(),
@@ -421,9 +430,12 @@ async def test_run_manifest_preserves_upload_policy_instead_of_forcing_configure
     )
     service._db = SimpleNamespace(create_run=AsyncMock())
     await service.create_run(
-        BenchmarkCreate(model_ids=["fixture"]), scope=AccessScope(user_id=uuid4())
+        BenchmarkCreate(model_ids=requested), scope=AccessScope(user_id=uuid4())
     )
-    manifest = service._db.create_run.call_args.kwargs["manifest"]
+    recorded = service._db.create_run.call_args.kwargs
+    assert recorded["model_ids"] == requested
+    assert list(recorded["model_digests"]) == requested
+    manifest = recorded["manifest"]
     assert manifest["inputs"][0]["pipeline"] == "upload"
     assert manifest["identity"]["ocr_settings"]["enabled"] is False
 
@@ -552,7 +564,7 @@ async def test_reference_selection_propagates_infrastructure_errors(failure):
         current_reference=AsyncMock(side_effect=[failure, object()]),
     )
     with pytest.raises(type(failure), match=str(failure)):
-        await service._select_receipts(BenchmarkCreate(limit=1), scope=AccessScope(user_id=uuid4()))
+        await service._select_receipts(BenchmarkCreate(model_ids=['fixture'], limit=1), scope=AccessScope(user_id=uuid4()))
     assert service._db.current_reference.await_count == 1
 
 
@@ -757,3 +769,34 @@ async def test_managed_benchmark_distinguishes_topology_from_frozen_client_drift
     begin.assert_not_awaited()
     for effect in (ocr.claim, ocr.park, ocr.load, ocr.extract_page, llm._client.chat):
         effect.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "body", [{}, {"model_ids": []}, {"model_ids": ["a", "a"]}, {"model_ids": ["   "]}]
+)
+def test_benchmark_create_requires_explicit_unique_models(body):
+    from pydantic import ValidationError
+
+    from vision_bill.model.benchmark import BenchmarkCreate
+
+    with pytest.raises(ValidationError, match="model_ids"):
+        BenchmarkCreate.model_validate(body)
+
+
+@pytest.mark.parametrize("body", [{}, {"model_ids": []}, {"model_ids": ["a", "a"]}])
+async def test_benchmark_service_rejects_invalid_model_selection_before_discovery(body):
+    from types import SimpleNamespace
+
+    from vision_bill.config import OcrSettings
+    from vision_bill.model.benchmark import BenchmarkCreate
+    from vision_bill.service.benchmark_service import BenchmarkService
+
+    service = object.__new__(BenchmarkService)
+    discover = AsyncMock(return_value=[])
+    service._provider = SimpleNamespace(get_available_models=discover)
+    service._receipts = SimpleNamespace(_ocr_settings=OcrSettings())
+    with pytest.raises(ValueError, match="Select at least one|unique"):
+        await service.create_run(
+            BenchmarkCreate.model_construct(**body), scope=AccessScope(user_id=uuid4())
+        )
+    discover.assert_not_awaited()
