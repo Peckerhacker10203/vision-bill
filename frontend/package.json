@@ -54,6 +54,7 @@
 		"svelte-i18n": "^4.0.1"
 	},
 	"allowScripts": {
+		"es5-ext@0.10.64": false,
 		"esbuild@0.19.12": true
 	}
 }

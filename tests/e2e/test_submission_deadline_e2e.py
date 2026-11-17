@@ -45,6 +45,10 @@ async def test_upload_deadline_atomic_recovery_and_artifacts(workflow_db, settin
 
         async def fetch(self, query, *args, **kwargs):
             self.tag_read = "FROM tags" in query
+            if phase == "tags" and self.tag_read and slow:
+                # Once source binding is done, block the retry write as well.
+                # Otherwise it may commit during the final outcome reserve.
+                await lock_image()
             return await super().fetch(query, *args, **kwargs)
 
         async def fetchrow(self, query, *args, **kwargs):

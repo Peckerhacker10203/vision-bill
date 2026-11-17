@@ -38,7 +38,7 @@ COPY ./alembic ./alembic
 # Bake the built SPA into the package's static dir (served by FastAPI at /).
 COPY --from=frontend /build/frontend/out/. ./src/vision_bill/static/
 
-RUN apt update && apt install -y --no-install-recommends libmagic1 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends libmagic1 && rm -rf /var/lib/apt/lists/*
 
 # Install the project itself (editable, matches the lockfile)
 RUN uv sync --frozen
