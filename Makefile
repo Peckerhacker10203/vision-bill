@@ -156,7 +156,7 @@ ocr-qualify-cuda ocr-qualify-rocm: ## Run an explicit supervised CUDA/ROCm sourc
 		compose=(docker compose --profile ocr -f docker-compose.yml -f "docker-compose.$$accelerator.yml"); \
 		running="$$("$${compose[@]}" ps --status running --status restarting --quiet vision_bill paddleocr-service)"; \
 		if test -n "$$running"; then echo "Stop the source app and OCR sidecar before qualification" >&2; exit 1; fi; \
-		"$${compose[@]}" run --rm --no-deps --no-build --pull never \
+		"$${compose[@]}" -f docker-compose.ocr-qualification.yml run --rm --no-deps --pull never \
 			-v "$$PWD/server_data/ocr-runtime:/var/lib/ocr" -v "$$PWD/server_data/config:/app/config" \
 			paddleocr-service python -m ocr_service.source_maintenance --accelerator "$$accelerator" \
 			--runtime /var/lib/ocr/candidate.runtime.json --cases /var/lib/ocr/fixtures.toml \

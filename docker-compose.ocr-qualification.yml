@@ -1,0 +1,5 @@
+# The operator qualifies the selected local candidate. Missing images fail.
+services:
+  paddleocr-service:
+    build: !reset null
+    pull_policy: never
