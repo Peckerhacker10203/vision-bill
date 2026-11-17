@@ -880,3 +880,69 @@ def test_result_artifact_write_and_read_reject_metadata_over_the_wire_cap(tmp_pa
     assert list(tmp_path.glob("*.json")) == [artifact]
     with pytest.raises(ValueError, match="ocr_response_metadata_too_large"):
         read_result(tmp_path, artifact.name)
+
+
+def test_metadata_preflight_rejects_before_typed_wire_parser(tmp_path, monkeypatch):
+    from ocr_contract import OcrResponse, limits
+
+    result = response(request(tmp_path))
+    result.working_image.transforms = [{"png_base64": "テ" * 250}]
+    payload = result.model_dump_json().encode()
+    monkeypatch.setattr(limits, "MAX_RESPONSE_METADATA_BYTES", 700)
+
+    def unexpected_parser(*args, **kwargs):
+        pytest.fail("oversized metadata reached typed parsing")
+
+    monkeypatch.setattr(OcrResponse, "model_validate_json", unexpected_parser)
+    with pytest.raises(ValueError, match="ocr_response_metadata_too_large"):
+        OcrResponse.parse_wire(payload)
+
+
+def test_metadata_measurement_rejects_before_whole_model_serialization(tmp_path, monkeypatch):
+    from ocr_contract import OcrResponse, limits
+    from ocr_service.worker import publish_result
+
+    result = response(request(tmp_path))
+    result.telemetry = {"observations": ["\\nテ", {"long": "テ" * 250}]}
+    monkeypatch.setattr(limits, "MAX_RESPONSE_METADATA_BYTES", 700)
+
+    class UnexpectedSerializer:
+        def to_json(self, *args, **kwargs):
+            pytest.fail("oversized metadata reached whole-model serialization")
+
+    monkeypatch.setattr(OcrResponse, "__pydantic_serializer__", UnexpectedSerializer())
+    with pytest.raises(ValueError, match="ocr_response_metadata_too_large"):
+        publish_result(result, tmp_path)
+
+
+def with_invalid_deflate(result):
+    """A PNG with valid chunk CRCs and an invalid DEFLATE block type."""
+    import struct
+    import zlib
+
+    def chunk(kind, payload):
+        return (
+            struct.pack(">I", len(payload)) + kind + payload
+            + struct.pack(">I", zlib.crc32(kind + payload))
+        )
+
+    view = result.working_image
+    raw = b"\x89PNG\r\n\x1a\n" + chunk(
+        b"IHDR", struct.pack(">IIBBBBB", view.width, view.height, 8, 2, 0, 0, 0)
+    ) + chunk(b"IDAT", b"\x78\x9c\x07\x00\x00\x00\x00") + chunk(b"IEND", b"")
+    with Image.open(BytesIO(raw)) as png:
+        png.verify()
+    with Image.open(BytesIO(raw)) as png, pytest.raises(OSError):
+        png.load()
+    view.sha256 = hashlib.sha256(raw).hexdigest()
+    view.png_base64 = base64.b64encode(raw).decode()
+    return result
+
+
+def test_worker_rejects_crc_correct_invalid_deflate_before_publication(tmp_path):
+    from ocr_service.worker import publish_result
+
+    result = with_invalid_deflate(response(request(tmp_path)))
+    with pytest.raises(ValueError, match="invalid_working_artifact_png"):
+        publish_result(result, tmp_path)
+    assert not list(tmp_path.glob("*.json"))

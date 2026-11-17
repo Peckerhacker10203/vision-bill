@@ -411,3 +411,13 @@ def test_native_api_retains_compact_ocr_text_cap(tmp_path, size):
             validate_result(result)
         assert error.value.status_code == 502
         assert error.value.detail == "ocr_invalid_result"
+
+
+def test_native_result_rejects_crc_correct_invalid_deflate(tmp_path):
+    from fastapi import HTTPException
+    from ocr_service.api import validate_result
+    from test_ocr_worker_lifecycle import request, response, with_invalid_deflate
+
+    with pytest.raises(HTTPException) as error:
+        validate_result(with_invalid_deflate(response(request(tmp_path))))
+    assert error.value.status_code == 502

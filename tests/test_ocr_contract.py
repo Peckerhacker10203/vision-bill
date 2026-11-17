@@ -70,6 +70,7 @@ def test_app_wheel_installs_neutral_contract(tmp_path):
         assert "ocr_contract/__init__.py" in archive.namelist()
         assert "ocr_contract/document_image.py" in archive.namelist()
         assert "ocr_contract/limits.py" in archive.namelist()
+        assert "ocr_contract/wire_json.py" in archive.namelist()
         archive.extractall(tmp_path / "installed")
     result = subprocess.run(
         [sys.executable, "-I", "-c", textwrap.dedent("""
@@ -116,3 +117,40 @@ def test_working_png_decode_checks_encoded_and_decoded_bounds(monkeypatch, encod
     else:
         with pytest.raises(ValueError, match="ocr_working_png_too_large"):
             decode_working_png(encoded)
+
+
+def test_wire_metadata_budget_preserves_exact_utf8_and_reordered_escaped_wire(
+    tmp_path, monkeypatch
+):
+    from ocr_contract import OcrBlock, OcrResponse, limits
+    from test_ocr_worker_lifecycle import request, response
+
+    result = response(request(tmp_path))
+    result.telemetry = {"note": ["テ𐍈\x00\n\\/\"", {"ratio": 1e-7, "flag": True}]}
+    result.working_image.transforms = [{"name": "source\tテ", "angle": 0}]
+    result.blocks = [
+        OcrBlock(id="0", label="text", text="SHOP", bbox=[[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]])
+    ]
+    canonical = result.model_dump_json().encode("utf-8")
+    view = result.working_image
+    exact_metadata_bytes = len(canonical) - len(view.png_base64)
+    monkeypatch.setattr(limits, "MAX_RESPONSE_METADATA_BYTES", exact_metadata_bytes)
+
+    # Present the PNG first, reorder the whole page, and escape the keys,
+    # base64, Unicode and whitespace without changing the canonical metadata.
+    reordered = dict(reversed(list(json.loads(canonical).items())))
+    reordered["working_image"] = dict(reversed(list(reordered["working_image"].items())))
+    result.check_wire_bounds()
+    assert result.dump_checked_wire() == canonical
+    assert OcrResponse.parse_wire(canonical) == result
+    alternate = json.dumps(reordered, ensure_ascii=True, indent=2)
+    alternate = alternate.replace('"working_image"', r'"working_\u0069mage"')
+    alternate = alternate.replace('"png_base64"', r'"png_\u0062ase64"')
+    alternate = alternate.replace(view.png_base64, r"\u0069" + view.png_base64[1:])
+    assert OcrResponse.parse_wire(bytearray(alternate.encode("utf-8"))) == result
+
+    monkeypatch.setattr(limits, "MAX_RESPONSE_METADATA_BYTES", exact_metadata_bytes - 1)
+    with pytest.raises(ValueError, match="ocr_response_metadata_too_large"):
+        OcrResponse.parse_wire(canonical)
+    with pytest.raises(ValueError, match="ocr_response_metadata_too_large"):
+        result.check_wire_bounds()

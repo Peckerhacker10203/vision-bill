@@ -271,6 +271,7 @@ class ImageService:
         artifact_path: str,
         metadata: WorkingImageMetadata,
     ) -> bytes:
+        limits.check_working_image_dimensions(metadata.width, metadata.height)
         expected = self._working_path(image_id, metadata.view_id)
         if Path(artifact_path).absolute() != expected or expected.is_symlink():
             raise ValueError("invalid_working_artifact_path")
@@ -282,7 +283,7 @@ class ImageService:
             raw = handle.read(info.st_size + 1)
             if len(raw) != info.st_size:
                 raise ValueError("invalid_working_artifact_size")
-        validate_working_png(raw, metadata, load=True)
+        validate_working_png(raw, metadata)
         return raw
 
     async def save_working_image(
@@ -295,6 +296,7 @@ class ImageService:
         """Isolated immutable publication; cancelled writers clean only their own file."""
         from time import monotonic
 
+        limits.check_working_image_dimensions(working.width, working.height)
         metadata = WorkingImageMetadata.model_validate(
             working.model_dump(exclude={"png_base64"})
         )
@@ -303,7 +305,7 @@ class ImageService:
         def save() -> tuple[Path, bool]:
             target = self._working_path(image_id, metadata.view_id)
             raw = decode_working_png(encoded)
-            validate_working_png(raw, metadata, load=True)
+            validate_working_png(raw, metadata)
             check_deadline(deadline)
             target.parent.mkdir(parents=True, exist_ok=True)
             created = False

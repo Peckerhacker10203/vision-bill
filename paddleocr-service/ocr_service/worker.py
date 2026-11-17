@@ -16,7 +16,8 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from ocr_contract import OcrResponse, WorkerReadiness
-from ocr_contract.limits import MAX_OCR_RESPONSE_BYTES, check_ocr_response_size
+from ocr_contract.document_image import decode_working_png, validate_working_png
+from ocr_contract.limits import MAX_OCR_RESPONSE_BYTES
 
 from .profile import RuntimeSettings, load_profile
 
@@ -62,8 +63,9 @@ class ControlChannel:
 
 def publish_result(result: OcrResponse, directory: Path) -> str:
     result.check_wire_bounds()
-    payload = result.model_dump_json().encode("utf-8")
-    check_ocr_response_size(len(payload))
+    view = result.working_image
+    validate_working_png(decode_working_png(view.png_base64), view)
+    payload = result.dump_checked_wire()
     destination = directory / (uuid4().hex + ".json")
     with tempfile.NamedTemporaryFile(dir=directory, suffix=".part", delete=False) as temporary:
         temporary.write(payload)

@@ -168,7 +168,7 @@ def test_runtime_lock_hashes_match_committed_inputs():
     import hashlib
 
     lock = json.loads((SERVICE / "runtime-lock.json").read_text())
-    assert "ocr_contract/limits.py" in lock["input_sha256"]
+    assert {"ocr_contract/limits.py", "ocr_contract/wire_json.py"} <= lock["input_sha256"].keys()
     for name, digest in lock["input_sha256"].items():
         assert hashlib.sha256((SERVICE / name).read_bytes()).hexdigest() == digest, name
 
@@ -297,5 +297,6 @@ def test_native_release_source_identity_covers_shared_ocr_limits():
 
     from ocr_service.provision import source_identities
 
-    name = "ocr_contract/limits.py"
-    assert source_identities()[name] == sha256((SERVICE / name).read_bytes()).hexdigest()
+    source = source_identities()
+    for name in ("ocr_contract/limits.py", "ocr_contract/wire_json.py"):
+        assert source[name] == sha256((SERVICE / name).read_bytes()).hexdigest()

@@ -355,3 +355,32 @@ async def test_working_artifact_save_and_read_apply_exact_png_byte_cap(
             uuid4(), view, deadline=time.monotonic() + 2
         )
     assert path.read_bytes() == png
+
+
+async def test_working_artifact_pixel_cap_precedes_pixel_loading(image_service, monkeypatch):
+    import base64
+    import hashlib
+    import time
+    from uuid import uuid4
+
+    from ocr_contract import WorkingImage, WorkingImageMetadata, limits
+
+    with BytesIO() as buffer:
+        Image.new("RGB", (3, 4), "white").save(buffer, "PNG")
+        png = buffer.getvalue()
+    view = WorkingImage(
+        view_id=uuid4(), width=3, height=4, sha256=hashlib.sha256(png).hexdigest(),
+        png_base64=base64.b64encode(png).decode(),
+    )
+    metadata = WorkingImageMetadata.model_validate(view.model_dump())
+    path = await image_service.save_working_image(RECEIPT_ID, view, deadline=time.monotonic() + 2)
+    monkeypatch.setattr(limits, "MAX_IMAGE_PIXELS", 11)
+
+    def unexpected_load(*args, **kwargs):
+        pytest.fail("working artifact exceeded the pixel envelope before loading")
+
+    monkeypatch.setattr(Image.Image, "load", unexpected_load)
+    with pytest.raises(ValueError, match="ocr_invalid_working_image_dimensions"):
+        image_service.read_working_image(RECEIPT_ID, str(path), metadata)
+    with pytest.raises(ValueError, match="ocr_invalid_working_image_dimensions"):
+        await image_service.save_working_image(uuid4(), view, deadline=time.monotonic() + 2)

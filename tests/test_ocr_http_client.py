@@ -200,3 +200,26 @@ def test_standalone_ocr_client_stops_at_oversized_body(monkeypatch, declared_len
         pytest.raises(ValueError, match="ocr_response_too_large"),
     ):
         module().recognize(b"source", media_type="image/png", url="http://ocr", client=transport)
+
+
+def test_standalone_client_rejects_crc_correct_invalid_deflate(tmp_path):
+    from test_ocr_worker_lifecycle import request, with_invalid_deflate
+
+    raw = b"source"
+    item = request(tmp_path)
+    result = with_invalid_deflate(
+        response(type("Request", (), {
+            "request_id": item.request_id, "photo_index": 0,
+            "source_sha256": hashlib.sha256(raw).hexdigest(),
+        })())
+    )
+    with (
+        httpx.Client(transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, content=result.model_dump_json())
+        )) as transport,
+        pytest.raises(ValueError, match="invalid_working_artifact_png"),
+    ):
+        module().recognize(
+            raw, media_type="image/png", url="http://ocr", request_id=item.request_id,
+            client=transport,
+        )

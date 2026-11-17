@@ -6,6 +6,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from . import limits
+from .wire_json import check_encoded_metadata, preflight_wire_metadata
 
 CONTRACT_VERSION: Literal[2] = 2
 
@@ -97,17 +98,14 @@ class OcrResponse(OcrPageMetadata):
         view = self.working_image
         limits.check_working_image_dimensions(view.width, view.height)
         limits.check_working_png_base64(view.png_base64)
+        # The bounded measuring traversal leaves the wire PNG framing intact
+        # while excluding its contents. All remaining fields count.
+        check_encoded_metadata(
+            self.model_copy(update={"working_image": view.model_copy(update={"png_base64": ""})})
+        )
         text = self.text.strip()
         if not text or len(text) > limits.MAX_OCR_TEXT_CHARS:
             raise ValueError("ocr_invalid_recognized_text")
-        # Measure the complete canonical object with only the PNG string's
-        # contents removed. This cap covers block text and geometry, telemetry,
-        # transforms and every other field, including UTF-8 JSON escaping.
-        metadata = self.model_copy(
-            update={"working_image": view.model_copy(update={"png_base64": ""})}
-        ).model_dump_json().encode("utf-8")
-        if len(metadata) > limits.MAX_RESPONSE_METADATA_BYTES:
-            raise ValueError("ocr_response_metadata_too_large")
         if any(
             not (0 <= x <= view.width and 0 <= y <= view.height)
             for block in self.blocks
@@ -115,9 +113,16 @@ class OcrResponse(OcrPageMetadata):
         ):
             raise ValueError("ocr_invalid_block_geometry")
 
+    def dump_checked_wire(self) -> bytes:
+        """Emit compact UTF-8 JSON after the producer has checked the page."""
+        payload = self.__pydantic_serializer__.to_json(self)
+        limits.check_ocr_response_size(len(payload))
+        return payload
+
     @classmethod
     def parse_wire(cls, payload: bytes | bytearray) -> "OcrResponse":
         limits.check_ocr_response_size(len(payload))
+        preflight_wire_metadata(payload)
         # Unknown nested wire fields would otherwise disappear before the
         # canonical measurement. Persisted metadata keeps its own validation.
         result = cls.model_validate_json(payload, extra="forbid")

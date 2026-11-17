@@ -12,7 +12,7 @@ def test_build_context_admits_sources_but_not_local_runtime_artifacts(tmp_path):
     context.mkdir()
     (context / '.dockerignore').write_bytes((ROOT / '.dockerignore').read_bytes())
     (context / 'Dockerfile').write_text('FROM scratch\nCOPY . /\n')
-    admitted = ['frontend/src/app.ts', 'frontend/package.json', 'frontend/package-lock.json', 'frontend/.npmrc', 'frontend/patches/vendor.patch', 'src/vision_bill/main.py', 'alembic/versions/0001.py', 'paddleocr-service/ocr_contract/__init__.py', 'paddleocr-service/ocr_contract/document_image.py', 'paddleocr-service/ocr_contract/limits.py', 'pyproject.toml', 'uv.lock']
+    admitted = ['frontend/src/app.ts', 'frontend/package.json', 'frontend/package-lock.json', 'frontend/.npmrc', 'frontend/patches/vendor.patch', 'src/vision_bill/main.py', 'alembic/versions/0001.py', 'paddleocr-service/ocr_contract/__init__.py', 'paddleocr-service/ocr_contract/document_image.py', 'paddleocr-service/ocr_contract/limits.py', 'paddleocr-service/ocr_contract/wire_json.py', 'pyproject.toml', 'uv.lock']
     excluded = ['frontend/test-results/private-trace.zip', 'frontend/playwright-report/private.html', 'frontend/.env', 'frontend/.env.local', 'src/vision_bill/__pycache__/main.cpython-312.pyc', 'alembic/__pycache__/env.pyc', 'frontend/node_modules/unneeded.js', 'paddleocr-service/qualification-private.json', 'paddleocr-service/ocr_service/targets.py', 'paddleocr-service/build/hip-rdna2-v1.patch', 'paddleocr-service/runtime-lock.json']
     for name in admitted + excluded:
         target = context / name; target.parent.mkdir(parents=True, exist_ok=True); target.write_text('synthetic marker')
@@ -31,6 +31,7 @@ def test_native_context_admits_contract_and_build_inputs_without_app_or_private_
     (context / "Dockerfile").write_text("FROM scratch\nCOPY . /\n")
     admitted = [
         "ocr_contract/__init__.py", "ocr_contract/document_image.py", "ocr_contract/limits.py",
+        "ocr_contract/wire_json.py",
         "ocr_service/api.py", "ocr_service/worker.py", "build/build_rocm.sh",
         "build/hip-rdna2-v1.patch", "profile.json", "runtime-lock.json",
         "requirements.runtime.lock", "requirements.cuda.attestation.json", "server.py",

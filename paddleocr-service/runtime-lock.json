@@ -7,9 +7,10 @@
   "input_sha256": {
     "build/hip-device-info.cpp": "a56d4111b7117bc540f7d88fefc2455db112bb8725dd0d6ef0d0825d851f1204",
     "build/hip-rdna2-v1.patch": "017f955eb5a9d2adec5e416ab0dc17b58a9fd128e4665da28af2e730eba6306a",
-    "ocr_contract/__init__.py": "e2c5acb177cf704da52faf54e6eff7bd39db8d662cc712b793e4b62c4a86f3eb",
-    "ocr_contract/document_image.py": "864406983970704c52a10cb709097123326949a1a685a070436486e62910e70f",
+    "ocr_contract/__init__.py": "15ee00813e4ec37204b6dae5c731154b8e92af07427bf10b70764f82068daeaf",
+    "ocr_contract/document_image.py": "7af9acad1c00b5d99ca3c1d83e4cce938ba7374e8f5709112d9cb7e2d86e1deb",
     "ocr_contract/limits.py": "e8a3516793c6ddd3f8af037f96edbdde458377f0ab648cf3a0e0a5cacaa2ffa4",
+    "ocr_contract/wire_json.py": "d68762507779fbae4a528c47f6d2587cb37cb5fe4ec583da2f72fc1f34431882",
     "requirements.bootstrap.lock": "ea0463cbcbd31b0f368bd61ecca40ab60afe376dbfc6f6af4734eab20aa134f3",
     "requirements.build.lock": "69689dc39bd5e96aff805a1fc556fab5d786b3de7330d1ab3b21cd954833872d",
     "requirements.runtime.lock": "c6d6471af279f271daac0e46017aea566af881493d0e43404d1ab0c9a6b15b88"

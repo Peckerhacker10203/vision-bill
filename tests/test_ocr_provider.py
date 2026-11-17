@@ -385,3 +385,14 @@ async def test_app_ocr_provider_stops_at_oversized_chunked_body(monkeypatch, tmp
         await provider.extract_page(
             path, photo_index=0, source_sha256=digest, deadline=time.monotonic() + 2
         )
+
+
+def test_app_provider_rejects_crc_correct_invalid_deflate(tmp_path):
+    from test_ocr_worker_lifecycle import request, response, with_invalid_deflate
+
+    result = with_invalid_deflate(response(request(tmp_path)))
+    with pytest.raises(ValueError, match="ocr_invalid_working_image"):
+        PaddleOcrProvider._validated_response(
+            result.model_dump_json().encode(), result.request_id, result.photo_index,
+            result.source_sha256, result.profile_id,
+        )

@@ -49,21 +49,25 @@ def decode_working_png(encoded: str) -> bytes:
     return base64.b64decode(encoded, validate=True)
 
 
-def validate_working_png(raw: bytes, metadata: WorkingImageMetadata, *, load: bool = False) -> None:
-    """Check the exact PNG identity and frame geometry against its metadata."""
+def validate_working_png(raw: bytes, metadata: WorkingImageMetadata) -> None:
+    """Check PNG identity, frame geometry, chunk CRCs and pixel decoding."""
+    limits.check_working_image_dimensions(metadata.width, metadata.height)
     if len(raw) > limits.MAX_WORKING_PNG_BYTES or sha256(raw).hexdigest() != metadata.sha256:
         raise ValueError("invalid_working_artifact_hash")
     try:
-        with Image.open(BytesIO(raw)) as decoded:
-            if (
-                decoded.format != "PNG"
-                or decoded.size != (metadata.width, metadata.height)
-                or getattr(decoded, "n_frames", 1) != 1
-            ):
-                raise ValueError("invalid_working_artifact_dimensions")
-            if load:
-                decoded.load()
-            else:
+        with BytesIO(raw) as stream:
+            with Image.open(stream) as decoded:
+                if (
+                    decoded.format != "PNG"
+                    or decoded.size != (metadata.width, metadata.height)
+                    or getattr(decoded, "n_frames", 1) != 1
+                ):
+                    raise ValueError("invalid_working_artifact_dimensions")
                 decoded.verify()
+            # Pillow verify checks chunk CRCs without inflating IDAT. Reopen
+            # the same bounded stream to validate the compressed pixels too.
+            stream.seek(0)
+            with Image.open(stream) as decoded:
+                decoded.load()
     except (OSError, SyntaxError, Image.DecompressionBombError) as exc:
         raise ValueError("invalid_working_artifact_png") from exc

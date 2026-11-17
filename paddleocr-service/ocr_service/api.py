@@ -17,7 +17,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 from ocr_contract import OcrResponse
 from ocr_contract.document_image import decode_working_png, validate_working_png
-from ocr_contract.limits import MAX_IMAGE_PIXELS, NATIVE_SOURCE_MAX_BYTES, check_ocr_response_size
+from ocr_contract.limits import MAX_IMAGE_PIXELS, NATIVE_SOURCE_MAX_BYTES
 from PIL import Image
 from pydantic import BaseModel, Field
 
@@ -79,7 +79,7 @@ def validate_result(result: OcrResponse) -> None:
         result.check_wire_bounds()
         view = result.working_image
         validate_working_png(decode_working_png(view.png_base64), view)
-    except ValueError:
+    except (TypeError, ValueError):
         raise HTTPException(502, "ocr_invalid_result") from None
 
 
@@ -190,11 +190,7 @@ def create_app(
             else:
                 result = worker.infer(request, deadline_monotonic=deadline, owner=owner_token)
             validate_result(result)
-            # The exact same compact UTF-8 Pydantic serializer defines the
-            # wire metadata allowance and emits the successful HTTP body.
-            payload = result.model_dump_json().encode("utf-8")
-            check_ocr_response_size(len(payload))
-            return Response(payload, media_type="application/json")
+            return Response(result.dump_checked_wire(), media_type="application/json")
         except OcrWorkerError as exc:
             cleanup_safe = exc.cleanup_safe
             raise HTTPException(exc.status_code, exc.code) from None
