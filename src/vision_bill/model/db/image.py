@@ -63,6 +63,7 @@ class ImageRow(BaseModel):
     lease_expires_at: datetime | None = Field(default=None, repr=False, exclude=True)
     claim_purpose: ClaimPurpose | None = Field(default=None, repr=False, exclude=True)
     observation_checkpoint: dict[str, Any] | None = Field(default=None, repr=False, exclude=True)
+    unmanaged_classification_unsettled: bool = Field(default=False, repr=False, exclude=True)
 
     @field_validator("observation_checkpoint", mode="before")
     @classmethod

@@ -64,6 +64,7 @@
 			(detail.status === 'error' && detail.error instanceof ApiError && detail.error.status === 404)
 	);
 	let data = $derived(detail.data ?? null);
+	let enrichment = $derived(data?.classification_enrichment);
 	const sourceJob = createQuery(
 		() => ({
 			queryKey: queryKeys.image(data?.receipt.image_id ?? ''),
@@ -246,7 +247,7 @@
 		</div>
 
 		{#if reviewMessage}<p class="my-3 text-error" role="alert">{reviewMessage}</p>{/if}
-		{#if data.classification_enrichment?.state === 'unavailable'}
+		{#if enrichment?.state === 'unavailable' || (enrichment?.state === 'skipped' && enrichment.reason_code === 'classification_budget_exhausted' && enrichment.missing_fields.length > 0)}
 			<p class="my-3 text-sm text-on-surface-variant">{$t('receipt.optionalLabelsUnavailable')}</p>
 		{/if}
 		{#if reviewMessage || needsReload}<button

@@ -132,11 +132,14 @@ async def db(postgres):
 
 
 @pytest.fixture
-async def workflow_db(db):
+async def workflow_db(db, settings):
     migrate(db)
     module = importlib.import_module("vision_bill.provider.db.workflow_db")
     from vision_bill.service.image_service import ImageService
-    provider = module.WorkflowDB(db, original_checker=ImageService.check_originals)
+    images = ImageService(settings.images)
+    provider = module.WorkflowDB(
+        db, original_checker=images.check_originals, working_view_checker=images.read_working_image,
+    )
     await provider.init_db()
     owner = uuid4()
     async with provider.pool.acquire() as conn:

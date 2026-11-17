@@ -45,7 +45,16 @@ class NoInference:
 
 
 async def produce_checkpoint(
-    w, scope, settings, tmp_path, *, ocr=False, expired=False, managed=None
+    w,
+    scope,
+    settings,
+    tmp_path,
+    *,
+    ocr=False,
+    expired=False,
+    managed=None,
+    terminal=False,
+    active=False,
 ):
     images = ImageService(settings.images)
     if managed is None:
@@ -107,9 +116,13 @@ async def produce_checkpoint(
     if expired:
         await expire(w, image.id)
         assert await w.reap_expired_claims() == 1
-    else:
+    elif not active:
         lost = await w.finish_attempt(
-            claim, workflow.AttemptOutcome(kind="retry", result_code="timed_out")
+            claim,
+            workflow.AttemptOutcome(
+                kind="terminal" if terminal else "retry",
+                result_code="source_integrity_failed" if terminal else "timed_out",
+            ),
         )
         assert lost.submission.observations_available
     return claim, checkpoint, service, llm
@@ -399,3 +412,202 @@ async def test_managed_checkpoint_waits_for_safe_owned_recovery(
     assert [result.status for result in results] == ["analyzed"]
     assert events == ["residency", "residency", "claim_park", ("unload", "test"), "residency"]
     assert not handoff.read_journal().models
+
+
+async def test_terminal_producer_can_complete_after_exact_original_restoration(
+    workflow_db, settings, tmp_path
+):
+    w, scope = workflow_db
+    original, checkpoint, service, llm = await produce_checkpoint(
+        w, scope, settings, tmp_path, terminal=True
+    )
+    image_id = original.image.id
+    path = Path(checkpoint.source_parts[1].image_path)
+    previous = path.read_bytes()
+    path.write_bytes(b"changed original")
+    scheduler = AnalysisScheduler(settings, llm, service.receipts, None, submission_service=service)
+    first = await scheduler.process_pending(scope=scope)
+    assert [item.status for item in first] == ["pending"]
+    held = await w.get_submission(image_id, scope=scope)
+    assert held.wait_reason == "source_integrity_failed" and held.attempt_count == 3
+    producer, count, _ = await state(w, image_id)
+    assert producer["outcome_kind"] == "terminal" and count == 0
+    path.write_bytes(previous)
+    completed = await scheduler.process_pending(scope=scope)
+    assert [item.status for item in completed] == ["analyzed"]
+    final = await w.get_submission(image_id, scope=scope)
+    assert final.generation == 1 and final.attempt_count == 3 and llm.calls == []
+    after, count, _ = await state(w, image_id)
+    assert after == producer and count == 1
+
+
+async def test_working_view_corrupted_during_managed_release_blocks_publication(
+    workflow_db, settings, tmp_path, monkeypatch
+):
+    from vision_bill.service import gpu_handoff
+
+    class ManagedLlm(ResidentLlm):
+        inference_identity = ENDPOINT
+        handoff = None
+
+        async def release_model(self, model):
+            await super().release_model(model)
+            self.resident -= {model}
+            path.write_bytes(b"working image changed during release")
+
+    class ParkOnlyOcr(Ocr):
+        managed_lifecycle = True
+
+    monkeypatch.setattr(gpu_handoff, "managed_ocr_enabled", lambda: True)
+    monkeypatch.setattr("vision_bill.service.submission_service.managed_ocr_enabled", lambda: True)
+    w, scope = workflow_db
+    events = []
+    llm = ManagedLlm(events)
+    original, checkpoint, service, _ = await produce_checkpoint(
+        w,
+        scope,
+        settings,
+        tmp_path,
+        ocr=True,
+        managed=(llm, ParkOnlyOcr(events)),
+    )
+    path = Path(checkpoint.persisted_views[1].artifact_path)
+    image_id = original.image.id
+    handoff = service.receipts.execution_handoff(settings.ocr)
+    abandoned = HandoffOwner(handoff, monotonic() + 10)
+    abandoned.models = ["test"]
+    abandoned.save()
+    llm.resident = frozenset({"test"})
+    scheduler = AnalysisScheduler(settings, llm, service.receipts, None, submission_service=service)
+    results = await scheduler.process_pending(scope=scope)
+    assert [item.status for item in results] == ["pending"]
+    assert ("unload", "test") in events
+    held = await w.get_submission(image_id, scope=scope)
+    assert held.wait_reason == "observation_checkpoint_invalid" and held.attempt_count == 3
+    _, count, history = await state(w, image_id)
+    assert count == 0 and all(event["event"] != "checkpoint_completed" for event in history)
+
+
+async def test_unmanaged_classification_requires_matching_operator_settlement(
+    workflow_db, settings, tmp_path
+):
+    w, scope = workflow_db
+    claim, checkpoint, service, llm = await produce_checkpoint(
+        w, scope, settings, tmp_path, active=True
+    )
+    image_id, checkpoint_id = claim.image.id, checkpoint.checkpoint_id
+    assert not await w.record_unmanaged_classification_event(claim, checkpoint_id, state="settled")
+    assert not await w.record_unmanaged_classification_event(claim, uuid4(), state="started")
+    assert await w.record_unmanaged_classification_event(claim, checkpoint_id, state="started")
+    assert await w.record_unmanaged_classification_event(claim, checkpoint_id, state="started")
+    assert not await w.reconcile_unmanaged_classification(
+        image_id,
+        checkpoint_id,
+        expected_generation=1,
+        inference_identity=ENDPOINT,
+        request_settled=True,
+    )
+    failure = await w.finish_attempt(
+        claim, workflow.AttemptOutcome(kind="retry", result_code="timed_out")
+    )
+    assert failure.submission.observations_available
+    scheduler = AnalysisScheduler(settings, llm, service.receipts, None, submission_service=service)
+    assert await scheduler.process_pending(scope=scope) == []
+    held = await w.get_submission(image_id, scope=scope)
+    assert held.wait_reason == "model_request_unsettled" and held.attempt_count == 3
+    assert await w.claim_next(image_id=image_id, purpose="completion") is None
+    status = await w.unmanaged_classification_status(image_id, inference_identity=ENDPOINT)
+    assert status == {
+        "state": "recovery_required",
+        "image_id": str(image_id),
+        "generation": 1,
+        "checkpoint_id": str(checkpoint_id),
+    }
+    for target, generation, endpoint, attested in (
+        (uuid4(), 1, ENDPOINT, True),
+        (checkpoint_id, 2, ENDPOINT, True),
+        (checkpoint_id, 1, "ollama:" + "e" * 64, True),
+        (checkpoint_id, 1, ENDPOINT, False),
+    ):
+        assert not await w.reconcile_unmanaged_classification(
+            image_id,
+            target,
+            expected_generation=generation,
+            inference_identity=endpoint,
+            request_settled=attested,
+        )
+    assert await w.reconcile_unmanaged_classification(
+        image_id,
+        checkpoint_id,
+        expected_generation=1,
+        inference_identity=ENDPOINT,
+        request_settled=True,
+    )
+    assert await w.reconcile_unmanaged_classification(
+        image_id,
+        checkpoint_id,
+        expected_generation=1,
+        inference_identity=ENDPOINT,
+        request_settled=True,
+    )
+    assert [item.status for item in await scheduler.process_pending(scope=scope)] == ["analyzed"]
+    producer, count, history = await state(w, image_id)
+    assert producer["result_code"] == "timed_out" and count == 1
+    assert sum(event["event"] == "unmanaged_classification_started" for event in history) == 1
+    assert sum(event.get("settlement") == "operator_attested" for event in history) == 1
+    assert llm.calls == []
+
+
+async def test_unmanaged_pending_marker_fences_normal_publication_and_explicit_retry(
+    workflow_db, settings, tmp_path
+):
+    from vision_bill.model.extraction import InferenceEnvelope
+    from vision_bill.model.review import OriginalAvailability
+    from vision_bill.service.receipt_review import evaluate_receipt
+
+    w, scope = workflow_db
+    claim, checkpoint, _, _ = await produce_checkpoint(w, scope, settings, tmp_path, active=True)
+    assert await w.record_unmanaged_classification_event(
+        claim, checkpoint.checkpoint_id, state="started"
+    )
+    envelope = InferenceEnvelope.model_validate(
+        checkpoint.recovered_envelope().model_dump(exclude={"ocr_pages"})
+    )
+    originals = [
+        OriginalAvailability(
+            part_id=part.part_id, photo_index=part.photo_index, available=True, sha256_matches=True
+        )
+        for part in checkpoint.source_parts
+    ]
+    review = evaluate_receipt(
+        envelope.receipt,
+        envelope.amount_policy,
+        envelope.field_sources,
+        envelope.overlap_decisions,
+        originals,
+    )
+    complete = workflow.AttemptOutcome(
+        kind="complete",
+        envelope=envelope,
+        review=review,
+        persisted_views=checkpoint.persisted_views,
+    )
+    result = await w.finish_attempt(claim, complete)
+    assert result.stale
+    async with w.pool.acquire() as conn:
+        assert (
+            await conn.fetchval("SELECT count(*) FROM receipts WHERE image_id=$1", claim.image.id)
+            == 0
+        )
+    assert await w.finish_attempt(
+        claim, workflow.AttemptOutcome(kind="retry", result_code="timed_out")
+    )
+    with pytest.raises(ValueError, match="model_request_unsettled"):
+        await w.retry_submission(
+            claim.image.id,
+            workflow.RetryRequest(
+                expected_generation=1, request_key="no-generation-bypass", policy="current"
+            ),
+            scope=scope,
+            replacement_snapshot=claim.image.effective_options,
+        )

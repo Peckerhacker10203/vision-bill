@@ -84,7 +84,11 @@ class ReceiptService:
         self._db = ReceiptDB(pg_settings, original_checker=self._image_service.check_originals)
         self._image_db = ImageDB(pg_settings)
         self._user_db = UserDB(pg_settings)
-        self._workflow_db = WorkflowDB(pg_settings, worker_settings=worker_settings, original_checker=self._image_service.check_originals)
+        self._workflow_db = WorkflowDB(
+            pg_settings, worker_settings=worker_settings,
+            original_checker=self._image_service.check_originals,
+            working_view_checker=self._image_service.read_working_image,
+        )
         self._collection_db: CollectionDB | None = None
 
     # ── Database delegation ──────────────────────────────────────────

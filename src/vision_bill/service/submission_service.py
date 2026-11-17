@@ -154,6 +154,9 @@ class SubmissionService:
 
     async def ready_for_completion(self, image: ImageRow) -> bool:
         """Check frozen policy and owned-resource recovery without model discovery."""
+        if image.unmanaged_classification_unsettled:
+            await self.db.set_wait_reason(image, "model_request_unsettled")
+            return False
         try:
             checkpoint = ObservationCheckpoint.model_validate(image.observation_checkpoint)
             handoff = self._completion_handoff(image, checkpoint)
@@ -292,14 +295,6 @@ class SubmissionService:
                         claim, checkpoint_id, deadline=db_deadline,
                     )
                 handoff = self._completion_handoff(claim.image, checkpoint)
-                for view in checkpoint.persisted_views:
-                    try:
-                        await run_sync_before(
-                            deadline, self.images.read_working_image,
-                            claim.image.id, view.artifact_path, view.metadata,
-                        )
-                    except OSError as exc:
-                        raise ValueError("checkpoint working artifact unavailable") from exc
                 envelope = checkpoint.recovered_envelope()
                 originals = [OriginalAvailability(
                     part_id=part.part_id, photo_index=part.photo_index,

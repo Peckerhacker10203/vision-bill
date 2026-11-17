@@ -384,20 +384,26 @@ it('does not attach a late created collection to the next receipt', async () => 
 	]);
 });
 
-it('shows unavailable optional labels on a recovered receipt without blocking review', async () => {
-	vi.mocked(api.getReceipt).mockResolvedValue({
-		...detail(),
-		classification_enrichment: {
-			state: 'unavailable',
-			reason_code: 'recovered_without_classification',
-			missing_fields: ['category']
-		}
-	});
-	render(Page);
-	await screen.findByText(/some optional labels are unavailable/i);
-	await waitFor(() =>
-		expect((screen.getByRole('button', { name: 'Verify' }) as HTMLButtonElement).disabled).toBe(
-			false
-		)
-	);
-});
+it.each([
+	['unavailable', 'recovered_without_classification'],
+	['skipped', 'classification_budget_exhausted']
+] as const)(
+	'shows missing optional labels for %s / %s without blocking review',
+	async (state, reason_code) => {
+		vi.mocked(api.getReceipt).mockResolvedValue({
+			...detail(),
+			classification_enrichment: {
+				state,
+				reason_code,
+				missing_fields: ['category']
+			}
+		});
+		render(Page);
+		await screen.findByText(/some optional labels are unavailable/i);
+		await waitFor(() =>
+			expect((screen.getByRole('button', { name: 'Verify' }) as HTMLButtonElement).disabled).toBe(
+				false
+			)
+		);
+	}
+);

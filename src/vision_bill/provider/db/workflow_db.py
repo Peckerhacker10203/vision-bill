@@ -1,16 +1,17 @@
 """Durable submissions and fenced, single-connection extraction transactions.
 
 Files are saved by the application before supplying PersistedWorkingView. This
-provider validates their identities and stores metadata only; it never decodes
-or opens images. Optional deadlines use the asyncio loop clock and bound the
+provider stores metadata and delegates completion byte checks to the image service
+under the publication locks. Optional deadlines use the asyncio loop clock and bound the
 whole connection/transaction lifecycle. A failed transaction may leave an unreferenced file for the
 application's artifact cleanup, but never a partially committed receipt.
 """
 
+import asyncio
 import json
 from collections.abc import Callable, Sequence
 from hashlib import sha256
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -50,6 +51,7 @@ from ...model.workflow import (
 )
 from ...service.execution_policy import (
     EXECUTION_POLICY_VERSION,
+    managed_ocr,
     semantic_policy_sha256,
     snapshot_ocr,
 )
@@ -65,6 +67,18 @@ COMPLETION_WAIT_REASONS = HANDOFF_WAIT_REASONS | {
 READINESS_WAIT_REASONS = HANDOFF_WAIT_REASONS | {
     "provider_unavailable", "vision_model_unavailable", "formatter_model_unavailable",
 }
+
+_UNMANAGED_CLASSIFICATION_UNSETTLED = """CASE
+    WHEN observation_checkpoint->>'eligible_generation'=generation::text THEN COALESCE((
+        SELECT entry->>'event' FROM jsonb_array_elements(legacy_events)
+            WITH ORDINALITY AS history(entry, event_number)
+        WHERE entry->>'event' IN ('unmanaged_classification_started','unmanaged_classification_settled')
+            AND entry->>'checkpoint_id'=observation_checkpoint->>'checkpoint_id'
+            AND entry->>'producer_generation'=generation::text
+            AND entry->>'producer_attempt_number'=attempt_count::text
+            AND entry->>'inference_identity'=observation_checkpoint#>>'{execution_identity,inference_identity}'
+        ORDER BY event_number DESC LIMIT 1
+    )='unmanaged_classification_started', FALSE) ELSE FALSE END"""
 
 
 def _json(value: Any) -> str:
@@ -97,6 +111,46 @@ def _observation_history(checkpoint: dict[str, Any], event: str) -> dict[str, An
         "producer_generation": checkpoint["producer_generation"],
         "producer_attempt_number": checkpoint["producer_attempt_number"],
     }
+
+
+def _unmanaged_classification_start(row: Any) -> dict[str, Any] | None:
+    checkpoint = _eligible_observations(row)
+    if checkpoint is None:
+        return None
+    try:
+        if (
+            checkpoint["producer_generation"] != row["generation"]
+            or checkpoint["producer_attempt_number"] != row["attempt_count"]
+            or checkpoint["envelope"]["classification_enrichment"]["state"] != "pending"
+        ):
+            return None
+        return _observation_history(checkpoint, "unmanaged_classification_started") | {
+            "inference_identity": checkpoint["execution_identity"]["inference_identity"],
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _is_unmanaged_checkpoint_policy(row: Any) -> bool:
+    try:
+        snapshot = _decoded(row["effective_options"])
+        identity = _decoded(row["observation_checkpoint"])["execution_identity"]
+        return not managed_ocr(snapshot_ocr(snapshot)) and (
+            semantic_policy_sha256(snapshot) == identity["semantic_policy_sha256"]
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _has_classification_event(row: Any, event: dict[str, Any]) -> bool:
+    return any(event.items() <= item.items() for item in _decoded(row["legacy_events"]))
+
+
+def _classification_settlement_required(row: Any) -> bool:
+    started = _unmanaged_classification_start(row)
+    return started is not None and _has_classification_event(row, started) and not (
+        _has_classification_event(row, started | {"event": "unmanaged_classification_settled"})
+    )
 
 
 class _ExpiredClaim(Exception):
@@ -132,11 +186,16 @@ def _nested_view_ids(value: Any) -> list[UUID]:
 
 
 class WorkflowDB:
-    def __init__(self, settings: PGSettings, *, worker_settings: WorkerSettings | None = None, original_checker: OriginalChecker | None = None):
+    def __init__(
+        self, settings: PGSettings, *, worker_settings: WorkerSettings | None = None,
+        original_checker: OriginalChecker | None = None,
+        working_view_checker: Callable[[UUID, str, WorkingImageMetadata], bytes] | None = None,
+    ):
         self._settings = settings
         self._worker = worker_settings or WorkerSettings()
         self._pool: asyncpg.Pool | None = None
         self._receipts = ReceiptDB(settings, original_checker=original_checker)
+        self._working_view_checker = working_view_checker
 
     @property
     def pool(self) -> asyncpg.Pool:
@@ -346,8 +405,9 @@ class WorkflowDB:
         """Release expired leases. Only inference creates abandonment history."""
         async with connection(self.pool, deadline=deadline, transaction=True) as conn:
             rows = await conn.fetch(
-                """SELECT id,generation,attempt_count,max_attempts,claim_purpose,
-                observation_checkpoint,wait_reason FROM images
+                f"""SELECT id,generation,attempt_count,max_attempts,claim_purpose,
+                observation_checkpoint,wait_reason,
+                {_UNMANAGED_CLASSIFICATION_UNSETTLED} AS unmanaged_classification_unsettled FROM images
                 WHERE status='processing' AND lease_expires_at<=clock_timestamp() AND receipt_id IS NULL
                 AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id)
                 ORDER BY id FOR UPDATE SKIP LOCKED"""
@@ -361,7 +421,9 @@ class WorkflowDB:
                 result_code = None if completion else "attempt_limit" if exhausted else "lease_expired"
                 delay = None if recovering or exhausted else self._worker.retry_delay(row["attempt_count"])
                 reason = row["wait_reason"]
-                if recovering and reason != "execution_policy_changed":
+                if row["unmanaged_classification_unsettled"]:
+                    reason = "model_request_unsettled"
+                elif recovering and reason != "execution_policy_changed":
                     reason = OBSERVATION_RECOVERY_WAIT
                 history = []
                 if checkpoint is not None and not completion:
@@ -396,11 +458,13 @@ class WorkflowDB:
         async with self.pool.acquire() as conn, conn.transaction():
             while True:
                 row = await conn.fetchrow(
-                    """SELECT * FROM images WHERE ($1::uuid IS NULL OR id=$1) AND receipt_id IS NULL AND
+                    f"""SELECT * FROM images WHERE ($1::uuid IS NULL OR id=$1) AND receipt_id IS NULL AND
                     NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id) AND
-                    status='pending' AND (retry_at IS NULL OR retry_at<=clock_timestamp())
+                    (status='pending' OR ($3='completion' AND status IN ('failed','timed_out','unreadable')))
+                    AND (retry_at IS NULL OR retry_at<=clock_timestamp())
                     AND CASE WHEN $3='completion'
                         THEN observation_checkpoint->>'eligible_generation'=generation::text
+                            AND NOT ({_UNMANAGED_CLASSIFICATION_UNSETTLED})
                         ELSE observation_checkpoint->>'eligible_generation' IS DISTINCT FROM generation::text
                             AND wait_reason IS DISTINCT FROM $2 END
                     ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1""",
@@ -796,14 +860,18 @@ class WorkflowDB:
             raise ValueError("invalid_wait_reason")
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                """UPDATE images SET wait_reason=$4 WHERE id=$1 AND generation=$2 AND status=$3
+                f"""UPDATE images SET wait_reason=$4,
+                status=CASE WHEN $7 AND status IN ('failed','timed_out','unreadable') THEN 'pending' ELSE status END
+                WHERE id=$1 AND generation=$2 AND status=$3
                 AND claim_token IS NOT DISTINCT FROM $5::uuid AND receipt_id IS NULL
                 AND claim_purpose IS NOT DISTINCT FROM $6
                 AND (observation_checkpoint->>'eligible_generation' IS NOT DISTINCT FROM generation::text)=$7
-                AND (status='pending' OR (status='processing' AND lease_expires_at>clock_timestamp()))
+                AND (NOT $7 OR ({_UNMANAGED_CLASSIFICATION_UNSETTLED})=$8)
+                AND (status='pending' OR (status='processing' AND lease_expires_at>clock_timestamp())
+                    OR ($7 AND status IN ('failed','timed_out','unreadable')))
                 AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id) RETURNING id""",
                 image.id, image.generation, image.status, reason, image.claim_token, image.claim_purpose,
-                image.observations_available,
+                image.observations_available, image.unmanaged_classification_unsettled,
             )
         return row is not None
 
@@ -903,9 +971,13 @@ class WorkflowDB:
 
     async def due_candidates(self, *, purpose: ClaimPurpose | None = "inference") -> list[ImageRow]:
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch("""SELECT * FROM images WHERE receipt_id IS NULL AND
+            rows = await conn.fetch(f"""SELECT *,
+                {_UNMANAGED_CLASSIFICATION_UNSETTLED} AS unmanaged_classification_unsettled
+                FROM images WHERE receipt_id IS NULL AND
                 NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id) AND
-                status='pending' AND (retry_at IS NULL OR retry_at<=clock_timestamp())
+                (status='pending' OR (status IN ('failed','timed_out','unreadable')
+                    AND observation_checkpoint->>'eligible_generation'=generation::text))
+                AND (retry_at IS NULL OR retry_at<=clock_timestamp())
                 AND CASE WHEN observation_checkpoint->>'eligible_generation'=generation::text
                     THEN $2::text IS DISTINCT FROM 'inference'
                     ELSE $2::text IS DISTINCT FROM 'completion' AND wait_reason IS DISTINCT FROM $1 END
@@ -925,15 +997,14 @@ class WorkflowDB:
             delay = await conn.fetchval(
                 """WITH wake_clock AS (SELECT clock_timestamp() AS sampled_at)
                 SELECT min(EXTRACT(EPOCH FROM CASE
-                    WHEN status='pending' THEN COALESCE(retry_at,sampled_at)
+                    WHEN status<>'processing' THEN COALESCE(retry_at,sampled_at)
                     WHEN lease_expires_at<=sampled_at THEN sampled_at+interval '1 second'
                     ELSE lease_expires_at END-sampled_at))
                 FROM images CROSS JOIN wake_clock
                 WHERE receipt_id IS NULL
-                AND (status='processing' OR (
-                    status='pending' AND (wait_reason IS DISTINCT FROM $2
-                        OR observation_checkpoint->>'eligible_generation'=generation::text)
-                ))
+                AND (status='processing' OR (status='pending' AND wait_reason IS DISTINCT FROM $2)
+                    OR (status IN ('pending','failed','timed_out','unreadable')
+                        AND observation_checkpoint->>'eligible_generation'=generation::text))
                 AND id<>ALL($1::uuid[])
                 AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id)""",
                 list(deferred_image_ids), OBSERVATION_RECOVERY_WAIT,
@@ -1017,6 +1088,102 @@ class WorkflowDB:
         async with connection(self.pool, deadline=deadline, transaction=True) as conn:
             return await self._checkpoint_completion_replay(conn, claim, checkpoint_id)
 
+    async def record_unmanaged_classification_event(
+        self, claim: AnalysisClaim, checkpoint_id: UUID, *,
+        state: Literal["started", "settled"], deadline: float | None = None,
+    ) -> bool:
+        """Record that the optional request may start or that its provider returned."""
+        if claim.purpose != "inference" or state not in ("started", "settled"):
+            return False
+        async with connection(self.pool, deadline=deadline, transaction=True) as conn:
+            row = await self._lock_claim(conn, claim)
+            if row is None or row["receipt_id"] is not None:
+                return False
+            started = _unmanaged_classification_start(row)
+            if (
+                started is None or started["checkpoint_id"] != str(checkpoint_id)
+                or not _is_unmanaged_checkpoint_policy(row)
+            ):
+                return False
+            settled = started | {"event": "unmanaged_classification_settled"}
+            already_started = _has_classification_event(row, started)
+            already_settled = _has_classification_event(row, settled)
+            if state == "settled":
+                if not already_started:
+                    return False
+                if already_settled:
+                    return True
+                event = settled | {"settlement": "provider_returned"}
+            else:
+                if already_settled:
+                    return False
+                if already_started:
+                    return True
+                event = started
+            updated = await conn.fetchval(
+                """UPDATE images SET legacy_events=legacy_events || $2::jsonb WHERE id=$1
+                AND lease_expires_at>clock_timestamp() AND receipt_id IS NULL
+                AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id) RETURNING id""",
+                row["id"], _json([event]),
+            )
+            return updated is not None
+
+    async def unmanaged_classification_status(
+        self, image_id: UUID, *, inference_identity: str, deadline: float | None = None,
+    ) -> dict[str, str | int] | None:
+        """Return only the identifiers needed by an operator to reconcile one request."""
+        async with connection(self.pool, deadline=deadline) as conn:
+            row = await conn.fetchrow(
+                "SELECT *, lease_expires_at>clock_timestamp() AS claim_live FROM images WHERE id=$1",
+                image_id,
+            )
+        if row is None:
+            return None
+        event = _unmanaged_classification_start(row)
+        if event is None or event["inference_identity"] != inference_identity:
+            return None
+        state = "not_required"
+        if _classification_settlement_required(row):
+            state = "busy" if row["claim_live"] else "recovery_required"
+        return {
+            "state": state, "image_id": str(image_id), "generation": row["generation"],
+            "checkpoint_id": event["checkpoint_id"],
+        }
+
+    async def reconcile_unmanaged_classification(
+        self, image_id: UUID, checkpoint_id: UUID, *, expected_generation: int,
+        inference_identity: str, request_settled: bool, deadline: float | None = None,
+    ) -> bool:
+        """Accept explicit operator confirmation for one exact, inactive checkpoint."""
+        if request_settled is not True:
+            return False
+        async with connection(self.pool, deadline=deadline, transaction=True) as conn:
+            row = await conn.fetchrow(
+                """SELECT * FROM images WHERE id=$1 AND generation=$2 AND claim_token IS NULL
+                AND status IN ('pending','failed','timed_out','unreadable') AND receipt_id IS NULL
+                AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id) FOR UPDATE""",
+                image_id, expected_generation,
+            )
+            if row is None:
+                return False
+            event = _unmanaged_classification_start(row)
+            if (
+                event is None or event["checkpoint_id"] != str(checkpoint_id)
+                or event["inference_identity"] != inference_identity
+                or not _is_unmanaged_checkpoint_policy(row)
+                or not _has_classification_event(row, event)
+            ):
+                return False
+            settled = event | {"event": "unmanaged_classification_settled"}
+            if not _has_classification_event(row, settled):
+                await conn.execute(
+                    """UPDATE images SET status='pending',wait_reason=$2,retry_at=NULL,
+                    legacy_events=legacy_events || $3::jsonb WHERE id=$1""",
+                    image_id, OBSERVATION_RECOVERY_WAIT,
+                    _json([settled | {"settlement": "operator_attested"}]),
+                )
+            return True
+
     async def defer_checkpoint_completion(
         self, claim: AnalysisClaim, checkpoint_id: UUID, reason: str,
         *, deadline: float | None = None,
@@ -1050,6 +1217,8 @@ class WorkflowDB:
                 row = await self._lock_claim(conn, claim)
                 if row is None:
                     return await self._checkpoint_completion_replay(conn, claim, checkpoint_id)
+                if _classification_settlement_required(row):
+                    return CommitResult(stale=True)
                 return await self._seal_checkpoint_completion(conn, row, claim, checkpoint_id, outcome)
         except _ExpiredClaim:
             return CommitResult(stale=True)
@@ -1070,6 +1239,8 @@ class WorkflowDB:
             or envelope != checkpoint.recovered_envelope()
         ):
             raise ValueError("checkpoint completion differs from saved observations")
+        if self._working_view_checker is None:
+            raise ValueError("checkpoint working artifact checker required")
         for view in checkpoint.persisted_views:
             saved = await conn.fetchrow(
                 "SELECT * FROM extraction_working_views WHERE view_id=$1 FOR SHARE", view.metadata.view_id,
@@ -1080,6 +1251,12 @@ class WorkflowDB:
                 or _decoded(saved["metadata"]) != view.metadata.model_dump(mode="json")
             ):
                 raise ValueError("checkpoint working artifact mismatch")
+            try:
+                await asyncio.to_thread(
+                    self._working_view_checker, row["id"], view.artifact_path, view.metadata,
+                )
+            except OSError as exc:
+                raise ValueError("checkpoint working artifact unavailable") from exc
         await self._validate_metadata_refs(
             conn, row["id"], parts,
             {"envelope": envelope.model_dump(mode="json"), "review": outcome.review.model_dump(mode="json")},
@@ -1195,6 +1372,10 @@ class WorkflowDB:
             row = await self._lock_claim(conn, claim)
             if row is None:
                 return CommitResult(stale=True)
+            failed = outcome.kind in {"retry", "terminal"}
+            settlement_required = _classification_settlement_required(row)
+            if settlement_required and not failed:
+                return CommitResult(stale=True)
             await self._lock_unedited_submission(conn, row)
             parts = await self._parts(conn, row["id"])
             views = await self._save_views(conn, row["id"], parts, outcome.persisted_views)
@@ -1225,7 +1406,6 @@ class WorkflowDB:
                 {"envelope": payload, "review": review_payload, "saved_views": saved_views},
             )
             checkpoint = _eligible_observations(row)
-            failed = outcome.kind in {"retry", "terminal"}
             history = []
             if checkpoint is not None and failed:
                 history.append(_observation_history(checkpoint, "observation_checkpoint_attempt_failed"))
@@ -1293,9 +1473,11 @@ class WorkflowDB:
                     _json(payload["overlap_decisions"]),
                 )
                 status = "needs_review"
-            elif outcome.kind == "retry" and checkpoint is not None:
+            elif failed and checkpoint is not None:
                 status = "pending"
-                if wait_reason != "execution_policy_changed":
+                if settlement_required:
+                    wait_reason = "model_request_unsettled"
+                elif wait_reason != "execution_policy_changed":
                     wait_reason = OBSERVATION_RECOVERY_WAIT
             elif outcome.kind == "retry" and row["attempt_count"] < row["max_attempts"]:
                 status = "pending"
@@ -1368,6 +1550,8 @@ class WorkflowDB:
                 return SubmissionStatus.model_validate(_decoded(old["result"]))
             if row["generation"] != request.expected_generation:
                 raise ValueError("retry generation conflict")
+            if _classification_settlement_required(row):
+                raise ValueError("model_request_unsettled")
             if row["receipt_id"] is not None or await conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM receipts WHERE image_id=$1)", image_id
             ):
