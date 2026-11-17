@@ -13,13 +13,22 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def initialize(tmp_path, *extra):
+def initialize(tmp_path, *extra, runtime_environment=None):
     env = {
         key: value
         for key, value in os.environ.items()
         if not key.startswith(("AUTH__", "LLM__", "PG__", "VISION_BILL_CONFIG"))
     }
     env["PYTHONPATH"] = str(ROOT / "src")
+    env.update(
+        {
+            "LLM__PROVIDER": "ollama",
+            "LLM__HOST": "http://external:11434",
+            "LLM__MODEL_NAME": "operator-model",
+        }
+        if runtime_environment is None
+        else runtime_environment
+    )
     return subprocess.run(
         [
             sys.executable,
@@ -55,7 +64,9 @@ def test_new_install_is_private_stable_and_settings_import_free(tmp_path):
     assert config["auth"]["bootstrap_password"] == admin["password"]
     assert config["pg"]["password"] == pg_password
     assert config["pg"]["user"] == "vision_bill"
-    assert config["llm"]["model_name"] == "llama3.2-vision:11b"
+    assert config["llm"]["model_name"] == "operator-model"
+    assert config["llm"]["host"] == "http://external:11434"
+    assert "distribution" not in config
     before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
     assert initialize(tmp_path).returncode == 0
     assert {p: p.read_bytes() for p in before} == before
@@ -110,7 +121,11 @@ def test_existing_legacy_yaml_preserves_credentials_without_inventing_admin(tmp_
 
 @pytest.mark.parametrize("kind,api_key", [("openai", "none"), ("ollama", "")])
 async def test_fresh_generated_llm_settings_construct_real_provider_without_http(
-    tmp_path, settings, monkeypatch, kind, api_key,
+    tmp_path,
+    settings,
+    monkeypatch,
+    kind,
+    api_key,
 ):
     from vision_bill import config
     from vision_bill.config import LLMSettings
@@ -118,7 +133,14 @@ async def test_fresh_generated_llm_settings_construct_real_provider_without_http
     from vision_bill.provider.llm.ollama import OllamaProvider
     from vision_bill.provider.llm.openai import OpenAIProvider
 
-    result = initialize(tmp_path, "--provider", kind, "--llm-host", "http://local/v1")
+    result = initialize(
+        tmp_path,
+        runtime_environment={
+            "LLM__PROVIDER": kind,
+            "LLM__HOST": "http://local/v1",
+            "LLM__MODEL_NAME": "operator-model",
+        },
+    )
     assert result.returncode == 0, result.stderr
     generated = yaml.safe_load((tmp_path / "config/config.yaml").read_text())
     llm_settings = LLMSettings.model_validate(generated["llm"])
@@ -229,3 +251,99 @@ def test_concurrent_initializers_share_one_stable_installation(tmp_path):
         results = list(pool.map(lambda _: initialize(tmp_path), range(4)))
     assert all(result.returncode == 0 for result in results)
     assert initialize(tmp_path).returncode == 0
+
+
+def test_restored_config_needs_no_llm_seeds(tmp_path):
+    assert initialize(tmp_path).returncode == 0
+    config_file = tmp_path / "config/config.yaml"
+    data = yaml.safe_load(config_file.read_text())
+    data["llm"]["host"] = "http://ollama:11434"
+    data["llm"]["model_name"] = "previously-selected-model"
+    data["distribution"] = {"expected_model_digest": "retained-legacy-metadata"}
+    config_file.write_text(yaml.safe_dump(data))
+    original_secrets = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+    assert initialize(tmp_path, runtime_environment={}).returncode == 0
+    assert {p: p.read_bytes() for p in original_secrets} == original_secrets
+
+
+@pytest.mark.parametrize("missing", ["LLM__PROVIDER", "LLM__HOST", "LLM__MODEL_NAME"])
+def test_missing_fresh_model_does_not_publish_secrets(tmp_path, missing):
+    environment = {
+        "LLM__PROVIDER": "ollama",
+        "LLM__HOST": "http://external:11434",
+        "LLM__MODEL_NAME": "chosen",
+    }
+    del environment[missing]
+    result = initialize(tmp_path, runtime_environment=environment)
+    assert result.returncode != 0
+    assert not (tmp_path / "config/config.yaml").exists()
+    assert not (tmp_path / "config/initial-admin.yaml").exists()
+    assert not (tmp_path / "pg-secret/password").exists()
+    assert missing in result.stderr
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"LLM__PROVIDER": "anthropic"},
+        {"LLM__API_KEY": "", "LLM__PROVIDER": "openai"},
+        {"LLM__TEMPERATURE": "nan"},
+        {"LLM__TEMPERATURE": "3"},
+        {"LLM__HOST": " "},
+    ],
+)
+def test_invalid_fresh_inputs_do_not_publish_secrets(tmp_path, change):
+    environment = {
+        "LLM__PROVIDER": "ollama",
+        "LLM__HOST": "http://external:11434",
+        "LLM__MODEL_NAME": "chosen",
+        **change,
+    }
+    result = initialize(tmp_path, runtime_environment=environment)
+    assert result.returncode != 0
+    assert not (tmp_path / "config/config.yaml").exists()
+    assert not (tmp_path / "pg-secret/password").exists()
+
+
+def test_literal_runtime_key_round_trip(tmp_path):
+    key = "literal '$HOME #key: \\ value\nnext line"
+    result = initialize(
+        tmp_path,
+        runtime_environment={
+            "LLM__PROVIDER": "openai",
+            "LLM__HOST": "http://external/v1",
+            "LLM__MODEL_NAME": "chosen",
+            "LLM__API_KEY": key,
+            "LLM__TEMPERATURE": "0.25",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    data = yaml.safe_load((tmp_path / "config/config.yaml").read_text())
+    assert data["llm"]["api_key"] == key
+    assert data["llm"]["temperature"] == 0.25
+    assert key not in result.stdout + result.stderr
+
+
+def test_explicit_runtime_mapping_does_not_inherit_process_seeds(tmp_path, monkeypatch):
+    from vision_bill.distribution.bootstrap import BootstrapError
+    from vision_bill.distribution.bootstrap import initialize as bootstrap
+
+    monkeypatch.setenv("LLM__PROVIDER", "openai")
+    monkeypatch.setenv("LLM__HOST", "http://ignored.example/v1")
+    monkeypatch.setenv("LLM__MODEL_NAME", "ignored-model")
+    with pytest.raises(BootstrapError, match="LLM__PROVIDER"):
+        bootstrap(tmp_path / "config", tmp_path / "pg/password", runtime_environment={})
+    assert not (tmp_path / "config/config.yaml").exists()
+
+
+def test_unsupported_restored_provider_has_actionable_diagnostic(tmp_path):
+    assert initialize(tmp_path).returncode == 0
+    path = tmp_path / "config/config.yaml"
+    data = yaml.safe_load(path.read_text())
+    data["llm"]["provider"] = "anthropic"
+    path.write_text(yaml.safe_dump(data))
+    before = path.read_bytes()
+    result = initialize(tmp_path, runtime_environment={})
+    assert result.returncode != 0
+    assert "ollama or openai" in result.stderr
+    assert path.read_bytes() == before

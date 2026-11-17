@@ -121,8 +121,7 @@
 							bind:value={form.llm.provider}
 							disabled={isLocked('llm.provider')}
 						>
-							<option value="ollama">Ollama</option><option value="anthropic">Anthropic</option
-							><option value="openai">OpenAI</option>
+							<option value="ollama">Ollama</option><option value="openai">OpenAI</option>
 						</select>
 					</label>
 					<label class="block text-sm">

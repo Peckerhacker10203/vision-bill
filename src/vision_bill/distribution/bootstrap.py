@@ -4,18 +4,19 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import math
 import os
 import re
 import secrets
 import stat
 import sys
 import tempfile
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import yaml
-
-DEFAULT_MODEL = "llama3.2-vision:11b"
 
 
 class BootstrapError(ValueError):
@@ -71,9 +72,36 @@ def write_private(path: Path, content: str, *, replace: bool = False) -> None:
             os.unlink(temporary)
 
 
+@contextmanager
+def config_lock(config_dir: Path) -> Iterator[None]:
+    """Serialize bootstrap and application configuration publication."""
+    private_directory(config_dir)
+    lock_path = config_dir / ".bootstrap.lock"
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(lock_fd, "r+") as lock:
+        private_file(lock_path)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+class _UniqueKeyLoader(yaml.SafeLoader):
+    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:
+        self.flatten_mapping(node)
+        result: dict[Any, Any] = {}
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in result:
+                raise BootstrapError("Persistent YAML has conflicting duplicate keys")
+            result[key] = self.construct_object(value_node, deep=deep)
+        return result
+
+
 def read_mapping(path: Path) -> dict[str, Any]:
     private_file(path)
-    value = yaml.safe_load(path.read_text(encoding="utf-8"))
+    try:
+        value = yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)
+    except (yaml.YAMLError, TypeError) as exc:
+        raise BootstrapError("Persistent YAML is malformed") from exc
     if not isinstance(value, dict):
         raise BootstrapError("Persistent YAML must be a mapping")
     return value
@@ -93,10 +121,10 @@ def read_config(path: Path) -> dict[str, Any]:
         ):
             raise BootstrapError("Persistent configuration is incomplete")
     llm = data["llm"]
-    if (
-        llm.get("provider", "ollama") not in ("ollama", "openai", "anthropic")
-        or not isinstance(llm.get("api_key"), str)
-        or not isinstance(llm.get("temperature"), (int, float))
+    if llm.get("provider", "ollama") not in ("ollama", "openai"):
+        raise BootstrapError("Unsupported LLM provider; select ollama or openai in llm.provider")
+    if not isinstance(llm.get("api_key"), str) or not isinstance(
+        llm.get("temperature"), (int, float)
     ):
         raise BootstrapError("Persistent LLM configuration is invalid")
     auth = data["auth"]
@@ -114,6 +142,33 @@ def digest_value(value: str) -> str:
     return value
 
 
+def _fresh_llm_settings(environment: Mapping[str, str]) -> dict[str, Any]:
+    for name in ("LLM__PROVIDER", "LLM__HOST", "LLM__MODEL_NAME"):
+        if not environment.get(name, "").strip():
+            raise BootstrapError(f"Fresh installation requires an explicit nonblank {name}")
+    provider = environment["LLM__PROVIDER"]
+    if provider not in ("ollama", "openai"):
+        raise BootstrapError("Unsupported LLM__PROVIDER; select ollama or openai")
+    api_key = environment.get("LLM__API_KEY", "none" if provider == "openai" else "")
+    if provider == "openai" and not api_key.strip():
+        raise BootstrapError(
+            "LLM__API_KEY must be nonblank for OpenAI; use none for a credentialless endpoint"
+        )
+    try:
+        temperature = float(environment.get("LLM__TEMPERATURE", "0"))
+    except ValueError as exc:
+        raise BootstrapError("LLM__TEMPERATURE must be a finite number between 0 and 2") from exc
+    if not math.isfinite(temperature) or not 0 <= temperature <= 2:
+        raise BootstrapError("LLM__TEMPERATURE must be a finite number between 0 and 2")
+    return {
+        "provider": provider,
+        "host": environment["LLM__HOST"],
+        "api_key": api_key,
+        "model_name": environment["LLM__MODEL_NAME"],
+        "temperature": temperature,
+    }
+
+
 def initialize(
     config_dir: Path,
     postgres_password_file: Path,
@@ -121,25 +176,15 @@ def initialize(
     pg_user: str = "vision_bill",
     pg_database: str = "vision_bill",
     pg_host: str = "db",
-    provider: str = "ollama",
-    llm_host: str = "http://ollama:11434",
-    model: str = DEFAULT_MODEL,
-    expected_model_digest: str | None = None,
+    runtime_environment: Mapping[str, str] | None = None,
 ) -> None:
-    if expected_model_digest is not None:
-        digest_value(expected_model_digest)
     private_directory(config_dir)
     private_directory(postgres_password_file.parent)
     config_path = config_dir / "config.yaml"
     admin_path = config_dir / "initial-admin.yaml"
     pending = config_dir / ".bootstrap-pending"
     complete = config_dir / ".bootstrap-complete.yaml"
-    # Persistent flock protects independently started initializer containers.
-    lock_path = config_dir / ".bootstrap.lock"
-    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(lock_fd, "r+") as lock:
-        private_file(lock_path)
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with config_lock(config_dir):
         if pending.exists() or pending.is_symlink():
             raise BootstrapError("Interrupted installation requires explicit recovery")
         existing = config_path.exists() or config_path.is_symlink()
@@ -150,16 +195,13 @@ def initialize(
         if existing:
             data = read_config(config_path)
         else:
-            if not all((pg_user, pg_database, pg_host, llm_host, model)):
+            llm = _fresh_llm_settings(
+                os.environ if runtime_environment is None else runtime_environment
+            )
+            if not all((pg_user, pg_database, pg_host)):
                 raise BootstrapError("Installation identities must not be empty")
             data = {
-                "llm": {
-                    "provider": provider,
-                    "host": llm_host,
-                    "api_key": "none" if provider == "openai" else "",
-                    "model_name": model,
-                    "temperature": 0.0,
-                },
+                "llm": llm,
                 "pg": {
                     "user": pg_user,
                     "password": secrets.token_urlsafe(36),
@@ -175,8 +217,6 @@ def initialize(
                     "admin_can_see_all": False,
                 },
             }
-            if expected_model_digest:
-                data["distribution"] = {"expected_model_digest": expected_model_digest}
         auth = data["auth"]
         admin = (
             {"username": auth["bootstrap_username"], "password": auth["bootstrap_password"]}
@@ -219,13 +259,12 @@ def main() -> int:
     parser.add_argument("--pg-user", default="vision_bill")
     parser.add_argument("--pg-database", default="vision_bill")
     parser.add_argument("--pg-host", default="db")
-    parser.add_argument("--provider", choices=("ollama", "openai"), default="ollama")
-    parser.add_argument("--llm-host", default="http://ollama:11434")
-    parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--expected-model-digest")
     args = parser.parse_args()
     try:
         initialize(**vars(args))
+    except BootstrapError as exc:
+        print(f"Installation initialization failed: {exc}", file=sys.stderr)
+        return 1
     except (OSError, ValueError, yaml.YAMLError):
         print(
             "Installation initialization failed: unsafe, conflicting, or incomplete state.",

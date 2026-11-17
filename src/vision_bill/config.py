@@ -8,7 +8,16 @@ from typing import Annotated, Any, Literal, Self
 from urllib.parse import quote, urlsplit
 
 import yaml
-from pydantic import AnyHttpUrl, BaseModel, Field, PostgresDsn, computed_field, model_validator
+from pydantic import (
+    AnyHttpUrl,
+    BaseModel,
+    Field,
+    PostgresDsn,
+    TypeAdapter,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -39,7 +48,6 @@ def get_config_path() -> Path:
 
 class LLMProviderEnum(str, Enum):
     OLLAMA = "ollama"
-    ANTHROPIC = "anthropic"
     OPENAI = "openai"
 
 
@@ -59,6 +67,22 @@ class LLMSettings(BaseModel):
     vision_model_ids: list[str] = Field(default_factory=list)
     # OpenAI-only option; other providers keep their own lifecycle after a switch.
     model_lifecycle: Literal["none", "llamacpp"] = "none"
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def supported_provider(cls, value: Any) -> Any:
+        if value not in ("ollama", "openai"):
+            raise ValueError(
+                "Unsupported LLM provider; select ollama or openai in LLM__PROVIDER or llm.provider"
+            )
+        return value
+
+    @field_validator("host", "model_name")
+    @classmethod
+    def explicit_identity(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("LLM host and model_name must be explicitly selected and nonblank")
+        return value
 
 
 class ApiSettings(BaseModel):
@@ -103,7 +127,9 @@ class OcrSettings(BaseModel):
     required: bool = False
     allow_vision_fallback: bool = False
     vision_fallback_model_id: str | None = None
-    coordination_path: Path = Field(default_factory=lambda: get_config_path().parent / "gpu-handoff.lock")
+    coordination_path: Path = Field(
+        default_factory=lambda: get_config_path().parent / "gpu-handoff.lock"
+    )
     manage_model_lifecycle: bool = True
 
     @model_validator(mode="before")
@@ -218,8 +244,8 @@ def _read_yaml_config(path: Path) -> dict[str, Any]:
     try:
         with path.open(encoding="utf-8") as config_file:
             data = yaml.safe_load(config_file) or {}
-    except (OSError, yaml.YAMLError) as exc:
-        logger.warning("Could not read YAML config %s: %s", path, exc)
+    except (OSError, yaml.YAMLError):
+        logger.warning("Could not read YAML config %s", path)
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -264,16 +290,57 @@ def editable_setting_sources() -> dict[str, str]:
     return sources
 
 
-def write_config_file(config: Settings) -> None:
-    """Atomically persist settings while keeping the external file private."""
+def write_config_file(config: Settings, *, changed_paths: frozenset[str] | None = None) -> None:
+    """Merge a save under the bootstrap lock without discarding private metadata."""
+    from .distribution.bootstrap import BootstrapError, config_lock, read_config, write_private
+
     path = get_config_path()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    data = config.model_dump(mode="json", exclude={"pg": {"database_url", "pg_dsn"}})
-    temporary = path.with_name(f".{path.name}.tmp")
-    with temporary.open("w", encoding="utf-8") as config_file:
-        yaml.safe_dump(data, config_file, sort_keys=False, default_flow_style=False)
-    os.chmod(temporary, 0o600)
-    temporary.replace(path)
+    resolved = config.model_dump(mode="json", exclude={"pg": {"database_url", "pg_dsn"}})
+    if changed_paths is not None and not changed_paths <= EDITABLE_ENV_KEYS.keys():
+        raise BootstrapError("Only editable setting paths may be selectively saved")
+
+    def merge(original: dict[str, Any], values: dict[str, Any]) -> None:
+        for key, value in values.items():
+            if isinstance(value, dict):
+                if key not in original:
+                    original[key] = {}
+                if not isinstance(original[key], dict):
+                    raise BootstrapError("Persistent configuration has a conflicting section type")
+                merge(original[key], value)
+            else:
+                original[key] = value
+
+    with config_lock(path.parent):
+        pending = path.parent / ".bootstrap-pending"
+        if pending.exists() or pending.is_symlink():
+            raise BootstrapError("Interrupted installation requires explicit recovery")
+        existing = path.exists() or path.is_symlink()
+        if not existing and any(
+            marker.exists() or marker.is_symlink()
+            for marker in (
+                path.parent / ".bootstrap-complete.yaml",
+                path.parent / "initial-admin.yaml",
+            )
+        ):
+            raise BootstrapError("Incomplete installation requires explicit recovery")
+        data = read_config(path) if existing else resolved
+        if existing:
+            # Validate the persisted document itself, independent of environment overrides.
+            for section, model_field in Settings.model_fields.items():
+                if section in data:
+                    TypeAdapter(model_field.annotation).validate_python(data[section])
+            if changed_paths is None:
+                merge(data, resolved)
+            else:
+                for field in sorted(changed_paths):
+                    section, key = field.split(".", 1)
+                    section_data = data.setdefault(section, {})
+                    if not isinstance(section_data, dict):
+                        raise BootstrapError(
+                            "Persistent configuration has a conflicting section type"
+                        )
+                    section_data[key] = resolved[section][key]
+        write_private(path, yaml.safe_dump(data, sort_keys=False), replace=existing)
 
 
 def initialize_config_file(config: Settings) -> None:

@@ -15,8 +15,8 @@ router = APIRouter(tags=["System"])
 
 class LLMSettingsUpdate(BaseModel):
     provider: LLMProviderEnum
-    host: str = Field(min_length=1)
-    model_name: str = Field(min_length=1)
+    host: str = Field(min_length=1, pattern=r"\S")
+    model_name: str = Field(min_length=1, pattern=r"\S")
     temperature: float = Field(ge=0, le=2)
 
 
@@ -102,8 +102,13 @@ async def update_settings(request: Request, update: SettingsUpdate) -> SettingsV
     candidate.llm.temperature = update.llm.temperature
     candidate.auth.allow_registration = update.allow_registration
     try:
-        write_config_file(candidate)
-    except OSError as exc:
+        write_config_file(
+            candidate,
+            changed_paths=frozenset(
+                field for field, value in requested.items() if value != current[field]
+            ),
+        )
+    except (OSError, ValueError) as exc:
         raise HTTPException(status_code=503, detail="Could not write application config") from exc
 
     settings.llm.provider = candidate.llm.provider

@@ -32,6 +32,9 @@ it.each([true, false])(
 		]);
 		render(Settings);
 		await waitFor(() => expect(api.listModels).toHaveBeenCalledWith(ocr ? 'text' : 'vision'));
+		expect(document.querySelector('option[value="anthropic"]')).toBeNull();
+		expect(document.querySelector('option[value="ollama"]')).toBeTruthy();
+		expect(document.querySelector('option[value="openai"]')).toBeTruthy();
 		const model = screen.getByLabelText(/Default model/);
 		await fireEvent.input(model, { target: { value: 'custom-model' } });
 		await queryClient.invalidateQueries({ queryKey: ['models'] });
