@@ -10,14 +10,21 @@ export interface PendingUpload {
 }
 const storageKey = (owner: string) => `vb-upload:${owner}`;
 
+interface PendingRecord {
+	storage: string;
+	upload: PendingUpload;
+	photos?: string;
+	savedAt: number;
+}
+
 export function requestKey(): string {
 	// getRandomValues is available on local HTTP; subtle/randomUUID require HTTPS.
 	return bytesToHex(crypto.getRandomValues(new Uint8Array(24)));
 }
 
-export function readPendingUpload(owner: string): PendingUpload | null {
+function readRecord(storage: string): PendingRecord | null {
 	try {
-		const value = JSON.parse(localStorage.getItem(storageKey(owner)) ?? 'null');
+		const value = JSON.parse(localStorage.getItem(storage) ?? 'null');
 		if (!value || typeof value.key !== 'string' || !/^[a-f0-9]{64}$/.test(value.identity))
 			return null;
 		const options = value.options;
@@ -32,7 +39,32 @@ export function readPendingUpload(owner: string): PendingUpload | null {
 		if ('allow_ocr_fallback' in options && typeof options.allow_ocr_fallback !== 'boolean')
 			return null;
 		if ('model_id' in options && typeof options.model_id !== 'string') return null;
-		return { key: value.key, identity: value.identity, options };
+		return {
+			storage,
+			upload: { key: value.key, identity: value.identity, options },
+			photos: typeof value.photos === 'string' ? value.photos : undefined,
+			savedAt: Number.isSafeInteger(value.savedAt) ? value.savedAt : 0
+		};
+	} catch {
+		return null;
+	}
+}
+
+function pendingRecords(owner: string): PendingRecord[] {
+	const prefix = storageKey(owner);
+	const records: PendingRecord[] = [];
+	for (let index = 0; index < localStorage.length; index++) {
+		const storage = localStorage.key(index);
+		if (storage !== prefix && !storage?.startsWith(prefix + ':')) continue;
+		const record = readRecord(storage);
+		if (record) records.push(record);
+	}
+	return records.sort((a, b) => b.savedAt - a.savedAt);
+}
+
+export function readPendingUpload(owner: string): PendingUpload | null {
+	try {
+		return pendingRecords(owner)[0]?.upload ?? null;
 	} catch {
 		return null;
 	}
@@ -55,28 +87,47 @@ export async function prepareUpload(
 	explicitOptions?: UploadOptions,
 	checkCurrent?: () => void
 ): Promise<PendingUpload> {
-	const pending = readPendingUpload(owner);
-	// An untouched control (including a changed server default) cannot alter a replay.
-	const selected = explicitOptions ?? pending?.options ?? {};
-	const options: UploadOptions = {};
-	if (selected.model_id !== undefined) options.model_id = selected.model_id;
-	if (selected.bypass_review !== undefined) options.bypass_review = selected.bypass_review;
-	if (selected.allow_ocr_fallback !== undefined)
-		options.allow_ocr_fallback = selected.allow_ocr_fallback;
 	const hashes: string[] = [];
 	for (const file of files) {
 		const bytes = await fileBytes(file);
 		checkCurrent?.();
 		hashes.push(bytesToHex(sha256(new Uint8Array(bytes))));
 	}
-	const identity = bytesToHex(sha256(utf8ToBytes(JSON.stringify({ owner, hashes, options }))));
-	if (pending?.identity === identity) return pending;
+	const photos = bytesToHex(sha256(utf8ToBytes(JSON.stringify(hashes))));
+	const identityOf = (options: UploadOptions) =>
+		bytesToHex(sha256(utf8ToBytes(JSON.stringify({ owner, hashes, options }))));
+	const records = pendingRecords(owner);
+
+	// A legacy single-slot record lacks a separate photo hash. Its opaque identity
+	// still proves the exact ordered bytes when reproduced with its saved options.
+	if (explicitOptions === undefined) {
+		const match = records.find(({ upload, photos: saved }) =>
+			saved === undefined ? identityOf(upload.options) === upload.identity : saved === photos
+		);
+		if (match) return match.upload;
+	}
+	const options: UploadOptions = {};
+	if (explicitOptions?.model_id !== undefined) options.model_id = explicitOptions.model_id;
+	if (explicitOptions?.bypass_review !== undefined)
+		options.bypass_review = explicitOptions.bypass_review;
+	if (explicitOptions?.allow_ocr_fallback !== undefined)
+		options.allow_ocr_fallback = explicitOptions.allow_ocr_fallback;
+	const identity = identityOf(options);
+	const matching = records.find(({ upload }) => upload.identity === identity);
+	if (matching) return matching.upload;
+
 	const next = { key: requestKey(), identity, options };
-	// Persist before POST. If storage is blocked, fail without creating an unrecoverable job.
-	localStorage.setItem(storageKey(owner), JSON.stringify(next));
+	const savedAt = Math.max(Date.now(), (records[0]?.savedAt ?? 0) + 1);
+	// Independent records prevent another tab from overwriting a pending request.
+	// Persist before POST so an ambiguous response can be retried after reload.
+	localStorage.setItem(
+		`${storageKey(owner)}:${next.key}`,
+		JSON.stringify({ ...next, photos, savedAt })
+	);
 	return next;
 }
 
 export function clearPendingUpload(owner: string, key: string): void {
-	if (readPendingUpload(owner)?.key === key) localStorage.removeItem(storageKey(owner));
+	const matched = pendingRecords(owner).find(({ upload }) => upload.key === key);
+	if (matched) localStorage.removeItem(matched.storage);
 }

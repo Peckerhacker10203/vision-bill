@@ -50,14 +50,9 @@
 	$effect(() => {
 		if ($session && $session !== 'loading' && recoveryOwner !== $session.id) {
 			recoveryOwner = $session.id;
-			const pending = readPendingUpload($session.id);
-			recovering = !!pending;
+			recovering = !!readPendingUpload($session.id);
 			bypassTouched = false;
 			bypassReviewDefaultApplied = false;
-			if (pending?.options.bypass_review !== undefined) {
-				bypassReview = pending.options.bypass_review;
-				bypassReviewDefaultApplied = true;
-			}
 		}
 		if (!bypassReviewDefaultApplied && uiConfig.data && !bypassTouched) {
 			bypassReview = uiConfig.data.bypass_review_default;
@@ -115,12 +110,7 @@
 			const pending = await prepareUpload(
 				owner,
 				files,
-				bypassTouched
-					? {
-							...readPendingUpload(owner)?.options,
-							bypass_review: bypassReview
-						}
-					: undefined,
+				bypassTouched ? { bypass_review: bypassReview } : undefined,
 				() => {
 					if (!current()) throw new DOMException('Upload view changed', 'AbortError');
 				}

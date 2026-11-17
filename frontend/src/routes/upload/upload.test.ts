@@ -67,7 +67,10 @@ it('reload recovery never posts automatically or adopts changed defaults as expl
 	const { container, unmount } = render(Upload);
 	await screen.findByText(/unknown outcome/);
 	expect(upload).not.toHaveBeenCalled();
-	expect((screen.getByRole('checkbox') as HTMLInputElement).checked).toBe(false);
+	// Until the photo bytes are identified, this form shows the current default.
+	await waitFor(() =>
+		expect((screen.getByRole('checkbox') as HTMLInputElement).checked).toBe(true)
+	);
 	await fireEvent.change(container.querySelector('input[type=file]')!, {
 		target: { files: [file] }
 	});

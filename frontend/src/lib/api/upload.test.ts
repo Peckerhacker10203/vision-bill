@@ -36,7 +36,7 @@ it('reuses key and first explicit options after network and truncated-success am
 	expect(readPendingUpload('owner')).toEqual(first);
 	expect((await prepareUpload('owner', files())).key).toBe(first.key);
 	expect(fetch).toHaveBeenCalledTimes(2);
-	expect(localStorage.getItem('vb-upload:owner')).not.toMatch(/private|same.png|blob:/);
+	expect(Object.values(localStorage).join()).not.toMatch(/private|same.png|blob:/);
 });
 it('changes key for changed content, order, explicit options/presence and owner', async () => {
 	const input = files();
@@ -53,7 +53,7 @@ it('changes key for changed content, order, explicit options/presence and owner'
 	});
 	expect(changed.key).not.toBe(explicit.key);
 	clearPendingUpload('a', changed.key);
-	expect(readPendingUpload('a')).toBeNull();
+	expect(readPendingUpload('a')).toEqual(explicit);
 });
 it('hashes actual bytes and generates keys on local HTTP without subtle or randomUUID', async () => {
 	vi.stubGlobal('crypto', {
@@ -91,4 +91,28 @@ it('binds fallback consent presence and keeps every untouched recovery option', 
 	);
 	await api.uploadImages(input, edited.options, edited.key);
 	expect(String(vi.mocked(fetch).mock.calls[0][0])).toContain('allow_ocr_fallback=true');
+});
+
+it('isolates different photo submissions in the same account without losing either replay key', async () => {
+	const filesA = [new File(['first receipt'], 'receipt.png')];
+	const filesB = [new File(['different receipt'], 'receipt.png')];
+	const b = await prepareUpload('owner', filesB, { bypass_review: true });
+	const a = await prepareUpload('owner', filesA);
+	expect(a.options).toEqual({});
+	expect(a.key).not.toBe(b.key);
+	expect(await prepareUpload('owner', filesB)).toEqual(b);
+	expect(await prepareUpload('owner', filesA)).toEqual(a);
+	clearPendingUpload('owner', a.key);
+	expect(await prepareUpload('owner', filesB)).toEqual(b);
+});
+
+it('recovers an old single-slot upload only when its ordered photos match', async () => {
+	const original = files();
+	const legacy = await prepareUpload('owner', original, { bypass_review: true });
+	clearPendingUpload('owner', legacy.key);
+	localStorage.setItem('vb-upload:owner', JSON.stringify(legacy));
+	const newUpload = await prepareUpload('owner', [...original].reverse());
+	expect(newUpload.options).toEqual({});
+	expect(await prepareUpload('owner', original)).toEqual(legacy);
+	expect(await prepareUpload('owner', [...original].reverse())).toEqual(newUpload);
 });
