@@ -2,9 +2,11 @@
 
 import asyncio
 import hashlib
+import json
 from decimal import Decimal
 from pathlib import Path
 from time import monotonic
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -12,19 +14,31 @@ import httpx
 import pytest
 from handoff_fixtures import install_owned_bindings
 from ollama import ChatResponse, ProcessResponse
+from openai import APIStatusError, APITimeoutError
 from PIL import Image
 from test_experiment_scoring import receipt
 from test_extraction_pipeline import formatter, pipeline, sidecar
 from test_gpu_handoff import enable_managed_ocr
+from test_llamacpp_lifecycle import Ocr as RouterOcr
+from test_llamacpp_lifecycle import configured, model_status
 from test_submission_service import context
 
 from vision_bill.config import OcrSettings
 from vision_bill.model.db.image import ImagePart
 from vision_bill.model.experiment import ExperimentOptions
+from vision_bill.model.receipt import Receipt
 from vision_bill.model.workflow import PersistedSourcePart
-from vision_bill.service.experiment_execution import ExperimentFailure, execute_submission
+from vision_bill.provider.llm.base import ModelInfo
+from vision_bill.provider.llm.experiment import endpoint_fingerprint
+from vision_bill.service.benchmark_service import BenchmarkService
+from vision_bill.service.experiment_execution import (
+    ExperimentFailure,
+    execute_submission,
+    ocr_fingerprint,
+    pipeline_identity,
+)
 from vision_bill.service.extraction_pipeline import ExtractionPipeline
-from vision_bill.service.gpu_handoff import current_owner
+from vision_bill.service.gpu_handoff import ModelHandoff, current_owner
 from vision_bill.service.receipt_service import ReceiptService
 
 
@@ -299,3 +313,190 @@ async def test_short_work_budget_skips_label_dispatch(tmp_path):
     assert result.receipt.total == Decimal("4.00")
     assert result.classification_enrichment.state == "skipped"
     assert result.classification_enrichment.reason_code == "classification_budget_exhausted"
+
+
+@pytest.mark.parametrize("mode", ["failed", "retry", "cancelled"])
+async def test_benchmark_worker_preserves_observations_after_outer_release_failure(
+    settings, monkeypatch, tmp_path, mode,
+):
+    llm, extract = managed_pipeline(monkeypatch, tmp_path)
+    extract.ocr.load = AsyncMock()
+    extract.ocr.get_capabilities.return_value.runtime_fingerprint = "runtime"
+    extract.settings.required = True
+    receipts = ReceiptService(
+        settings.images, settings.pg, llm, ocr_provider=extract.ocr, ocr_settings=extract.settings,
+    )
+    worker = object.__new__(BenchmarkService)
+    worker._provider, worker._receipts, worker._settings = llm, receipts, settings.worker
+    path = tmp_path / "photo.png"
+    Image.new("RGB", (4, 5)).save(path)
+    options = ExperimentOptions(pipeline="ocr")
+    identity = await pipeline_identity(receipts, options)
+    receipt_id = uuid4()
+    manifest = {
+        "identity": identity,
+        "options": options.model_dump(mode="json"),
+        "tags": [],
+        "inputs": [{
+            "receipt_id": str(receipt_id),
+            "expected": receipt().model_dump(mode="json"),
+            "images": [{"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}],
+            "pipeline": "ocr",
+            "reference": {},
+        }],
+        "provider": type(llm).__name__,
+        "endpoint_fingerprint": endpoint_fingerprint(llm),
+        "ocr_fingerprint": ocr_fingerprint(extract.ocr),
+        "validation_schema_sha256": hashlib.sha256(
+            json.dumps(Receipt.model_json_schema(), sort_keys=True).encode(),
+        ).hexdigest(),
+        "prompt_hashes": {"1": hashlib.sha256(
+            llm.for_experiment(options).build_prompt([], image_count=1).encode(),
+        ).hexdigest()},
+    }
+    count = 2 if mode == "failed" else 0
+    task = {
+        "run_id": uuid4(), "receipt_id": receipt_id, "model_id": "fixture", "attempts": 0,
+        "inference_started": False, "inference_attempt_count": count,
+    }
+    worker._db = SimpleNamespace(
+        run=AsyncMock(return_value=SimpleNamespace(model_ids=["fixture"])),
+        manifest=AsyncMock(return_value=manifest),
+        begin_attempt=AsyncMock(return_value={
+            "inference_started": True, "inference_attempt_count": count + 1,
+        }),
+        finish_task=AsyncMock(), retry_task=AsyncMock(),
+    )
+    worker._run_digests = AsyncMock(return_value={})
+    worker._timeout = AsyncMock(return_value=600)
+    llm._client.chat.side_effect = [llm._client.chat.return_value, chat_reply("{")]
+    release_started, release_continue = asyncio.Event(), asyncio.Event()
+
+    async def unload(**request):
+        assert request == {"model": "fixture", "keep_alive": 0}
+        assert llm._client.chat.await_count == 2
+        release_started.set()
+        if mode == "cancelled":
+            await release_continue.wait()
+        raise httpx.ReadTimeout("unload response lost")
+
+    llm._client.generate = AsyncMock(side_effect=unload)
+    if mode == "cancelled":
+        running = asyncio.create_task(worker._execute(task))
+        try:
+            async with asyncio.timeout(3):
+                await release_started.wait()
+                running.cancel()
+                await asyncio.sleep(0)
+                release_continue.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await running
+        finally:
+            if not running.done():
+                running.cancel()
+            await asyncio.gather(running, return_exceptions=True)
+        worker._db.retry_task.assert_not_awaited()
+        worker._db.finish_task.assert_not_awaited()
+    else:
+        await worker._execute(task)
+        if mode == "retry":
+            worker._db.retry_task.assert_awaited_once()
+            worker._db.finish_task.assert_not_awaited()
+        else:
+            worker._db.retry_task.assert_not_awaited()
+            failure = worker._db.finish_task.await_args.kwargs
+            assert failure["success"] is False
+            assert failure["result"]["full_receipt_correct"] is False
+            assert "actual" not in failure["result"]
+            metadata = failure["result"]["metadata"]
+            assert metadata["draft"]["total"] == "4.00"
+            assert metadata["ocr_pages"][0]["working_image"]["width"] == 3
+            assert metadata["classification_enrichment"]["reason_code"] == "invalid_response"
+            assert metadata["inference_attempt_count"] == 3
+    journal = extract.coordinator().read_journal()
+    assert release_started.is_set() and journal.unsettled and journal.models == ["fixture"]
+
+
+@pytest.mark.parametrize("reply", ["empty_choices", "proxy_503", "read_timeout"])
+async def test_openai_classifier_distinguishes_empty_choices_from_ambiguous_transport(
+    monkeypatch, tmp_path, reply,
+):
+    path = tmp_path / "photo.png"
+    Image.new("RGB", (4, 5)).save(path)
+    raw = receipt().model_dump(mode="json")
+    del raw["category"]
+    raw["line_items"][0]["spending_category"] = "milk"
+    raw["line_items"][0]["tags"] = ["observed"]
+    events = []
+    status = "unloaded"
+
+    def handler(request):
+        nonlocal status
+        if request.url.path == "/llama/models":
+            if "unload_requested" in events:
+                events.append("unload_verified")
+            return httpx.Response(200, json=model_status(status, foreign="unloaded"))
+        if request.url.path == "/llama/models/unload":
+            assert json.loads(request.content) == {"model": "own"}
+            events.append("unload_requested")
+            status = "unloaded"
+            return httpx.Response(200, json={"success": True})
+        assert request.url.path == "/llama/v1/chat/completions"
+        status = "loaded"
+        message = json.loads(request.content)["messages"][0]["content"]
+        if isinstance(message, list):
+            events.append("formatter")
+            choices = [{
+                "index": 0, "message": {"role": "assistant", "content": json.dumps(raw)},
+                "finish_reason": "stop",
+            }]
+        else:
+            assert message.startswith("Classify these ordered")
+            assert events[-1] == "observations"
+            events.append("classifier")
+            if reply == "proxy_503":
+                return httpx.Response(503, json={"error": "proxy unavailable"})
+            if reply == "read_timeout":
+                raise httpx.ReadTimeout("ambiguous inference", request=request)
+            choices = []
+        return httpx.Response(200, json={
+            "id": "chat", "object": "chat.completion", "created": 0, "model": "own",
+            "choices": choices,
+        })
+
+    async def checkpoint(observed):
+        assert observed.receipt.total == Decimal("4.00")
+        events.append("observations")
+
+    install_owned_bindings(monkeypatch)
+    async with configured(monkeypatch, handler) as llm:
+        model = ModelInfo("own")
+        model.capabilities = ["vision"]
+        llm.get_available_models = AsyncMock(return_value=[model])
+        llm.handoff = ModelHandoff(tmp_path / "handoff", llm, RouterOcr([]))
+        extract = ExtractionPipeline(llm)
+
+        async def run():
+            return await extract.extract(
+                "own", [path], options=ExperimentOptions(pipeline="direct_vision"),
+                deadline=monotonic() + 90, tags=[], observation_checkpoint=checkpoint,
+            )
+
+        if reply == "empty_choices":
+            result = await run()
+            assert result.receipt.total == Decimal("4.00")
+            assert result.receipt.line_items[0].spending_category == "milk"
+            assert result.receipt.line_items[0].tags == ["observed"]
+            assert result.classification_enrichment.state == "unavailable"
+            assert result.classification_enrichment.reason_code == "invalid_response"
+            assert result.telemetry.calls[-1]["stage"] == "classification"
+            assert events == [
+                "formatter", "observations", "classifier", "unload_requested", "unload_verified",
+            ]
+        else:
+            error = APIStatusError if reply == "proxy_503" else APITimeoutError
+            with pytest.raises(error):
+                await run()
+            assert events == ["formatter", "observations", "classifier"]
+            journal = llm.handoff.read_journal()
+            assert journal.unsettled and journal.models == ["own"]

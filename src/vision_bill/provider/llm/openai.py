@@ -271,6 +271,8 @@ class OpenAIProvider(LLMProvider):
             self.experiment_trace.append(
                 chat_telemetry(response, messages, (perf_counter() - started) * 1000)
             )
+        if not response.choices:
+            return ""
         return response.choices[0].message.content or ""
 
     def _build_image_messages(

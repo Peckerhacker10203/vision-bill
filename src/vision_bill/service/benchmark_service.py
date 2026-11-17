@@ -34,6 +34,7 @@ from ..provider.llm.experiment import endpoint_fingerprint
 from .benchmark_scoring import PROMPT_VERSION, dataset_fingerprint, score_receipts
 from .experiment_execution import (
     ExperimentFailure,
+    ExperimentResult,
     effective_policy,
     image_digest,
     ocr_fingerprint,
@@ -366,7 +367,7 @@ class BenchmarkService:
         self, manifest: dict[str, Any], receipt_id: UUID, model_id: str, *,
         before_inference: Callable[[], Awaitable[None]] | None = None,
         inference_deadline: float, managed_model_ids: Sequence[str],
-    ) -> tuple[Receipt, Any]:
+    ) -> tuple[Receipt, ExperimentResult]:
         item = next((x for x in manifest["inputs"] if x["receipt_id"] == str(receipt_id)), None)
         if item is None:
             raise ValueError("Receipt is absent from the frozen benchmark inputs")
@@ -490,32 +491,40 @@ class BenchmarkService:
         if model_id not in available_ids:
             raise _ReadinessWait(f"{capability}_model_unavailable")
 
-        async def infer() -> Any:
+        async def infer() -> ExperimentResult:
             return await self._receipts.analyse_submission_with_metadata(
                 model_id, paths, options, list(manifest["tags"]), deadline=inference_deadline,
             )
 
+        result: ExperimentResult | None = None
         if handoff is None:
             if before_inference is not None:
                 await before_inference()
             result = await infer()
         else:
-            async with handoff.session(
-                inference_deadline, model_id=model_id, model_ids=managed_model_ids,
-                expected_binding_sha256=frozen_binding, before_dispatch=before_inference,
-                lock_deadline=admission_deadline(inference_deadline),
-            ) as owner:
-                if qualify_runtime and ocr is not None:
-                    await owner.ocr_phase()
-                    live = await ocr.get_capabilities()
-                    frozen_runtime = (frozen_identity or {}).get("ocr_runtime") or {}
-                    if not live.ready or not live.runtime_fingerprint:
-                        raise ValueError("ocr_unavailable")
-                    if any(frozen_runtime.get(key) != getattr(live, key) for key in (
-                        "profile_id", "runtime_fingerprint", "ocr_max_new_tokens",
-                    )):
-                        raise ValueError("Effective pipeline identity changed; create a new run")
-                result = await infer()
+            try:
+                async with handoff.session(
+                    inference_deadline, model_id=model_id, model_ids=managed_model_ids,
+                    expected_binding_sha256=frozen_binding, before_dispatch=before_inference,
+                    lock_deadline=admission_deadline(inference_deadline),
+                ) as owner:
+                    if qualify_runtime and ocr is not None:
+                        await owner.ocr_phase()
+                        live = await ocr.get_capabilities()
+                        frozen_runtime = (frozen_identity or {}).get("ocr_runtime") or {}
+                        if not live.ready or not live.runtime_fingerprint:
+                            raise ValueError("ocr_unavailable")
+                        if any(frozen_runtime.get(key) != getattr(live, key) for key in (
+                            "profile_id", "runtime_fingerprint", "ocr_max_new_tokens",
+                        )):
+                            raise ValueError("Effective pipeline identity changed; create a new run")
+                    result = await infer()
+            except Exception as exc:
+                if result is None:
+                    raise
+                # The outer owner can still fail releasing the model after inference returns.
+                raise ExperimentFailure(type(exc).__name__, result.metadata) from exc
+        assert result is not None
         if manifest.get("identity") is not None:
             if result.metadata.get("ordered_source_sha256") != [image["sha256"] for image in item["images"]]:
                 raise ValueError("Executed source identity differs from frozen input")
