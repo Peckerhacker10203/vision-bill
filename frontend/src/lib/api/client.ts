@@ -13,6 +13,7 @@ import type {
 	SubmissionStatus,
 	UploadOptions,
 	RetryRequest,
+	ReviewPreview,
 	ReviewRequest,
 	ModelInfo,
 	ImageListFilters,
@@ -310,7 +311,11 @@ export const api = {
 		});
 	},
 
-	/** POST /receipts/{id}/verify returns the verified receipt row (409 if already verified). */
+	previewHumanReview(id: string): Promise<ReviewPreview> {
+		return request<ReviewPreview>(`/receipts/${id}/verify`);
+	},
+
+	/** Verify the receipt or record a human review of an automatically or historically verified receipt. */
 	verifyReceipt(id: string, body?: ReviewRequest): Promise<ReceiptRow> {
 		return request<ReceiptRow>(`/receipts/${id}/verify`, {
 			method: 'POST',

@@ -647,3 +647,121 @@ async def test_standalone_gold_selection_is_one_snapshot_and_excludes_bypass_leg
     monkeypatch.setattr(BenchmarkDB,'_reference_preview',original)
     current=await freeze_references(w.pool,w._settings,scope,limit=1,category=None)
     assert len(current)==1 and current[0].receipt_identity in {row.id for row in rows[:2]} - set(changed)
+
+
+async def test_gold2_requires_fresh_label_confirmation_and_preserves_old_run(workflow_db, tmp_path, monkeypatch):
+    from hashlib import sha256
+
+    from vision_bill.model.benchmark import CouncilPolicy
+    from vision_bill.service.receipt_review import material_document
+
+    w, scope = workflow_db
+    row, body, _ = await human(w, scope, tmp_path)
+    b = bench(w)
+    load_preview = b._reference_preview
+
+    async def gold1_preview(conn, receipt_id, scope, *, lock=True):
+        preview = await load_preview(conn, receipt_id, scope, lock=lock)
+        record = await conn.fetchrow("SELECT * FROM receipts WHERE id=$1", receipt_id)
+        material = material_document(await w._receipts._review_document(conn, record))
+        material["line_items"] = [
+            {key: item[key] for key in ("description", "quantity", "unit_price", "total_price")}
+            for item in preview.expected["line_items"]
+        ]
+        material["taxes"] = preview.expected["taxes"]
+        payload = {
+            "version": "gold-1",
+            "material": material,
+            "sources": [
+                {key: source[key] for key in ("part_id", "photo_index", "sha256")}
+                for source in preview.sources
+            ],
+            "schema_version": preview.schema_version,
+            "scored_fields": preview.scored_fields,
+        }
+        digest = sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return preview.model_copy(update={"document_sha256": digest})
+
+    async def frozen_bytes(reference, run):
+        async with w.pool.acquire() as conn:
+            return (
+                await conn.fetchval(
+                    "SELECT to_jsonb(r)::text FROM benchmark_references r WHERE id=$1", reference.id
+                ),
+                await conn.fetchval(
+                    "SELECT to_jsonb(r)::text FROM benchmark_runs r WHERE id=$1", run.id
+                ),
+            )
+
+    with monkeypatch.context() as context:
+        context.setattr(b, "_reference_preview", gold1_preview)
+        preview = await b.reference_preview(row.id, scope=scope)
+        gold1 = await b.qualify_reference(
+            row.id, preview.review_revision, preview.document_sha256, scope=scope
+        )
+        run = await b.create_run(
+            model_ids=["fixture"],
+            receipt_ids=[row.id],
+            fingerprint="frozen",
+            model_digests={},
+            timeout=600,
+            policy=CouncilPolicy.ALL,
+            absolute=None,
+            relative=None,
+            apply_flags=False,
+            prompt_version="4",
+            scoring_version=gold1.scoring_version,
+            owner_id=scope.user_id,
+            scope=scope,
+            manifest={
+                "inputs": [{"receipt_id": str(row.id), "reference": gold1.model_dump(mode="json")}]
+            },
+        )
+
+    old_bytes = await frozen_bytes(gold1, run)
+    with pytest.raises(ValueError, match="qualified"):
+        await b.current_reference(row.id, scope=scope)
+    with pytest.raises(ValueError, match="confirmation_conflict"):
+        await b.qualify_reference(row.id, gold1.review_revision, gold1.document_sha256, scope=scope)
+    preview = await b.reference_preview(row.id, scope=scope)
+    assert preview.document_sha256 != gold1.document_sha256
+    assert preview.expected_sha256 == gold1.expected_sha256
+    current = await b.qualify_reference(
+        row.id, preview.review_revision, preview.document_sha256, scope=scope
+    )
+    assert current.id != gold1.id
+
+    updates = [
+        (body, "category", "grocery"),
+        (body.line_items[0], "spending_category", "milk"),
+        (body.line_items[0], "tags", ["Corrected tag"]),
+    ]
+    for revision, (target, field, value) in enumerate(updates, start=2):
+        setattr(target, field, value)
+        body.expected_operation_revision = revision
+        edited = await w._receipts.update_receipt(row.id, body, user_id=scope.user_id)
+        assert edited.verified and edited.operation_revision == revision + 1
+        assert edited.review_revision == current.review_revision == gold1.review_revision == 1
+        with pytest.raises(ValueError, match="qualified"):
+            await b.current_reference(row.id, scope=scope)
+        with pytest.raises(ValueError, match="confirmation_conflict"):
+            await b.qualify_reference(
+                row.id, current.review_revision, current.document_sha256, scope=scope
+            )
+        new = await b.reference_preview(row.id, scope=scope)
+        assert new.document_sha256 != current.document_sha256
+        assert new.expected_sha256 != current.expected_sha256
+        assert new.scored_fields == current.scored_fields
+        updated = await b.qualify_reference(
+            row.id, new.review_revision, new.document_sha256, scope=scope
+        )
+        assert updated.id != current.id
+        current = await b.current_reference(row.id, scope=scope)
+        assert current == updated
+
+    assert current.expected["category"] == "grocery"
+    assert current.expected["line_items"][0]["spending_category"] == "milk"
+    assert current.expected["line_items"][0]["tags"] == ["Corrected tag"]
+    assert await frozen_bytes(gold1, run) == old_bytes

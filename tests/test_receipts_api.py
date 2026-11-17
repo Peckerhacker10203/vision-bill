@@ -910,11 +910,15 @@ def test_verify_receipt_preserves_original_path(api_context, settings):
 
 
 def test_verify_receipt_already_verified_conflict(api_context: ApiContext) -> None:
-    """Verifying a receipt that is already verified -> 409, no state change."""
+    """An already-human review returns 409 on duplicate verification."""
     ctx = api_context
     ctx.conn.fetchrow = AsyncMock(
         return_value=_receipt_row(
-            id=RECEIPT_ID, image_id=IMAGE_ID, status="verified", verified=True
+            id=RECEIPT_ID,
+            image_id=IMAGE_ID,
+            status="verified",
+            verified=True,
+            verification_source="human",
         )
     )
 
@@ -922,6 +926,24 @@ def test_verify_receipt_already_verified_conflict(api_context: ApiContext) -> No
 
     assert response.status_code == 409
     assert response.json()["detail"] == "Receipt already verified"
+    ctx.conn.execute.assert_not_awaited()
+
+
+def test_bypass_rereview_requires_explicit_revisions(api_context: ApiContext) -> None:
+    ctx = api_context
+    ctx.conn.fetchrow = AsyncMock(
+        return_value=_receipt_row(
+            image_id=IMAGE_ID,
+            status="verified",
+            verified=True,
+            verification_source="automatic_bypass",
+        )
+    )
+
+    response = ctx.client.post(f"{RECEIPTS_URL}/{RECEIPT_ID}/verify")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "review_revision_required"
     ctx.conn.execute.assert_not_awaited()
 
 

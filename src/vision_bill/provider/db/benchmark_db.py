@@ -329,7 +329,15 @@ class BenchmarkDB:
                   (key in defaults and material.get(key) != defaults[key])]
         def digest(value: Any) -> str:
             return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-        identity = {'version': 'gold-1', 'material': material,
+        # Bind scoring labels to Gold consent without changing the financial review revision.
+        labels = {
+            'category': expected['category'],
+            'line_items': [
+                {key: item[key] for key in ('spending_category', 'tags')}
+                for item in expected['line_items']
+            ],
+        }
+        identity = {'version': 'gold-2', 'material': material, 'labels': labels,
                     'sources': [{k: source[k] for k in ('part_id','photo_index','sha256')} for source in sources],
                     'schema_version': EXTRACTION_SCHEMA_VERSION, 'scored_fields': scored}
         return ReferencePreview(receipt_identity=receipt_id, owner_id=current.user_id,

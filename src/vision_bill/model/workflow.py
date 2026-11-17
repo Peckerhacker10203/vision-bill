@@ -15,7 +15,7 @@ from .extraction import (
     assert_metadata_only,
 )
 from .ocr import OcrPageMetadata, OcrResponse, Sha256, SourceRef, WorkingImageMetadata
-from .review import FindingAcknowledgement, ReviewEvaluation, SourceView
+from .review import FindingAcknowledgement, ReviewEvaluation, ReviewFinding, SourceView
 
 TERMINAL_STATES = frozenset({"analyzed", "needs_review", "failed", "timed_out", "unreadable"})
 
@@ -119,6 +119,14 @@ class DraftPatch(BaseModel):
 class DraftFinalize(BaseModel):
     expected_revision: int = Field(ge=1)
     request_key: str = Field(min_length=1)
+
+
+class ReviewPreview(BaseModel):
+    """Current diagnostics and compare-and-swap revisions for explicit human review."""
+
+    operation_revision: int = Field(ge=1)
+    review_revision: int = Field(ge=1)
+    findings: list[ReviewFinding]
 
 
 class ReviewRequest(BaseModel):

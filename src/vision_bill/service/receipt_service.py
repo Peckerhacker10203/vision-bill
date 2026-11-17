@@ -26,6 +26,7 @@ from ..model.statistics import ReceiptStatistics
 from ..model.workflow import (
     AccessScope,
     EnqueueResult,
+    ReviewPreview,
     ReviewRequest,
     SubmissionCreate,
     SubmissionStatus,
@@ -303,6 +304,11 @@ class ReceiptService:
         return await self._db.update_receipt(
             receipt_id, receipt, user_id=user_id, can_see_all=can_see_all
         )
+
+    async def preview_human_review(
+        self, receipt_id: UUID, *, scope: AccessScope
+    ) -> ReviewPreview | None:
+        return await self._db.preview_human_review(receipt_id, scope=scope)
 
     async def verify_receipt(
         self, receipt_id: UUID, request: ReviewRequest | None = None, *,

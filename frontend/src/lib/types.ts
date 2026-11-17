@@ -171,6 +171,11 @@ export interface ReviewRequest {
 	expected_review_revision?: number;
 	acknowledgements: { finding_id: string; comment: string }[];
 }
+export interface ReviewPreview {
+	operation_revision: number;
+	review_revision: number;
+	findings: ReviewFinding[];
+}
 export interface ModelInfo {
 	id: string;
 	parameter_size?: string | null;

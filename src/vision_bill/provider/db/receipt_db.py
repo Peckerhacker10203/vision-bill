@@ -28,7 +28,7 @@ from ...model.extraction import (
 from ...model.item_category import CATEGORY_CODE_SET, normalize_history_key
 from ...model.ocr import SourceRef
 from ...model.receipt import Receipt
-from ...model.review import OriginalAvailability
+from ...model.review import OriginalAvailability, ReviewEvaluation
 from ...model.search import ProductPurchase
 from ...model.statistics import (
     CurrencyStatistics,
@@ -37,7 +37,7 @@ from ...model.statistics import (
     WeekdayStatistics,
     WeeklyStatistics,
 )
-from ...model.workflow import AccessScope, ReviewRequest
+from ...model.workflow import AccessScope, ReviewPreview, ReviewRequest
 from ...service.receipt_review import (
     evaluate_receipt,
     material_document,
@@ -979,6 +979,59 @@ class ReceiptDB:
 
         return self._receipt_row_from_record(row)
 
+    @staticmethod
+    def _can_rereview(receipt: ReceiptRow) -> bool:
+        return (
+            receipt.verified
+            and receipt.status == "verified"
+            and receipt.verification_source != "human"
+        )
+
+    async def _evaluate_current_review(
+        self,
+        conn: asyncpg.Connection,
+        row: asyncpg.Record,
+        current: ReceiptRow,
+        *,
+        lock: bool = True,
+    ) -> ReviewEvaluation:
+        document = await self._review_document(conn, row)
+        await self._validate_review_sources(
+            conn, current.image_id, current.field_sources, current.overlap_decisions, lock=lock
+        )
+        originals = await self._review_originals(conn, current.image_id, lock=lock)
+        return evaluate_receipt(
+            document,
+            current.amount_policy,
+            current.field_sources,
+            current.overlap_decisions,
+            originals,
+            retained_findings=persistent_findings(current.findings),
+        )
+
+    async def preview_human_review(
+        self, receipt_id: UUID, *, scope: AccessScope
+    ) -> ReviewPreview | None:
+        """Evaluate current findings on a read-only, owner-scoped snapshot."""
+        async with (
+            self.pool.acquire() as conn,
+            conn.transaction(isolation="repeatable_read", readonly=True),
+        ):
+            row = await self._lock_review_receipt(
+                conn, receipt_id, scope.user_id, scope.can_see_all, lock=False
+            )
+            if row is None:
+                return None
+            current = self._receipt_row_from_record(row)
+            if not self._can_rereview(current):
+                raise ValueError("human_rereview_not_available")
+            evaluation = await self._evaluate_current_review(conn, row, current, lock=False)
+            return ReviewPreview(
+                operation_revision=current.operation_revision,
+                review_revision=current.review_revision,
+                findings=evaluation.findings,
+            )
+
     async def verify_receipt(
         self,
         receipt_id: UUID,
@@ -1007,26 +1060,18 @@ class ReceiptDB:
                 and request.expected_review_revision != current.review_revision
             ):
                 raise ValueError("review_revision_conflict")
-            if current.verified or current.status == "verified":
-                raise ValueError("receipt_already_verified")
-            document = await self._review_document(conn, row)
-            await self._validate_review_sources(
-                conn, current.image_id, current.field_sources, current.overlap_decisions
-            )
-            originals = await self._review_originals(conn, current.image_id)
-            evaluation = evaluate_receipt(
-                document,
-                current.amount_policy,
-                current.field_sources,
-                current.overlap_decisions,
-                originals,
-                retained_findings=persistent_findings(current.findings),
-            )
-            validate_acknowledgements(evaluation, request.acknowledgements)
-            if evaluation.findings and (
+            missing_revision = (
                 request.expected_operation_revision is None
                 or request.expected_review_revision is None
-            ):
+            )
+            if current.verified or current.status == "verified":
+                if not self._can_rereview(current) or user_id is None:
+                    raise ValueError("receipt_already_verified")
+                if missing_revision:
+                    raise ValueError("review_revision_required")
+            evaluation = await self._evaluate_current_review(conn, row, current)
+            validate_acknowledgements(evaluation, request.acknowledgements)
+            if evaluation.findings and missing_revision:
                 raise ValueError("review_revision_required")
             saved = await conn.fetchrow(
                 """UPDATE receipts SET status='verified',verified=TRUE,verification_source='human',

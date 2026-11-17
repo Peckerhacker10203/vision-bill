@@ -2,7 +2,7 @@ import logging
 from datetime import date
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import Field, model_validator
 
 from ..model.db.receipt import ReceiptRow, ReceiptWithDetails
@@ -10,7 +10,7 @@ from ..model.item_category import CATEGORY_CODE_SET
 from ..model.ocr import SourceRef
 from ..model.receipt import LineItem, Receipt
 from ..model.review import AmountPolicy
-from ..model.workflow import AccessScope, ReviewRequest
+from ..model.workflow import AccessScope, ReviewPreview, ReviewRequest
 from ..security.dependencies import get_current_user
 from ..security.models import User
 from ..service.image_service import ImageService
@@ -132,6 +132,32 @@ async def update_receipt(
     if row is None:
         raise HTTPException(status_code=404, detail="Receipt not found")
     return row
+
+
+@router.get("/{receipt_id}/verify")
+async def preview_human_review(
+    receipt_id: UUID,
+    response: Response,
+    receipt_service: ReceiptService = Depends(get_receipt_service),  # noqa: B008
+    current_user: User = Depends(get_current_user),  # noqa: B008
+) -> ReviewPreview:
+    """Preview current findings for a verified receipt awaiting human review."""
+    if not receipt_service.db_ready:
+        raise HTTPException(status_code=503, detail="Database not available")
+    try:
+        preview = await receipt_service.preview_human_review(
+            receipt_id,
+            scope=AccessScope(user_id=current_user.id, can_see_all=current_user.can_see_all),
+        )
+    except ValueError as exc:
+        code = str(exc)
+        raise HTTPException(
+            status_code=409 if code == "human_rereview_not_available" else 422, detail=code
+        ) from exc
+    if preview is None:
+        raise HTTPException(status_code=404, detail="Receipt not found")
+    response.headers["Cache-Control"] = "no-store"
+    return preview
 
 
 @router.post("/{receipt_id}/verify")

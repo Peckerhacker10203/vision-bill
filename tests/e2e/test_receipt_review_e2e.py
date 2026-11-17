@@ -971,3 +971,219 @@ async def test_delete_preserves_owner_scope_and_benchmark_foreign_key(workflow_d
     assert (
         await w._receipts.delete_receipt(row.id, user_id=uuid4(), can_see_all=True)
     ).id == row.id
+
+
+async def test_rereview_migrated_verified_receipt_via_http(db, tmp_path):
+    import asyncpg
+    import httpx
+    from fastapi import FastAPI
+
+    from vision_bill.api.helper.helper import get_receipt_service
+    from vision_bill.api.receipts import router
+    from vision_bill.model.workflow import AccessScope
+    from vision_bill.provider.db.benchmark_db import BenchmarkDB
+    from vision_bill.provider.db.receipt_db import ReceiptDB
+    from vision_bill.security.dependencies import get_current_user
+    from vision_bill.security.models import User
+    from vision_bill.service.image_service import ImageService
+    from vision_bill.service.receipt_service import ReceiptService
+
+    original = tmp_path / "migrated.png"
+    original.write_bytes(b"original legacy receipt")
+    migrate(db, "0012")
+    conn = await asyncpg.connect(db.pg_dsn)
+    try:
+        owner = await conn.fetchval(
+            "INSERT INTO users(username,hashed_password) VALUES('owner','test') RETURNING id"
+        )
+        admin = await conn.fetchval(
+            "INSERT INTO users(username,hashed_password,is_admin) VALUES('admin','test',TRUE) RETURNING id"
+        )
+        image = await conn.fetchval(
+            "INSERT INTO images(user_id,image_path,status) VALUES($1,$2,'analyzed') RETURNING id",
+            owner,
+            str(original),
+        )
+        receipt_id = await conn.fetchval(
+            """INSERT INTO receipts(user_id,image_id,merchant_name,date,subtotal,total,currency,status,verified)
+            VALUES($1,$2,'Migrated','2026-01-01',10.25,10.25,'EUR','verified',TRUE) RETURNING id""",
+            owner,
+            image,
+        )
+        await conn.execute("UPDATE images SET receipt_id=$2 WHERE id=$1", image, receipt_id)
+        await conn.execute(
+            """INSERT INTO line_items(receipt_id,description,original_description,quantity,unit_price,total_price,position)
+            VALUES($1,'Printed item','Printed item',1,10.25,10.25,0)""",
+            receipt_id,
+        )
+    finally:
+        await conn.close()
+    migrate(db)
+    receipts = ReceiptDB(db, original_checker=ImageService.check_originals)
+    await receipts.init_db()
+    service = ReceiptService.__new__(ReceiptService)
+    service._db = receipts
+    app = FastAPI()
+    app.include_router(router, prefix="/api/v1/receipts")
+    app.dependency_overrides[get_receipt_service] = lambda: service
+    actor = User(id=admin, username="admin", is_admin=True, can_see_all=True)
+    app.dependency_overrides[get_current_user] = lambda: actor
+    benchmarks = BenchmarkDB(receipts.pool, receipts)
+    scope = AccessScope(user_id=owner)
+    try:
+        before = await receipts.get_receipt_with_details(receipt_id, user_id=owner)
+        stats = await receipts.get_statistics(user_id=owner)
+        assert before.receipt.verification_source == "legacy" and before.receipt.findings == []
+        assert stats.verified_receipt_count == 1
+        with pytest.raises(ValueError, match="human"):
+            await benchmarks.reference_preview(receipt_id, scope=scope)
+
+        path = f"/api/v1/receipts/{receipt_id}/verify"
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            cas = {"expected_operation_revision": 1, "expected_review_revision": 1}
+            preview = await client.get(path)
+            assert preview.status_code == 200, preview.text
+            fresh = preview.json()
+            assert (fresh["operation_revision"], fresh["review_revision"]) == (1, 1)
+            assert {f["code"] for f in fresh["findings"]} == {
+                "unknown_tax_basis",
+                "unknown_subtotal_origin",
+                "missing_tax_information",
+            }
+            actor = actor.model_copy(update={"can_see_all": False})
+            assert (await client.get(path)).status_code == 404
+            assert (await client.post(path, json=cas)).status_code == 404
+            actor = actor.model_copy(update={"can_see_all": True})
+            assert await receipts.get_receipt_with_details(receipt_id, user_id=owner) == before
+            async with receipts.pool.acquire() as check:
+                assert await check.fetchval("SELECT count(*) FROM receipt_review_revisions") == 0
+            assert (await client.post(path, json=cas)).status_code == 422
+            acknowledgements = [
+                {"finding_id": finding["id"], "comment": "Checked the printed original"}
+                for finding in fresh["findings"]
+            ]
+            original.unlink()
+            missing = await client.post(path, json={**cas, "acknowledgements": acknowledgements})
+            assert (
+                missing.status_code == 422
+                and missing.json()["detail"] == "receipt_integrity_failed"
+            )
+            original.write_bytes(b"original legacy receipt")
+            for bad in (
+                acknowledgements[:-1],
+                [*acknowledgements, acknowledgements[0]],
+                [{**acknowledgements[0], "finding_id": "stale"}, *acknowledgements[1:]],
+            ):
+                result = await client.post(path, json={**cas, "acknowledgements": bad})
+                assert (
+                    result.status_code == 422
+                    and result.json()["detail"] == "review_acknowledgements_invalid"
+                )
+            result = await client.post(path, json={**cas, "acknowledgements": acknowledgements})
+            assert result.status_code == 200, result.text
+            assert result.json()["acknowledgements"] == acknowledgements
+            assert (
+                await client.post(path, json={**cas, "expected_operation_revision": 2})
+            ).json() == {"detail": "Receipt already verified"}
+
+        after = await receipts.get_receipt_with_details(receipt_id, user_id=owner)
+        assert after.receipt.verification_source == "human"
+        assert (
+            after.receipt.verified and after.receipt.status == before.receipt.status == "verified"
+        )
+        assert after.receipt.review_revision == before.receipt.review_revision == 1
+        assert after.receipt.operation_revision == 2
+        assert (
+            after.receipt.total
+            == after.receipt.subtotal
+            == before.receipt.total
+            == Decimal("10.25")
+        )
+        assert after.line_items == before.line_items
+        assert after.taxes == before.taxes
+        assert after.image_path == before.image_path == str(original)
+        assert original.read_bytes() == b"original legacy receipt"
+        assert await receipts.get_statistics(user_id=owner) == stats
+        async with receipts.pool.acquire() as check:
+            events = await check.fetch(
+                "SELECT * FROM receipt_review_revisions WHERE receipt_id=$1", receipt_id
+            )
+        assert len(events) == 1 and events[0]["event_kind"] == "verified"
+        assert events[0]["actor_user_id"] == admin and after.receipt.user_id == owner
+        with pytest.raises(ValueError, match="qualified"):
+            await benchmarks.current_reference(receipt_id, scope=scope)
+        gold = await benchmarks.reference_preview(receipt_id, scope=scope)
+        saved = await benchmarks.qualify_reference(
+            receipt_id, gold.review_revision, gold.document_sha256, scope=scope
+        )
+        assert saved.id == (await benchmarks.current_reference(receipt_id, scope=scope)).id
+    finally:
+        await receipts.destroy_db()
+
+
+async def test_bypass_rereview_requires_cas_and_rechecks_known_original(workflow_db, tmp_path):
+    from hashlib import sha256
+
+    w, scope = workflow_db
+    row, _, original = await seed(w, scope, tmp_path, verified=True, total="10.000001")
+    original_bytes = original.read_bytes()
+    async with w.pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE receipts SET verification_source='automatic_bypass' WHERE id=$1", row.id
+        )
+        await conn.execute(
+            """INSERT INTO image_source_parts(image_id,photo_index,source_sha256,image_path,metadata)
+            VALUES($1,0,$2,$3,'{}')""",
+            row.image_id,
+            sha256(original_bytes).hexdigest(),
+            str(original),
+        )
+    before = await w._receipts.get_receipt_with_details(row.id, user_id=scope.user_id)
+    stats = await w._receipts.get_statistics(user_id=scope.user_id)
+    for request in (
+        ReviewRequest(),
+        ReviewRequest(expected_operation_revision=1),
+        ReviewRequest(expected_review_revision=1),
+    ):
+        with pytest.raises(ValueError, match="review_revision_required"):
+            await w._receipts.verify_receipt(row.id, request, scope=scope)
+    for request, code in [
+        (
+            ReviewRequest(expected_operation_revision=2, expected_review_revision=1),
+            "operation_revision_conflict",
+        ),
+        (
+            ReviewRequest(expected_operation_revision=1, expected_review_revision=2),
+            "review_revision_conflict",
+        ),
+    ]:
+        with pytest.raises(ValueError, match=code):
+            await w._receipts.verify_receipt(row.id, request, scope=scope)
+    request = ReviewRequest(expected_operation_revision=1, expected_review_revision=1)
+    preview = await w._receipts.preview_human_review(row.id, scope=scope)
+    assert preview.findings == []
+    original.write_bytes(b"changed original")
+    with pytest.raises(ValueError, match="receipt_integrity_failed"):
+        await w._receipts.verify_receipt(row.id, request, scope=scope)
+    assert await w._receipts.get_receipt_with_details(row.id, user_id=scope.user_id) == before
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM receipt_review_revisions") == 0
+    original.write_bytes(original_bytes)
+    results = await asyncio.gather(
+        w._receipts.verify_receipt(row.id, request, scope=scope),
+        w._receipts.verify_receipt(row.id, request, scope=scope),
+        return_exceptions=True,
+    )
+    saved = [result for result in results if not isinstance(result, BaseException)]
+    assert len(saved) == 1 and saved[0].verification_source == "human"
+    assert saved[0].total == before.receipt.total == Decimal("10.000001")
+    assert saved[0].verified and saved[0].review_revision == before.receipt.review_revision == 1
+    assert any(
+        isinstance(result, ValueError) and str(result) == "operation_revision_conflict"
+        for result in results
+    )
+    assert await w._receipts.get_statistics(user_id=scope.user_id) == stats
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM receipt_review_revisions") == 1

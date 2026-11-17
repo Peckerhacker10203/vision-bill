@@ -407,3 +407,65 @@ it.each([
 		);
 	}
 );
+
+it.each(['legacy', 'automatic_bypass'])(
+	'reviews a %s receipt explicitly with current findings and exact revisions',
+	async (verificationSource) => {
+		const verified: ReceiptRow = {
+			...row,
+			status: 'verified',
+			verified: true,
+			verification_source: verificationSource
+		};
+		const human = { ...verified, operation_revision: 8, verification_source: 'human' };
+		const findings = [
+			{
+				id: 'current-finding',
+				code: 'total_mismatch',
+				severity: 'review' as const,
+				field_path: 'total',
+				source_refs: [],
+				comparison: {}
+			}
+		];
+		vi.mocked(api.getReceipt)
+			.mockResolvedValueOnce(detail(verified))
+			.mockResolvedValue(detail(human));
+		const preview = vi
+			.fn()
+			.mockResolvedValue(Response.json({ operation_revision: 7, review_revision: 3, findings }));
+		vi.stubGlobal('fetch', preview);
+		const verify = vi.spyOn(api, 'verifyReceipt').mockResolvedValue(human);
+		const save = vi.spyOn(api, 'updateReceipt');
+		try {
+			render(Page);
+			await screen.findByLabelText('Merchant');
+			expect(screen.queryByRole('button', { name: 'Save & verify' })).toBeNull();
+			await fireEvent.click(screen.getByRole('button', { name: 'Review as human' }));
+			const dialog = await screen.findByRole('dialog', { name: 'Review receipt as human?' });
+			const confirm = within(dialog).getByRole('button', {
+				name: 'Review as human'
+			}) as HTMLButtonElement;
+			expect(confirm.disabled).toBe(true);
+			await fireEvent.input(await within(dialog).findByRole('textbox'), {
+				target: { value: 'Checked the original' }
+			});
+			await fireEvent.click(confirm);
+			await waitFor(() =>
+				expect(verify).toHaveBeenCalledWith(row.id, {
+					expected_operation_revision: 7,
+					expected_review_revision: 3,
+					acknowledgements: [{ finding_id: 'current-finding', comment: 'Checked the original' }]
+				})
+			);
+			await waitFor(() =>
+				expect(screen.queryByRole('button', { name: 'Review as human' })).toBeNull()
+			);
+			expect(preview).toHaveBeenCalledOnce();
+			expect(preview.mock.calls[0][0]).toBe(`/api/v1/receipts/${row.id}/verify`);
+			expect(save).not.toHaveBeenCalled();
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	}
+);
