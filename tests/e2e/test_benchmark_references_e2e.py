@@ -418,10 +418,37 @@ async def test_filtered_creation_qualifies_before_limit_and_explicit_ids_are_str
     manifest = await b.manifest(run.id)
     assert manifest['inputs'][0]['receipt_id'] == str(rows['valid'])
     # A restricted admin cannot include a foreign reference; configured see-all can.
-    admin_run = await service.create_run(request,scope=AccessScope(user_id=scope.user_id,can_see_all=True))
+    privileged = AccessScope(user_id=scope.user_id, can_see_all=True)
+    admin_run = await service.create_run(request, scope=privileged)
     assert admin_run.receipt_ids == [rows['foreign']]
+    mixed = await service.create_run(
+        BenchmarkCreate(model_ids=["fixture"], receipt_ids=[rows["valid"], rows["foreign"]]),
+        scope=privileged,
+    )
     async with w.pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO benchmark_results(run_id,model_id,receipt_id,success,payload) "
+            "VALUES($1,'fixture',$2,TRUE,$3::jsonb)",
+            mixed.id, rows["foreign"], json.dumps({"expected": {"merchant_name": "Foreign data"}}),
+        )
         before = await conn.fetchval('SELECT count(*) FROM benchmark_runs')
+
+    assert {listed.id for listed in await service.list_runs(scope=privileged)} == {
+        run.id, admin_run.id, mixed.id,
+    }
+    assert {listed.id for listed in await service.list_runs(scope=scope)} == {run.id}
+    assert await b.run(mixed.id) is not None  # Workers continue to own old jobs.
+    assert await service.get_status(run.id, scope=scope) is not None
+    assert await service.get_status(mixed.id, scope=privileged) is not None
+    assert await service.get_status(mixed.id, scope=scope) is None
+    assert (await service.results(mixed.id, limit=5, offset=0, scope=privileged))[0]["expected"] == {
+        "merchant_name": "Foreign data",
+    }
+    with pytest.raises(ValueError, match="Benchmark run not found"):
+        await service.results(mixed.id, limit=5, offset=0, scope=scope)
+    with pytest.raises(ValueError, match="not part of this benchmark run"):
+        await service.reevaluate(mixed.id, rows["foreign"], "fixture", scope=scope)
+
     for invalid in [uuid4(), *[rows[name] for name in ('foreign','unqualified','stale','missing_source','unverified')]]:
         with pytest.raises((ValueError,FileNotFoundError)):
             await service.create_run(BenchmarkCreate(model_ids=['fixture'],receipt_ids=[rows['valid'],invalid],limit=1),scope=scope)

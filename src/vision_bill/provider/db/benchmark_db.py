@@ -26,6 +26,27 @@ from .deadline import connection
 from .receipt_db import ReceiptDB
 
 
+# A restricted actor may read a whole run only while every frozen receipt is
+# still theirs. Result payloads can retain evidence after a receipt is deleted.
+_RUN_SCOPE = """(
+    {see_all} OR (
+        b.owner_id={owner}
+        AND jsonb_typeof(b.receipt_ids)='array'
+        AND b.receipt_ids <> '[]'::jsonb
+        AND NOT EXISTS (
+            SELECT 1 FROM jsonb_array_elements_text(
+                CASE WHEN jsonb_typeof(b.receipt_ids)='array' THEN b.receipt_ids ELSE '[]'::jsonb END
+            ) AS inputs(receipt_id)
+            WHERE NOT EXISTS (
+                SELECT 1 FROM receipts r
+                WHERE r.id=CASE WHEN pg_input_is_valid(inputs.receipt_id,'uuid') THEN inputs.receipt_id::uuid END
+                  AND r.user_id={owner}
+            )
+        )
+    )
+)"""
+
+
 class BenchmarkDB:
     def __init__(self, pool: asyncpg.Pool, receipts: ReceiptDB | None = None,
                  *, worker: WorkerSettings | None = None):
@@ -70,12 +91,20 @@ class BenchmarkDB:
 
     async def run(self, run_id: UUID, *, scope: AccessScope | None = None, deadline: float | None = None) -> BenchmarkRun | None:
         async with connection(self._pool, deadline=deadline) as conn:
-            row = await conn.fetchrow("SELECT * FROM benchmark_runs WHERE id=$1 AND ($2 OR owner_id=$3)", run_id, scope is None or scope.can_see_all, scope.user_id if scope else None)
+            visible = _RUN_SCOPE.format(see_all="$2", owner="$3")
+            row = await conn.fetchrow(
+                f"SELECT b.* FROM benchmark_runs b WHERE b.id=$1 AND {visible}", run_id,
+                scope is None or scope.can_see_all, scope.user_id if scope else None,
+            )
         return self._run(row) if row else None
 
     async def runs(self, *, scope: AccessScope) -> list[BenchmarkRun]:
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch("SELECT * FROM benchmark_runs WHERE ($1 OR owner_id=$2) ORDER BY created_at DESC, id DESC", scope.can_see_all, scope.user_id)
+            visible = _RUN_SCOPE.format(see_all="$1", owner="$2")
+            rows = await conn.fetch(
+                f"SELECT b.* FROM benchmark_runs b WHERE {visible} ORDER BY b.created_at DESC, b.id DESC",
+                scope.can_see_all, scope.user_id,
+            )
         return [self._run(r) for r in rows]
 
     async def task_counts(self, run_id: UUID) -> dict[str, int]:

@@ -385,3 +385,28 @@ async def test_cancelled_pool_queue_wait_does_not_disrupt_another_borrower():
             await pool.release(reused)
     finally:
         pool.terminate()
+
+
+async def test_benchmark_reads_include_current_receipt_scope():
+    from contextlib import asynccontextmanager
+
+    from vision_bill.model.workflow import AccessScope
+
+    conn = SimpleNamespace(fetchrow=AsyncMock(return_value=None), fetch=AsyncMock(return_value=[]))
+
+    @asynccontextmanager
+    async def acquire():
+        yield conn
+
+    database = BenchmarkDB(SimpleNamespace(acquire=acquire))
+    run_id, owner = uuid4(), uuid4()
+    scope = AccessScope(user_id=owner)
+    assert await database.run(run_id, scope=scope) is None
+    assert await database.runs(scope=scope) == []
+    status_sql, *status_args = conn.fetchrow.await_args.args
+    list_sql, *list_args = conn.fetch.await_args.args
+    for sql in (status_sql, list_sql):
+        assert "jsonb_array_elements_text" in sql
+        assert "FROM receipts" in sql and "r.user_id" in sql
+    assert status_args == [run_id, False, owner]
+    assert list_args == [False, owner]
