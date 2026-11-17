@@ -23,6 +23,7 @@
 		}
 	});
 	let alive = true;
+	let refreshing = false;
 	let refreshRequest = 0,
 		detailsRequest = 0;
 	onDestroy(() => {
@@ -50,10 +51,12 @@
 		}
 	}
 	const fmt = (value: number | null, digits = 2) => (value === null ? '—' : value.toFixed(digits));
-	async function refresh() {
+	async function refresh(selectionChanged = false) {
+		if (refreshing && !selectionChanged) return;
 		const request = ++refreshRequest;
 		const current = () => currentView() && refreshRequest === request;
 		if (!actor || !current()) return;
+		refreshing = true;
 		try {
 			const available = await api.listBenchmarks(actor);
 			if (!current()) return;
@@ -75,6 +78,8 @@
 		} catch (cause) {
 			if (current())
 				error = cause instanceof Error ? cause.message : 'Unable to load benchmark results.';
+		} finally {
+			if (refreshRequest === request) refreshing = false;
 		}
 	}
 	onMount(() => {
@@ -114,7 +119,7 @@
 					error = '';
 					details = [];
 					detailsOffset = 0;
-					void refresh();
+					void refresh(true);
 				}}
 				>{#each runs as run (run.id)}<option value={run.id}>#{run.id} — {run.status}</option
 					>{/each}</select

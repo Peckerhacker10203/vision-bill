@@ -110,28 +110,23 @@ it.each([false, true])(
 		).toBe(false);
 	}
 );
-it('accepts only the latest poll for one run', async () => {
-	const fetchMock = await setup(),
-		older = deferred<Response>(),
-		newer = deferred<Response>();
-	let requests = 0;
+it('coalesces timer ticks until a slow refresh has delivered its result', async () => {
+	const fetchMock = await setup();
+	const slow = deferred<Response>();
 	fetchMock.mockImplementation(async (url) =>
-		url === '/api/v1/benchmarks'
-			? Response.json([run('A'), run('B')])
-			: ++requests === 1
-				? older.promise
-				: newer.promise
+		url === '/api/v1/benchmarks' ? Response.json([run('A'), run('B')]) : slow.promise
 	);
+	fetchMock.mockClear();
 	poll();
-	await waitFor(() => expect(requests).toBe(1));
+	await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
 	poll();
-	await waitFor(() => expect(requests).toBe(2));
-	newer.resolve(Response.json(status('A', 'newer')));
-	await screen.findByText(/Scoring version: newer/);
-	older.resolve(Response.json(status('A', 'older')));
+	poll();
 	await tick();
-	await new Promise((r) => setTimeout(r, 0));
-	expect(screen.queryByText(/Scoring version: older/)).toBeNull();
+	expect(fetchMock).toHaveBeenCalledTimes(2);
+	slow.resolve(Response.json(status('A', 'slow result')));
+	await screen.findByText(/Scoring version: slow result/);
+	poll();
+	await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
 });
 
 it('clears the removed run and fences its pending details when polling selects a successor', async () => {
