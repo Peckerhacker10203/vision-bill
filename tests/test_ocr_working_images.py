@@ -160,14 +160,17 @@ async def test_accepted_seeded_12mp_jpeg_round_trips_full_resolution_working_png
 
     # The decoded JPEG stands in for the preprocessor's BGR output.
     with Image.open(BytesIO(source)) as decoded:
-        expected_pixels = np.asarray(decoded.convert("RGB"))
+        expected_rgb = decoded.convert("RGB").tobytes()
+    expected_pixels = np.frombuffer(expected_rgb, dtype=np.uint8).reshape(3000, 4000, 3)
     view = working_image({"output_img": expected_pixels[:, :, ::-1], "angle": 0}, [])
     png = base64.b64decode(view.png_base64)
     assert len(png) > 25 * 1024 * 1024
     print(f"source={len(source)} bytes, working PNG={len(png)} bytes")
     assert (view.width, view.height) == (4000, 3000)
     with Image.open(BytesIO(png)) as decoded:
-        np.testing.assert_array_equal(np.asarray(decoded), expected_pixels)
+        assert decoded.mode == "RGB"
+        assert decoded.size == (4000, 3000)
+        assert decoded.tobytes() == expected_rgb
     result = OcrResponse(
         request_id=uuid4(),
         photo_index=0,
