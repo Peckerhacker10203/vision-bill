@@ -271,7 +271,12 @@ def validate_managed_ocr() -> None:
         from pydantic_settings import EnvSettingsSource
 
         # Deliberately after initialization: config imports eagerly resolve settings.
-        from vision_bill.config import Settings, get_config_path, settings
+        from vision_bill.config import (
+            Settings,
+            get_config_path,
+            settings,
+            validate_saved_ocr_config,
+        )
 
         saved_ocr = read_config(get_config_path()).get("ocr", {})
         runtime_ocr = EnvSettingsSource(Settings)().get("ocr", {})
@@ -306,6 +311,7 @@ def validate_managed_ocr() -> None:
             or effective.allow_vision_fallback
         ):
             raise ValueError("conflicting effective topology")
+        validate_saved_ocr_config(saved_ocr, effective_enabled=effective.enabled)
     except (OSError, ValueError, yaml.YAMLError) as exc:
         raise BootstrapError(
             "Managed OCR bundle requires OCR__ENDPOINT=http://ocr:8082, "

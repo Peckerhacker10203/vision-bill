@@ -288,7 +288,11 @@ def test_first_start_does_not_overwrite_locked_winner(saved_settings, monkeypatc
 
 @pytest.mark.parametrize(
     ("saved_ocr", "status"),
-    [({"required": True}, 200), ({"required": True, "enabled": "invalid-boolean"}, 503)],
+    [
+        ({"required": True}, 200),
+        ({"required": True, "enabled": "invalid-boolean"}, 503),
+        ({"timeout_seconds": 0}, 503),
+    ],
 )
 def test_settings_save_preserves_partial_ocr_with_canonical_runtime_endpoint(
     saved_settings, monkeypatch, saved_ocr, status
@@ -298,9 +302,10 @@ def test_settings_save_preserves_partial_ocr_with_canonical_runtime_endpoint(
     path.write_text(yaml.safe_dump(original))
     monkeypatch.setitem(config.Settings.model_config, "yaml_file", str(path))
     monkeypatch.setenv("OCR__ENDPOINT", "http://ocr:8082")
+    monkeypatch.setenv("OCR__TIMEOUT_SECONDS", "600")
     active = config.Settings()
     monkeypatch.setattr(system, "settings", active)
-    assert active.ocr.required and active.ocr.enabled
+    assert active.ocr.enabled and active.ocr.timeout_seconds == 600
     before = path.read_bytes()
 
     response = client.put("/system/settings", json=payload(active, model_name="new-selection"))

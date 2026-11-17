@@ -24,6 +24,12 @@ import yaml
             0,
             id="canonical-runtime-endpoint-supplies-missing-saved-service-url",
         ),
+        pytest.param(
+            {"timeout_seconds": 0},
+            {"OCR__ENDPOINT": "http://ocr:8082", "OCR__TIMEOUT_SECONDS": "600"},
+            1,
+            id="runtime-timeout-cannot-hide-invalid-saved-timeout",
+        ),
         ({"endpoint": "http://ocr:8082"}, {}, 0),
         ({"enabled": True, "service_url": "http://ocr:8082"}, {}, 0),
         ({}, {}, 1),

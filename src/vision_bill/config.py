@@ -159,6 +159,18 @@ class OcrSettings(BaseModel):
         return self
 
 
+def validate_saved_ocr_config(saved: object, *, effective_enabled: bool) -> None:
+    """Validate saved OCR fields with the effective enabled state for partial settings."""
+    if (
+        effective_enabled
+        and isinstance(saved, dict)
+        and "enabled" not in saved
+        and "endpoint" not in saved
+    ):
+        saved = {**saved, "enabled": True}
+    OcrSettings.model_validate(saved)
+
+
 class PGSettings(BaseModel):
     user: str
     password: str
@@ -324,17 +336,10 @@ def _publish_config_file(
             for section, model_field in Settings.model_fields.items():
                 if section not in data:
                     continue
-                section_data = data[section]
-                if (
-                    section == "ocr"
-                    and isinstance(section_data, dict)
-                    and config.ocr.enabled
-                    and "enabled" not in section_data
-                    and "endpoint" not in section_data
-                ):
-                    # Check partial OCR with its effective enabled state without saving it.
-                    section_data = {**section_data, "enabled": True}
-                TypeAdapter(model_field.annotation).validate_python(section_data)
+                if section == "ocr":
+                    validate_saved_ocr_config(data[section], effective_enabled=config.ocr.enabled)
+                else:
+                    TypeAdapter(model_field.annotation).validate_python(data[section])
             if changed_paths is None:
                 merge(data, resolved)
             else:
