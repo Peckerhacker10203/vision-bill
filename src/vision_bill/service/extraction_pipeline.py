@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from contextlib import nullcontext
 from pathlib import Path
 from time import monotonic, perf_counter
+from typing import Literal
 
 import httpx
 
@@ -25,6 +26,8 @@ from ..provider.llm.base import LLMProvider, ModelInfo
 from ..provider.ocr.base import OcrProvider, compact_ocr_text
 from .gpu_handoff import ModelHandoff, admission_deadline, current_owner
 from .observation_admission import admit_observations
+
+UnmanagedClassificationEvent = Callable[[Literal["started", "settled"]], Awaitable[None]]
 
 
 def select_vision_model(models: Sequence[ModelInfo], requested_id: str) -> ModelInfo | None:
@@ -82,6 +85,7 @@ class ExtractionPipeline:
         tags: Sequence[str],
         checkpoint: Callable[[OcrResponse], Awaitable[None]] | None = None,
         observation_checkpoint: Callable[[InferenceEnvelope], Awaitable[None]] | None = None,
+        unmanaged_classification_event: UnmanagedClassificationEvent | None = None,
         resume_pages: Sequence[OcrResponse] = (),
         source_refs: Sequence[SourceRef] = (),
         max_output_tokens: int | None = None,
@@ -109,6 +113,7 @@ class ExtractionPipeline:
                 tags=tuple(tags),
                 checkpoint=checkpoint,
                 observation_checkpoint=observation_checkpoint,
+                unmanaged_classification_event=unmanaged_classification_event,
                 resume_pages=tuple(p.model_copy(deep=True) for p in resume_pages),
                 source_refs=tuple(r.model_copy(deep=True) for r in source_refs),
                 max_output_tokens=max_output_tokens,
@@ -127,6 +132,7 @@ class ExtractionPipeline:
         tags: Sequence[str],
         checkpoint: Callable[[OcrResponse], Awaitable[None]] | None,
         observation_checkpoint: Callable[[InferenceEnvelope], Awaitable[None]] | None,
+        unmanaged_classification_event: UnmanagedClassificationEvent | None,
         resume_pages: Sequence[OcrResponse],
         source_refs: Sequence[SourceRef],
         max_output_tokens: int | None,
@@ -283,6 +289,7 @@ class ExtractionPipeline:
                     formatted.telemetry.context_window_tokens = model.context_window_tokens
                     return await self._finish(
                         provider, formatted, result, started, tags, deadline, observation_checkpoint,
+                        unmanaged_classification_event,
                     )
                 result.provenance.fallback_reason = reason
                 return self._failed(result, reason, started)
@@ -307,6 +314,7 @@ class ExtractionPipeline:
             formatted.telemetry.context_window_tokens = model.context_window_tokens
             return await self._finish(
                 provider, formatted, result, started, tags, deadline, observation_checkpoint,
+                unmanaged_classification_event,
             )
 
     @staticmethod
@@ -332,6 +340,7 @@ class ExtractionPipeline:
         tags: Sequence[str],
         deadline: float,
         observation_checkpoint: Callable[[InferenceEnvelope], Awaitable[None]] | None,
+        unmanaged_classification_event: UnmanagedClassificationEvent | None,
     ) -> InferenceEnvelope:
         original.provenance.used_pipeline = formatted.provenance.used_pipeline
         formatted.provenance = original.provenance
@@ -345,6 +354,15 @@ class ExtractionPipeline:
         await run_sync_before(deadline, admit_observations, formatted)
         if observation_checkpoint is not None:
             await observation_checkpoint(formatted)
-        return await provider.enrich_observations(
+        event = None
+        if formatted.classification_enrichment.state == "pending" and current_owner() is None:
+            event = unmanaged_classification_event
+        if event is not None:
+            await event("started")
+        enriched = await provider.enrich_observations(
             formatted.provenance.model_id, formatted, tags, work_deadline=deadline,
         )
+        if event is not None:
+            # A normal unmanaged return proves a response or no dispatch.
+            await event("settled")
+        return enriched

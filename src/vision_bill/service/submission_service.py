@@ -8,7 +8,7 @@ from contextlib import AsyncExitStack
 from functools import partial
 from pathlib import Path
 from time import monotonic
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 import httpx
@@ -458,6 +458,7 @@ class SubmissionService:
             for p in parts
         ]
         pages, manifests = await self._resume(claim, parts, ocr, deadline, db_deadline=db_deadline)
+        observation_checkpoint_id: UUID | None = None
 
         async def save_page(page: OcrResponse) -> None:
             manifest = await self._save_view(
@@ -485,6 +486,7 @@ class SubmissionService:
                 manifests.append(manifest)
 
         async def save_observations(envelope: InferenceEnvelope) -> None:
+            nonlocal observation_checkpoint_id
             if envelope.provenance.ordered_source_sha256 != hashes:
                 raise SourceIntegrityError
             await save_direct_views(envelope)
@@ -515,6 +517,16 @@ class SubmissionService:
             )
             if not await self.db.save_observation_checkpoint(claim, checkpoint, deadline=db_deadline):
                 raise StaleClaimError
+            observation_checkpoint_id = checkpoint.checkpoint_id
+
+        async def record_classification_event(state: Literal["started", "settled"]) -> None:
+            if observation_checkpoint_id is None:
+                raise StaleClaimError
+            recorded = await self.db.record_unmanaged_classification_event(
+                claim, observation_checkpoint_id, state=state, deadline=db_deadline,
+            )
+            if not recorded:
+                raise StaleClaimError
 
         tags = await self.receipts.list_tags(deadline=db_deadline)
         expected_binding = (snapshot.get("managed_binding_sha256") or "") if managed_ocr(ocr) else None
@@ -534,6 +546,7 @@ class SubmissionService:
                     tags=tags,
                     checkpoint=save_page,
                     observation_checkpoint=save_observations,
+                    unmanaged_classification_event=record_classification_event,
                     resume_pages=list(pages),
                     source_refs=refs,
                     ocr_settings=ocr,

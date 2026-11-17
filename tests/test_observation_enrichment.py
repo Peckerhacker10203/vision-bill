@@ -104,6 +104,16 @@ async def test_submission_checkpoints_all_views_before_text_labels(
         return save_succeeds
 
     db.save_observation_checkpoint = AsyncMock(side_effect=save)
+
+    async def record(claim_arg, checkpoint_id, *, state, deadline=None):
+        assert claim_arg == claim
+        saved = db.save_observation_checkpoint.await_args
+        assert checkpoint_id == saved.args[1].checkpoint_id
+        assert deadline == saved.kwargs["deadline"]
+        events.append(state)
+        return True
+
+    db.record_unmanaged_classification_event = AsyncMock(side_effect=record)
     formatted = llm._client.chat.return_value
 
     async def chat(**request):
@@ -117,7 +127,6 @@ async def test_submission_checkpoints_all_views_before_text_labels(
                 assert len(messages[0]["images"]) == 2
             return formatted
         events.append("classification_dispatched")
-        assert "checkpoint_committed" in events
         assert all("images" not in message for message in messages)
         return chat_reply('{"category":"grocery","line_items":[{}]}')
 
@@ -125,7 +134,7 @@ async def test_submission_checkpoints_all_views_before_text_labels(
     claim.image.model_id = "fixture"
     result = await service.process_claim(claim)
     if save_succeeds:
-        assert events == ["checkpoint_committed", "classification_dispatched"]
+        assert events == ["checkpoint_committed", "started", "classification_dispatched", "settled"]
         outcome = db.finish_attempt.call_args.args[1]
         assert outcome.envelope.receipt.total == Decimal("4.00")
         assert outcome.envelope.receipt.line_items[0].spending_category == "milk"
@@ -134,6 +143,7 @@ async def test_submission_checkpoints_all_views_before_text_labels(
     else:
         assert events == []
         assert result.stale
+        db.record_unmanaged_classification_event.assert_not_awaited()
         db.finish_attempt.assert_not_awaited()
 
 
@@ -161,6 +171,7 @@ async def test_classification_local_timeout_requires_settlement_and_verified_rel
     owners = []
     resident = False
     formatted = llm._client.chat.return_value
+    record_upload_event = AsyncMock(side_effect=AssertionError("managed dispatch uses its journal"))
 
     async def checkpoint(observed):
         assert observed.input_views[0].photo_index == 0
@@ -209,6 +220,7 @@ async def test_classification_local_timeout_requires_settlement_and_verified_rel
                 result = await extract.extract(
                     "fixture", [path], options=ExperimentOptions(pipeline="direct_vision"),
                     deadline=deadline, tags=[], observation_checkpoint=checkpoint,
+                    unmanaged_classification_event=record_upload_event,
                 )
                 assert result.classification_enrichment.state == "unavailable"
                 assert result.receipt.total == Decimal("4.00")
@@ -217,6 +229,7 @@ async def test_classification_local_timeout_requires_settlement_and_verified_rel
                     await extract.extract(
                         "fixture", [path], options=ExperimentOptions(pipeline="direct_vision"),
                         deadline=deadline, tags=[], observation_checkpoint=checkpoint,
+                        unmanaged_classification_event=record_upload_event,
                     )
         finally:
             responder.cancel()
@@ -225,6 +238,7 @@ async def test_classification_local_timeout_requires_settlement_and_verified_rel
         "release_requested", "release_verified",
     ]
     assert owners[0] is not None and owners[0].request_sequence == 3
+    record_upload_event.assert_not_awaited()
 
 
 @pytest.mark.parametrize("failure", ["proxy", "transport_timeout", "cancel"])

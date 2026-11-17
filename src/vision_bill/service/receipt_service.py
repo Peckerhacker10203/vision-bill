@@ -43,7 +43,7 @@ from .image_service import ImageService
 if TYPE_CHECKING:
     from ..model.experiment import ExperimentOptions
     from .experiment_execution import ExperimentResult
-    from .extraction_pipeline import ExtractionPipeline
+    from .extraction_pipeline import ExtractionPipeline, UnmanagedClassificationEvent
     from .gpu_handoff import ModelHandoff
 
 logger = logging.getLogger(__name__)
@@ -485,6 +485,7 @@ class ReceiptService:
         deadline: float, tags: Sequence[str],
         checkpoint: Callable[[OcrResponse], Awaitable[None]] | None = None,
         observation_checkpoint: Callable[[InferenceEnvelope], Awaitable[None]] | None = None,
+        unmanaged_classification_event: "UnmanagedClassificationEvent | None" = None,
         resume_pages: Sequence[OcrResponse] = (), source_refs: Sequence[SourceRef] = (),
         ocr_settings: OcrSettings | None = None, max_output_tokens: int | None = None,
         expected_binding_sha256: str | None = None, handoff_deadline: float | None = None,
@@ -496,6 +497,7 @@ class ReceiptService:
             model_id, paths, options=options, deadline=deadline, tags=tags,
             checkpoint=checkpoint, resume_pages=resume_pages, source_refs=source_refs,
             observation_checkpoint=observation_checkpoint,
+            unmanaged_classification_event=unmanaged_classification_event,
             max_output_tokens=max_output_tokens, expected_binding_sha256=expected_binding_sha256,
             handoff_deadline=handoff_deadline,
         )
