@@ -28,6 +28,8 @@ from ..model.handoff import (
     ResourceIdentity,
 )
 
+MAX_READINESS_PROBE_SECONDS = 2.0
+
 _current: ContextVar["HandoffOwner | None"] = ContextVar("model_handoff", default=None)
 
 
@@ -37,7 +39,7 @@ def _handoff_error(status: HandoffStatus, *, admission: bool) -> RuntimeError:
 
 
 def admission_deadline(deadline: float) -> float:
-    """Leave time inside the caller's budget to record a contended admission."""
+    """Bound the local lock wait, leaving time to record contention."""
     now = monotonic()
     return min(now + 0.25, now + max(0.0, deadline - now) / 2)
 
@@ -370,7 +372,7 @@ class ModelHandoff:
                 recorded = saved.models if saved else []
                 if any(model not in binding.model_ids for model in recorded):
                     return HandoffStatus(state="recovery_required", reason_code="model_handoff_recorded_model_not_adopted")
-                await self.require_residency(recorded, deadline)
+                await self.require_residency(recorded, min(deadline, monotonic() + MAX_READINESS_PROBE_SECONDS))
                 return HandoffStatus(state="ready")
         except HandoffWait as exc:
             return exc.status
@@ -461,8 +463,8 @@ class ModelHandoff:
             raise ValueError("model_release_unsupported: managed OCR requires an unload-capable provider")
         token = None
         owner = HandoffOwner(self, deadline)
-        admission_limit = min(deadline, lock_deadline) if lock_deadline is not None else deadline
-        async with self.exclusion(admission_limit, admission=lock_deadline is not None):
+        lock_limit = min(deadline, lock_deadline) if lock_deadline is not None else deadline
+        async with self.exclusion(lock_limit, admission=lock_deadline is not None):
             if self.resources != resources:
                 raise ValueError("model_handoff_identity_changed")
             if expected_binding_sha256 is not None:
@@ -490,9 +492,15 @@ class ModelHandoff:
                 raise HandoffWait(HandoffStatus(
                     state="recovery_required", reason_code="model_handoff_recorded_model_not_adopted",
                 ))
-            await self.require_residency(owner.models, admission_limit)
+            # Transport latency must not consume the earlier lock-contention
+            # budget. Keep a shared bounded probe window before counting work.
+            probe_limit = deadline
+            if lock_deadline is not None:
+                now = monotonic()
+                probe_limit = now + min(MAX_READINESS_PROBE_SECONDS, max(0.0, deadline - now) / 2)
+            await self.require_residency(owner.models, probe_limit)
             if lock_deadline is not None and not recovery_only:
-                await self.require_ocr_mode(admission_limit)
+                await self.require_ocr_mode(probe_limit)
             # Read-only admission has its own earlier clock. Start the full
             # work timer before any durable attempt or external mutation.
             timeout.reschedule(expires_at)

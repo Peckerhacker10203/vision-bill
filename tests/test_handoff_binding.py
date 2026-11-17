@@ -670,3 +670,26 @@ async def test_recovery_session_confirms_owned_cleanup_before_publication(tmp_pa
         saved = handoff.read_journal()
         assert not saved.models and not saved.ocr_pending and not saved.unsettled
     assert events == ["residency", "claim_park", ("unload", "own"), "residency", "publish"]
+
+
+@pytest.mark.asyncio
+async def test_session_allows_metadata_slower_than_the_contended_lock_window(tmp_path):
+    from vision_bill.service.gpu_handoff import admission_deadline
+
+    events = []
+    llm = ResidentLlm(events)
+    handoff = ModelHandoff(tmp_path / "handoff.lock", llm, Ocr(events))
+    await adopt(handoff)
+    resident_models = llm.resident_model_ids
+
+    async def slow_residency(*, deadline):
+        assert deadline - monotonic() > 0.25
+        await asyncio.sleep(0.3)
+        return await resident_models(deadline=deadline)
+
+    llm.resident_model_ids = slow_residency
+    deadline = monotonic() + 2
+    async with handoff.session(
+        deadline, model_id="own", lock_deadline=admission_deadline(deadline)
+    ):
+        assert handoff.journal.exists()

@@ -418,7 +418,7 @@ class BenchmarkService:
             if (uses_ocr or "managed_binding_sha256" in (frozen_identity or {})) and not frozen_binding:
                 frozen_binding = ""
             status = await handoff.inspect(
-                model_id=model_id, deadline=admission_deadline(inference_deadline),
+                model_id=model_id, deadline=inference_deadline,
                 expected_binding_sha256=frozen_binding,
             )
             if status.state != "ready":
