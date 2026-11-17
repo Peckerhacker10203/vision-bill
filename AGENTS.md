@@ -3,10 +3,10 @@
 ## Scope and architecture
 
 vision-bill is a local-first, multi-user receipt API and bundled SvelteKit SPA.
-Ollama is the default; OpenAI-compatible providers are optional and user-configured.
-Keep receipt processing on local endpoints unless the user explicitly chooses an
-external endpoint. Never introduce external receipt processing or receipt contents
-in general logs. Preserve original bytes, human corrections, exact money and owners.
+Operators supply an existing Ollama or OpenAI-compatible endpoint and explicitly
+select a model. The app and OCR distributions include no LLM runtime or weights.
+Use only the operator's configured endpoint. Keep receipt contents out of
+general logs. Preserve original bytes, human corrections, exact money and owners.
 
 Public operator contracts are in [UPGRADE_AND_VERIFY.md](UPGRADE_AND_VERIFY.md),
 [MULTI_IMAGE_RECEIPTS.md](MULTI_IMAGE_RECEIPTS.md),
@@ -27,7 +27,7 @@ experiment reports do not certify production hardware or accuracy.
 - `src/vision_bill/provider/db/`: raw SQL and transactional ownership/CAS/leases;
   services delegate DB access here. `provider/llm/`: model discovery, extraction,
   repairs/classification; services do not call provider SDKs directly.
-- `alembic/versions/`: migrations 0001–0019. No application DDL/autogenerate.
+- `alembic/versions/`: migrations 0001–0020. No application DDL/autogenerate.
 - `paddleocr-service/ocr_service/`: isolated native pipeline, qualification and
   disposable worker lifecycle. `build/` and locks pin runtime/build candidates.
 - `frontend/`: SvelteKit static SPA, TypeScript, Tailwind, Vitest, Playwright,
@@ -46,9 +46,12 @@ All `/api/v1` data routes require authentication; auth register/login/logout and
 `GET /system/ui-config` are public. Benchmarks/settings require admin. Admin access
 across owners additionally requires `auth.admin_can_see_all`; preserve scope on
 all reads/mutations, sources, drafts, retries, collections and benchmark references.
-Entity IDs are UUIDs. DB-unavailable paths return 503.
+Entity IDs are UUIDs. DB-unavailable paths return 503. Browser data requests bind
+the originating cookie actor with `X-Vision-Bill-Expected-User` or the private
+media query parameter `vb_expected_user`. Malformed or conflicting expectations
+return 400. Actor mismatch returns 409 before the protected operation.
 
-- `POST /images`: 1–10 repeated multipart `receipt` fields, at most 20 MB/photo;
+- `POST /images`: 1–10 repeated multipart `receipt` fields, at most 20 MiB/photo;
   committed 202 + durable ID + Location for **all** uploads. Options `model_id`,
   `bypass_review`, deprecated compatibility `allow_ocr_fallback`, and owner-scoped
   `Idempotency-Key` preserve explicit presence/intent, ordered hashes and first defaults.
@@ -60,16 +63,18 @@ Entity IDs are UUIDs. DB-unavailable paths return 503.
   Draft GET reads current state; PATCH requires expected_revision;
   `/draft/finalize` also takes request_key.
 - Receipts list/get/update/delete/verify retain exact amounts and file paths.
-  Verify uses current operation/review revision and exact finding acknowledgements;
-  integrity failures block it. No Verify/bypass file moves.
+  Human review uses the current preview, displayed operation/review revisions
+  and the exact finding acknowledgements. Integrity failures block completion.
+  Verification and bypass preserve the original and working files.
 - Deletion commits rows plus durable owned-file cleanup metadata, then unlinks
   validated originals/thumbnail/working derivatives. Same authorized DELETE resumes
   interrupted cleanup. Active/referenced resources conflict; no arbitrary sweeper.
 - Search/statistics use verified receipts. Collections preserve owner-scoped active
   membership, even for see-all admin changes. Tags are normalized vocabulary.
-- Benchmark create returns 202/Location; status/results/reevaluate are scoped.
-  GET/POST `/benchmarks/references/{receipt_id}` previews and explicitly qualifies
-  current human Gold. Verified/bypass/legacy flags alone never suffice.
+- Benchmark create requires explicit unique model IDs and returns 202/Location.
+  Status, results and reevaluation use current owner permissions. GET/POST
+  `/benchmarks/references/{receipt_id}` previews and explicitly qualifies current
+  human Gold. Verification provenance and current document identity govern Gold.
 
 ## Workflow and contracts
 
@@ -78,8 +83,13 @@ Entity IDs are UUIDs. DB-unavailable paths return 503.
 claims/generations/retry/backoff/drafts/extractions/views/deletion. No ad-hoc worker
 loops. Default whole-attempt deadline 600s, max three attempts, 30/60s backoff,
 cap 300s, lease 900s; readiness/model-start waits can remain pending at zero attempts.
-Stale completions are fenced; a later-photo failure never commits a successful
-prefix as a receipt or complete checkpoint. Legacy linked receipts are not re-OCRed.
+Stale completions are fenced. A later-photo failure retains only the validated
+prefix. Legacy linked receipts keep their original provenance. An all-photo
+observation checkpoint precedes optional enrichment. Its completion-only claim
+rechecks frozen policy/endpoint, generation, original/working artifacts, current
+receipt and review state, and settled resource ownership. It spends no inference
+attempt and appends a separate idempotent history event. Keep ambiguous dispatches
+held through recovery. See [upload recovery](MULTI_IMAGE_RECEIPTS.md#complete-observations-and-optional-labels).
 
 `extraction_pipeline.py` selects direct vision only without OCR, otherwise OCR
 followed by strict text/evidence-only formatting, repair and classification. No
@@ -91,9 +101,11 @@ Policy mismatch holds work before claim; retry `policy: "current"` explicitly ad
 the current snapshot with history/CAS/request replay. Never overwrite completed
 receipts, human edits or live claims. See the upload guide.
 
-Printed observations live in nullable `ExtractionDraft`; category/tags are optional
-downstream enrichment. Missing currency/amounts stay missing. The completed Receipt
-boundary and checks decide persistence/finalization, never invented defaults.
+Printed observations live in nullable `ExtractionDraft`. Category and tags are
+optional downstream enrichment. Missing currency and amounts stay missing.
+Complete observations can survive safely settled label failure with an explicit
+`classification_enrichment` status. Missing optional labels stay outside
+financial and integrity checks.
 Only proposed adjacent suffix/prefix overlaps that pass shared duplicate verification
 may be removed. Preserve repeated purchases; no global deduplication or blanket
 splitting. `receipt_review.py` checks version 2 performs exact Decimal diagnostics
@@ -104,7 +116,10 @@ findings cannot be waived. Local time supports valid seconds and microseconds.
 `ImageService` preserves original bytes/hash, creates thumbnails nonfatally and
 saves exact validated working PNG artifacts. Shared white RGB composition is
 `white-document-rgb-v2`; EXIF correction and native orientation/unwarp are distinct.
-Working geometry stays in working coordinates; inverse mapping remains null.
+Working geometry stays in working coordinates and inverse mapping remains null.
+Shared source limits are 20 MiB for the app and 25 MiB for the native service
+with 40,000,000 pixels, a derived RGB8 PNG bound and bounded metadata/response
+encoding. See the [native contract](paddleocr-service/README.md#fixed-extraction-policy).
 
 ## Native OCR policy
 
@@ -156,8 +171,12 @@ admin writes are atomic/0600. OpenAI inference can opt into `LLM__MODEL_LIFECYCL
 for a dedicated router with exact canonical IDs, autoload on and eager loads off.
 The default `none` cannot release models for shared managed OCR; Ollama ignores this
 OpenAI-only option. In llama.cpp mode, inference/control refuse redirects; release requires
-exact router status `unloaded`, never just a successful POST. Preserve shared journal
-ownership and recovery before endpoint/lifecycle changes. See the backend guide.
+exact router status `unloaded`. Explicit adoption binds selected models and
+matching resources to the original shared coordinator. Keep the dedicated
+external endpoint quiescent or use a separate device for explicit native
+maintenance. Shared locks coordinate participating services. Preserve journal
+ownership and recovery before endpoint or lifecycle changes. See
+[backend setup and adoption](OPENAI_COMPATIBLE.md).
 Editable settings expose source/restart flags without
 credentials. Provider/host need restart; model/temperature/registration apply live.
 `AUTH__SECRET_KEY` is required, optional pepper otherwise falls back to it. Empty
@@ -168,7 +187,7 @@ Lifespan creates provider/services, initializes DB, bootstraps admin, starts ana
 and benchmark workers when ready; shutdown stops workers before closing DB.
 SPA fallback is registered after API routes. DB initialization failures are sanitized.
 
-Current migration head `0019`. Stop/drain old app/benchmark/standalone workers
+Current migration head `0020`. Stop/drain old app/benchmark/standalone workers
 **before** schema, queue or policy cutover; never run old/new workers concurrently. Alembic uses settings `PG__*`, including on the image entrypoint;
 `MIGRATION_DATABASE_URL` is only the grant tool input. Bootstrap missing group roles
 as admin/CREATEROLE, execute grants/default ACL as the actual migration owner,
@@ -186,17 +205,20 @@ use a private `UV_PROJECT_ENVIRONMENT` in shared worktrees and do not sync a sha
 and copies static assets. Do not change locks/dependencies as a prose edit.
 
 Prepared bundles are the end-user path; source Compose is advanced development.
-See [distribution maintenance](distribution/README.md) for five variants, separate
-private bootstrap/model/native initializers, retained PID1 supervisors, crash fences
-and exact-source artifact gates. Native source contexts are independent of the app.
+See [distribution maintenance](distribution/README.md) for five external-LLM
+variants, private app bootstrap, cache-only native startup, explicit maintenance,
+retained PID1 crash fences and exact-source artifact gates. Native source contexts
+are independent of the app. The [native guide](paddleocr-service/README.md#local-qualification-inputs)
+documents guarded source qualification.
 No real native images/bundles were published or physically qualified here.
 
 Canonical checks: `make lint` (Ruff/mypy on app/native/build/e2e/harness/scripts),
 `make test` (non-E2E pytest), `make fe-verify` (Svelte/lint/format/Vitest/E2E types/build),
 `make release-test`, `make distribution-test`, `make distribution-pid1-test`,
 `make compose-check`, `make test-e2e`, `make fe-test-e2e`.
-E2E uses `e2e/run.py` to allocate unique projects, ports, private settings and fixture
-copies and clean only its owned resources. `make e2e-up/down` requires explicit
+E2E uses `e2e/run.py` to allocate unique projects, ports and private fixture copies.
+Its app configuration is seeded in a project-owned volume. Cleanup is scoped to
+runner-owned test resources. `make e2e-up/down` requires explicit
 `E2E_STATE`; no shared fixed stack may be adopted. Playwright can use
 `VB_E2E_BASE_URL` for an intentionally supplied stack. Stubs validate known original
 and normalized hashes; synthetic tests are not model-quality/hardware evidence.

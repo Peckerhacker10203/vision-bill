@@ -26,8 +26,9 @@ separate complete/partial/unreadable scenarios. Test-only synthetic defaults bel
 to these explicit replies, not production inference. Classification is a separate
 stub stage; primary printed observations carry no prefilled enrichment. Stubs and
 fixture scores do not qualify real OCR hardware or model quality. Each E2E run uses
-private copies/settings and a unique owned app/DB/stub stack; it does not rewrite
-tracked operator config or adopt shared services.
+private copies and a unique app/DB/stub project. The runner seeds synthetic app
+settings into a project-owned configuration volume and preserves test edits
+through restart. Cleanup is scoped to the runner's resources.
 
 Example (add your own):
 

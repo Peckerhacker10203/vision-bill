@@ -1,6 +1,6 @@
 # Uploads, multi-photo receipts and review
 
-Use one to ten ordered photos (at most 20 MB each) of one receipt. Include header
+Use one to ten ordered photos (at most 20 MiB each) of one receipt. Include header
 and total and a few overlapping rows between adjacent photos; reorder before
 upload. Repeated purchases elsewhere remain distinct.
 
@@ -20,11 +20,19 @@ replaying the same
 ordered original hashes and explicitly supplied options returns the same ID;
 changed content or intent returns 409. Omitting a flag differs from explicitly
 sending false. The first resolved defaults are frozen, so changing server settings
-does not reinterpret a replay. Generated paths/thumbnails are not request identity.
+does not reinterpret a replay. Generated paths and thumbnails do not determine
+request identity. In the browser, reselect the same ordered photo bytes to
+recover an ambiguous submission. Saved review preferences appear after those
+photos match. Changing the review choice records a new intent and preserves
+the other matched options. After a file-read error, retry the local photo check
+before submitting.
 
 Read `status`, `terminal`, `generation`, `attempt_count`, `max_attempts`, `retry_at`,
-`wait_reason`, `result_code`, `draft_available`, `receipt_id` and `source_views`.
-Pending capability/provider/model-start waits can consume zero attempts. Terminal
+`wait_reason`, `result_code`, `draft_available`, `observations_available`,
+`receipt_id` and `source_views`. Readiness checks the exact requested or configured
+LLM model. Provider availability, an incompatible OCR mode, missing supported
+model capability and a changed handoff binding can hold work before inference.
+A pre-work wait leaves the attempt budget available. Terminal
 states are `analyzed`, `needs_review`, `failed`, `timed_out`, `unreadable`.
 EN/DE UI explanations distinguish waiting from failed attempts; raw codes remain
 secondary diagnostics. Acceptance is not a claim that extraction succeeded.
@@ -51,18 +59,20 @@ request key. The server preserves the original request/fingerprint and old effec
 policy in history, increments generation and clears incompatible execution/checkpoint
 state. Retry-key replay binds the policy choice too. Live claims, linked receipts
 and human-edited/finalized drafts cannot be overwritten; completed receipts are
-never reprocessed. Stop/drain workers before a policy cutover; a setting change does
-not silently rewrite old submissions.
+never reprocessed. Stop and drain workers before a policy cutover. Existing
+submissions retain their frozen settings until explicit adoption.
 
 ## Extraction and source evidence
 
-Direct vision receives all ordered photos only when OCR is not configured. OCR
-processes each photo with the fixed native profile, then formats all ordered
-transcripts. Ordinary formatting, JSON repair and classification remain text/evidence
-only even on OCR failure; no image fallback occurs. Requested/actual model IDs,
-digests and OCR profile/runtime remain recorded. Deprecated fallback fields and old
-results retain their historical meaning. An explicitly requested admin direct-vision
-benchmark is the comparison exception, never an automatic upload recovery path.
+Vision Bill uses the operator's external LLM endpoint and selected model.
+Direct vision sends all ordered photos when OCR is disabled and requires a
+model that accepts images. When OCR is selected by server configuration, it
+processes each photo with the fixed native profile. Formatting, JSON repair and
+classification use text and structured evidence only. OCR failure cannot switch
+an upload to image inference. Requested and actual model IDs, digests and OCR
+profile/runtime remain recorded. Deprecated fallback fields and old results
+retain their historical meaning. Admins can explicitly select direct vision
+for a benchmark comparison.
 
 Only model-proposed ordered suffix/prefix overlaps between adjacent photos may be
 removed. `helper/duplicates.py::verify_duplicate` checks description, quantity and
@@ -75,7 +85,51 @@ independent of orientation classification/unwarping; transparency is composited 
 white (`white-document-rgb-v2`). OCR boxes are in the actual working image's
 coordinates. An inverse unwarp mapping is unknown (`null`), never invented.
 Authenticated `/file?part=N` serves originals; `/views/<view_id>` serves validated
-working PNGs with private/no-store caching. Review displays both.
+working PNGs with private/no-store caching. Review displays both. The app and
+native service share bounded PNG, JSON and text handling for photos up to
+40,000,000 pixels. See the [native resource limits](paddleocr-service/README.md#fixed-extraction-policy).
+
+## Complete observations and optional labels
+
+An all-photo result is validated and checkpointed before optional classification.
+Incomplete drafts and successful prefixes keep their separate recovery paths.
+The extraction record exposes `classification_enrichment` with a state, a reason
+and missing field paths where applicable. Optional receipt categories, item
+categories and tags can be unavailable or skipped. Older records can have
+`not_recorded` status. Missing labels remain separate from financial and integrity
+findings. Safely settled enrichment failures preserve the valid receipt.
+
+An unresolved request or teardown can hold publication with
+`wait_reason: "model_request_unsettled"`. The checkpoint retains the complete
+observations and provenance. When ownership has been safely reconciled, the
+scheduler can finish the same generation from that checkpoint even after the
+last allowed inference attempt. It validates the original and working bytes,
+frozen execution settings and current review state. Completion issues no new OCR,
+formatter or classification request, spends no inference attempt and adds a
+separate history event. An explicit retry into a new generation is a different
+operation.
+
+For an unmanaged classification hold, inspect from an application environment
+using the same configured inference endpoint as the held submission:
+
+```sh
+python -m vision_bill.distribution.handoff reconcile-classification \
+  --image-id "$SUBMISSION_ID"
+```
+
+After independently confirming that the previous request at that endpoint has
+settled, provide the exact generation and checkpoint ID from inspection together
+with the attestation:
+
+```sh
+python -m vision_bill.distribution.handoff reconcile-classification \
+  --image-id "$SUBMISSION_ID" --expected-generation "$GENERATION" \
+  --checkpoint-id "$CHECKPOINT_ID" --request-settled
+```
+
+A stale identity, busy claim or mismatched checkpoint blocks the operation.
+Managed holds use the dedicated endpoint and app journal recovery procedure.
+See [managed recovery](paddleocr-service/README.md#internal-model-ownership).
 
 ## Drafts, checks and deletion
 
@@ -87,15 +141,25 @@ Required missing values block finalization, rather than acquiring made-up defaul
 
 Receipt review uses checks version 2. See the
 [amount policy and human acknowledgement contract](UPGRADE_AND_VERIFY.md#review-and-financial-contract).
-Verify uses current operation/review revisions and exact finding IDs/comments;
-integrity failures cannot be acknowledged away. Bypass verifies only clean current
-checks with identified originals; it does not create human-qualified Gold.
-Verification does not move original or working files.
+Verify uses current operation and review revisions with acknowledgements for the
+exact displayed finding IDs. Integrity failures block even with an acknowledgement.
+Previously bypassed or legacy verification can receive explicit human review of
+the current receipt. Use the current `GET /api/v1/receipts/<id>/verify` preview and
+submit both expected revisions and acknowledgements to the matching POST.
+Automatic bypass requires complete observations, clean current checks and
+identified originals. Verification preserves original and working files. Benchmark
+Gold qualification
+requires separate human confirmation of the current document fingerprint and
+review revision.
 
 Resources and mutations are owner-scoped; admins cross owners only with
 `AUTH__ADMIN_CAN_SEE_ALL=true`. Account switches invalidate old UI requests,
-queries, notices and view state. Deletion first commits authorized database removal
-and a durable owned-file manifest, then removes validated originals, thumbnails
-and working derivatives. Failed cleanup remains pending; repeat the same authorized
-DELETE to finish it. Referenced receipts/active submissions conflict. See the
+queries, notices and view state. The browser binds JSON requests with
+`X-Vision-Bill-Expected-User` and private media URLs with `vb_expected_user`.
+An actor mismatch returns 409 before the protected operation. The signed cookie and
+ordinary authorization rules determine access. Deliberate API clients may omit
+the actor expectation and act as the cookie user. Deletion first commits authorized
+database removal and a durable owned-file manifest, then removes validated
+originals, thumbnails and working derivatives and syncs their directories. Failed
+cleanup stays pending. Repeat the same authorized DELETE to finish it. Referenced receipts/active submissions conflict. See the
 [upgrade and recovery runbook](UPGRADE_AND_VERIFY.md).

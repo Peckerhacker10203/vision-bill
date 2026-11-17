@@ -9,8 +9,10 @@ receipt fixtures belong in Git or the Docker build context.
 
 PaddleOCR-VL-1.6 (`pipeline_version=v1.6`), PP-DocLayoutV3, native Paddle,
 FP32; batch 1 throughout, internal PaddleX queues off, chart/seal off. Document
-orientation classification and UVDoc unwarping are ON by user choice. EXIF
-orientation normalization is independent and still applies. Region min 112896 /
+orientation classification detects page rotation and turns sideways or upside-down
+pages upright. UVDoc unwarping flattens curved or perspective-distorted
+pages. Both are enabled. EXIF orientation normalization applies smartphone
+metadata independently before native preprocessing. Region min 112896 /
 max 2000000 pixels (including table regions), OCR max_new_tokens 4096, no extra
 sampling parameters. The official VLM grid alignment applies **per region**;
 2MP is not a whole-working-image downscale. No platform-specific precision,
@@ -23,6 +25,15 @@ pixels become a separately hashed working PNG with transform metadata. Native v2
 responses contain this PNG and recognized blocks in **working coordinates**.
 No inverse UVDoc transform is fabricated (`inverse_mapping=null`). Raw diagnostic
 responses can contain receipt text/pixels and belong only in private artifacts.
+
+The app accepts up to 20 MiB per source photo and the native service up to 25 MiB.
+Positive working dimensions are bounded at 40,000,000 pixels. The shared contract
+allows up to 182,533,476 bytes of metadata-free RGB8 working PNG and 8 MiB of
+canonical UTF-8 JSON metadata, with a 200,000-character OCR text limit. The
+251,766,576-byte complete response bound includes padded base64 and JSON framing.
+The PNG bound accounts for row filters, worst-shape DEFLATE and chunk overhead.
+Readers validate lengths, dimensions, PNG integrity and hashes before accepting
+working artifacts. The 2 MP setting still applies to VLM regions.
 
 ## Build inputs
 
@@ -125,32 +136,39 @@ file `sha256`. Use five distinct real inputs. For `table` and `formula`, also se
 that structure. Keep the upright input at `fixtures/upright.png` for the default
 startup path, or explicitly change `OCR_QUALIFICATION_IMAGE_PATH`.
 
-Use `make ocr-qualify-cuda` or `make ocr-qualify-rocm`. This is an explicit offline
-hardware gate, never a build prerequisite or automatic comparative benchmark.
-First stop/drain the application's analysis, benchmark and standalone workers and
-stop its OCR sidecar. Release only Vision Bill's model IDs on its dedicated LLM
-endpoint before starting the gate. Verify absence with Ollama's `/api/ps`, or
-confirm each canonical llama.cpp router ID has `status.value=unloaded` in
-`GET /models`; see [backend control](../OPENAI_COMPATIBLE.md). Stopping the app
-alone does not unload its LLM. Leave unrelated GPU applications alone.
-These commands run only the
-sidecar, with the runtime input/output volume writable for this gate. For Radeon,
-set `OCR_RENDER_NODE`, `OCR_RENDER_GID` and `OCR_VIDEO_GID` to the actual host node
-and groups; only KFD and the selected render node are passed. For NVIDIA,
-`OCR_CUDA_DEVICE_ID` selects the host device; the selected single device normally
-has container index 0. No architecture spoofing or privileged container is used.
-The direct CLI is:
+Use the supervised source Make targets for the explicit offline hardware gate.
+Drain analysis, benchmark and standalone clients. Stop the source app and sidecar
+using the selected overlay. If they share the device with Vision Bill's dedicated
+LLM endpoint, quiesce that endpoint and confirm that no requests remain in flight.
+Release only Vision Bill's selected model IDs. Confirm absence with Ollama's
+`/api/ps`, or confirm `status.value=unloaded` for each canonical llama.cpp router ID
+in `GET /models`. See [backend control](../OPENAI_COMPATIBLE.md).
 
 ```sh
-python -m ocr_service.qualify --accelerator cuda \
-  --runtime /var/lib/ocr/candidate.runtime.json \
-  --cases /var/lib/ocr/fixtures.toml --output /var/lib/ocr/qualification.json
+accelerator=cuda
+docker compose --profile ocr -f docker-compose.yml \
+  -f "docker-compose.$accelerator.yml" stop vision_bill paddleocr-service
+OCR_MAINTENANCE_INTENT=external-llm-quiesced \
+  OCR_APP_HANDOFF_LOCK=/app/config/gpu-handoff.lock \
+  make "ocr-qualify-$accelerator"
 ```
 
-`--runtime` defaults to `OCR_RUNTIME_SETTINGS_PATH`. The CLI exits nonzero on any
-failure and writes a sanitized failure stage/type; framework output and fixture
-text never go to general logs. Each native child has a 600-second bound and is
-killed/reaped on timeout.
+Use `accelerator=rocm` for Radeon. Set `OCR_RENDER_NODE`, `OCR_RENDER_GID` and
+`OCR_VIDEO_GID` to the actual host node and groups. For NVIDIA,
+`OCR_CUDA_DEVICE_ID` selects the host device and its container index is normally 0.
+The original app lock path must be absolute under the shared `/app/config` mount.
+Supply its actual location if overridden. Use the invocation-local
+`OCR_MAINTENANCE_INTENT=separate-ocr-device` when OCR uses a separate GPU. These
+attestations describe operator-verified conditions. The locks and metadata cannot
+prove external quiescence.
+
+The target refuses to run while the source app or sidecar is running or restarting.
+It uses the selected local image, requires the original app handoff and native
+installation locks, and gives the qualification run a writable runtime mount.
+The low-level `ocr_service.qualify` command requires a live installer lock inherited
+from a supervisor. Run the guarded Make target to qualify source images. Failures
+exit nonzero with sanitized stage/type diagnostics. Each native child has a
+600-second bound and is killed and reaped on timeout.
 
 ## What qualifies
 
@@ -212,13 +230,24 @@ OCR host port. The app's optional endpoint selector is independent of service mo
 
 ## First setup and serving handoff
 
-Prepared bundles run `ocr_service.initialize` separately before serving. It checks
-[pinned release assets](release-bundle.schema.json), image config/source identities,
-licenses and model/fixture inventories, provisions their verified bytes, and runs
-the full fixed native qualification. Successful complete state selects runtime and
-smoke paths; an exact matching cached installation is reused. This initializer is
-required first setup, never an unsolicited historical/Gemma model comparison or
-part of a 600-second receipt attempt. See [bundle ordering](../distribution/README.md).
+Ordinary prepared startup runs the cache-only `ocr-init` check before serving.
+It checks the selected installation against the
+[pinned release assets](release-bundle.schema.json), image config/source and device
+identities, licenses, qualification and model/fixture inventories. An exact healthy
+cache is reused. A missing, damaged or mismatched cache requires explicit
+`ocr-maintenance` using the prepared bundle's `ocr-maintenance` profile. During
+maintenance, `ocr_service.initialize maintain` provisions verified OCR assets and
+runs full native qualification before publishing the runtime and smoke paths.
+Maintenance runs independently of receipt attempts and comparative benchmarks.
+See the [prepared bundle instructions](../distribution/README.md).
+
+Each maintenance invocation requires `--maintenance-intent external-llm-quiesced`
+or `--maintenance-intent separate-ocr-device`. For an app/OCR pair, also give the
+original shared app lock, usually `--handoff-lock /app/config/gpu-handoff.lock`.
+Drain participating clients and stop the app and OCR service first. Confirm
+external quiescence or separate devices before setting the intent. OCR-only
+maintenance uses its native installation lock. See the bundle instructions for
+the exact Compose service and image identity arguments.
 
 Serving starts parked with no native child/loaded models. `/health` is passive;
 `/ready` stays false with `ocr_parked` until explicitly loaded and qualified. `/info`
@@ -233,31 +262,26 @@ qualification. The app distinguishes parked `can_load` from qualified readiness,
 waits before claim on unavailable/incompatible managed pairs, and does not silently
 opt out. A cold unmanaged native pipeline also waits before claim.
 
-Advanced source deployments can use the existing manual `make ocr-qualify-cuda` or
-`make ocr-qualify-rocm` path above, then run the selected Compose overlay. Those
-commands preserve the native entrypoint supervisor, with explicit
-`OCR_RUNTIME_SETTINGS_PATH` and `OCR_QUALIFICATION_IMAGE_PATH`; these variables select
-the manual runtime route instead of requiring automatic selected-state discovery.
-They do not create a prepared release. The direct `ocr_service.qualify` CLI is the
-manual qualifier, while `ocr_service.initialize` consumes release bundle/config/ID
-inputs and supervises setup as container PID1. Do not substitute one CLI's flags
-for the other. The default native Dockerfile intentionally fails; base source
-Compose is not a CPU runtime. Source GPU overlays enable legacy OCR; canonical
-`OCR__ENDPOINT` wins if explicitly present. Ordinary OCR never permits image fallback,
-regardless of deprecated required/allow/alternate fields. To change policy, follow
+After a successful guarded source qualification, start the selected Compose overlay.
+`OCR_RUNTIME_SETTINGS_PATH` and `OCR_QUALIFICATION_IMAGE_PATH` select the source runtime
+and smoke input. Prepared startup selects its validated installation through the
+release manifest and image identities. The default native Dockerfile requires an
+accelerator-specific selection. Source GPU overlays select legacy OCR unless the
+operator supplies canonical `OCR__ENDPOINT`. Ordinary OCR uses text-only LLM
+formatting and does not fall back to image inference. See
 [worker drain and explicit adoption](../UPGRADE_AND_VERIFY.md#disable-pause-and-recover).
 
-The initializer, OCR entrypoint and derived Ollama supervisor retain PID1 with
-`init: false`; do not insert Docker `--init` or detach their owned native processes.
-An exclusive installation lock excludes initialization from serving; per-role locks
-exclude duplicate initializer/OCR/Ollama roles. Durable markers survive hard death.
-`initialize --force` requests requalification only after serving stops and does not
-clear crash fences. Ordinary startup never clears them by age or missing local PID.
-After hard death, externally confirm **all** managed initializer/OCR/Ollama containers
-using the volume are removed and all their descendants are gone. Only then archive/
-remove `/coord/installation.active-*.json` markers; retain the installation and role
-lockfiles. Never delete live lockfiles or run `compose down --volumes` on user data.
-This installation fence is distinct from the app's model-handoff journal below.
+The initializer and OCR entrypoint retain PID1 with `init: false`. Keep that
+supervision and its owned native processes. An exclusive installation lock
+excludes maintenance from serving, and per-role locks exclude duplicate native
+roles. Durable markers survive hard death, including retained legacy Ollama
+markers from prior bundles. `initialize maintain --force` requalifies only under
+the ordinary lock and crash fences. Ordinary startup preserves these markers.
+After hard death, externally confirm all managed containers recorded by the
+markers and their descendants are gone. Only then archive the applicable
+`/coord/installation.active-*.json` markers and retain the installation and role
+lockfiles. Preserve the user's volumes through recovery. The installation fence
+and the app's model-handoff journal are separate.
 
 ## Internal model ownership
 
@@ -265,9 +289,12 @@ With `OCR__MANAGE_MODEL_LIFECYCLE=true` (default), Linux app processes, uploads,
 benchmarks including direct vision, and supported standalone clients share one
 advisory lock and durable journal. `OCR__COORDINATION_PATH` defaults to
 `gpu-handoff.lock` beside `VISION_BILL_CONFIG_PATH`; Compose uses its existing
-`/app/config` bind mount. Every process must use the **same underlying file**,
-even when host/container paths differ, and the same spelling of the LLM endpoint.
-Keep the directory private to Vision Bill and use local storage supporting flock.
+`/app/config` bind mount. Every process must use the **same underlying file**, even when host/container
+paths differ, and agree on the LLM/OCR resource identities. Keep the directory
+private to Vision Bill and use local storage supporting flock. Before managed
+work is admitted, explicitly adopt the configured pair and selected models with
+the operator CLI. The binding requires a dedicated endpoint and disabled eager
+loads. See the [adoption and endpoint instructions](../OPENAI_COMPATIBLE.md).
 
 One owner releases and verifies its exact owned LLM model IDs, loads OCR, processes
 every receipt photo, then parks OCR and confirms native child death. Only then can
@@ -308,11 +335,14 @@ Recreate old benchmark manifests after changing this lifecycle contract.
 
 Failed teardown or unconfirmed unload blocks the next phase. A crashed/cancelled
 or failed model request whose completion is unknown leaves `unsettled=true` in
-the journal, even if a momentary residence probe looks idle. The attempt deadline remains
-600 seconds including cleanup. Cleanup uses at most 30 seconds of the remaining
-absolute attempt budget; when none remains, pending/unsettled state stays durable
-for the next owner's confirmed claim/release barrier. Expiry never becomes a
-successful result. A late response cannot clear a successor's journal.
+the journal, even if a momentary residency probe looks idle. The 600-second
+attempt deadline includes cleanup. Bounded cleanup uses time reserved within that
+deadline. If settlement cannot be confirmed, pending/unsettled state stays durable
+for the next owner's confirmed claim/release barrier. A late response cannot
+clear a successor's journal. An upload with saved complete observations can finish
+later without further inference once ownership is reconciled and the original
+source, generation and execution policy still match. See
+[upload recovery](../MULTI_IMAGE_RECEIPTS.md#complete-observations-and-optional-labels).
 For manual recovery, stop/drain all Vision Bill app/standalone workers and its
 sidecar, then establish that the dedicated LLM endpoint has no outstanding
 requests (restart only that dedicated endpoint if necessary). Unload/verify only

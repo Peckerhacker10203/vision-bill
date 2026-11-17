@@ -13,12 +13,11 @@ reachable connection/network; template ports do not publish one. Keep credential
 in private files, not ARGS or shell history. Reports and traces may contain receipt
 text and must remain private. See [upgrade/roles/recovery](../UPGRADE_AND_VERIFY.md).
 
-Build/install targets and ordinary API startup do not run these tools or unsolicited
-historical colleague/Gemma comparisons. Explicit persisted pending work can resume
-under policy/readiness guards. Prepared native first setup runs separate full
-qualification; model pull/tags checks provision data without LLM generation.
-Invoke only the desired
-diagnostic explicitly; you can build first and test your own receipts through the UI.
+Run these diagnostics explicitly or test your own receipts through the UI.
+Build, installation and ordinary startup leave benchmark creation to the operator.
+Persisted pending work can resume under policy and readiness guards. Choose your
+own LLM endpoint and model. Native OCR qualification runs through explicit
+maintenance and is separate from LLM operation.
 For native shared-GPU work, all supported clients must use the application's same
 configured provider, lifecycle mode, endpoint spelling, OCR settings and underlying
 `OCR__COORDINATION_PATH` file. See [OpenAI/llama.cpp setup](../OPENAI_COMPATIBLE.md).
@@ -61,11 +60,13 @@ insufficient. Put `VB_USERNAME`/`VB_PASSWORD` in the private env.
 
 ```bash
 make script-create-benchmark ARGS="--model installed-local-model --limit 10"
-make script-create-benchmark ARGS="--receipt-id 125b2a52-60ac-4e1f-b9bf-d223f15c8cd1"
+make script-create-benchmark ARGS="--model installed-local-model --receipt-id 125b2a52-60ac-4e1f-b9bf-d223f15c8cd1"
 ```
 
-`--model` and `--receipt-id` can repeat; otherwise current eligible scoped Gold is
-selected. Other flags include `--category`, `--max-source-confidence`, `--limit`,
+Supply at least one explicit `--model` and use each exact model ID once. Repeat
+`--receipt-id` to select individual references or omit it to use current eligible
+Gold in the caller's scope. Other flags include `--category`,
+`--max-source-confidence`, `--limit`,
 `--request-timeout-seconds` (default 300, at most 600), `--council-policy` and explicit
 council thresholds/flags. This CLI does not expose every experiment UI/API setting;
 consult `--help` and `BenchmarkCreate` before assuming a pipeline flag exists.
@@ -83,8 +84,12 @@ make script-standalone-benchmark ARGS="--user-id 125b2a52-60ac-4e1f-b9bf-d223f15
 `--user-id` is mandatory; omission never means all owners. `--category`, `--limit`,
 `--db-host`, `--db-port`, `--db-user`, `--db-name`, `--ocr-url`, `--llm-host` are
 actual selection/connection flags. Prefer private `PG__PASSWORD` over
-`--db-password`. `LLM__MODEL_NAME`, `LLM__HOST`, `OCR__TIMEOUT_SECONDS` and
-`PG__*` provide defaults. For both app-aware manual CLIs,
+`--db-password`. The formatter uses the loaded application settings, including
+`LLM__PROVIDER`, `LLM__HOST`, `LLM__MODEL_NAME`, `LLM__API_KEY`,
+`LLM__TEMPERATURE` and `LLM__MODEL_LIFECYCLE`. Only an explicit `--llm-host` or
+`--model` overrides its corresponding field. Use `LLM__PROVIDER=openai` for an
+OpenAI-compatible endpoint. `OLLAMA_HOST` is for the context-budget diagnostic.
+`PG__*` provides database defaults. For both app-aware manual CLIs,
 `script-standalone-benchmark` and `script-test-ocr`, URL precedence is
 `--ocr-url` > `OCR__SERVICE_URL` > `http://localhost:8082`.
 `OCR__ENDPOINT` selects production OCR but does not supply these manual CLI URLs.
@@ -95,16 +100,19 @@ OCR and always selects the OCR pipeline, preserving configured coordination/
 lifecycle settings.
 It reads an owner-scoped, repeatable-read read-only snapshot, without row locks,
 DB mutation, API startup or human-reference qualification writes. Explicit run
-creation loads/qualifies/parks native OCR to freeze real runtime identity. Every selected case, including
-changed/missing sources and extraction failures, stays in the v4 denominator.
+creation loads, qualifies and parks native OCR to freeze the runtime identity.
+Every selected case, including changed or missing sources and extraction failures, stays in the v4 denominator.
+An ambiguous post-observation classification failure retains available evidence
+and counts as a failed case. Upload-only completion recovery applies to queued
+submissions.
 
 Output includes manifest hash and model/source/profile/prompt/schema/output/context
 identity, observed-field mask, full-receipt correctness, ordered item precision/
 recall, exact count/order and amounts. `avg_score` remains separately labeled
-**Historical average score (successful cases)**. It is not the all-case score or
-perfect-receipt rate. This CLI disables fallback and supplies no consent flag;
-do not interpret OCR failure as permission to use vision. Unknown context remains null. No expected
-reference values enter inference.
+**Historical average score (successful cases)**. Full-receipt correctness and
+the all-case average use all selected cases. OCR formatting, repairs and
+classification receive text and source evidence. Unknown context remains null.
+Expected reference values are used only for scoring.
 
 ## Native OCR-only diagnostic
 
@@ -177,7 +185,7 @@ groups require admin/CREATEROLE first; then `make db-configure-roles` must use t
 actual Alembic owner for grants/default privileges on current/future tables and
 sequences. `MIGRATION_DATABASE_URL` is only this Make tool's connection; entrypoint
 Alembic uses `PG__*`. Runtime credentials cannot apply pending owner DDL. Stop/drain
-old workers, back up/restore-test DB and files, migrate to 0019 with owner credentials,
+old workers, back up/restore-test DB and files, migrate to 0020 with owner credentials,
 refresh grants and start only compatible workers. No automatic destructive backout.
 `bash scripts/pg-backup.sh --help` lists backup/restore options.
 
