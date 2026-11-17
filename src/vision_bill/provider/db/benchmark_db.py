@@ -159,8 +159,11 @@ class BenchmarkDB:
             if row is None:
                 return False
             count = row["inference_attempt_count"]
-            delay = min(30 if waiting or count == 0 else self._worker.retry_backoff_seconds[count-1],
-                        self._worker.retry_backoff_cap_seconds)
+            delay = (
+                min(30, self._worker.retry_backoff_cap_seconds)
+                if waiting or count == 0
+                else self._worker.retry_delay(count)
+            )
             changed = await conn.execute("""UPDATE benchmark_tasks SET status=$5, claim_token=NULL,
                 leased_until=NULL, retry_at=clock_timestamp()+make_interval(secs => $6)
                 WHERE run_id=$1 AND model_id=$2 AND receipt_id=$3 AND claim_token=$4

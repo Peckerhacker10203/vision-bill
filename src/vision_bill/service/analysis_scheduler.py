@@ -95,6 +95,7 @@ class AnalysisScheduler:
             self._deferred_image_ids.clear()
             if not self._db.is_ready:
                 return []
+            await self._db.reap_expired_claims()
             results = []
             for image in await self._db.due_candidates():
                 try:

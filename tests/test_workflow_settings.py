@@ -43,3 +43,23 @@ def test_formatter_limit_is_separate_from_context_and_ocr_limits():
         LLMSettings(
             host="local", api_key="none", model_name="model", temperature=0, max_output_tokens=0
         )
+
+
+@pytest.mark.parametrize(
+    "maximum,delays,cap,attempt,expected",
+    [
+        (1, (), 300, 1, 30),
+        (1, (), 300, 2, 60),
+        (2, (20,), 300, 1, 20),
+        (2, (20,), 45, 2, 45),
+        (3, (50, 150), 40, 1, 40),
+        (3, (30, 60), 300, 2, 60),
+    ],
+)
+def test_retry_delay_uses_current_entries_or_defaults_for_persisted_attempts(
+    maximum, delays, cap, attempt, expected,
+):
+    worker = WorkerSettings(
+        max_attempts=maximum, retry_backoff_seconds=delays, retry_backoff_cap_seconds=cap,
+    )
+    assert worker.retry_delay(attempt) == expected

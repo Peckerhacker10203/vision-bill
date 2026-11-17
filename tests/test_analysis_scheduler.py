@@ -18,6 +18,7 @@ def context(settings):
     claim = SimpleNamespace(image=image)
     db = SimpleNamespace(
         is_ready=True,
+        reap_expired_claims=AsyncMock(return_value=0),
         due_candidates=AsyncMock(return_value=[image]),
         claim_next=AsyncMock(return_value=claim),
         next_wake_delay=AsyncMock(return_value=0.01),
@@ -94,6 +95,7 @@ async def test_database_unavailable_never_claims(settings):
     scheduler, db, _service, _image = context(settings)
     db.is_ready = False
     assert await scheduler.process_pending() == []
+    db.reap_expired_claims.assert_not_awaited()
     db.due_candidates.assert_not_awaited()
 
 
@@ -220,6 +222,7 @@ async def test_incompatible_ocr_mode_waits_before_claim_and_preserves_attempt_bu
 
     db = SimpleNamespace(
         is_ready=True,
+        reap_expired_claims=AsyncMock(return_value=0),
         due_candidates=AsyncMock(return_value=[image]),
         set_wait_reason=AsyncMock(side_effect=persist_wait),
         claim_next=AsyncMock(side_effect=claim_next),

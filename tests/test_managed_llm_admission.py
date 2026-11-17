@@ -130,6 +130,7 @@ async def admission_context(settings, monkeypatch, tmp_path):
 
         db = SimpleNamespace(
             is_ready=True,
+            reap_expired_claims=AsyncMock(return_value=0),
             due_candidates=AsyncMock(return_value=[image]),
             set_wait_reason=AsyncMock(side_effect=persist_wait),
             claim_next=AsyncMock(side_effect=claim_next),

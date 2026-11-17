@@ -22,7 +22,7 @@ pytestmark = pytest.mark.e2e
                                           ("references", 1), ("reference_release", 1), ("tags", 1)])
 async def test_upload_deadline_atomic_recovery_and_artifacts(workflow_db, settings, tmp_path, phase, attempt):
     w, scope = workflow_db
-    image, paths, llm, native, service = await submissions.setup(w, scope, settings, tmp_path)
+    image, paths, _llm, native, service = await submissions.setup(w, scope, settings, tmp_path)
     originals = [p.read_bytes() for p in paths]
     source_hashes = [hashlib.sha256(data).hexdigest() for data in originals]
     if attempt == 3:
@@ -185,9 +185,9 @@ async def test_upload_deadline_atomic_recovery_and_artifacts(workflow_db, settin
         native.extract_page.reset_mock()
         async with original_pool.acquire() as conn:
             await conn.execute("UPDATE images SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", image.id)
-        recovered = await w.claim_next()
+        assert await w.reap_expired_claims() == 1
+        assert await w.claim_next() is None
         if attempt == 3:
-            assert recovered is None
             status = await w.get_submission(image.id, scope=scope)
             assert status.terminal and status.status == "failed" and status.attempt_count == 3
             native.extract_page.assert_not_awaited()
@@ -196,6 +196,11 @@ async def test_upload_deadline_atomic_recovery_and_artifacts(workflow_db, settin
                 history = await conn.fetch("SELECT attempt_number,result_code,outcome_kind FROM receipt_extractions")
                 assert [dict(row) for row in history] == [{"attempt_number": 3, "result_code": "lease_expired", "outcome_kind": "terminal"}]
         else:
+            pending = await w.get_submission(image.id, scope=scope)
+            assert pending.status == "pending" and pending.attempt_count == 1 and pending.retry_at is not None
+            async with original_pool.acquire() as conn:
+                await conn.execute("UPDATE images SET retry_at=clock_timestamp() WHERE id=$1", image.id)
+            recovered = await w.claim_next()
             assert recovered.attempt_number == 2
             final = await service.process_claim(recovered)
             assert final.receipt is not None and final.submission.status == "analyzed"

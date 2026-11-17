@@ -51,7 +51,11 @@ async def submission_context(settings, monkeypatch, tmp_path, *, managed):
 
         await adopt(receipts.execution_handoff(settings.ocr), (image.model_id,))
         image.effective_options = receipts.current_execution_snapshot(settings)
-    db = SimpleNamespace(is_ready=True, due_candidates=AsyncMock(return_value=[image]))
+    db = SimpleNamespace(
+        is_ready=True,
+        reap_expired_claims=AsyncMock(return_value=0),
+        due_candidates=AsyncMock(return_value=[image]),
+    )
     waits = []
 
     async def persist_wait(observed, reason):

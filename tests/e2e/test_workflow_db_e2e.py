@@ -264,6 +264,12 @@ async def test_expiry_tokens_generation_and_three_attempt_limit(workflow_db):
             "UPDATE images SET lease_expires_at=now()-interval '1 second' WHERE id=$1", image.id
         )
     assert (await w.finish_attempt(claim1, complete())).stale
+    assert await w.reap_expired_claims() == 1
+    saved = await w.get_submission(image.id, scope=scope)
+    assert saved.status == "pending" and saved.attempt_count == 1 and saved.retry_at is not None
+    assert await w.claim_next() is None
+    async with w.pool.acquire() as conn:
+        await conn.execute("UPDATE images SET retry_at=clock_timestamp() WHERE id=$1", image.id)
     claim2 = await w.claim_next()
     assert claim2.attempt_number == 2
     assert (await w.finish_attempt(claim1, complete())).stale
@@ -848,7 +854,13 @@ async def test_expired_third_lease_seals_terminal_without_fourth_claim(workflow_
                 "UPDATE images SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1",
                 image.id,
             )
-    assert await w.claim_next() is None
+        assert await w.reap_expired_claims() == 1
+        assert await w.claim_next() is None
+        if attempt < 3:
+            saved = await w.get_submission(image.id, scope=scope)
+            assert saved.status == "pending" and saved.attempt_count == attempt and saved.retry_at is not None
+            async with w.pool.acquire() as conn:
+                await conn.execute("UPDATE images SET retry_at=clock_timestamp() WHERE id=$1", image.id)
     async with w.pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM images WHERE id=$1", image.id)
         assert row["status"] == "failed" and row["attempt_count"] == 3
@@ -1376,7 +1388,7 @@ async def test_next_wake_includes_overdue_retry_and_defers_unavailable_candidate
                 "UPDATE images SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1",
                 first.id,
             )
-    assert await w.next_wake_delay(300) == 0
+    assert await w.next_wake_delay(300) == (1 if due_kind == "lease" else 0)
     delay = await w.next_wake_delay(300, deferred_image_ids=[first.id])
     assert 55 < delay <= 60
     assert await w.next_wake_delay(300, deferred_image_ids=[first.id, second.id]) == 300

@@ -291,6 +291,45 @@ class WorkflowDB:
                 )
             return EnqueueResult(submission=_status(row), created=True)
 
+    @staticmethod
+    async def _record_abandonment(conn: asyncpg.Connection, row: Any, *, exhausted: bool) -> None:
+        await conn.execute(
+            """INSERT INTO receipt_extractions(image_id,generation,attempt_number,outcome_kind,result_code)
+            VALUES($1,$2,$3,$4,'lease_expired')
+            ON CONFLICT(image_id,generation,attempt_number) DO NOTHING""",
+            row["id"], row["generation"], row["attempt_count"], "terminal" if exhausted else "retry",
+        )
+
+    async def reap_expired_claims(self, *, deadline: float | None = None) -> int:
+        """Seal expired attempts and release their claims before admitting work."""
+        async with connection(self.pool, deadline=deadline, transaction=True) as conn:
+            rows = await conn.fetch(
+                """SELECT id,generation,attempt_count,max_attempts FROM images
+                WHERE status='processing' AND lease_expires_at<=clock_timestamp() AND receipt_id IS NULL
+                AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id)
+                ORDER BY id FOR UPDATE SKIP LOCKED"""
+            )
+            reaped = 0
+            for row in rows:
+                exhausted = row["attempt_count"] >= row["max_attempts"]
+                result_code = "attempt_limit" if exhausted else "lease_expired"
+                delay = None if exhausted else self._worker.retry_delay(row["attempt_count"])
+                # Recheck expiry and receipt association after acquiring the image lock.
+                changed = await conn.fetchval(
+                    """UPDATE images SET status=$2,result_code=$3,error=$3,
+                    claim_token=NULL,lease_expires_at=NULL,processing_at=NULL,
+                    retry_at=clock_timestamp()+make_interval(secs => $4)
+                    WHERE id=$1 AND status='processing' AND lease_expires_at<=clock_timestamp()
+                    AND receipt_id IS NULL
+                    AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id)
+                    RETURNING id""",
+                    row["id"], "failed" if exhausted else "pending", result_code, delay,
+                )
+                if changed is not None:
+                    await self._record_abandonment(conn, row, exhausted=exhausted)
+                    reaped += 1
+            return reaped
+
     async def claim_next(
         self, *, lease_seconds: int = 900, image_id: UUID | None = None
     ) -> AnalysisClaim | None:
@@ -301,23 +340,12 @@ class WorkflowDB:
                 row = await conn.fetchrow(
                     """SELECT * FROM images WHERE ($1::uuid IS NULL OR id=$1) AND receipt_id IS NULL AND
                     NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id) AND
-                    ((status='pending' AND (retry_at IS NULL OR retry_at<=clock_timestamp())) OR
-                     (status='processing' AND lease_expires_at<=clock_timestamp()))
+                    status='pending' AND (retry_at IS NULL OR retry_at<=clock_timestamp())
                     ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1""",
                     image_id,
                 )
                 if row is None:
                     return None
-                if row["status"] == "processing":
-                    await conn.execute(
-                        """INSERT INTO receipt_extractions(image_id,generation,
-                        attempt_number,outcome_kind,result_code) VALUES($1,$2,$3,$4,'lease_expired')
-                        ON CONFLICT(image_id,generation,attempt_number) DO NOTHING""",
-                        row["id"],
-                        row["generation"],
-                        row["attempt_count"],
-                        "terminal" if row["attempt_count"] >= row["max_attempts"] else "retry",
-                    )
                 if row["attempt_count"] >= row["max_attempts"]:
                     await conn.execute(
                         """UPDATE images SET status='failed', result_code='attempt_limit',
@@ -672,8 +700,7 @@ class WorkflowDB:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("""SELECT * FROM images WHERE receipt_id IS NULL AND
                 NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id) AND
-                ((status='pending' AND (retry_at IS NULL OR retry_at<=clock_timestamp())) OR
-                (status='processing' AND lease_expires_at<=clock_timestamp()))
+                status='pending' AND (retry_at IS NULL OR retry_at<=clock_timestamp())
                 ORDER BY created_at,id""")
         return [ImageRow.model_validate(dict(row)) for row in rows]
 
@@ -685,10 +712,15 @@ class WorkflowDB:
     ) -> float:
         """Include jobs that became due during work, but defer failed readiness probes."""
         async with self.pool.acquire() as conn:
+            # An expired row can be skipped by a reaper because another transaction
+            # holds it. Revisit it promptly while giving the lock holder time to finish.
             delay = await conn.fetchval(
-                """SELECT EXTRACT(EPOCH FROM min(CASE WHEN status='pending'
-                    THEN COALESCE(retry_at,clock_timestamp()) ELSE lease_expires_at END)
-                    -clock_timestamp()) FROM images
+                """WITH wake_clock AS (SELECT clock_timestamp() AS sampled_at)
+                SELECT min(EXTRACT(EPOCH FROM CASE
+                    WHEN status='pending' THEN COALESCE(retry_at,sampled_at)
+                    WHEN lease_expires_at<=sampled_at THEN sampled_at+interval '1 second'
+                    ELSE lease_expires_at END-sampled_at))
+                FROM images CROSS JOIN wake_clock
                 WHERE status IN ('pending','processing') AND receipt_id IS NULL
                 AND id<>ALL($1::uuid[])
                 AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id)""",
@@ -891,12 +923,10 @@ class WorkflowDB:
                 status = "needs_review"
             elif outcome.kind == "retry" and row["attempt_count"] < row["max_attempts"]:
                 status = "pending"
-                delay = min(
-                    outcome.retry_delay_seconds
-                    if outcome.retry_delay_seconds is not None
-                    else self._worker.retry_backoff_seconds[claim.attempt_number - 1],
-                    self._worker.retry_backoff_cap_seconds,
-                )
+                if outcome.retry_delay_seconds is None:
+                    delay = self._worker.retry_delay(claim.attempt_number)
+                else:
+                    delay = min(outcome.retry_delay_seconds, self._worker.retry_backoff_cap_seconds)
             elif outcome.kind == "retry":
                 result_code = result_code or "attempt_limit"
             elif outcome.result_code in {"timed_out", "unreadable"}:
@@ -995,12 +1025,8 @@ class WorkflowDB:
                 model_id = _decoded(row["requested_options"]).get("model_id")
                 if expired_processing:
                     # Preserve the real abandoned attempt exactly as normal lease recovery does.
-                    await conn.execute(
-                        """INSERT INTO receipt_extractions(image_id,generation,attempt_number,
-                        outcome_kind,result_code) VALUES($1,$2,$3,$4,'lease_expired')
-                        ON CONFLICT(image_id,generation,attempt_number) DO NOTHING""",
-                        image_id, row["generation"], row["attempt_count"],
-                        "terminal" if row["attempt_count"] >= row["max_attempts"] else "retry",
+                    await self._record_abandonment(
+                        conn, row, exhausted=row["attempt_count"] >= row["max_attempts"],
                     )
             updated = await conn.fetchrow(
                 """UPDATE images SET generation=generation+1,attempt_count=0,

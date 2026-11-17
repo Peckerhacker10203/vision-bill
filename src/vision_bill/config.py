@@ -100,13 +100,16 @@ class ImageSettings(BaseModel):
     thumbnail_quality: int = Field(default=80, ge=1, le=100)
 
 
+_DEFAULT_RETRY_BACKOFF_SECONDS = (30, 60)
+
+
 class WorkerSettings(BaseModel):
     """Background analysis worker tuning."""
 
     check_interval_seconds: int = Field(default=300, ge=1)
     attempt_timeout_seconds: int = Field(default=600, gt=0, le=600)
     max_attempts: int = Field(default=3, ge=1, le=3)
-    retry_backoff_seconds: tuple[Annotated[int, Field(gt=0)], ...] = (30, 60)
+    retry_backoff_seconds: tuple[Annotated[int, Field(gt=0)], ...] = _DEFAULT_RETRY_BACKOFF_SECONDS
     retry_backoff_cap_seconds: int = Field(default=300, gt=0)
     claim_lease_seconds: int = Field(default=900, gt=0)
 
@@ -117,6 +120,18 @@ class WorkerSettings(BaseModel):
         if len(self.retry_backoff_seconds) < self.max_attempts - 1:
             raise ValueError("a backoff is required for each automatic retry")
         return self
+
+    def retry_delay(self, attempt_number: int) -> int:
+        """Resolve the current delay for an attempt from any accepted budget."""
+        if attempt_number < 1:
+            raise ValueError("attempt number must be positive")
+        index = attempt_number - 1
+        if index < len(self.retry_backoff_seconds):
+            delay = self.retry_backoff_seconds[index]
+        else:
+            # A previously accepted job can outlive the schedule for new jobs.
+            delay = _DEFAULT_RETRY_BACKOFF_SECONDS[min(index, len(_DEFAULT_RETRY_BACKOFF_SECONDS) - 1)]
+        return min(delay, self.retry_backoff_cap_seconds)
 
 
 class OcrSettings(BaseModel):
