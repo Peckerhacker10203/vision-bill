@@ -1,3 +1,4 @@
+import { session } from '$lib/session-lifetime';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import TagEditor from './TagEditor.svelte';
@@ -40,6 +41,10 @@ async function openDropdown() {
 beforeEach(() => {
 	vi.stubGlobal('fetch', setupFetch());
 });
+
+beforeEach(() =>
+	session.set({ id: 'viewer', username: 'alice', is_admin: false, can_see_all: false })
+);
 
 afterEach(() => {
 	// Vitest runs without `globals: true`, so testing-library's automatic

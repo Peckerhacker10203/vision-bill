@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { captureSessionActor } from '$lib/session-lifetime';
 	import { api } from '$lib/api/client';
 	import { t } from '$lib/i18n';
 	import Icon from '$lib/ui/Icon.svelte';
@@ -18,6 +19,7 @@
 		clickable?: boolean;
 	} = $props();
 
+	const actor = captureSessionActor();
 	let lightboxOpen = $state(false);
 	let thumbFailed = $state(false);
 
@@ -28,7 +30,7 @@
 	}
 
 	function fallback(): string | 'icon' {
-		return imageId === null ? 'icon' : missingThumbSource(imageId);
+		return imageId === null ? 'icon' : missingThumbSource(imageId, actor);
 	}
 
 	function open(e: MouseEvent) {
@@ -61,7 +63,7 @@
 		aria-label={alt}
 	>
 		<img
-			src={api.imageThumbUrl(imageId)}
+			src={api.imageThumbUrl(imageId, actor)}
 			{alt}
 			loading="lazy"
 			decoding="async"
@@ -109,7 +111,7 @@
 			<Icon icon="close" />
 		</button>
 		<img
-			src={api.imageFileUrl(imageId)}
+			src={api.imageFileUrl(imageId, 0, actor)}
 			{alt}
 			class="max-h-full max-w-full rounded-lg object-contain"
 		/>

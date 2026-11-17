@@ -4,6 +4,7 @@
 	import { resolve } from '$app/paths';
 	import { t, translate } from '$lib/i18n';
 	import { api, ApiError } from '$lib/api/client';
+	import { captureSessionActor, isCurrentSessionActor } from '$lib/session-lifetime';
 	import { queryClient } from '$lib/query/client';
 	import { queryKeys } from '$lib/query/keys';
 	import { snackbar } from '$lib/ui/snackbar.svelte';
@@ -39,7 +40,10 @@
 	let reviewMessage = $state('');
 	let needsReload = $state(false);
 	let selectedSources = $state<SourceRef[]>([]);
-	let activeView: object | null = null;
+	const actor = captureSessionActor();
+	let activeView: { id: string } | null = null;
+	const isCurrentView = (view: typeof activeView) =>
+		view !== null && activeView === view && view.id === id && isCurrentSessionActor(actor);
 	$effect(() => {
 		const view = { id };
 		activeView = view;
@@ -117,8 +121,9 @@
 		};
 	}
 	async function refresh(requestId = id, view = activeView): Promise<void> {
+		if (!isCurrentView(view)) return;
 		const fresh = await api.getReceipt(requestId);
-		if (activeView !== view || id !== requestId) return;
+		if (!isCurrentView(view)) return;
 		queryClient.setQueryData(queryKeys.receipt(requestId), fresh);
 		editorRevision++;
 		needsReload = false;
@@ -127,28 +132,30 @@
 	async function discardReload() {
 		const requestId = id;
 		const view = activeView;
+		if (!isCurrentView(view)) return;
 		saving = true;
 		try {
 			await refresh(requestId, view);
-			if (activeView !== view) return;
+			if (!isCurrentView(view)) return;
 			reviewMessage = '';
 		} catch {
-			if (activeView !== view) return;
+			if (!isCurrentView(view)) return;
 			reviewMessage = translate('receipt.saveFailed');
 		} finally {
-			if (activeView === view) saving = false;
+			if (isCurrentView(view)) saving = false;
 		}
 	}
 	async function save(write: ReceiptWrite, verify: boolean) {
 		if (saving || needsReload || childPending) return;
 		const requestId = id;
 		const view = activeView;
+		if (!isCurrentView(view)) return;
 		saving = true;
 		reviewMessage = '';
 		let saved: ReceiptRow | null = null;
 		try {
 			saved = await api.updateReceipt(requestId, write);
-			if (activeView !== view) return;
+			if (!isCurrentView(view)) return;
 			savedRevision++;
 			acknowledgementReset++;
 			acknowledgements = [];
@@ -159,26 +166,26 @@
 			);
 			snackbar.notify('success', translate('receipt.saved'));
 			await refresh(requestId, view);
-			if (activeView !== view) return;
+			if (!isCurrentView(view)) return;
 			if (verify) {
 				if (saved.findings.some((f) => f.severity !== 'info')) {
 					reviewMessage = translate('review.savedReview');
 					return;
 				}
 				await api.verifyReceipt(requestId, reviewBody(saved, []));
-				if (activeView !== view) return;
+				if (!isCurrentView(view)) return;
 				snackbar.notify('success', translate('receipt.verifySuccess'));
 				await refresh(requestId, view);
 			}
 		} catch (error) {
-			if (activeView !== view) return;
+			if (!isCurrentView(view)) return;
 			reviewMessage =
 				error instanceof ApiError && error.status === 409
 					? translate('review.conflict')
 					: translate(saved ? 'receipt.verifyFailed' : 'receipt.saveFailed');
 			snackbar.notify('error', reviewMessage);
 		} finally {
-			if (activeView === view) saving = false;
+			if (isCurrentView(view)) saving = false;
 		}
 	}
 	function saveOnly(write: ReceiptWrite) {
@@ -196,11 +203,12 @@
 		if (!canReviewAsHuman || previewing || reviewBlocked) return;
 		const requestId = id;
 		const view = activeView;
+		if (!isCurrentView(view)) return;
 		previewing = true;
 		reviewMessage = '';
 		try {
 			const preview = await api.previewHumanReview(requestId);
-			if (activeView !== view) return;
+			if (!isCurrentView(view)) return;
 			if (!matchesReview(preview)) {
 				reviewMessage = translate('review.conflict');
 				return;
@@ -210,13 +218,13 @@
 				verifyOpen = true;
 			}
 		} catch (error) {
-			if (activeView !== view) return;
+			if (!isCurrentView(view)) return;
 			reviewMessage =
 				error instanceof ApiError && error.status === 409
 					? translate('review.conflict')
 					: translate('receipt.verifyFailed');
 		} finally {
-			if (activeView === view) previewing = false;
+			if (isCurrentView(view)) previewing = false;
 		}
 	}
 	function matchesReview(preview: ReviewPreview) {
@@ -226,7 +234,9 @@
 		);
 	}
 	async function doVerify() {
-		if (!data || reviewBlocked) return;
+		const requestId = id;
+		const view = activeView;
+		if (!isCurrentView(view) || !data || reviewBlocked) return;
 		const preview = humanPreview;
 		if (preview && !matchesReview(preview)) {
 			closeReview();
@@ -234,20 +244,18 @@
 			return;
 		}
 		if (preview ? !humanReviewReady : !canVerify || !reviewReady) return;
-		const requestId = id;
-		const view = activeView;
 		const request = reviewBody(preview ?? data.receipt, [
 			...(preview ? humanAcknowledgements : acknowledgements)
 		]);
 		verifying = true;
 		try {
 			await api.verifyReceipt(requestId, request);
-			if (activeView !== view) return;
+			if (!isCurrentView(view)) return;
 			snackbar.notify('success', translate('receipt.verifySuccess'));
 			closeReview();
 			await refresh(requestId, view);
 		} catch (error) {
-			if (activeView !== view) return;
+			if (!isCurrentView(view)) return;
 			if (preview) closeReview();
 			reviewMessage =
 				error instanceof ApiError && error.status === 409
@@ -255,7 +263,7 @@
 					: translate('receipt.verifyFailed');
 			snackbar.notify('error', reviewMessage);
 		} finally {
-			if (activeView === view) verifying = false;
+			if (isCurrentView(view)) verifying = false;
 		}
 	}
 </script>

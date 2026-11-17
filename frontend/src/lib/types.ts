@@ -513,3 +513,74 @@ export interface CollectionUpdate {
 	start_date?: string | null;
 	end_date?: string | null;
 }
+
+export interface BenchmarkReferenceConfirmation {
+	expected_review_revision: number;
+	expected_document_sha256: string;
+}
+
+export interface BenchmarkReferencePreview {
+	receipt_identity: string;
+	review_revision: number;
+	document_sha256: string;
+	expected: Record<string, unknown>;
+	scored_fields: string[];
+	sources: unknown[];
+	findings: unknown[];
+}
+
+export interface BenchmarkCapabilities {
+	ocr_available: boolean;
+	ocr_enabled: boolean;
+	thinking_control: boolean;
+}
+
+export type BenchmarkCouncilPolicy = 'all' | 'material' | 'custom';
+
+export interface BenchmarkCreate {
+	model_ids: string[];
+	experiment: {
+		pipeline: 'upload' | 'direct_vision' | 'ocr';
+		temperature: number | null;
+		think: boolean | null;
+		include_classification: boolean;
+		allow_ocr_fallback: boolean;
+	};
+	request_timeout_seconds: number;
+	council_policy: BenchmarkCouncilPolicy;
+	apply_council_flags: boolean;
+	receipt_ids?: string[];
+	category?: string;
+	max_source_confidence?: number;
+	limit?: number;
+	council_absolute_threshold?: number;
+	council_relative_threshold?: number;
+}
+
+export interface BenchmarkRun {
+	id: string;
+	status: string;
+	model_ids: string[];
+	receipt_ids: string[];
+	scoring_version: string;
+	experiment?: Record<string, unknown> | null;
+}
+
+export interface BenchmarkStatus {
+	run: BenchmarkRun;
+	queued: number;
+	running: number;
+	retrying: number;
+	waiting_for_model: number;
+	terminal: number;
+	summaries: {
+		model_id: string;
+		model_digest: string | null;
+		succeeded: number;
+		failed: number;
+		average_score: number | null;
+		average_confidence: number | null;
+		average_latency_ms: number | null;
+		council_findings: number;
+	}[];
+}

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { captureSessionActor, isCurrentSessionActor } from '$lib/session-lifetime';
 	import { diagnosticLabel } from '$lib/diagnostics';
 	import { createQuery } from '@tanstack/svelte-query';
 	import { resolve } from '$app/paths';
@@ -10,6 +11,7 @@
 	import type { SubmissionStatus } from '$lib/types';
 
 	let { id }: { id: string } = $props();
+	const actor = captureSessionActor();
 	let retrying = $state(false);
 	let retryError = $state('');
 	let retryRequest: {
@@ -55,6 +57,7 @@
 
 	async function retry(policy: 'preserve' | 'current' = 'preserve') {
 		if (
+			!isCurrentSessionActor(actor) ||
 			!activeView ||
 			activeView.id !== id ||
 			retrying ||
@@ -66,7 +69,10 @@
 		const request = { id, generation: job.data.generation, view: activeView };
 		const key = queryKeys.image(request.id);
 		const isCurrent = () =>
-			activeView === request.view && activeRetry === request && id === request.id;
+			isCurrentSessionActor(actor) &&
+			activeView === request.view &&
+			activeRetry === request &&
+			id === request.id;
 		activeRetry = request;
 		retrying = true;
 		retryError = '';
@@ -200,13 +206,16 @@
 		{#if job.data.source_views?.length}
 			<ul class="mt-4 flex flex-wrap gap-3">
 				{#each job.data.source_views as view (view.view_id)}
-					<li>
-						<!-- Authenticated artifact URLs are supplied by the API, not SPA routes. -->
-						<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -->
-						<a class="text-primary underline" href={view.url} target="_blank" rel="noreferrer"
-							>{$t('submission.photo', { values: { number: view.photo_index + 1 } })} ({view.coordinate_space})</a
-						>
-					</li>
+					{@const href = api.sourceViewUrl(view.url, actor)}
+					{#if href}
+						<li>
+							<!-- Authenticated artifact URLs are supplied by the API. -->
+							<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -->
+							<a class="text-primary underline" {href} target="_blank" rel="noreferrer"
+								>{$t('submission.photo', { values: { number: view.photo_index + 1 } })} ({view.coordinate_space})</a
+							>
+						</li>
+					{/if}
 				{/each}
 			</ul>
 		{/if}

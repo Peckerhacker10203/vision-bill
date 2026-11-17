@@ -1,6 +1,11 @@
-import { afterEach, expect, it, vi } from 'vitest';
+import { session } from '$lib/session-lifetime';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { api } from './client';
 import { prepareUpload, readPendingUpload, clearPendingUpload } from './upload';
+beforeEach(() =>
+	session.set({ id: 'owner', username: 'alice', is_admin: false, can_see_all: false })
+);
+
 afterEach(() => {
 	localStorage.clear();
 	vi.unstubAllGlobals();

@@ -52,7 +52,8 @@ function fileBytes(file: File): Promise<ArrayBuffer> {
 export async function prepareUpload(
 	owner: string,
 	files: File[],
-	explicitOptions?: UploadOptions
+	explicitOptions?: UploadOptions,
+	checkCurrent?: () => void
 ): Promise<PendingUpload> {
 	const pending = readPendingUpload(owner);
 	// An untouched control (including a changed server default) cannot alter a replay.
@@ -63,7 +64,11 @@ export async function prepareUpload(
 	if (selected.allow_ocr_fallback !== undefined)
 		options.allow_ocr_fallback = selected.allow_ocr_fallback;
 	const hashes: string[] = [];
-	for (const file of files) hashes.push(bytesToHex(sha256(new Uint8Array(await fileBytes(file)))));
+	for (const file of files) {
+		const bytes = await fileBytes(file);
+		checkCurrent?.();
+		hashes.push(bytesToHex(sha256(new Uint8Array(bytes))));
+	}
 	const identity = bytesToHex(sha256(utf8ToBytes(JSON.stringify({ owner, hashes, options }))));
 	if (pending?.identity === identity) return pending;
 	const next = { key: requestKey(), identity, options };

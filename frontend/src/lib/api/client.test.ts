@@ -1,7 +1,14 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { api } from './client';
+import { fetchAllReceipts } from './receipts';
 import { queryKeys } from '../query/keys';
+import { advanceSessionGeneration, captureSessionActor, session } from '../session-lifetime';
+
+const USER_ID = '00000000-0000-4000-8000-000000000001';
+beforeEach(() =>
+	session.set({ id: USER_ID, username: 'tester', is_admin: false, can_see_all: false })
+);
 
 const OK_BODY = {
 	query: 'Schinken',
@@ -37,6 +44,7 @@ function mockOkFetch(): void {
 
 afterEach(() => {
 	vi.unstubAllGlobals();
+	session.set(null);
 });
 
 describe('api.searchProducts', () => {
@@ -49,7 +57,8 @@ describe('api.searchProducts', () => {
 		expect(fetchMock).toHaveBeenCalledOnce();
 		const [url, init] = fetchMock.mock.calls[0];
 		expect(String(url)).toContain('/search?query=Schinken');
-		expect(init).toEqual({ credentials: 'same-origin' });
+		expect(init).toMatchObject({ credentials: 'same-origin', cache: 'no-store' });
+		expect(new Headers(init?.headers).get('X-Vision-Bill-Expected-User')).toBe(USER_ID);
 		expect(result).toEqual(OK_BODY);
 	});
 
@@ -100,7 +109,8 @@ describe('api collection capture', () => {
 
 		const [url, init] = vi.mocked(fetch).mock.calls[0];
 		expect(String(url)).toContain('/collections/coll-1/activate');
-		expect(init).toEqual({ credentials: 'same-origin', method: 'POST' });
+		expect(init).toMatchObject({ credentials: 'same-origin', method: 'POST' });
+		expect(new Headers(init?.headers).get('X-Vision-Bill-Expected-User')).toBe(USER_ID);
 		expect(result).toEqual(COLLECTION_BODY);
 	});
 
@@ -111,7 +121,8 @@ describe('api collection capture', () => {
 
 		const [url, init] = vi.mocked(fetch).mock.calls[0];
 		expect(String(url)).toContain('/collections/coll-1/deactivate');
-		expect(init).toEqual({ credentials: 'same-origin', method: 'POST' });
+		expect(init).toMatchObject({ credentials: 'same-origin', method: 'POST' });
+		expect(new Headers(init?.headers).get('X-Vision-Bill-Expected-User')).toBe(USER_ID);
 	});
 });
 
@@ -146,7 +157,8 @@ describe('api.getStatistics', () => {
 		const [url, init] = vi.mocked(fetch).mock.calls[0];
 		expect(String(url)).toContain('/statistics?weeks=12');
 		expect(String(url)).not.toContain('collection_id');
-		expect(init).toEqual({ credentials: 'same-origin' });
+		expect(init).toMatchObject({ credentials: 'same-origin', cache: 'no-store' });
+		expect(new Headers(init?.headers).get('X-Vision-Bill-Expected-User')).toBe(USER_ID);
 	});
 
 	it('appends collection_id when a collection is selected', async () => {
@@ -161,7 +173,15 @@ describe('api.getStatistics', () => {
 
 describe('api image URL helpers', () => {
 	it('builds the image thumbnail URL', () => {
-		expect(api.imageThumbUrl('abc-123')).toBe('/api/v1/images/abc-123/thumb');
+		expect(api.imageThumbUrl('abc-123')).toBe(
+			`/api/v1/images/abc-123/thumb?vb_expected_user=${USER_ID}`
+		);
+		expect(api.imageFileUrl('abc-123', 1)).toBe(
+			`/api/v1/images/abc-123/file?part=1&vb_expected_user=${USER_ID}`
+		);
+		expect(api.sourceViewUrl('/api/v1/images/abc-123/views/working')).toBe(
+			`/api/v1/images/abc-123/views/working?vb_expected_user=${USER_ID}`
+		);
 	});
 });
 
@@ -182,7 +202,8 @@ describe('durable submissions', () => {
 		});
 		const [url, init] = vi.mocked(fetch).mock.calls[0];
 		expect(url).toBe('/api/v1/images');
-		expect(init?.headers).toEqual({ 'Idempotency-Key': 'stable-key' });
+		expect(new Headers(init?.headers).get('Idempotency-Key')).toBe('stable-key');
+		expect(new Headers(init?.headers).get('X-Vision-Bill-Expected-User')).toBe(USER_ID);
 		expect((init?.body as FormData).getAll('receipt')).toEqual(files);
 		await api.uploadImages(files, { bypass_review: false, model_id: 'text model' }, 'stable-key');
 		expect(vi.mocked(fetch).mock.calls[1][0]).toBe(
@@ -247,4 +268,30 @@ describe('versioned drafts and review', () => {
 			{ finding_id: 'f', comment: 'Checked original' }
 		]);
 	});
+});
+
+it('never fetches a protected endpoint or produces an unbound media URL without an actor', async () => {
+	mockOkFetch();
+	const stale = captureSessionActor();
+	session.set(null);
+	await expect(api.getImage('private')).rejects.toMatchObject({ name: 'AbortError' });
+	expect(fetch).not.toHaveBeenCalled();
+	expect(api.imageThumbUrl('private')).toBeUndefined();
+	expect(api.imageFileUrl('private', 0, stale)).toBeUndefined();
+});
+
+it('does not start another receipt page after the originating session changes', async () => {
+	const list = vi
+		.spyOn(api, 'listReceipts')
+		.mockImplementationOnce(async () => {
+			queueMicrotask(advanceSessionGeneration);
+			return Array.from({ length: 500 }, () => ({ id: 'old' }) as never);
+		})
+		.mockResolvedValueOnce([]);
+	try {
+		await expect(fetchAllReceipts()).rejects.toMatchObject({ name: 'AbortError' });
+		expect(list).toHaveBeenCalledOnce();
+	} finally {
+		list.mockRestore();
+	}
 });

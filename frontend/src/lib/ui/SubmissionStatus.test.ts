@@ -1,5 +1,6 @@
+import { session } from '$lib/session-lifetime';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api, ApiError } from '$lib/api/client';
 import { setLocale } from '$lib/i18n';
 import { queryClient } from '$lib/query/client';
@@ -22,6 +23,10 @@ const status = (overrides = {}) => ({
 	source_views: [],
 	...overrides
 });
+beforeEach(() =>
+	session.set({ id: 'viewer', username: 'alice', is_admin: false, can_see_all: false })
+);
+
 afterEach(() => {
 	cleanup();
 	queryClient.clear();
@@ -97,7 +102,7 @@ describe('SubmissionStatus', () => {
 					)
 				).not.toBeNull();
 				expect(screen.getByRole('link', { name: /1.*working/ }).getAttribute('href')).toBe(
-					'/api/v1/images/job/views/working'
+					'/api/v1/images/job/views/working?vb_expected_user=viewer'
 				);
 				expect(screen.queryByText('Photo is too blurry', { exact: true })).toBeNull();
 				expect(queryClient.getQueryData(queryKeys.image('job'))).toEqual(before);
@@ -151,7 +156,7 @@ describe('SubmissionStatus', () => {
 			'/upload?job=job&draft=1'
 		);
 		expect(screen.getByRole('link', { name: /Photo 1/ }).getAttribute('href')).toBe(
-			'/api/v1/images/job/views/view'
+			'/api/v1/images/job/views/view?vb_expected_user=viewer'
 		);
 	});
 	it('suppresses duplicate retry clicks and preserves stale-generation detail', async () => {

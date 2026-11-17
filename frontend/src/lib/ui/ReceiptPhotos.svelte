@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { captureSessionActor } from '$lib/session-lifetime';
 	import { createQuery } from '@tanstack/svelte-query';
 	import { api } from '$lib/api/client';
 	import { queryClient } from '$lib/query/client';
@@ -11,6 +12,7 @@
 		thumbnailPath,
 		alt
 	}: { imageId: string; thumbnailPath: string | null; alt: string } = $props();
+	const actor = captureSessionActor();
 	let selected = $state(0);
 	$effect(() => {
 		void imageId;
@@ -47,7 +49,7 @@
 	/>
 {:else}
 	<img
-		src={api.imageFileUrl(imageId, selected)}
+		src={api.imageFileUrl(imageId, selected, actor)}
 		{alt}
 		class="mx-auto block h-auto max-w-full rounded-xl border border-outline-variant object-contain lg:max-h-[calc(100vh-10rem)]"
 	/>

@@ -21,7 +21,7 @@
 	} from '@lucide/svelte';
 	import { api } from '$lib/api/client';
 	import { sessionGeneration } from '$lib/session-lifetime';
-	import { initSession, session, signOut } from '$lib/auth';
+	import { initSession, session, signOut, watchSession } from '$lib/auth';
 	import { LOCALES, locale, setLocale, t } from '$lib/i18n';
 	import { queryClient } from '$lib/query/client';
 	import { queryKeys } from '$lib/query/keys';
@@ -63,7 +63,9 @@
 	// Populate the session once on start (the HttpOnly cookie is the source of
 	// truth; this is just the client's view of it).
 	onMount(() => {
+		const stopWatching = watchSession();
 		void initSession();
+		return stopWatching;
 	});
 
 	// Auth guard: signed out -> the login page; signed in on /login -> home.
@@ -159,10 +161,11 @@
 			<p class="text-sm text-on-surface-variant">{$t('common.loading')}</p>
 		</div>
 	{:else if currentUser === null}
-		<!-- Signed out: only /login reaches here (otherwise the guard redirected). -->
-		<div class="flex min-h-[calc(100vh-4rem)] items-center justify-center p-4">
-			{@render children()}
-		</div>
+		{#if activePath === '/login'}
+			<div class="flex min-h-[calc(100vh-4rem)] items-center justify-center p-4">
+				{@render children()}
+			</div>
+		{/if}
 	{:else}
 		{#key $sessionGeneration}
 			<AppShell

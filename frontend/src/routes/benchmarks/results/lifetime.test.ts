@@ -69,7 +69,9 @@ it('drops late A status when B is selected', async () => {
 	);
 	fetchMock.mockClear();
 	poll();
-	await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/v1/benchmarks/A'));
+	await waitFor(() =>
+		expect(fetchMock).toHaveBeenCalledWith('/api/v1/benchmarks/A', expect.any(Object))
+	);
 	await fireEvent.change(screen.getByLabelText('Benchmark run'), { target: { value: 'B' } });
 	await screen.findByText(/Scoring version: B/);
 	late.resolve(Response.json(status('A')));

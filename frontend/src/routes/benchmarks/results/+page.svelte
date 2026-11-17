@@ -3,39 +3,17 @@
 	import { resolve } from '$app/paths';
 	import { onMount, onDestroy } from 'svelte';
 	import { session } from '$lib/auth';
+	import { api } from '$lib/api/client';
+	import { captureSessionActor, isCurrentSessionActor } from '$lib/session-lifetime';
+	import type { BenchmarkRun, BenchmarkStatus } from '$lib/types';
 	import BenchmarkResultDetails from '$lib/ui/BenchmarkResultDetails.svelte';
 	import type { IndividualResult } from '$lib/benchmark-experiments';
 
-	type Summary = {
-		model_id: string;
-		model_digest: string | null;
-		succeeded: number;
-		failed: number;
-		average_score: number | null;
-		average_confidence: number | null;
-		average_latency_ms: number | null;
-		council_findings: number;
-	};
-	type Run = {
-		id: string;
-		status: string;
-		model_ids: string[];
-		receipt_ids: string[];
-		scoring_version: string;
-		experiment?: Record<string, unknown> | null;
-	};
-	type Status = {
-		run: Run;
-		queued: number;
-		running: number;
-		retrying: number;
-		waiting_for_model: number;
-		terminal: number;
-		summaries: Summary[];
-	};
-	let runs = $state<Run[]>([]),
+	const actor = captureSessionActor();
+	const currentView = () => alive && isCurrentSessionActor(actor);
+	let runs = $state<BenchmarkRun[]>([]),
 		selectedId = $state<string | null>(null),
-		result = $state<Status | null>(null),
+		result = $state<BenchmarkStatus | null>(null),
 		error = $state('');
 	// Admin-only page: bounce non-admins home (mirrors the /settings guard).
 	$effect(() => {
@@ -55,13 +33,11 @@
 	async function loadDetails(offset = 0) {
 		const runId = selectedId,
 			request = ++detailsRequest;
-		const current = () => alive && selectedId === runId && detailsRequest === request;
-		if (!runId) return;
+		const current = () => currentView() && selectedId === runId && detailsRequest === request;
+		if (!actor || !runId || !current()) return;
 		loadingDetails = true;
 		try {
-			const response = await fetch(`/api/v1/benchmarks/${runId}/results?limit=50&offset=${offset}`);
-			if (!response.ok) throw new Error('Unable to load individual results.');
-			const rows = await response.json();
+			const rows = await api.getBenchmarkResults(runId, offset, actor);
 			if (!current()) return;
 			details = rows;
 			detailsOffset = offset;
@@ -75,11 +51,10 @@
 	const fmt = (value: number | null, digits = 2) => (value === null ? '—' : value.toFixed(digits));
 	async function refresh() {
 		const request = ++refreshRequest;
-		const current = () => alive && refreshRequest === request;
+		const current = () => currentView() && refreshRequest === request;
+		if (!actor || !current()) return;
 		try {
-			const response = await fetch('/api/v1/benchmarks');
-			if (!response.ok) throw new Error('Unable to load benchmark runs.');
-			const available = (await response.json()) as Run[];
+			const available = await api.listBenchmarks(actor);
 			if (!current()) return;
 			runs = available;
 			if (!selectedId || !runs.some((run) => run.id === selectedId)) {
@@ -91,9 +66,7 @@
 				loadingDetails = false;
 			}
 			if (selectedId) {
-				const status = await fetch(`/api/v1/benchmarks/${selectedId}`);
-				if (!status.ok) throw new Error('Unable to load benchmark results.');
-				const next = (await status.json()) as Status;
+				const next = await api.getBenchmarkStatus(selectedId, actor);
 				if (!current()) return;
 				result = next;
 			}
@@ -158,7 +131,7 @@
 					href={resolve('/benchmarks')}
 					onclick={(event) => {
 						event.preventDefault();
-						if (!result) return;
+						if (!result || !currentView()) return;
 						window.sessionStorage.setItem(
 							'benchmark-reuse-receipts',
 							result.run.receipt_ids.join(',')

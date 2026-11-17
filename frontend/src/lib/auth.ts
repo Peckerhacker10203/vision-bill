@@ -1,27 +1,22 @@
-import { writable, type Writable } from 'svelte/store';
+import { get } from 'svelte/store';
 import { goto } from '$app/navigation';
 import { resolve } from '$app/paths';
-import { api, onUnauthorized } from '$lib/api/client';
+import { api, ApiError, onSessionActorChanged, onUnauthorized } from '$lib/api/client';
 import type { User } from '$lib/types';
 import { queryClient } from '$lib/query/client';
 import { snackbar } from '$lib/ui/snackbar.svelte';
 import {
 	advanceSessionGeneration,
 	currentSessionGeneration,
-	requireSessionGeneration
+	requireSessionGeneration,
+	session,
+	type SessionState
 } from '$lib/session-lifetime';
 
-/**
- * Client-side session state. `loading` until the first `/auth/me` round-trip
- * settles; `null` when signed out; the `User` when signed in. The server keeps
- * the authoritative session in the HttpOnly cookie — this store is just the
- * client's view of it for rendering and guarding.
- */
-export type SessionState = User | null | 'loading';
-
-export const session: Writable<SessionState> = writable<SessionState>('loading');
+export { session };
 
 function beginSession(state: SessionState = null): number {
+	session.set('loading');
 	const generation = advanceSessionGeneration();
 	// Cancellation settles Query retryers before clearing; late query functions
 	// cannot populate either the removed cache or successor observers.
@@ -46,7 +41,26 @@ function authRequest<T>(generation: number, operation: () => Promise<T>): Promis
 	return result;
 }
 
-/** Populate the session from the server. Call once on app start. */
+let channel: BroadcastChannel | undefined;
+let pendingCookieWrites = 0;
+
+async function changeCookie<T>(generation: number, operation: () => Promise<T>): Promise<T> {
+	pendingCookieWrites++;
+	try {
+		return await authRequest(generation, async () => {
+			try {
+				return await operation();
+			} finally {
+				// An obsolete local response can still carry an applied Set-Cookie.
+				channel?.postMessage('cookie-may-have-changed');
+			}
+		});
+	} finally {
+		pendingCookieWrites--;
+	}
+}
+
+/** Populate the session from the server and remount the private view. */
 export async function initSession(): Promise<void> {
 	const generation = beginSession('loading');
 	try {
@@ -62,7 +76,7 @@ export async function initSession(): Promise<void> {
 /** Authenticate with username/password and record the returned user. */
 export async function signIn(username: string, password: string): Promise<User> {
 	const generation = beginSession();
-	const user = await authRequest(generation, () => api.login(username, password));
+	const user = await changeCookie(generation, () => api.login(username, password));
 	requireSessionGeneration(generation);
 	session.set(user);
 	return user;
@@ -71,7 +85,7 @@ export async function signIn(username: string, password: string): Promise<User> 
 /** Create an account and sign in with it. */
 export async function signUp(username: string, password: string): Promise<User> {
 	const generation = beginSession();
-	const user = await authRequest(generation, () => api.register(username, password));
+	const user = await changeCookie(generation, () => api.register(username, password));
 	requireSessionGeneration(generation);
 	session.set(user);
 	return user;
@@ -84,7 +98,7 @@ session is cleared regardless and the caller redirects to the login page. */
 export async function signOut(): Promise<void> {
 	const generation = beginSession();
 	try {
-		await authRequest(generation, () => api.logout());
+		await changeCookie(generation, () => api.logout());
 	} catch {
 		// Ignore: clearing the local session is what actually signs the user out.
 	}
@@ -97,3 +111,69 @@ onUnauthorized(() => {
 	beginSession();
 	void goto(resolve('/login'));
 });
+
+onSessionActorChanged(() => {
+	void initSession();
+});
+
+let checkingGeneration: number | undefined;
+
+async function revalidateSession(): Promise<void> {
+	const generation = currentSessionGeneration();
+	if (checkingGeneration === generation || get(session) === 'loading') return;
+	checkingGeneration = generation;
+	try {
+		const user = await authRequest(generation, () => api.me());
+		requireSessionGeneration(generation);
+		const previous = get(session);
+		if (
+			!previous ||
+			previous === 'loading' ||
+			previous.id !== user.id ||
+			previous.username !== user.username ||
+			previous.is_admin !== user.is_admin ||
+			previous.can_see_all !== user.can_see_all
+		) {
+			beginSession(user);
+		}
+	} catch (error) {
+		if (
+			generation === currentSessionGeneration() &&
+			error instanceof ApiError &&
+			error.status === 401 &&
+			get(session) !== null
+		) {
+			beginSession();
+		}
+	} finally {
+		if (checkingGeneration === generation) checkingGeneration = undefined;
+	}
+}
+
+/** Listen for cookie changes and recheck after a sleeping tab resumes. */
+export function watchSession(): () => void {
+	const messages =
+		typeof BroadcastChannel === 'undefined' ? undefined : new BroadcastChannel('vision-bill-auth');
+	channel = messages;
+	function onMessage(event: MessageEvent) {
+		if (event.data !== 'cookie-may-have-changed') return;
+		// Recheck after a locally queued cookie write; do not obsolete that write.
+		if (pendingCookieWrites) void revalidateSession();
+		else void initSession();
+	}
+	function onResume() {
+		if (document.visibilityState === 'visible') void revalidateSession();
+	}
+
+	messages?.addEventListener('message', onMessage);
+	window.addEventListener('focus', onResume);
+	window.addEventListener('pageshow', onResume);
+	document.addEventListener('visibilitychange', onResume);
+	return () => {
+		window.removeEventListener('focus', onResume);
+		window.removeEventListener('pageshow', onResume);
+		document.removeEventListener('visibilitychange', onResume);
+		messages?.close();
+		if (channel === messages) channel = undefined;
+	};
+}

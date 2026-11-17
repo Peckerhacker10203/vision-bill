@@ -2,10 +2,11 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { api, ApiError } from '$lib/api/client';
 import { queryClient } from '$lib/query/client';
-import type { ReceiptRow, ReceiptWithDetails } from '$lib/types';
+import type { ReceiptRow, ReceiptWithDetails, ReviewPreview } from '$lib/types';
 import Page from './+page.svelte';
 import { page } from '$app/state';
 import { tick } from 'svelte';
+import { advanceSessionGeneration, session } from '$lib/session-lifetime';
 vi.mock('$app/state', async () => {
 	const { SvelteURL } = await import('svelte/reactivity');
 	return {
@@ -51,6 +52,14 @@ const row: ReceiptRow = {
 	checks_version: '1',
 	verification_source: null
 };
+const owner = { id: 'owner', username: 'alice', is_admin: false, can_see_all: false };
+const verifiedByBypass: ReceiptRow = {
+	...row,
+	status: 'verified',
+	verified: true,
+	verification_source: 'automatic_bypass'
+};
+const previewResponse: ReviewPreview = { operation_revision: 7, review_revision: 3, findings: [] };
 const detail = (receipt = row): ReceiptWithDetails => ({
 	receipt,
 	line_items: [],
@@ -60,6 +69,7 @@ const detail = (receipt = row): ReceiptWithDetails => ({
 	classification_enrichment: { state: 'not_recorded', reason_code: null, missing_fields: [] }
 });
 beforeEach(() => {
+	session.set(owner);
 	queryClient.clear();
 	page.url.pathname = '/receipts/00000000-0000-4000-8000-000000000001';
 	vi.spyOn(api, 'getReceipt').mockResolvedValue(detail());
@@ -69,6 +79,8 @@ beforeEach(() => {
 });
 afterEach(() => {
 	cleanup();
+	vi.unstubAllGlobals();
+	session.set(null);
 	queryClient.clear();
 	vi.restoreAllMocks();
 });
@@ -462,10 +474,71 @@ it.each(['legacy', 'automatic_bypass'])(
 				expect(screen.queryByRole('button', { name: 'Review as human' })).toBeNull()
 			);
 			expect(preview).toHaveBeenCalledOnce();
-			expect(preview.mock.calls[0][0]).toBe(`/api/v1/receipts/${row.id}/verify`);
+			const [url, init] = preview.mock.calls[0];
+			expect(url).toBe(`/api/v1/receipts/${row.id}/verify`);
+			expect(new Headers(init.headers).get('X-Vision-Bill-Expected-User')).toBe(owner.id);
 			expect(save).not.toHaveBeenCalled();
 		} finally {
 			vi.unstubAllGlobals();
 		}
 	}
 );
+
+it('abandons the verify continuation if the session changes while reloading the save', async () => {
+	const saved = { ...row, merchant_name: 'Saved', operation_revision: 8, review_revision: 4 };
+	const pending = deferred<ReceiptWithDetails>();
+	vi.spyOn(api, 'updateReceipt').mockResolvedValue(saved);
+	vi.mocked(api.getReceipt).mockResolvedValueOnce(detail()).mockReturnValue(pending.promise);
+	const verify = vi.spyOn(api, 'verifyReceipt').mockResolvedValue(saved);
+	render(Page);
+	await screen.findByLabelText('Merchant');
+	await fireEvent.input(screen.getByLabelText('Merchant'), { target: { value: 'Saved' } });
+	await fireEvent.click(screen.getByRole('button', { name: 'Save & verify' }));
+	await waitFor(() => expect(api.getReceipt).toHaveBeenCalledTimes(2));
+	advanceSessionGeneration();
+	queryClient.clear();
+	pending.resolve(detail(saved));
+	await pending.promise;
+	await tick();
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(verify).not.toHaveBeenCalled();
+	expect(queryClient.getQueryData(['receipts', row.id])).toBeUndefined();
+});
+
+it('stops an accepted human-review preview after the originating account changes', async () => {
+	vi.mocked(api.getReceipt).mockResolvedValue(detail(verifiedByBypass));
+	const body = deferred<ReviewPreview>();
+	const json = vi.fn(() => body.promise);
+	vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, status: 200, json }));
+	render(Page);
+	await fireEvent.click(await screen.findByRole('button', { name: 'Review as human' }));
+	await waitFor(() => expect(json).toHaveBeenCalledOnce());
+
+	body.resolve(previewResponse);
+	// The client validates A when it resumes parsing. Switch before its fulfilled
+	// promise resumes the still-mounted receipt view.
+	queueMicrotask(() => {
+		advanceSessionGeneration();
+		session.set({ ...owner, id: 'successor', username: 'bob' });
+	});
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(screen.queryByRole('dialog', { name: 'Review receipt as human?' })).toBeNull();
+});
+
+it('drops a human-review preview from a different receipt view', async () => {
+	vi.mocked(api.getReceipt).mockImplementation(async (id) =>
+		detail(id === second.id ? second : verifiedByBypass)
+	);
+	const pending = deferred<Response>();
+	const fetchMock = vi.fn().mockReturnValue(pending.promise);
+	vi.stubGlobal('fetch', fetchMock);
+	render(Page);
+	await fireEvent.click(await screen.findByRole('button', { name: 'Review as human' }));
+	await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+
+	await navigateSecond();
+	pending.resolve(Response.json(previewResponse));
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(screen.queryByRole('dialog', { name: 'Review receipt as human?' })).toBeNull();
+	expect(screen.queryByRole('alert')).toBeNull();
+});

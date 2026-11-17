@@ -44,7 +44,12 @@ it.each([
 	});
 	await fireEvent.click(screen.getByRole('button', { name: 'Upload' }));
 	await waitFor(() => expect(goto).toHaveBeenCalledWith('/upload?job=durable-job'));
-	expect(api.uploadImages).toHaveBeenCalledWith(expect.any(Array), {}, expect.any(String));
+	expect(api.uploadImages).toHaveBeenCalledWith(
+		expect.any(Array),
+		{},
+		expect.any(String),
+		expect.objectContaining({ userId: 'owner' })
+	);
 });
 
 it('reload recovery never posts automatically or adopts changed defaults as explicit input', async () => {
@@ -67,7 +72,14 @@ it('reload recovery never posts automatically or adopts changed defaults as expl
 		target: { files: [file] }
 	});
 	await fireEvent.click(screen.getByRole('button', { name: 'Upload' }));
-	await waitFor(() => expect(upload).toHaveBeenCalledWith([file], pending.options, pending.key));
+	await waitFor(() =>
+		expect(upload).toHaveBeenCalledWith(
+			[file],
+			pending.options,
+			pending.key,
+			expect.objectContaining({ userId: 'owner' })
+		)
+	);
 	await screen.findByRole('alert');
 	expect(readPendingUpload('owner')).toEqual(pending);
 	unmount();
@@ -100,12 +112,9 @@ it('does not submit under a different authenticated owner if the session changes
 	await fireEvent.click(screen.getByRole('button', { name: 'Upload' }));
 	session.set({ id: 'other', username: 'other', is_admin: false, can_see_all: false });
 	finish(new Uint8Array([1, 2]).buffer);
-	await waitFor(() =>
-		expect((screen.getByRole('button', { name: 'Upload' }) as HTMLButtonElement).disabled).toBe(
-			false
-		)
-	);
+	await new Promise((resolve) => setTimeout(resolve, 0));
 	expect(upload).not.toHaveBeenCalled();
+	expect(localStorage.getItem('vb-upload:owner')).toBeNull();
 });
 
 it('offers no fallback choice and preserves the exact recovered legacy options', async () => {
@@ -137,7 +146,8 @@ it('offers no fallback choice and preserves the exact recovered legacy options',
 		expect(upload).toHaveBeenCalledWith(
 			[file],
 			{ model_id: 'saved-model', bypass_review: false, allow_ocr_fallback: true },
-			expect.any(String)
+			expect.any(String),
+			expect.objectContaining({ userId: 'owner' })
 		)
 	);
 	expect(screen.queryByRole('checkbox', { name: 'Allow vision analysis if OCR fails' })).toBeNull();

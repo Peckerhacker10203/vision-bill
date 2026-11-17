@@ -1,7 +1,10 @@
 <script lang="ts">
+	import { captureSessionActor } from '$lib/session-lifetime';
+	import { api } from '$lib/api/client';
 	import { t } from '$lib/i18n';
 	import type { SourceView, SourceRef } from '$lib/types';
 	let { views, sources = [] }: { views: SourceView[]; sources?: SourceRef[] } = $props();
+	const actor = captureSessionActor();
 	let failed = $state(false);
 	let matching = $derived(
 		views.find((v) =>
@@ -56,7 +59,7 @@
 		<p class="text-xs">{view.coordinate_space} · {view.width} × {view.height} · {view.view_id}</p>
 		<div class="relative w-full">
 			<img
-				src={view.url}
+				src={api.sourceViewUrl(view.url, actor)}
 				alt={$t('review.sourceView')}
 				width={view.width}
 				height={view.height}

@@ -1,11 +1,15 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, expect, it, vi } from 'vitest';
-import { session } from '$lib/auth';
+import { goto } from '$app/navigation';
+import { tick } from 'svelte';
+import { session, signIn } from '$lib/auth';
 import Page from './+page.svelte';
 vi.mock('$app/paths', () => ({ resolve: (path: string) => path }));
 vi.mock('$app/navigation', () => ({ goto: vi.fn() }));
 afterEach(() => {
 	cleanup();
+	session.set('loading');
+	vi.clearAllMocks();
 	vi.unstubAllGlobals();
 });
 
@@ -101,3 +105,65 @@ it('labels the default upload policy as a text formatter when OCR is enabled', a
 	expect(screen.getByRole('group', { name: 'OCR text formatter models' })).not.toBeNull();
 	expect(calls).toContain('/api/v1/llm/models?capability=text');
 });
+
+it.each(['account change', 'view destruction'])(
+	'stops after the first outstanding qualification on %s',
+	async (boundary) => {
+		const alice = { id: 'a', username: 'alice', is_admin: true, can_see_all: false };
+		const bob = { ...alice, id: 'b', username: 'bob' };
+		session.set(alice);
+		let finishQualification!: (response: Response) => void;
+		const qualification = new Promise<Response>((resolve) => {
+			finishQualification = resolve;
+		});
+		const protectedWrites: string[] = [];
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async (url: string, init?: RequestInit) => {
+				if (url.endsWith('/auth/login')) return Response.json(bob);
+				if (url.endsWith('/capabilities'))
+					return Response.json({
+						ocr_available: false,
+						ocr_enabled: false,
+						thinking_control: false
+					});
+				if (url.endsWith('/llm/models')) return Response.json([{ id: 'model' }]);
+				if (init?.method === 'POST') {
+					protectedWrites.push(url);
+					return protectedWrites.length === 1 ? qualification : Response.json({});
+				}
+				return Response.json({
+					receipt_identity: url.endsWith('/first') ? 'first' : 'second',
+					review_revision: 7,
+					document_sha256: 'a'.repeat(64),
+					scored_fields: ['total'],
+					expected: { total: '2.00' },
+					sources: [],
+					findings: []
+				});
+			})
+		);
+		const view = render(Page);
+		await screen.findByText('model');
+		await fireEvent.input(screen.getByLabelText('Explicit receipt IDs'), {
+			target: { value: 'first,second' }
+		});
+		await fireEvent.click(screen.getByRole('button', { name: 'Preview human references' }));
+		await fireEvent.click(
+			await screen.findByLabelText(
+				'I checked these current receipts and originals and explicitly qualify them as benchmark references.'
+			)
+		);
+		await fireEvent.click(screen.getByRole('button', { name: 'Create benchmark' }));
+		await fireEvent.click(screen.getByRole('button', { name: 'Confirm and start' }));
+		await waitFor(() => expect(protectedWrites).toEqual(['/api/v1/benchmarks/references/first']));
+		if (boundary === 'account change') await signIn('bob', 'x');
+		else view.unmount();
+		finishQualification(Response.json({}));
+		await qualification;
+		await tick();
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(protectedWrites).toEqual(['/api/v1/benchmarks/references/first']);
+		expect(goto).not.toHaveBeenCalled();
+	}
+);

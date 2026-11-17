@@ -9,6 +9,7 @@
 	import { queryClient } from '$lib/query/client';
 	import { queryKeys } from '$lib/query/keys';
 	import { session } from '$lib/auth';
+	import { captureSessionActor, isCurrentSessionActor } from '$lib/session-lifetime';
 	import { prepareUpload, readPendingUpload, clearPendingUpload } from '$lib/api/upload';
 	import Icon from '$lib/ui/Icon.svelte';
 	import SubmissionStatus from '$lib/ui/SubmissionStatus.svelte';
@@ -22,7 +23,12 @@
 	let photos = $state<{ file: File; url: string }[]>([]);
 	let file = $derived(photos[0]?.file ?? null);
 	let jobId = $derived(page.url.searchParams.get('job'));
-	onDestroy(() => photos.forEach((photo) => URL.revokeObjectURL(photo.url)));
+	const actor = captureSessionActor();
+	let alive = true;
+	onDestroy(() => {
+		alive = false;
+		photos.forEach((photo) => URL.revokeObjectURL(photo.url));
+	});
 	let dragging = $state(false);
 	let bypassReview = $state(false);
 	let bypassReviewDefaultApplied = $state(false);
@@ -98,43 +104,48 @@
 	}
 
 	async function upload() {
-		const owner = $session;
-		if (!file || uploading || !owner || owner === 'loading') return;
+		if (!alive || !file || uploading || !isCurrentSessionActor(actor)) return;
+		const owner = actor.userId;
+		const origin = jobId;
+		const current = () => alive && jobId === origin && isCurrentSessionActor(actor);
 		uploading = true;
 		uploadError = '';
 		try {
 			const files = photos.map((photo) => photo.file);
 			const pending = await prepareUpload(
-				owner.id,
+				owner,
 				files,
 				bypassTouched
 					? {
-							...readPendingUpload(owner.id)?.options,
+							...readPendingUpload(owner)?.options,
 							bypass_review: bypassReview
 						}
-					: undefined
+					: undefined,
+				() => {
+					if (!current()) throw new DOMException('Upload view changed', 'AbortError');
+				}
 			);
-			if (!$session || $session === 'loading' || $session.id !== owner.id) {
-				throw new Error(translate('submission.ownerChanged'));
-			}
-			const result = await api.uploadImages(files, pending.options, pending.key);
+			if (!current()) return;
+			const result = await api.uploadImages(files, pending.options, pending.key, actor);
+			if (!current()) return;
 			// Treat a malformed successful response as ambiguous, retaining the key/options.
 			if (!result.id) throw new ApiError(202, 'Response did not include a submission ID');
-			clearPendingUpload(owner.id, pending.key);
+			clearPendingUpload(owner, pending.key);
 			photos.forEach((photo) => URL.revokeObjectURL(photo.url));
 			photos = [];
 			void queryClient.invalidateQueries({ queryKey: ['images'] });
 			void queryClient.invalidateQueries({ queryKey: ['receipts'] });
 			await goto(resolve(`/upload?job=${result.id}`));
 		} catch (error) {
-			recovering = !!readPendingUpload(owner.id);
+			if (!current()) return;
+			recovering = !!readPendingUpload(owner);
 			if (error instanceof ApiError && error.imageId) {
 				await goto(resolve(`/upload?job=${error.imageId}`));
 				return;
 			}
 			uploadError = error instanceof Error ? error.message : translate('upload.errorGeneric');
 		} finally {
-			uploading = false;
+			if (alive && isCurrentSessionActor(actor)) uploading = false;
 		}
 	}
 

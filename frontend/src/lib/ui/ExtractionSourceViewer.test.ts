@@ -1,5 +1,6 @@
+import { session } from '$lib/session-lifetime';
 import { cleanup, render, screen, fireEvent } from '@testing-library/svelte';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, beforeEach, expect, it } from 'vitest';
 import ExtractionSourceViewer from './ExtractionSourceViewer.svelte';
 const view = {
 	view_id: 'unwarped',
@@ -26,11 +27,15 @@ const source = {
 	block_id: 'block',
 	text_span: null
 };
+beforeEach(() =>
+	session.set({ id: 'viewer', username: 'alice', is_admin: false, can_see_all: false })
+);
+
 afterEach(cleanup);
 it('uses the exact working view and its own dimensions', () => {
 	render(ExtractionSourceViewer, { views: [view], sources: [source] });
 	const img = screen.getByRole('img');
-	expect(img.getAttribute('src')).toBe('/exact-working.png');
+	expect(img.getAttribute('src')).toBe('/exact-working.png?vb_expected_user=viewer');
 	expect(img.getAttribute('width')).toBe('1200');
 	expect(img.getAttribute('height')).toBe('1800');
 	expect(document.querySelector('svg')?.getAttribute('viewBox')).toBe('0 0 1200 1800');
@@ -66,6 +71,6 @@ it('allows selecting an original without drawing working coordinates on it', asy
 		sources: [source]
 	});
 	await fireEvent.change(screen.getByRole('combobox'), { target: { value: 'original' } });
-	expect(screen.getByRole('img').getAttribute('src')).toBe('/original.png');
+	expect(screen.getByRole('img').getAttribute('src')).toBe('/original.png?vb_expected_user=viewer');
 	expect(document.querySelector('polygon')).toBeNull();
 });

@@ -24,7 +24,8 @@ const { mockApi, mockGoto, setUnauthorizedHandler, getUnauthorizedHandler } = vi
 
 vi.mock('$lib/api/client', () => ({
 	api: mockApi,
-	onUnauthorized: setUnauthorizedHandler
+	onUnauthorized: setUnauthorizedHandler,
+	onSessionActorChanged: () => undefined
 }));
 vi.mock('$app/navigation', () => ({ goto: mockGoto }));
 vi.mock('$app/paths', () => ({ resolve: (path: string) => path }));

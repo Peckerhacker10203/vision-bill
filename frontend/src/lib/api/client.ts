@@ -1,6 +1,20 @@
-import { currentSessionGeneration, requireSessionGeneration } from '$lib/session-lifetime';
+import {
+	captureSessionActor,
+	currentSessionGeneration,
+	isCurrentSessionActor,
+	requireCurrentSessionActor,
+	requireSessionGeneration,
+	type SessionActor
+} from '$lib/session-lifetime';
+import type { IndividualResult } from '$lib/benchmark-experiments';
 import type {
 	AnalyzeResponse,
+	BenchmarkCapabilities,
+	BenchmarkCreate,
+	BenchmarkReferenceConfirmation,
+	BenchmarkReferencePreview,
+	BenchmarkRun,
+	BenchmarkStatus,
 	DraftView,
 	DraftPatch,
 	DraftFinalize,
@@ -40,9 +54,14 @@ const API_BASE = (import.meta.env.VITE_API_BASE ?? '/api/v1').replace(/\/$/, '')
  * swappable callback so this module never imports the session store (no cycle).
  */
 let unauthorizedHandler: (() => void) | null = null;
+let sessionActorChangedHandler: (() => void) | null = null;
 
 export function onUnauthorized(handler: () => void): void {
 	unauthorizedHandler = handler;
+}
+
+export function onSessionActorChanged(handler: () => void): void {
+	sessionActorChangedHandler = handler;
 }
 
 export class ApiError extends Error {
@@ -62,23 +81,41 @@ export class ApiError extends Error {
 	}
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-	const generation = currentSessionGeneration();
+async function request<T>(
+	path: string,
+	init?: RequestInit,
+	actor = captureSessionActor()
+): Promise<T> {
+	const isProtected = !path.startsWith('/auth/') && path !== '/system/ui-config';
+	const generation = actor?.generation ?? currentSessionGeneration();
+	function requireCurrent() {
+		requireSessionGeneration(generation);
+		if (isProtected) requireCurrentSessionActor(actor);
+	}
+	requireCurrent();
+
+	const options: RequestInit = { credentials: 'same-origin', ...init };
+	if (isProtected && actor) {
+		const headers = new Headers(options.headers);
+		headers.set('X-Vision-Bill-Expected-User', actor.userId);
+		options.headers = headers;
+	}
+	if (isProtected || path === '/auth/me') options.cache = 'no-store';
+
 	let response: Response;
 	try {
-		// same-origin so the HttpOnly session cookie is sent automatically.
-		response = await fetch(`${API_BASE}${path}`, { credentials: 'same-origin', ...init });
+		response = await fetch(`${API_BASE}${path}`, options);
 	} catch {
-		requireSessionGeneration(generation);
+		requireCurrent();
 		throw new ApiError(0, 'Network error');
 	}
 
-	requireSessionGeneration(generation);
+	requireCurrent();
 	if (!response.ok) {
 		// A 401 on a protected endpoint means the session expired: bounce to
 		// login. The /auth/ endpoints 401 for bad credentials, not an expired
 		// session, so they are excluded.
-		if (response.status === 401 && !path.startsWith('/auth/')) {
+		if (response.status === 401 && isProtected) {
 			unauthorizedHandler?.();
 		}
 		let detail = `${response.status} ${response.statusText}`;
@@ -100,7 +137,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 		} catch {
 			// Non-JSON error body: keep the status text.
 		}
-		requireSessionGeneration(generation);
+		requireCurrent();
+		if (isProtected && response.status === 409 && detail === 'session_actor_changed') {
+			sessionActorChangedHandler?.();
+			requireCurrent();
+		}
 		throw new ApiError(response.status, detail, imageId);
 	}
 
@@ -110,10 +151,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 	try {
 		const body = (await response.json()) as T;
-		requireSessionGeneration(generation);
+		requireCurrent();
 		return body;
 	} catch {
-		requireSessionGeneration(generation);
+		requireCurrent();
 		// A successful status with an unreadable body is still an ambiguous mutation.
 		throw new ApiError(response.status, 'Response body could not be read');
 	}
@@ -133,12 +174,18 @@ function toQueryString(
 	return parts.length > 0 ? `?${parts.join('&')}` : '';
 }
 
+function privateMediaUrl(path: string, actor: SessionActor | null): string | undefined {
+	if (!isCurrentSessionActor(actor)) return undefined;
+	return `${path}${path.includes('?') ? '&' : '?'}vb_expected_user=${encodeURIComponent(actor.userId)}`;
+}
+
 export const api = {
 	/** Files are appended in capture order; absent options stay absent. */
 	async uploadImages(
 		files: File[],
 		options: UploadOptions,
-		idempotencyKey: string
+		idempotencyKey: string,
+		actor = captureSessionActor()
 	): Promise<SubmissionStatus> {
 		const form = new FormData();
 		for (const image of files) form.append('receipt', image);
@@ -155,7 +202,8 @@ export const api = {
 				},
 				true
 			)}`,
-			{ method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: form }
+			{ method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: form },
+			actor
 		);
 	},
 
@@ -167,8 +215,75 @@ export const api = {
 		});
 	},
 
-	listModels(capability: 'vision' | 'text' = 'vision'): Promise<ModelInfo[]> {
-		return request<ModelInfo[]>(`/llm/models${capability === 'text' ? '?capability=text' : ''}`);
+	listModels(
+		capability: 'vision' | 'text' = 'vision',
+		actor = captureSessionActor()
+	): Promise<ModelInfo[]> {
+		return request<ModelInfo[]>(
+			`/llm/models${capability === 'text' ? '?capability=text' : ''}`,
+			undefined,
+			actor
+		);
+	},
+
+	getBenchmarkCapabilities(actor: SessionActor): Promise<BenchmarkCapabilities> {
+		return request<BenchmarkCapabilities>('/benchmarks/capabilities', undefined, actor);
+	},
+
+	previewBenchmarkReference(id: string, actor: SessionActor): Promise<BenchmarkReferencePreview> {
+		return request<BenchmarkReferencePreview>(
+			`/benchmarks/references/${encodeURIComponent(id)}`,
+			undefined,
+			actor
+		);
+	},
+
+	qualifyBenchmarkReference(
+		id: string,
+		body: BenchmarkReferenceConfirmation,
+		actor: SessionActor
+	): Promise<unknown> {
+		return request(
+			`/benchmarks/references/${encodeURIComponent(id)}`,
+			{
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(body)
+			},
+			actor
+		);
+	},
+
+	createBenchmark(body: BenchmarkCreate, actor: SessionActor): Promise<BenchmarkRun> {
+		return request<BenchmarkRun>(
+			'/benchmarks',
+			{
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(body)
+			},
+			actor
+		);
+	},
+
+	listBenchmarks(actor: SessionActor): Promise<BenchmarkRun[]> {
+		return request<BenchmarkRun[]>('/benchmarks', undefined, actor);
+	},
+
+	getBenchmarkStatus(id: string, actor: SessionActor): Promise<BenchmarkStatus> {
+		return request<BenchmarkStatus>(`/benchmarks/${encodeURIComponent(id)}`, undefined, actor);
+	},
+
+	getBenchmarkResults(
+		id: string,
+		offset: number,
+		actor: SessionActor
+	): Promise<IndividualResult[]> {
+		return request<IndividualResult[]>(
+			`/benchmarks/${encodeURIComponent(id)}/results?limit=50&offset=${offset}`,
+			undefined,
+			actor
+		);
 	},
 
 	getUiConfig(): Promise<UiConfig> {
@@ -256,17 +371,23 @@ export const api = {
 		return request<AnalyzeResponse>('/images/analyze', { method: 'POST' });
 	},
 
-	/** URL for <img> tags / opening in a new tab (not used via fetch). */
-	imageFileUrl(id: string, part = 0): string {
-		return `${API_BASE}/images/${id}/file${part ? `?part=${part}` : ''}`;
+	/** Private URLs for image tags and direct navigation. */
+	imageFileUrl(id: string, part = 0, actor = captureSessionActor()): string | undefined {
+		return privateMediaUrl(`${API_BASE}/images/${id}/file${part ? `?part=${part}` : ''}`, actor);
 	},
 
-	/** URL for the small WebP thumbnail (not used via fetch). */
-	imageThumbUrl(id: string): string {
-		return `${API_BASE}/images/${id}/thumb`;
+	imageThumbUrl(id: string, actor = captureSessionActor()): string | undefined {
+		return privateMediaUrl(`${API_BASE}/images/${id}/thumb`, actor);
 	},
 
-	listReceipts(filters: ReceiptListFilters = {}): Promise<ReceiptRow[]> {
+	sourceViewUrl(url: string, actor = captureSessionActor()): string | undefined {
+		return privateMediaUrl(url, actor);
+	},
+
+	listReceipts(
+		filters: ReceiptListFilters = {},
+		actor = captureSessionActor()
+	): Promise<ReceiptRow[]> {
 		return request<ReceiptRow[]>(
 			`/receipts${toQueryString({
 				limit: filters.limit,
@@ -276,7 +397,9 @@ export const api = {
 				date_to: filters.date_to,
 				search: filters.search,
 				collection_id: filters.collection_id
-			})}`
+			})}`,
+			undefined,
+			actor
 		);
 	},
 

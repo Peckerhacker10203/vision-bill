@@ -2,21 +2,27 @@
 	import { t } from '$lib/i18n';
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
+	import { api } from '$lib/api/client';
 	import { session } from '$lib/auth';
+	import { captureSessionActor, isCurrentSessionActor } from '$lib/session-lifetime';
+	import type {
+		BenchmarkCouncilPolicy,
+		BenchmarkCreate,
+		BenchmarkReferencePreview,
+		ModelInfo
+	} from '$lib/types';
 	import BenchmarkExperimentControls from '$lib/ui/BenchmarkExperimentControls.svelte';
 	import { defaultExperiment, experimentRequest } from '$lib/benchmark-experiments';
 
-	type ReferencePreview = {
-		receipt_identity: string;
-		review_revision: number;
-		document_sha256: string;
-		expected: Record<string, unknown>;
-		scored_fields: string[];
-		sources: unknown[];
-		findings: unknown[];
-	};
-	let references = $state<ReferencePreview[]>([]);
+	const actor = captureSessionActor();
+	let alive = true;
+	const current = () => alive && isCurrentSessionActor(actor);
+	onDestroy(() => {
+		alive = false;
+	});
+
+	let references = $state<BenchmarkReferencePreview[]>([]);
 	let referenceSelection = $state('');
 	let qualify = $state(false);
 	let previewing = $state(false);
@@ -27,6 +33,7 @@
 		}
 	});
 	async function previewReferences() {
+		if (!actor || !current() || previewing) return;
 		previewing = true;
 		qualify = false;
 		references = [];
@@ -41,61 +48,54 @@
 				throw new Error(
 					'Enter explicit receipt IDs to qualify new references. Filters use existing qualified references.'
 				);
-			const previews = await Promise.all(
-				ids.map(async (id) => {
-					const response = await fetch(`/api/v1/benchmarks/references/${encodeURIComponent(id)}`);
-					if (!response.ok) throw new Error(await response.text());
-					return (await response.json()) as ReferencePreview;
-				})
-			);
-			if (receiptIds === selection) {
+			const previews = await Promise.all(ids.map((id) => api.previewBenchmarkReference(id, actor)));
+			if (current() && receiptIds === selection) {
 				referenceSelection = selection;
 				references = previews;
 			}
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Unable to preview references.';
+			if (current() && receiptIds === selection)
+				error = cause instanceof Error ? cause.message : 'Unable to preview references.';
 		} finally {
-			previewing = false;
+			if (current()) previewing = false;
 		}
 	}
 	let experiment = $state(defaultExperiment());
 	let capabilities = $state({ ocr_available: false, ocr_enabled: false, thinking_control: false });
 	let loaded = $state(false);
-	let capability = $derived(
+	let capability: 'text' | 'vision' = $derived(
 		experiment.pipeline === 'ocr' || (experiment.pipeline === 'upload' && capabilities.ocr_enabled)
 			? 'text'
 			: 'vision'
 	);
 	$effect(() => {
-		if (!loaded) return;
+		if (!actor || !loaded || !current()) return;
 		let active = true;
 		models = [];
 		selected = [];
-		void fetch(`/api/v1/llm/models${capability === 'text' ? '?capability=text' : ''}`)
-			.then(async (response) => {
-				if (!response.ok) throw new Error();
-				const available = (await response.json()) as Model[];
-				if (active) {
+		void api
+			.listModels(capability, actor)
+			.then((available) => {
+				if (active && current()) {
 					models = available;
 					selected = available.map((model) => model.id);
 				}
 			})
 			.catch(() => {
-				if (active) error = 'Unable to load local models.';
+				if (active && current()) error = 'Unable to load local models.';
 			});
 		return () => {
 			active = false;
 		};
 	});
-	type Model = { id: string };
-	let models = $state<Model[]>([]),
+	let models = $state<ModelInfo[]>([]),
 		selected = $state<string[]>([]),
 		receiptIds = $state(''),
 		category = $state(''),
 		maxConfidence = $state<number | undefined>(),
 		limit = $state<number | undefined>(),
 		timeout = $state(600),
-		policy = $state('all'),
+		policy = $state<BenchmarkCouncilPolicy>('all'),
 		absolute = $state<number | undefined>(),
 		relative = $state<number | undefined>(),
 		applyFlags = $state(false),
@@ -108,32 +108,36 @@
 			void goto(resolve('/'));
 		}
 	});
-	onMount(async () => {
+	async function initialize() {
+		if (!actor || !current()) return;
 		receiptIds = window.sessionStorage.getItem('benchmark-reuse-receipts') ?? '';
 		window.sessionStorage.removeItem('benchmark-reuse-receipts');
 		const reuse = new URLSearchParams(window.location.search).get('reuse');
 		if (reuse) {
-			const previous = await fetch(`/api/v1/benchmarks/${encodeURIComponent(reuse)}`);
-			if (previous.ok) {
-				const data = await previous.json();
-				receiptIds = data.run.receipt_ids.join(',');
-			}
+			const previous = await api.getBenchmarkStatus(reuse, actor).catch(() => null);
+			if (!current()) return;
+			if (previous) receiptIds = previous.run.receipt_ids.join(',');
 		}
-		const available = await fetch('/api/v1/benchmarks/capabilities').catch(() => null);
-		if (available?.ok) capabilities = await available.json();
+		const available = await api.getBenchmarkCapabilities(actor).catch(() => null);
+		if (!current()) return;
+		if (available) capabilities = available;
 		loaded = true;
+	}
+	onMount(() => {
+		void initialize();
 	});
 	function toggle(id: string) {
 		selected = selected.includes(id) ? selected.filter((model) => model !== id) : [...selected, id];
 	}
 	async function create() {
+		if (!actor || !current() || creating) return;
 		creating = true;
 		error = '';
 		const ids = receiptIds
 			.split(',')
 			.map((id) => id.trim())
 			.filter(Boolean);
-		const body: Record<string, unknown> = {
+		const body: BenchmarkCreate = {
 			model_ids: selected,
 			experiment: experimentRequest(experiment),
 			request_timeout_seconds: timeout,
@@ -151,32 +155,26 @@
 				if (!references.length || receiptIds !== referenceSelection)
 					throw new Error('Preview the current selection again.');
 				for (const reference of references) {
-					const response = await fetch(
-						`/api/v1/benchmarks/references/${encodeURIComponent(reference.receipt_identity)}`,
+					await api.qualifyBenchmarkReference(
+						reference.receipt_identity,
 						{
-							method: 'POST',
-							headers: { 'Content-Type': 'application/json' },
-							body: JSON.stringify({
-								expected_review_revision: reference.review_revision,
-								expected_document_sha256: reference.document_sha256
-							})
-						}
+							expected_review_revision: reference.review_revision,
+							expected_document_sha256: reference.document_sha256
+						},
+						actor
 					);
-					if (!response.ok) throw new Error(await response.text());
+					if (!current()) return;
 				}
 			}
-			const response = await fetch('/api/v1/benchmarks', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify(body)
-			});
-			if (!response.ok) throw new Error(await response.text());
-			await goto(resolve('/benchmarks/results'));
+			await api.createBenchmark(body, actor);
+			if (current()) await goto(resolve('/benchmarks/results'));
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Unable to create benchmark.';
+			if (current()) error = cause instanceof Error ? cause.message : 'Unable to create benchmark.';
 		} finally {
-			creating = false;
-			confirm = false;
+			if (current()) {
+				creating = false;
+				confirm = false;
+			}
 		}
 	}
 </script>

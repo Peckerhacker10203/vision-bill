@@ -1,3 +1,4 @@
+import { session } from '$lib/session-lifetime';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { LineItemRow, ReceiptRow, ReceiptWrite } from '$lib/types';
@@ -100,6 +101,10 @@ beforeEach(() => {
 		})
 	);
 });
+
+beforeEach(() =>
+	session.set({ id: 'viewer', username: 'alice', is_admin: false, can_see_all: false })
+);
 
 afterEach(() => {
 	cleanup();

@@ -17,7 +17,7 @@ from ..service.analysis_scheduler import AnalysisScheduler
 from ..service.submission_service import SubmissionService
 from .helper.helper import get_analysis_scheduler
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
 
 
 def get_submission_service(request: Request) -> SubmissionService:

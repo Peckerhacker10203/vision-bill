@@ -165,3 +165,57 @@ it('does not expose an old protected error body that finishes after the principa
 	body.resolve({ detail: 'Alice private conflict' });
 	expect((await pending).name).toBe('AbortError');
 });
+
+it('binds protected browser requests to the view actor and leaves bootstrap discovery unbound', async () => {
+	vi.spyOn(api, 'login').mockResolvedValue(alice);
+	await signIn('alice', 'x');
+	vi.stubGlobal(
+		'fetch',
+		vi.fn().mockImplementation(() => Promise.resolve(response({})))
+	);
+	await api.uploadImages([new File(['image'], 'receipt.png')], {}, 'stable-key');
+	await api.me();
+	await api.getUiConfig();
+	const [upload, me, uiConfig] = vi
+		.mocked(fetch)
+		.mock.calls.map(([, init]) => new Headers(init?.headers));
+	expect(upload.get('X-Vision-Bill-Expected-User')).toBe(alice.id);
+	expect(upload.get('Idempotency-Key')).toBe('stable-key');
+	expect(upload.has('Content-Type')).toBe(false);
+	expect(me.has('X-Vision-Bill-Expected-User')).toBe(false);
+	expect(uiConfig.has('X-Vision-Bill-Expected-User')).toBe(false);
+});
+
+it('revalidates a current actor mismatch and empties its private cache', async () => {
+	vi.spyOn(api, 'login').mockResolvedValue(alice);
+	const me = vi.spyOn(api, 'me').mockResolvedValue(bob);
+	await signIn('alice', 'x');
+	queryClient.setQueryData(queryKeys.receipts(), ['Alice']);
+	vi.stubGlobal(
+		'fetch',
+		vi.fn().mockResolvedValue(response({ detail: 'session_actor_changed' }, 409))
+	);
+	await expect(api.listReceipts()).rejects.toMatchObject({ name: 'AbortError' });
+	await vi.waitFor(() => expect(get(session)).toEqual(bob));
+	expect(me).toHaveBeenCalledOnce();
+	expect(queryClient.getQueryData(queryKeys.receipts())).toBeUndefined();
+});
+
+it('ignores a delayed actor mismatch body once a successor signs in', async () => {
+	vi.spyOn(api, 'login').mockResolvedValueOnce(alice).mockResolvedValueOnce(bob);
+	const me = vi.spyOn(api, 'me');
+	await signIn('alice', 'x');
+	const late = deferred<unknown>();
+	const json = vi.fn(() => late.promise);
+	vi.stubGlobal(
+		'fetch',
+		vi.fn().mockResolvedValue({ ok: false, status: 409, statusText: 'Conflict', json })
+	);
+	const old = api.listReceipts().catch((error) => error);
+	await vi.waitFor(() => expect(json).toHaveBeenCalled());
+	await signIn('bob', 'x');
+	late.resolve({ detail: 'session_actor_changed' });
+	expect((await old).name).toBe('AbortError');
+	expect(me).not.toHaveBeenCalled();
+	expect(get(session)).toEqual(bob);
+});

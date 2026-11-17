@@ -213,7 +213,11 @@ async def get_image_file(
     path = Path(source.image_path)
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Image file not found")
-    return FileResponse(path, media_type=source.media_type or "application/octet-stream")
+    return FileResponse(
+        path,
+        media_type=source.media_type or "application/octet-stream",
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 @router.get("/{image_id}/thumb")
@@ -237,7 +241,7 @@ async def get_image_thumb(
     path = Path(image.thumbnail_path)
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Image thumbnail not found")
-    return FileResponse(path, media_type="image/webp")
+    return FileResponse(path, media_type="image/webp", headers={"Cache-Control": "private, no-store"})
 
 
 @router.delete("/{image_id}")
