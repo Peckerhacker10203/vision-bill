@@ -218,6 +218,7 @@
 		"reviewTitle": "Review extracted data",
 		"errorUnsupported": "Unsupported image type",
 		"errorDb": "Database not available",
+		"recoveryReadError": "Could not check the selected photos.",
 		"errorGeneric": "Upload failed"
 	},
 	"queue": {

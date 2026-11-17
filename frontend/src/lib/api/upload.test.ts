@@ -116,3 +116,16 @@ it('recovers an old single-slot upload only when its ordered photos match', asyn
 	expect(await prepareUpload('owner', original)).toEqual(legacy);
 	expect(await prepareUpload('owner', [...original].reverse())).toEqual(newUpload);
 });
+
+it('does not store a pending upload if the actor changes after hashing', async () => {
+	let current = true;
+	const checkCurrent = () => {
+		if (!current) throw new DOMException('Session changed', 'AbortError');
+		queueMicrotask(() => (current = false));
+	};
+	const original = [new File(['same bytes'], 'photo.png')];
+	await expect(prepareUpload('owner', original, {}, checkCurrent)).rejects.toMatchObject({
+		name: 'AbortError'
+	});
+	expect(readPendingUpload('owner')).toBeNull();
+});

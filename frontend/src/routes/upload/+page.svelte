@@ -40,6 +40,7 @@
 	let bypassChoice = $state<boolean>();
 	let recoveredUpload = $state.raw<PendingUpload | null>(null);
 	let checkingRecovery = $state(false);
+	let recoveryFailed = $state(false);
 	let recoveryOwner = $state('');
 	let recovering = $state(false);
 	let uploadError = $state('');
@@ -74,8 +75,8 @@
 		const origin = jobId;
 		recoveredUpload = null;
 		checkingRecovery = false;
+		recoveryFailed = false;
 		if (origin || !selection.length || !isCurrentSessionActor(actor)) return;
-		if (!readPendingUpload(actor.userId)) return;
 
 		const sameSelection = () => alive && photos === selection && isCurrentSessionActor(actor);
 		const current = () => sameSelection() && jobId === origin;
@@ -92,11 +93,15 @@
 				if (current()) {
 					recoveredUpload = pending;
 					if (pending) recovering = true;
+				} else {
+					recoveryFailed = true;
 				}
 				checkingRecovery = false;
 			},
 			() => {
-				if (sameSelection()) checkingRecovery = false;
+				if (!sameSelection()) return;
+				recoveryFailed = true;
+				checkingRecovery = false;
 			}
 		);
 	}
@@ -139,7 +144,15 @@
 	}
 
 	async function upload() {
-		if (!alive || jobId || !file || uploading || checkingRecovery || !isCurrentSessionActor(actor))
+		if (
+			!alive ||
+			jobId ||
+			!file ||
+			uploading ||
+			checkingRecovery ||
+			recoveryFailed ||
+			!isCurrentSessionActor(actor)
+		)
 			return;
 		const owner = actor.userId;
 		const selection = photos;
@@ -307,6 +320,20 @@
 			/>
 		</div>
 
+		{#if recoveryFailed}
+			<div class="mt-3 flex items-center gap-2 text-sm text-error" role="alert">
+				<Icon icon="alert" />
+				<p>{$t('upload.recoveryReadError')}</p>
+				<button
+					type="button"
+					class="rounded-lg px-2 py-1 font-medium text-primary underline"
+					onclick={() => setPhotos([...photos])}
+				>
+					{$t('common.retry')}
+				</button>
+			</div>
+		{/if}
+
 		{#if uploadError}
 			<p class="mt-3 flex items-center gap-2 text-sm text-error" role="alert">
 				<Icon icon="alert" />
@@ -320,7 +347,7 @@
 					type="checkbox"
 					class="mt-1 size-4"
 					checked={bypassReview}
-					disabled={uploading || checkingRecovery}
+					disabled={uploading || checkingRecovery || recoveryFailed}
 					onchange={onBypassChange}
 				/>
 				<span>
@@ -333,7 +360,12 @@
 		<button
 			type="button"
 			class="mt-4 w-full rounded-lg bg-primary px-4 py-3 text-sm font-medium text-on-primary hover:opacity-90 disabled:opacity-50"
-			disabled={!file || uploading || checkingRecovery || !$session || $session === 'loading'}
+			disabled={!file ||
+				uploading ||
+				checkingRecovery ||
+				recoveryFailed ||
+				!$session ||
+				$session === 'loading'}
 			onclick={upload}
 		>
 			{#if uploading}

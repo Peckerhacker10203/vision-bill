@@ -224,3 +224,51 @@ it('resets the recovered review choice when the selected photos are reordered', 
 	expect(upload.mock.calls[0].slice(0, 2)).toEqual([[bottom, top], {}]);
 	expect(upload.mock.calls[0][2]).not.toBe(pending.key);
 });
+
+it('blocks upload after an unreadable selection until recovery checks the bytes again', async () => {
+	const { prepareUpload, readPendingUpload } = await import('$lib/api/upload');
+	session.set({ id: 'owner', username: 'test', is_admin: false, can_see_all: false });
+	const file = new File(['same bytes'], 'photo.png');
+	const pending = await prepareUpload('owner', [file], { bypass_review: true });
+	const bytes = new TextEncoder().encode('same bytes').buffer;
+	Object.defineProperty(file, 'arrayBuffer', {
+		value: vi
+			.fn()
+			.mockRejectedValueOnce(new DOMException('Temporarily unreadable', 'NotReadableError'))
+			.mockResolvedValue(bytes)
+	});
+	vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:retry-read');
+	vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+	vi.spyOn(api, 'getUiConfig').mockResolvedValue({
+		bypass_review_default: false,
+		registration_open: true
+	});
+	const upload = vi.spyOn(api, 'uploadImages').mockResolvedValue({ id: 'job' } as never);
+	const { container } = render(Upload);
+	await fireEvent.change(container.querySelector('input[type=file]')!, {
+		target: { files: [file] }
+	});
+	expect((await screen.findByRole('alert')).textContent).toContain(
+		'Could not check the selected photos'
+	);
+	const button = screen.getByRole<HTMLButtonElement>('button', { name: 'Upload' });
+	expect(button.disabled).toBe(true);
+	await fireEvent.click(button);
+	expect(upload).not.toHaveBeenCalled();
+	expect(readPendingUpload('owner')).toEqual(pending);
+
+	await fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+	await waitFor(() => {
+		expect(screen.getByRole<HTMLInputElement>('checkbox').checked).toBe(true);
+		expect(button.disabled).toBe(false);
+	});
+	await fireEvent.click(button);
+	await waitFor(() =>
+		expect(upload).toHaveBeenCalledExactlyOnceWith(
+			[file],
+			pending.options,
+			pending.key,
+			expect.objectContaining({ userId: 'owner' })
+		)
+	);
+});

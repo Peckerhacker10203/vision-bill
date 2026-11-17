@@ -218,6 +218,7 @@
 		"reviewTitle": "Erkannte Daten prüfen",
 		"errorUnsupported": "Nicht unterstützter Bilddatentyp",
 		"errorDb": "Datenbank nicht verfügbar",
+		"recoveryReadError": "Die ausgewählten Fotos konnten nicht geprüft werden.",
 		"errorGeneric": "Hochladen fehlgeschlagen"
 	},
 	"queue": {

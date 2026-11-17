@@ -23,8 +23,9 @@ export function requestKey(): string {
 }
 
 function readRecord(storage: string): PendingRecord | null {
+	const raw = localStorage.getItem(storage);
 	try {
-		const value = JSON.parse(localStorage.getItem(storage) ?? 'null');
+		const value = JSON.parse(raw ?? 'null');
 		if (!value || typeof value.key !== 'string' || !/^[a-f0-9]{64}$/.test(value.identity))
 			return null;
 		const options = value.options;
@@ -118,6 +119,7 @@ export async function prepareUpload(
 	checkCurrent?: () => void
 ): Promise<PendingUpload> {
 	const hashes = await hashFiles(files, checkCurrent);
+	checkCurrent?.();
 	const photos = bytesToHex(sha256(utf8ToBytes(JSON.stringify(hashes))));
 	const identityOf = (options: UploadOptions) => uploadIdentity(owner, hashes, options);
 	const records = pendingRecords(owner);
