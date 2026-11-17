@@ -149,8 +149,10 @@ async def test_two_reapers_and_late_completion_seal_one_abandonment(workflow_db)
         workflow.reap_expired_claims(),
         workflow.finish_attempt(dead, complete()),
     )
-    assert sorted((first, second)) == [0, 1]
     assert late.stale
+    # Both concurrent sweeps may skip the row while the stale finisher holds its lock.
+    follow_up = await workflow.reap_expired_claims()
+    assert first + second + follow_up == 1
     assert await workflow.reap_expired_claims() == 0
     assert await workflow.claim_next(image_id=image.id) is None
     await make_due(workflow, image.id)
