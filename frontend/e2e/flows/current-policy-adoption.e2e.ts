@@ -1,4 +1,6 @@
 import { expect, test } from '@playwright/test';
+import { sha256 } from '@noble/hashes/sha256';
+import { bytesToHex, utf8ToBytes } from '@noble/hashes/utils';
 import { registerUser } from '../helpers/auth';
 import { awaitSubmission } from '../helpers/api';
 import { testEnvironment } from '../helpers/environment';
@@ -142,6 +144,7 @@ test.describe('explicit current policy adoption', () => {
 		const completed = await awaitSubmission(context, id);
 		expect(completed.status).toBe('analyzed');
 		expect(completed.generation).toBe(held.generation + 1);
+		expect(completed.attempt_count).toBe(1);
 		const receiptUrl = `/api/v1/receipts/${completed.receipt_id}`;
 		const receipt = await (await context.request.get(receiptUrl)).json();
 		for (const body of [
@@ -153,6 +156,7 @@ test.describe('explicit current policy adoption', () => {
 		expect(await (await context.request.get(receiptUrl)).json()).toEqual(receipt);
 		const after = await history('inspect', id, ownerId);
 		expect(after.user_id).toBe(ownerId);
+		expect(after.generation).toBe(completed.generation);
 		for (const key of [
 			'source_manifest',
 			'requested_options',
@@ -167,8 +171,32 @@ test.describe('explicit current policy adoption', () => {
 			allow_ocr_fallback: false,
 			ocr: { enabled: true, allow_vision_fallback: false }
 		});
-		expect(after.legacy_events).toHaveLength(1);
-		expect(after.legacy_events[0].effective_options).toEqual(before.effective_options);
+		// Use the app's Compose-side stub endpoint, which differs from the published test URL.
+		const inferenceIdentity = `openai:${bytesToHex(sha256(utf8ToBytes('http://llm-stub:9123/v1')))}`;
+		expect(after.inference_identity).toBe(inferenceIdentity);
+		expect(after.checkpoint_id).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+		const checkpoint = {
+			checkpoint_id: after.checkpoint_id,
+			producer_generation: completed.generation,
+			producer_attempt_number: 1,
+			inference_identity: inferenceIdentity
+		};
+		expect(after.legacy_events).toEqual([
+			{
+				event: 'execution_policy_adopted',
+				generation: held.generation,
+				effective_options: before.effective_options,
+				model_id: 'e2e-text',
+				requested_options: before.requested_options,
+				request_fingerprint: before.request_fingerprint
+			},
+			{ event: 'unmanaged_classification_started', ...checkpoint },
+			{
+				event: 'unmanaged_classification_settled',
+				...checkpoint,
+				settlement: 'provider_returned'
+			}
+		]);
 		const calls = (await (await fetch(`${testEnvironment('VB_E2E_STUB_URL')}/__requests`)).json())
 			.requests as { kind: string; image_sha256: string | null; served: string }[];
 		expect(calls.filter((call) => call.kind === 'ocr').length).toBeGreaterThanOrEqual(2);

@@ -11,7 +11,7 @@ import pytest
 
 from tests.e2e import test_submission_service_e2e as submissions
 from tests.e2e.test_benchmark_claims_e2e import wait_blocked
-from vision_bill.model.workflow import AttemptOutcome
+from vision_bill.model.workflow import AttemptOutcome, ObservationCheckpoint
 
 postgres, db, workflow_db = submissions.postgres, submissions.db, submissions.workflow_db
 pytestmark = pytest.mark.e2e
@@ -22,7 +22,7 @@ pytestmark = pytest.mark.e2e
                                           ("references", 1), ("reference_release", 1), ("tags", 1)])
 async def test_upload_deadline_atomic_recovery_and_artifacts(workflow_db, settings, tmp_path, phase, attempt):
     w, scope = workflow_db
-    image, paths, _llm, native, service = await submissions.setup(w, scope, settings, tmp_path)
+    image, paths, llm, native, service = await submissions.setup(w, scope, settings, tmp_path)
     originals = [p.read_bytes() for p in paths]
     source_hashes = [hashlib.sha256(data).hexdigest() for data in originals]
     if attempt == 3:
@@ -166,12 +166,18 @@ async def test_upload_deadline_atomic_recovery_and_artifacts(workflow_db, settin
                 assert await conn.fetchval(f"SELECT count(*) FROM {table}") == 0
             checkpoint = await conn.fetchval("SELECT ocr_checkpoint FROM images WHERE id=$1", image.id)
             saved = await conn.fetch("SELECT artifact_path FROM extraction_working_views WHERE image_id=$1", image.id)
-            row = await conn.fetchrow("SELECT status,attempt_count FROM images WHERE id=$1", image.id)
+            row = await conn.fetchrow(
+                """SELECT status,attempt_count,observation_checkpoint,legacy_events
+                FROM images WHERE id=$1""",
+                image.id,
+            )
         assert row["status"] == "processing" and row["attempt_count"] == attempt
         prefix = 2 if phase.startswith("finish") else 1 if phase.startswith("checkpoint") else 0
         assert len(saved) == prefix
         assert (len(json.loads(checkpoint)["pages"]) if checkpoint else 0) == prefix
-        files = list((tmp_path / "uploads" / "working").glob("*/*.png"))
+        assert (row["observation_checkpoint"] is not None) == (prefix == 2)
+        working_dir = tmp_path / "uploads" / "working"
+        files = list(working_dir.glob("*/*.png"))
         assert len(files) == (2 if prefix else 0 if phase == "tags" else 1)
         before = {p: p.read_bytes() for p in files}
         assert all(Path(row["artifact_path"]).exists() for row in saved)
@@ -187,17 +193,81 @@ async def test_upload_deadline_atomic_recovery_and_artifacts(workflow_db, settin
             await conn.execute("UPDATE images SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", image.id)
         assert await w.reap_expired_claims() == 1
         assert await w.claim_next() is None
-        if attempt == 3:
-            status = await w.get_submission(image.id, scope=scope)
-            assert status.terminal and status.status == "failed" and status.attempt_count == 3
-            native.extract_page.assert_not_awaited()
-            assert await w.claim_next() is None
+        pending = await w.get_submission(image.id, scope=scope)
+        assert pending.status == "pending" and not pending.terminal
+        assert pending.generation == claim.generation and pending.attempt_count == attempt
+        if prefix == 2:
+            assert pending.observations_available and pending.receipt_id is None
+            assert pending.retry_at is None and pending.wait_reason == "observation_recovery_required"
+            observed = ObservationCheckpoint.model_validate_json(row["observation_checkpoint"])
+            assert observed.producer_generation == claim.generation
+            assert observed.producer_attempt_number == attempt
+            assert [part.source_sha256 for part in observed.source_parts] == source_hashes
             async with original_pool.acquire() as conn:
-                history = await conn.fetch("SELECT attempt_number,result_code,outcome_kind FROM receipt_extractions")
-                assert [dict(row) for row in history] == [{"attempt_number": 3, "result_code": "lease_expired", "outcome_kind": "terminal"}]
+                (producer,) = await conn.fetch(
+                    "SELECT * FROM receipt_extractions WHERE image_id=$1", image.id
+                )
+            assert producer["generation"] == claim.generation and producer["attempt_number"] == attempt
+            assert producer["outcome_kind"] == "retry" and producer["result_code"] == "lease_expired"
+            assert json.loads(producer["envelope"]) == observed.envelope.model_dump(mode="json")
+            assert json.loads(producer["source_views"]) == [
+                view.model_dump(mode="json") for view in observed.persisted_views
+            ]
+
+            providers = (
+                llm.get_available_models, llm._client.ps, llm._client.chat,
+                native.get_capabilities, native.extract_page,
+            )
+            for operation in providers:
+                operation.reset_mock()
+            recovered = await w.claim_next(image_id=image.id, purpose="completion")
+            assert recovered.purpose == "completion" and recovered.checkpoint_id == observed.checkpoint_id
+            assert recovered.generation == claim.generation and recovered.attempt_number == attempt
+            assert recovered.claim_token != claim.claim_token
+            assert await w.get_observation_checkpoint(recovered) == observed
+            final = await service.complete_checkpoint(recovered)
+            assert not final.stale and final.receipt is not None
+            assert final.receipt.extraction_id == producer["id"]
+            assert final.submission.status == "analyzed" and not final.submission.observations_available
+            assert final.submission.generation == claim.generation and final.submission.attempt_count == attempt
+            assert final.submission.receipt_id == final.receipt.id and final.submission.retry_at is None
+            for operation in providers:
+                operation.assert_not_called()
+            assert await w.claim_next(image_id=image.id, purpose="completion") is None
+            assert (await w.finish_attempt(claim, AttemptOutcome(kind="retry", result_code="timed_out"))).stale
+
+            identity = {
+                "checkpoint_id": str(observed.checkpoint_id),
+                "producer_generation": claim.generation,
+                "producer_attempt_number": attempt,
+            }
+            async with original_pool.acquire() as conn:
+                assert await conn.fetchval("SELECT count(*) FROM receipts") == 1
+                assert await conn.fetch(
+                    "SELECT * FROM receipt_extractions WHERE image_id=$1", image.id
+                ) == [producer]
+                history = await conn.fetchval("SELECT legacy_events FROM images WHERE id=$1", image.id)
+                (review,) = await conn.fetch(
+                    "SELECT * FROM receipt_review_revisions WHERE receipt_id=$1", final.receipt.id
+                )
+            assert json.loads(history) == json.loads(row["legacy_events"]) + [
+                {"event": "observation_checkpoint_abandoned", **identity},
+                {
+                    "event": "checkpoint_completed", **identity,
+                    "completion_token_sha256": hashlib.sha256(recovered.claim_token.bytes).hexdigest(),
+                    "receipt_id": str(final.receipt.id), "extraction_id": str(producer["id"]),
+                },
+            ]
+            assert review["event_kind"] == "checkpoint_completed"
+            assert review["operation_revision"] == review["review_revision"] == 1
+            snapshot = json.loads(review["snapshot"])
+            assert {key: snapshot[key] for key in identity} == identity
+            assert snapshot["extraction_id"] == str(producer["id"])
+            assert snapshot["provenance"] == observed.envelope.provenance.model_dump(mode="json")
+            assert set(working_dir.glob("*/*.png")) == set(before)
         else:
-            pending = await w.get_submission(image.id, scope=scope)
-            assert pending.status == "pending" and pending.attempt_count == 1 and pending.retry_at is not None
+            assert attempt == 1 and pending.retry_at is not None
+            assert not pending.observations_available
             async with original_pool.acquire() as conn:
                 await conn.execute("UPDATE images SET retry_at=clock_timestamp() WHERE id=$1", image.id)
             recovered = await w.claim_next()

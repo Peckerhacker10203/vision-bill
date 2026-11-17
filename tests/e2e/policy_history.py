@@ -45,7 +45,10 @@ async def main():
                 )
         row = await conn.fetchrow(
             """SELECT user_id,source_manifest,requested_options,request_fingerprint,idempotency_key,
-            effective_options,legacy_events,generation FROM images WHERE id=$1 AND user_id=$2""",
+            effective_options,legacy_events,generation,
+            observation_checkpoint->>'checkpoint_id' AS checkpoint_id,
+            observation_checkpoint#>>'{execution_identity,inference_identity}' AS inference_identity
+            FROM images WHERE id=$1 AND user_id=$2""",
             image_id,
             owner_id,
         )

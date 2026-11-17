@@ -5,6 +5,20 @@ import { testEnvironment } from '../helpers/environment';
 import { uploadViaApi, verifyReceiptViaApi } from '../helpers/api';
 import { registerUser } from '../helpers/auth';
 
+async function ownerId(context: BrowserContext): Promise<string> {
+	const response = await context.request.get('/api/v1/auth/me');
+	expect(response.status()).toBe(200);
+	const { id } = (await response.json()) as { id: string };
+	expect(id).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+	return id;
+}
+
+function ownerMediaUrl(path: string, owner: string): URL {
+	const url = new URL(path, testEnvironment('VB_E2E_BASE_URL'));
+	url.searchParams.set('vb_expected_user', owner);
+	return url;
+}
+
 async function removeOwnedFile(id: string, kind: 'original' | 'thumbnail') {
 	const response = await fetch(testEnvironment('VB_E2E_OCR_URL') + '/__files', {
 		method: 'POST',
@@ -15,7 +29,8 @@ async function removeOwnedFile(id: string, kind: 'original' | 'thumbnail') {
 }
 async function assertWorkingView(
 	page: Page,
-	view: { url: string; sha256: string; width: number; height: number },
+	view: { sha256: string; width: number; height: number },
+	boundUrl: URL,
 	bbox: number[][]
 ) {
 	const actual = await page.evaluate(async (url) => {
@@ -31,10 +46,10 @@ async function assertWorkingView(
 				.map((b) => b.toString(16).padStart(2, '0'))
 				.join('')
 		};
-	}, view.url);
+	}, boundUrl.href);
 	expect(actual).toEqual({ width: view.width, height: view.height, sha256: view.sha256 });
 	const image = page.getByRole('img', { name: 'Source view', exact: true });
-	await expect(image).toHaveAttribute('src', view.url);
+	await expect(image).toHaveAttribute('src', boundUrl.pathname + boundUrl.search);
 	await expect(image).toHaveAttribute('width', String(view.width));
 	await expect(image).toHaveAttribute('height', String(view.height));
 	const svg = page.getByLabel('Source boxes', { exact: true });
@@ -60,26 +75,32 @@ test.describe('saved OCR evidence and original integrity', () => {
 			'Working OCR geometry requires the explicitly enabled stack'
 		);
 		await registerUser(context, 'ocr-geometry');
+		const owner = await ownerId(context);
 		await setStubScenario('partial');
 		const job = await create(context);
 		expect(job.status).toBe('needs_review');
 		const draft = await (await context.request.get(`/api/v1/images/${job.id}/draft`)).json();
 		const source = draft.field_sources.merchant_name[0];
 		const view = draft.source_views.find((v: { view_id: string }) => v.view_id === source.view_id);
+		const workingUrl = ownerMediaUrl(view.url, owner);
 		expect(source.coordinate_space).toBe('working');
 		await page.goto(`/upload?job=${job.id}&draft=1`);
 		const field = page.locator('p').filter({ hasText: /^merchant_name\s/ });
 		await field.getByRole('button', { name: 'Show source', exact: true }).click();
-		await assertWorkingView(page, view, source.bbox);
+		await assertWorkingView(page, view, workingUrl, source.bbox);
 		// The separately selected original never borrows working-coordinate polygons.
 		const original = page.getByRole('img', { name: 'Original photos', exact: true });
-		await expect(original).toHaveAttribute('src', `/api/v1/images/${job.id}/file`);
+		const originalUrl = ownerMediaUrl(`/api/v1/images/${job.id}/file`, owner);
+		await expect(original).toHaveAttribute('src', originalUrl.pathname + originalUrl.search);
 		await expect(original.locator('..').locator('polygon')).toHaveCount(0);
 		await field.getByRole('button', { name: 'Mark source unknown' }).click();
 		await field.getByRole('button', { name: 'Show source', exact: true }).click();
 		await expect(page.getByText('Source mapping unknown', { exact: true })).toBeVisible();
 		await expect(page.locator('svg polygon')).toHaveCount(0);
-		await page.route('**' + view.url, (route) => route.fulfill({ status: 404 }));
+		await page.route(
+			(url) => url.href === workingUrl.href,
+			(route) => route.fulfill({ status: 404 })
+		);
 		await page.reload();
 		await expect(page.getByText('Source image unavailable', { exact: true })).toBeVisible();
 		await expect(page.getByText(/The original photo is missing/)).toHaveCount(0);
@@ -94,6 +115,7 @@ test.describe('saved OCR evidence and original integrity', () => {
 			'Working OCR geometry requires the explicitly enabled stack'
 		);
 		await registerUser(context, 'ocr-boundary');
+		const owner = await ownerId(context);
 		await setStubScenario('overlap');
 		const fixture = await loadFixture('a');
 		const { body: job } = await uploadViaApi(context, 'a.png', fixture.bytes, fixture.mimeType, {
@@ -142,16 +164,13 @@ test.describe('saved OCR evidence and original integrity', () => {
 			height: number;
 			sha256: string;
 		}[];
-		await assertWorkingView(
-			page,
-			views.find((v) => v.view_id === source.view_id)!,
-			source.bbox
-		);
+		const view = views.find((v) => v.view_id === source.view_id)!;
+		await assertWorkingView(page, view, ownerMediaUrl(view.url, owner), source.bbox);
 		await page.getByRole('button', { name: 'Photo 2', exact: true }).click();
-		await expect(page.locator('img[src$="file?part=1"]')).toBeVisible();
-		await expect(
-			page.locator('img[src$="file?part=1"]').locator('..').locator('polygon')
-		).toHaveCount(0);
+		const originalUrl = ownerMediaUrl(`/api/v1/images/${job.id}/file?part=1`, owner);
+		const original = page.locator(`img[src="${originalUrl.pathname}${originalUrl.search}"]`);
+		await expect(original).toBeVisible();
+		await expect(original.locator('..').locator('polygon')).toHaveCount(0);
 	});
 
 	test('server detects missing original despite retained working image and thumbnail', async ({
@@ -212,16 +231,19 @@ test.describe('saved OCR evidence and original integrity', () => {
 		context
 	}) => {
 		await registerUser(context, 'missing-thumbnail');
+		const owner = await ownerId(context);
 		const job = await create(context);
 		expect(job.status).toBe('analyzed');
 		await removeOwnedFile(job.id as string, 'thumbnail');
 		await page.setViewportSize({ width: 390, height: 844 });
+		const thumbnailUrl = ownerMediaUrl(`/api/v1/images/${job.id}/thumb`, owner);
 		const missing = page.waitForResponse(
-			(r) => r.url().endsWith(`/images/${job.id}/thumb`) && r.status() === 404
+			(r) => r.url() === thumbnailUrl.href && r.status() === 404
 		);
 		await page.goto(`/receipts/${job.receipt_id}`);
 		await missing;
-		const original = page.locator(`img[src="/api/v1/images/${job.id}/file"]`);
+		const originalUrl = ownerMediaUrl(`/api/v1/images/${job.id}/file`, owner);
+		const original = page.locator(`img[src="${originalUrl.pathname}${originalUrl.search}"]`);
 		await expect(original).toBeVisible();
 		expect(
 			await original.evaluate((img) => (img as HTMLImageElement).naturalWidth)
