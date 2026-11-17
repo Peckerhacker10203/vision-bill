@@ -72,7 +72,8 @@ def main() -> None:
                 print("main: OCR disabled (no services started)")
                 continue
             ocr = services["paddleocr-service"]
-            assert ocr["build"]["dockerfile"] == f"paddleocr-service/Dockerfile.{accelerator}"
+            assert ocr["build"]["context"] == str(ROOT / "paddleocr-service")
+            assert ocr["build"]["dockerfile"] == f"Dockerfile.{accelerator}"
             assert ocr["profiles"] == ["ocr"]
             assert not ocr.get("privileged", False)
             if accelerator == "cuda":

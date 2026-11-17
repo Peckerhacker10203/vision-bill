@@ -62,3 +62,31 @@ def test_installed_migration_precedes_exec_without_package_resolution(tmp_path, 
         assert observed[1]["args"] == arguments
         assert observed[1]["pid"] == process.pid
         assert process.returncode == 23, (stdout, stderr)
+
+
+@pytest.mark.parametrize(
+    "mode,module",
+    [
+        ("init", "vision_bill.distribution.bootstrap"),
+        ("provision-model", "vision_bill.distribution.models"),
+    ],
+)
+def test_prepared_modes_bypass_migrations(tmp_path, mode, module):
+    commands = tmp_path / "bin"
+    commands.mkdir()
+    events = tmp_path / "events"
+    python = commands / "python"
+    python.write_text(
+        f"#!{sys.executable}\nimport sys\nfrom pathlib import Path\n"
+        f'Path({str(events)!r}).write_text("\\n".join(sys.argv[1:]))\n'
+    )
+    python.chmod(0o700)
+    result = subprocess.run(
+        [str(ENTRYPOINT), mode, "--help"],
+        env={"PATH": str(commands)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert events.read_text().splitlines() == ["-m", module, "--help"]

@@ -7,8 +7,8 @@ services:
       OCR__ALLOW_VISION_FALLBACK: "${OCR__ALLOW_VISION_FALLBACK:-false}"
   paddleocr-service:
     build:
-      context: .
-      dockerfile: paddleocr-service/Dockerfile.cuda
+      context: ./paddleocr-service
+      dockerfile: Dockerfile.cuda
     image: vision-bill-ocr-cuda:${OCR_IMAGE_TAG:-candidate}
     deploy:
       resources:

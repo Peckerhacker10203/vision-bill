@@ -31,6 +31,32 @@ def test_feature_requires_lifecycle_api():
     assert importlib.util.find_spec("ocr_service.api") is not None, "lifecycle API missing"
 
 
+def test_park_fences_delayed_load_http_until_new_claim_without_starting_child():
+    from ocr_service.api import create_app
+    from ocr_service.worker import OcrWorkerManager
+
+    context = FakeContext()
+    worker = OcrWorkerManager(mp_context=context, startup_timeout=.2)
+    with TestClient(create_app(worker_factory=lambda: worker)) as client:
+        owner = {"owner_token": "1:first"}
+        assert client.post("/lifecycle/claim", json=owner).status_code == 200
+        assert client.post("/lifecycle/load", json=owner).status_code == 200
+        assert client.post("/lifecycle/load", json=owner).status_code == 200
+        assert len(context.processes) == 1
+        assert client.post("/lifecycle/park", json=owner).status_code == 200
+        assert not context.processes[0].is_alive()
+        assert client.post("/lifecycle/park", json=owner).status_code == 200
+        delayed = client.post("/lifecycle/load", json=owner)
+        assert delayed.status_code == 409
+        assert delayed.json()["detail"] == "ocr_owner_phase_closed"
+        assert len(context.processes) == 1
+        assert client.get("/ready").json()["reason_code"] == "ocr_parked"
+        successor = {"owner_token": "2:second"}
+        assert client.post("/lifecycle/claim", json=successor).status_code == 200
+        assert client.post("/lifecycle/load", json=successor).status_code == 200
+        assert len(context.processes) == 2
+
+
 def test_health_does_not_imply_readiness_and_metadata_is_safe():
     from ocr_service.api import create_app
     from ocr_service.worker import OcrWorkerManager

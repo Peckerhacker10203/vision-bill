@@ -87,16 +87,17 @@ def poll(client, image_id, predicate, timeout=20):
         time.sleep(0.1)
 
 
-def test_enabled_exact_v2_saved_working_png_and_text_only_format(wire):
+@pytest.mark.parametrize("model_id", ["e2e-vision", "e2e-text"])
+def test_enabled_exact_v2_saved_working_png_and_text_only_format(wire, model_id):
     client, ocr, llm, _ = wire
     raw = llm.get("/__fixtures/a").content
-    id = upload(client, raw, count=2)
+    id = upload(client, raw, count=2, model_id=model_id)
     job = poll(client, id, lambda row: row["terminal"])
     assert job["status"] == "analyzed", job
     assert [r["photo_index"] for r in ocr.get("/__requests").json()["requests"]] == [0, 1]
-    formatted = [
-        r for r in llm.get("/__requests").json()["requests"] if r["kind"] != "classification"
-    ]
+    calls = llm.get("/__requests").json()["requests"]
+    assert calls and all(call["image_sha256"] is None for call in calls)
+    formatted = [r for r in calls if r["kind"] != "classification"]
     assert len(formatted) == 1 and formatted[0]["kind"] == "ocr"
     assert formatted[0]["image_sha256"] is None
     assert formatted[0]["ordered_sources"] == [[hashlib.sha256(raw).hexdigest(), i] for i in (0, 1)]
@@ -113,8 +114,8 @@ def test_enabled_exact_v2_saved_working_png_and_text_only_format(wire):
 
 @pytest.mark.parametrize("result", ["empty", "503", "timeout"])
 @pytest.mark.parametrize("permission", [None, False, True])
-def test_failure_policy_requires_global_and_submission_permission(wire, result, permission):
-    client, ocr, llm, policy = wire
+def test_legacy_fallback_grants_cannot_enable_image_inference(wire, result, permission):
+    client, ocr, llm, _ = wire
     raw = llm.get("/__fixtures/a").content
     digest = hashlib.sha256(raw).hexdigest()
     ocr.post(
@@ -126,27 +127,14 @@ def test_failure_policy_requires_global_and_submission_permission(wire, result, 
         raw,
         **({} if permission is None else {"allow_ocr_fallback": str(permission).lower()}),
     )
-    allowed = policy == "fallback" and permission is True
     job = poll(
         client,
         id,
-        lambda row: (
-            row["terminal"] if allowed else row["attempt_count"] >= 1 and row["status"] == "pending"
-        ),
+        lambda row: row["attempt_count"] >= 1 and row["status"] == "pending",
     )
-    calls = [r for r in llm.get("/__requests").json()["requests"] if r["kind"] != "classification"]
-    if allowed:
-        assert job["status"] == "analyzed", job
-        assert [r["kind"] for r in calls] == ["direct"]
-        artifact = client.get(
-            f"/api/v1/images/{id}/extractions/{job['latest_extraction_id']}"
-        ).json()
-        assert artifact["envelope"]["provenance"]["fallback_used"] is True
-        assert artifact["envelope"]["provenance"]["fallback_reason"] == "ocr_page_failed"
-    else:
-        assert calls == []
-        assert job["receipt_id"] is None and job["result_code"] == "ocr_page_failed"
-        assert job["attempt_count"] == 1
+    assert llm.get("/__requests").json()["requests"] == []
+    assert job["receipt_id"] is None and job["result_code"] == "ocr_page_failed"
+    assert job["attempt_count"] == 1 and not job["terminal"]
     # Delete only this receipt-free test job before its automatic retry can cross scenarios.
     if job["receipt_id"] is None:
         assert client.delete("/api/v1/images/" + id).status_code == 200

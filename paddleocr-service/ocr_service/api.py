@@ -6,20 +6,20 @@ import binascii
 import hashlib
 import os
 import tempfile
+import threading
 import time
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from io import BytesIO
 from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
+from ocr_contract import OcrResponse
 from PIL import Image
 from pydantic import BaseModel, Field
-
-from vision_bill.model.ocr import OcrResponse
 
 from .profile import RuntimeSettings, load_profile
 from .worker import OcrRequest, OcrWorkerError, OcrWorkerManager
@@ -109,9 +109,12 @@ def validate_result(result: OcrResponse) -> None:
 
 def create_app(
     *,
+    mode: str = "managed",
     worker_factory: Callable[[], OcrWorkerManager] = configured_worker,
     max_upload_bytes: int = MAX_UPLOAD_BYTES,
 ) -> FastAPI:
+    if mode not in ("managed", "standalone"):
+        raise ValueError("OCR service mode must be managed or standalone")
     worker: OcrWorkerManager | None = None
     startup_failed = False
     closing = False
@@ -168,6 +171,7 @@ def create_app(
     async def info() -> dict[str, object]:
         return {
             "contract_version": 2,
+            "service_mode": mode,
             "profile": load_profile(Path(__file__).parents[1] / "profile.json").model_dump(),
             "worker": ready_body(),
             "last_qualified_identity": getattr(worker, "last_identity", {}),
@@ -176,16 +180,17 @@ def create_app(
             "max_timeout_ms": 600000,
         }
 
-    @app.post("/ocr", response_model=OcrResponse)
-    def ocr(
-        image: Annotated[UploadFile, File()],
-        request_id: Annotated[UUID, Form()],
-        photo_index: Annotated[int, Form(ge=0)],
-        source_sha256: Annotated[str, Form(pattern=r"^[0-9a-f]{64}$")],
-        timeout_ms: Annotated[int, Form(gt=0, le=600000)],
-        owner_token: Annotated[str | None, Form()] = None,
+    def process_request(
+        image: UploadFile,
+        request_id: UUID,
+        photo_index: int,
+        source_sha256: str,
+        deadline: float,
+        owner_token: str | None,
+        cancel_event: threading.Event,
     ) -> OcrResponse:
-        deadline = time.monotonic() + timeout_ms / 1000
+        if mode == "standalone" and owner_token is not None:
+            raise HTTPException(403, "ocr_standalone_lifecycle_owned")
         if worker is None:
             raise HTTPException(503, "ocr_init_failed" if startup_failed else "ocr_starting")
         raw = image.file.read(max_upload_bytes + 1)
@@ -199,11 +204,15 @@ def create_app(
             path = Path(f.name)
         cleanup_safe = True
         try:
-            result = worker.infer(
-                OcrRequest(request_id, path, photo_index, source_sha256),
-                deadline_monotonic=deadline,
-                owner=owner_token,
-            )
+            request = OcrRequest(request_id, path, photo_index, source_sha256)
+            if mode == "standalone":
+                result = worker.infer_standalone(
+                    request,
+                    deadline_monotonic=deadline,
+                    cancel_event=cancel_event,
+                )
+            else:
+                result = worker.infer(request, deadline_monotonic=deadline, owner=owner_token)
             validate_result(result)
             return result
         except OcrWorkerError as exc:
@@ -213,8 +222,70 @@ def create_app(
             if cleanup_safe:
                 path.unlink(missing_ok=True)
 
+    @app.post("/ocr", response_model=OcrResponse)
+    async def ocr(
+        http_request: Request,
+        image: Annotated[UploadFile, File()],
+        request_id: Annotated[UUID, Form()],
+        photo_index: Annotated[int, Form(ge=0)],
+        source_sha256: Annotated[str, Form(pattern=r"^[0-9a-f]{64}$")],
+        timeout_ms: Annotated[int, Form(gt=0, le=600000)],
+        owner_token: Annotated[str | None, Form()] = None,
+    ) -> OcrResponse:
+        deadline = time.monotonic() + timeout_ms / 1000
+        cancel_event = threading.Event()
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                process_request,
+                image,
+                request_id,
+                photo_index,
+                source_sha256,
+                deadline,
+                owner_token,
+                cancel_event,
+            )
+        )
+
+        async def observe_disconnect() -> None:
+            # Multipart parsing has consumed the body before this route starts.
+            # A disconnect therefore belongs to this admitted request only.
+            while True:
+                message = await http_request.receive()
+                if message["type"] == "http.disconnect":
+                    cancel_event.set()
+                    return
+
+        observer = asyncio.create_task(observe_disconnect()) if mode == "standalone" else None
+        try:
+            result = await asyncio.shield(task)
+            if cancel_event.is_set():
+                raise HTTPException(499, "ocr_cancelled")
+            return result
+        except asyncio.CancelledError:
+            cancel_event.set()
+            # The native thread retains its original until park confirms death.
+            # Drain it before FastAPI closes the upload or lifespan shuts down.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:  # noqa: BLE001 - drain failure while preserving cancellation
+                    break
+            if task.done() and not task.cancelled():
+                task.exception()
+            raise
+        finally:
+            if observer is not None:
+                observer.cancel()
+                with suppress(asyncio.CancelledError):
+                    await observer
+
     @app.post("/lifecycle/{action}")
     def lifecycle(action: str, body: LifecycleRequest) -> dict[str, object]:
+        if mode == "standalone":
+            raise HTTPException(403, "ocr_standalone_lifecycle_owned")
         if worker is None or closing:
             raise HTTPException(503, "ocr_unavailable")
         if action not in ("claim", "load", "park"):

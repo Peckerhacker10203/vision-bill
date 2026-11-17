@@ -29,8 +29,8 @@ services:
   paddleocr-service:
     profiles: [ocr]
     build:
-      context: .
-      dockerfile: paddleocr-service/Dockerfile
+      context: ./paddleocr-service
+      dockerfile: Dockerfile
     container_name: paddleocr-service
     restart: always
     environment:

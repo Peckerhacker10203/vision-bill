@@ -13,8 +13,10 @@ resource. The response ID is the submission/image UUID, not a completed receipt.
 A disconnected client can resume by ID; `/upload?job=<id>` survives reload.
 Queue shows pending/processing/errors; completed receipts appear in Receipts.
 
-Optional query parameters are `model_id`, `bypass_review` and
-`allow_ocr_fallback`. An `Idempotency-Key` is owner-scoped: replaying the same
+Query parameters include `model_id` and `bypass_review`. Deprecated
+`allow_ocr_fallback` is accepted for compatibility and request identity only; it
+does not grant ordinary image fallback. An `Idempotency-Key` is owner-scoped:
+replaying the same
 ordered original hashes and explicitly supplied options returns the same ID;
 changed content or intent returns 409. Omitting a flag differs from explicitly
 sending false. The first resolved defaults are frozen, so changing server settings
@@ -35,21 +37,32 @@ backoff, configurable cap 300 seconds and a 900-second claim lease. Lower config
 deadlines apply. Generation/claim tokens fence stale completions and expired leases.
 Unusable readiness is checked before claiming. Retryable failures retry within the
 bound; unreadable input is terminal. A later photo failure never saves a successful
-prefix as a completed receipt or reusable all-photo OCR checkpoint.
+prefix as a completed receipt or all-photo checkpoint. A validated exact OCR prefix
+may be retained/reused across retries; formatting requires every ordered photo.
 
 `POST /api/v1/images/<id>/retry` takes `expected_generation` and a nonempty
 `request_key`. Replaying that key returns its original outcome; a new retry must
 use the current generation and a new key. Conflicts return 409. Retrying preserves
-sources and frozen intent rather than silently adopting new server defaults.
+sources and frozen intent by default (`policy: "preserve"`). Changed OCR routing
+or historical image-fallback permissions can hold pending work with
+`wait_reason: "execution_policy_changed"` before claim. To adopt current server
+policy explicitly, send `policy: "current"` with the current generation and a new
+request key. The server preserves the original request/fingerprint and old effective
+policy in history, increments generation and clears incompatible execution/checkpoint
+state. Retry-key replay binds the policy choice too. Live claims, linked receipts
+and human-edited/finalized drafts cannot be overwritten; completed receipts are
+never reprocessed. Stop/drain workers before a policy cutover; a setting change does
+not silently rewrite old submissions.
 
 ## Extraction and source evidence
 
-Direct vision receives all ordered photos. OCR processes each photo with the fixed
-native profile, then formats all ordered transcripts. Requested and actual model
-IDs/digests, OCR profile/runtime and fallback reason are recorded. Optional fallback
-requires frozen global permission AND explicit `allow_ocr_fallback=true`; required
-OCR forbids it. A text-only formatter needs an explicitly configured/discovered
-vision alternate to fall back; that alternate's identity is frozen too.
+Direct vision receives all ordered photos only when OCR is not configured. OCR
+processes each photo with the fixed native profile, then formats all ordered
+transcripts. Ordinary formatting, JSON repair and classification remain text/evidence
+only even on OCR failure; no image fallback occurs. Requested/actual model IDs,
+digests and OCR profile/runtime remain recorded. Deprecated fallback fields and old
+results retain their historical meaning. An explicitly requested admin direct-vision
+benchmark is the comparison exception, never an automatic upload recovery path.
 
 Only model-proposed ordered suffix/prefix overlaps between adjacent photos may be
 removed. `helper/duplicates.py::verify_duplicate` checks description, quantity and

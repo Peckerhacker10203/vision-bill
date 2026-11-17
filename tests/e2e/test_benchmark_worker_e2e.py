@@ -62,17 +62,31 @@ async def prepare(w, scope, tmp_path, *, kind="legacy", pipeline="direct_vision"
     return service, run, row, path, inference, ocr
 
 
-@pytest.mark.parametrize("kind", ["legacy", "manifest", "old_manifest"])
+async def test_unmanifested_history_fails_before_discovery_or_new_inference(workflow_db, tmp_path):
+    w, scope = workflow_db
+    service, run, _, _, inference, _ = await prepare(w, scope, tmp_path, kind="legacy")
+    async with w.pool.acquire() as conn:
+        await conn.execute("UPDATE benchmark_tasks SET attempts=431 WHERE run_id=$1", run.id)
+    service._provider.get_available_models.side_effect = AssertionError("history must not rediscover")
+    task = dict(await service._db.lease_task())
+    assert task["inference_attempt_count"] == 0
+    assert task["attempts"] == 431
+    await service._execute(task)
+    service._provider.get_available_models.assert_not_awaited()
+    inference.assert_not_awaited()
+    assert await service._db.lease_task() is None
+    assert (await service._db.summaries(run.id))[0].failed == 1
+    assert await service._db.results(run.id) == []
+
+
+@pytest.mark.parametrize("kind", ["manifest", "old_manifest"])
 @pytest.mark.parametrize("outcome", ["success", "exhausted"])
 async def test_two_transient_failures_then_success_or_terminal_third(workflow_db, tmp_path, kind, outcome):
     w, scope = workflow_db
     service, run, _, _, inference, _ = await prepare(w, scope, tmp_path, kind=kind)
     success = inference.return_value
-    failure = httpx.ConnectError("provider unavailable")
-    if kind != "legacy":
-        wrapped = ExperimentFailure("ConnectError", {"calls": []})
-        wrapped.__cause__ = failure
-        failure = wrapped
+    failure = ExperimentFailure("ConnectError", {"calls": []})
+    failure.__cause__ = httpx.ConnectError("provider unavailable")
     inference.side_effect = [failure, failure, success if outcome == "success" else failure]
     for attempt in (1, 2, 3):
         task = await service._db.lease_task()
@@ -92,8 +106,7 @@ async def test_two_transient_failures_then_success_or_terminal_third(workflow_db
     # Provider-call telemetry remains separate from durable automatic-attempt count.
     if outcome == "success":
         assert summary.average_attempts == 7
-        # Historical v2 counts absent tip as a failed money comparison (4/5 totals).
-        assert summary.average_score == pytest.approx(0.93 if kind == "legacy" else 1)
+        assert summary.average_score == pytest.approx(1)
     if kind == "manifest":
         result = (await service._db.results(run.id))[0]
         assert result["metadata"]["inference_attempt_count"] == 3
@@ -184,7 +197,7 @@ async def test_frozen_preflight_violations_are_terminal_without_inference(workfl
     assert result["scores"]["normalized"] == 0
 
 
-@pytest.mark.parametrize("kind", ["legacy", "manifest"])
+@pytest.mark.parametrize("kind", ["manifest", "old_manifest"])
 async def test_unreadable_output_is_permanent_after_one_attempt(workflow_db, tmp_path, kind):
     from vision_bill.provider.llm.errors import UnreadableReceiptError
     w, scope = workflow_db
@@ -197,7 +210,7 @@ async def test_unreadable_output_is_permanent_after_one_attempt(workflow_db, tmp
 
 @pytest.mark.parametrize("pipeline,enabled,fallback,want_wait", [
     ("direct_vision", True, False, False), ("upload", False, False, False),
-    ("upload", True, True, False), ("upload", True, False, True), ("ocr", False, True, True),
+    ("upload", True, True, True), ("upload", True, False, True), ("ocr", False, True, True),
 ])
 async def test_readiness_obeys_effective_policy(workflow_db, tmp_path, pipeline, enabled, fallback, want_wait):
     w, scope = workflow_db
@@ -216,7 +229,7 @@ async def test_readiness_obeys_effective_policy(workflow_db, tmp_path, pipeline,
         assert summary.succeeded == 1
 
 
-@pytest.mark.parametrize("kind", ["legacy", "manifest", "old_manifest"])
+@pytest.mark.parametrize("kind", ["manifest", "old_manifest"])
 async def test_configured_single_attempt_and_unknown_legacy_baseline(workflow_db, tmp_path, kind):
     w, scope = workflow_db
     service, run, _, _, inference, _ = await prepare(w, scope, tmp_path, kind=kind,
@@ -228,11 +241,10 @@ async def test_configured_single_attempt_and_unknown_legacy_baseline(workflow_db
     assert inference.await_count == 1
     assert await service._db.lease_task() is None
     assert (await service._db.summaries(run.id))[0].failed == 1
-    if kind != "legacy":
-        metadata = (await service._db.results(run.id))[0]["metadata"]
-        assert metadata["inference_attempt_count"] == 1
-        assert metadata["legacy_control_poll_count"] == 431
-        assert metadata["historical_inference_attempt_count"] is None
+    metadata = (await service._db.results(run.id))[0]["metadata"]
+    assert metadata["inference_attempt_count"] == 1
+    assert metadata["legacy_control_poll_count"] == 431
+    assert metadata["historical_inference_attempt_count"] is None
 
 
 @pytest.mark.parametrize("failure_code", ["ocr_page_failed", "ocr_unavailable"])
@@ -274,7 +286,7 @@ async def test_stale_worker_stops_before_inference_after_preflight_barrier(workf
         await asyncio.gather(work, return_exceptions=True)
 
 
-async def test_permitted_fallback_waits_when_no_vision_model_is_available(workflow_db, tmp_path):
+async def test_legacy_permission_cannot_bypass_ocr_readiness(workflow_db, tmp_path):
     w, scope = workflow_db
     service, run, _, _, inference, ocr = await prepare(w, scope, tmp_path, kind="manifest", pipeline="upload", permission=True,
         ocr_settings=OcrSettings(enabled=True, allow_vision_fallback=True))
@@ -287,15 +299,14 @@ async def test_permitted_fallback_waits_when_no_vision_model_is_available(workfl
 
 
 @pytest.mark.parametrize("change", ["formatter_budget", "ocr_recovery_race"])
-async def test_permitted_fallback_preserves_frozen_contract_and_executed_runtime(workflow_db, tmp_path, change):
+async def test_strict_upload_preserves_frozen_contract_and_executed_runtime(workflow_db, tmp_path, change):
     w, scope = workflow_db
-    service, run, _, _, inference, ocr = await prepare(w, scope, tmp_path, kind="manifest", pipeline="upload", permission=True,
+    service, run, _, _, inference, _ocr = await prepare(w, scope, tmp_path, kind="manifest", pipeline="upload", permission=True,
         ocr_settings=OcrSettings(enabled=True, allow_vision_fallback=True))
-    ocr.get_capabilities.return_value.ready = False
     if change == "formatter_budget":
         service._provider.max_output_tokens += 1
     else:
-        # OCR became ready between preflight and extraction, on a different runtime.
+        # Ready frozen OCR reported a different runtime during extraction.
         inference.return_value.metadata.update(used_pipeline="ocr", profile_id="different", runtime_fingerprint="different")
     await service._execute(dict(await service._db.lease_task()))
     assert (await service._db.summaries(run.id))[0].failed == 1

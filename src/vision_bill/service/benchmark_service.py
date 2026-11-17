@@ -149,15 +149,7 @@ class BenchmarkService:
                     "expected": item["expected"] if item.get("reference") else expected.model_dump(mode="json"),
                     "actual": result.receipt.model_dump(mode="json"),
                     "metadata": result.metadata}
-        expected, image_path = await self._expected_receipt_and_path(receipt_id)
-        if not image_path or not Path(image_path).is_file():
-            raise FileNotFoundError("Verified receipt image is unavailable")
-        result = await self._provider.analyse_receipt_with_metadata(model_id, Path(image_path))
-        actual = result.receipt
-        scores = score_receipts(expected, actual)
-        expected_dump, actual_dump = expected.model_dump(mode="json"), actual.model_dump(mode="json")
-        diff = {key: {"expected": expected_dump[key], "actual": actual_dump[key]} for key in expected_dump if expected_dump[key] != actual_dump[key]}
-        return {"receipt_id": receipt_id, "model_id": model_id, "scores": scores, "expected": expected_dump, "actual": actual_dump, "diff": diff}
+        raise ValueError("Historical benchmark has no execution manifest; create a new run")
 
     async def _select_receipts(self, request: BenchmarkCreate, *, scope: AccessScope) -> list[UUID]:
         if request.receipt_ids is not None:
@@ -234,6 +226,8 @@ class BenchmarkService:
         reserve = min(5.0, (deadline - started) * 0.05)
         try:
             async with asyncio.timeout_at(deadline - reserve):
+                if not manifest:
+                    raise ValueError("Historical benchmark has no execution manifest; create a new run")
                 try:
                     models = {m.id: m for m in await self._provider.get_available_models(capability="all")}
                 except Exception as exc:
@@ -242,16 +236,7 @@ class BenchmarkService:
                 expected_digest = (await self._run_digests(run, deadline=deadline)).get(task["model_id"])
                 if model is None or (expected_digest and expected_digest != model.digest):
                     raise _ReadinessWait("model_unavailable_or_changed")
-                if manifest:
-                    await self._execute_experiment(task, manifest, deadline)
-                else:
-                    expected, image_path = await self._expected_receipt_and_path(task["receipt_id"], deadline=deadline)
-                    if not image_path or not Path(image_path).is_file():
-                        raise FileNotFoundError("Image missing")
-                    await self._begin(task, deadline)
-                    result = await self._provider.analyse_receipt_with_metadata(task["model_id"], Path(image_path))
-                    await self._db.finish_task(task, success=True, score=score_receipts(expected, result.receipt)["overall"],
-                        confidence=result.receipt.confidence, attempts=result.attempts, latency_ms=result.elapsed_ms, deadline=deadline)
+                await self._execute_experiment(task, manifest, deadline)
         except _StaleClaim:
             return
         except Exception as exc:
@@ -376,7 +361,7 @@ class BenchmarkService:
                 raise ValueError("Receipt image changed since run creation")
         options = ExperimentOptions.model_validate(manifest["options"])
         current_identity = await pipeline_identity(self._receipts, options)
-        ocr, settings, effective_options = effective_policy(self._receipts, options)
+        ocr, settings, _ = effective_policy(self._receipts, options)
         uses_ocr = settings.enabled and options.pipeline != ExtractionPipeline.DIRECT
         runtime = current_identity.get("ocr_runtime") or {}
         if ocr is not None and getattr(ocr, "managed_lifecycle", False):
@@ -389,17 +374,13 @@ class BenchmarkService:
                 )
                 runtime = current_identity.get("ocr_runtime") or {}
             runtime = {**runtime, "ready": available.ready or available.can_load}
-        if uses_ocr and not runtime.get("ready") and (
-            settings.required or not settings.allow_vision_fallback or not effective_options.allow_ocr_fallback
-        ):
+        if uses_ocr and not runtime.get("ready"):
             # Check readiness BEFORE frozen identity: an outage is a wait, not
             # evidence that a different runtime permanently replaced this one.
             raise _ReadinessWait("ocr_unavailable")
         frozen_identity = manifest.get("identity")
-        if frozen_identity is not None and (not uses_ocr or not runtime.get("ready")):
-            # Disabled OCR / explicitly allowed vision fallback does not consume an
-            # OCR runtime. All other frozen identity fields still match exactly;
-            # any OCR actually used after a readiness race is checked below.
+        if frozen_identity is not None and not uses_ocr:
+            # Direct processing does not consume an OCR runtime.
             current_identity["ocr_runtime"] = frozen_identity.get("ocr_runtime")
         if frozen_identity is not None and frozen_identity != current_identity:
             raise ValueError("Effective pipeline identity changed; create a new run")
@@ -409,15 +390,15 @@ class BenchmarkService:
             raise ValueError("Extraction prompt changed since run creation; create a new run")
         options = options.model_copy(update={"pipeline": ExtractionPipeline(item["pipeline"])})
         expected = Receipt.model_validate(item["expected"])
-        if not uses_ocr or not runtime.get("ready"):
+        if not uses_ocr:
             try:
                 models = await self._provider.get_available_models(capability="vision")
             except Exception as exc:
                 raise _ReadinessWait("vision_model_discovery_unavailable") from exc
             vision = {model.id for model in models if model.capabilities and
                       any(capability in model.capabilities for capability in ("vision", "multimodal"))}
-            if model_id not in vision and (not uses_ocr or settings.vision_fallback_model_id not in vision):
-                raise _ReadinessWait("vision_fallback_unavailable" if uses_ocr else "vision_model_unavailable")
+            if model_id not in vision:
+                raise _ReadinessWait("vision_model_unavailable")
         # The outer run deadline includes OCR, LLM generation and repair attempts.
         if before_inference is not None:
             await before_inference()
@@ -425,11 +406,6 @@ class BenchmarkService:
         if manifest.get("identity") is not None:
             if result.metadata.get("ordered_source_sha256") != [image["sha256"] for image in item["images"]]:
                 raise ValueError("Executed source identity differs from frozen input")
-            alternate = manifest["identity"].get("vision_fallback_model")
-            if (result.metadata.get("fallback_used") and result.metadata.get("model_id") != model_id
-                and (not alternate or any(result.metadata.get(key) != alternate.get(target)
-                    for key, target in (("model_id", "id"), ("model_digest", "digest"))))):
-                raise ValueError("Executed fallback model differs from frozen input")
             runtime = manifest["identity"].get("ocr_runtime")
             if runtime and result.metadata.get("used_pipeline") == "ocr" and any(
                 runtime.get(key) != result.metadata.get(key)

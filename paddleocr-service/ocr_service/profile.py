@@ -7,11 +7,10 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal
 
+from ocr_contract import document_image
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from pydantic import BaseModel, ConfigDict, Field
-
-from vision_bill.helper import document_image
 
 ADAPTER_VERSION = "native-fp32-v1"
 NORMALIZER_VERSION = document_image.NORMALIZER_VERSION

@@ -13,14 +13,18 @@ reachable connection/network; template ports do not publish one. Keep credential
 in private files, not ARGS or shell history. Reports and traces may contain receipt
 text and must remain private. See [upgrade/roles/recovery](../UPGRADE_AND_VERIFY.md).
 
-Build/install targets and ordinary startup do not run these tools, historical
-colleague/Gemma comparisons, or real model benchmarks. Invoke only the desired
+Build/install targets and ordinary API startup do not run these tools or unsolicited
+historical colleague/Gemma comparisons. Explicit persisted pending work can resume
+under policy/readiness guards. Prepared native first setup runs separate full
+qualification; model pull/tags checks provision data without LLM generation.
+Invoke only the desired
 diagnostic explicitly; you can build first and test your own receipts through the UI.
 For native shared-GPU work, all supported clients must use the application's same
 configured provider, lifecycle mode, endpoint spelling, OCR settings and underlying
 `OCR__COORDINATION_PATH` file. See [OpenAI/llama.cpp setup](../OPENAI_COMPATIBLE.md).
 A host-side path must refer to the same file mounted at `/app/config` in Compose.
-Managed standalone/forced OCR also requires production `OCR__ENABLED=true` and
+Managed standalone/forced OCR also requires production OCR selected (canonical
+nonblank `OCR__ENDPOINT` or legacy `OCR__ENABLED=true`) and
 `OCR__MANAGE_MODEL_LIFECYCLE=true`; it is rejected before load when ordinary app
 LLM work would not participate. Explicit unmanaged CPU/replay modes are separate.
 See [model ownership and recovery](../paddleocr-service/README.md#internal-model-ownership).
@@ -79,9 +83,16 @@ make script-standalone-benchmark ARGS="--user-id 125b2a52-60ac-4e1f-b9bf-d223f15
 `--user-id` is mandatory; omission never means all owners. `--category`, `--limit`,
 `--db-host`, `--db-port`, `--db-user`, `--db-name`, `--ocr-url`, `--llm-host` are
 actual selection/connection flags. Prefer private `PG__PASSWORD` over
-`--db-password`. `LLM__MODEL_NAME`, `LLM__HOST`, `OCR__SERVICE_URL`, `OCR__TIMEOUT_SECONDS` and
-`PG__*` provide defaults. The script explicitly enables OCR and always selects
-the OCR pipeline, preserving configured coordination/lifecycle settings.
+`--db-password`. `LLM__MODEL_NAME`, `LLM__HOST`, `OCR__TIMEOUT_SECONDS` and
+`PG__*` provide defaults. For both app-aware manual CLIs,
+`script-standalone-benchmark` and `script-test-ocr`, URL precedence is
+`--ocr-url` > `OCR__SERVICE_URL` > `http://localhost:8082`.
+`OCR__ENDPOINT` selects production OCR but does not supply these manual CLI URLs.
+For managed ownership, keep production OCR selection enabled and set the scripts'
+`OCR__SERVICE_URL` or pass `--ocr-url` to the same intended service, together with
+the matching coordination and LLM settings above. The script explicitly enables
+OCR and always selects the OCR pipeline, preserving configured coordination/
+lifecycle settings.
 It reads an owner-scoped, repeatable-read read-only snapshot, without row locks,
 DB mutation, API startup or human-reference qualification writes. Explicit run
 creation loads/qualifies/parks native OCR to freeze real runtime identity. Every selected case, including
@@ -97,22 +108,27 @@ reference values enter inference.
 
 ## Native OCR-only diagnostic
 
-First build and **physically qualify** the selected sidecar according to the
-[native gate](../paddleocr-service/README.md). Base Compose alone does not build a
-usable backend; default native Dockerfile deliberately fails. To serve a qualified
-ROCm candidate, for example:
+Prefer the independent HTTP client with an actually released, qualified standalone
+OCR bundle; see [service modes/client](../paddleocr-service/README.md#independent-service-and-client).
+For a VisionBill-managed pair, set the OCR-only bundle's `OCR_SERVICE_MODE=managed`
+and match shared coordination/LLM identities. Combined bundles already fix managed
+mode. Do not use unmanaged lifecycle opt-out to start a native shared pair.
+
+The advanced app-aware diagnostic below requires a deliberately deployed/physically
+qualified service and a reachable private endpoint; base source Compose publishes
+no OCR host port. For native build/manual qualification prerequisites see the
+[native guide](../paddleocr-service/README.md). No real public native release or
+hardware qualification was performed here.
 
 ```bash
-docker compose --profile ocr -f docker-compose.yml -f docker-compose.rocm.yml up -d
-# Run only from a client that can reach this deliberately configured local endpoint:
 make script-test-ocr ARGS="--ocr-url http://127.0.0.1:8082 --data-dir /private/synthetic-images --timeout 600 --quiet --output /private/ocr-results.json"
 ```
 
-Use the CUDA overlay instead for a qualified CUDA image. The GPU overlay explicitly
-enables application OCR; it is not an OCR-only app-off switch. Compose publishes no
-OCR host port. `127.0.0.1:8082` works only if a local deployment explicitly exposes
-it; otherwise use a client on the sidecar network with its service URL. Do not run
-this command against an unrelated endpoint or assume an unqualified image is ready.
+This URL works only when your deployment explicitly exposes it. Without `--ocr-url`,
+this diagnostic also uses `OCR__SERVICE_URL`, then `http://localhost:8082`, regardless
+of canonical `OCR__ENDPOINT`; keep both selections on the same intended managed
+service. An app-aware managed client needs managed service mode; use the independent
+HTTP client for standalone mode instead. A checkout does not update a running image.
 
 `--timeout`/`OCR__TIMEOUT_SECONDS` defaults 300. Effective requests are bounded at
 600 seconds; increasing it cannot extend the app whole-attempt deadline. This
@@ -161,7 +177,7 @@ groups require admin/CREATEROLE first; then `make db-configure-roles` must use t
 actual Alembic owner for grants/default privileges on current/future tables and
 sequences. `MIGRATION_DATABASE_URL` is only this Make tool's connection; entrypoint
 Alembic uses `PG__*`. Runtime credentials cannot apply pending owner DDL. Stop/drain
-old workers, back up/restore-test DB and files, migrate to 0018 with owner credentials,
+old workers, back up/restore-test DB and files, migrate to 0019 with owner credentials,
 refresh grants and start only compatible workers. No automatic destructive backout.
 `bash scripts/pg-backup.sh --help` lists backup/restore options.
 

@@ -36,6 +36,8 @@ class Llm:
 
 
 class Ocr:
+    lifecycle_identity = "ocr:test"
+
     def __init__(self, events):
         self.events = events
 
@@ -47,6 +49,242 @@ class Ocr:
 
     async def park(self, token, deadline):
         self.events.append("park_ocr")
+
+
+@pytest.mark.asyncio
+async def test_changed_ocr_resource_rejects_abandoned_worker_before_side_effects(tmp_path):
+    from vision_bill.service.gpu_handoff import ModelHandoff
+
+    events = []
+    old = Ocr(events)
+    handoff = ModelHandoff(tmp_path / "handoff", Llm(events), old)
+    with pytest.raises(TimeoutError):
+        async with handoff.session(monotonic() + .03) as owner:
+            await owner.ocr_phase()
+            # An expired session cannot perform its final cleanup.
+            await asyncio.sleep(.1)
+    state = (tmp_path / "handoff.json").read_text()
+    replacement = Ocr(events)
+    replacement.lifecycle_identity = "ocr:replacement"
+    events.clear()
+    with pytest.raises(ValueError, match="model_handoff_ocr_resource_changed"):
+        async with ModelHandoff(handoff.path, Llm(events), replacement).session(monotonic() + 1):
+            pytest.fail("old native resource was forgotten")
+    assert not events
+    assert (tmp_path / "handoff.json").read_text() == state
+
+
+@pytest.mark.asyncio
+async def test_ocr_pending_is_durable_before_load_and_failed_park_retains_it(tmp_path):
+    from vision_bill.service.gpu_handoff import ModelHandoff
+
+    events = []
+    ocr = Ocr(events)
+    journal = tmp_path / "handoff.json"
+    async def load(token, deadline):
+        state = json.loads(journal.read_text())
+        assert state["ocr_pending"] is True
+        assert state["resources"] == {"llm": "ollama:test", "ocr": "ocr:test"}
+        assert state["version"] == 2
+        assert state["coordinator"] == "vision-bill-model-handoff-v2"
+        assert "endpoint" not in state  # Old readers must fail before dispatch.
+        events.append("load_ocr")
+        raise ConnectionError("load response lost")
+    async def park(token, deadline):
+        raise RuntimeError("ocr_worker_unstoppable")
+    ocr.load, ocr.park = load, park
+    with pytest.raises(RuntimeError, match="ocr_worker_unstoppable"):
+        async with ModelHandoff(tmp_path / "handoff", Llm(events), ocr).session(monotonic() + 1) as owner:
+            await owner.ocr_phase()
+    assert events == ["claim_park", "load_ocr"]
+    assert json.loads(journal.read_text())["ocr_pending"] is True
+    recovered = Ocr(events)
+    async with ModelHandoff(tmp_path / "handoff", Llm(events), recovered).session(monotonic() + 1):
+        assert json.loads(journal.read_text())["ocr_pending"] is False
+    assert events[-2:] == ["claim_park", "park_ocr"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("models", [[], ["old-model"]])
+async def test_legacy_journal_never_proves_ocr_parked(tmp_path, models):
+    from vision_bill.service.gpu_handoff import ModelHandoff
+
+    journal = tmp_path / "handoff.json"
+    original = json.dumps({"endpoint": "ollama:test", "models": models, "generation": 9})
+    journal.write_text(original)
+    events = []
+    with pytest.raises(ValueError, match="model_handoff_legacy_journal.*recover.*OCR.*LLM"):
+        async with ModelHandoff(tmp_path / "handoff", Llm(events), Ocr(events)).session(monotonic() + 1):
+            pytest.fail("untrusted legacy journal admitted")
+    assert not events
+    assert journal.read_text() == original
+
+
+@pytest.mark.asyncio
+async def test_nested_session_cannot_change_ocr_resource(tmp_path):
+    from vision_bill.service.gpu_handoff import ModelHandoff
+
+    events = []
+    llm, ocr = Llm(events), Ocr(events)
+    other = Ocr(events)
+    other.lifecycle_identity = "ocr:other"
+    async with ModelHandoff(tmp_path / "handoff", llm, ocr).session(monotonic() + 1):
+        with pytest.raises(ValueError, match="model_handoff_identity_changed"):
+            async with ModelHandoff(tmp_path / "handoff", llm, other).session(monotonic() + 1):
+                pytest.fail("nested resource switched")
+
+
+@pytest.mark.asyncio
+async def test_ocr_identity_must_be_explicit_before_resource_side_effects(tmp_path):
+    from vision_bill.service.gpu_handoff import ModelHandoff
+
+    events = []
+    ocr = Ocr(events)
+    ocr.lifecycle_identity = None
+    with pytest.raises(ValueError, match="model_handoff_ocr_identity_required"):
+        async with ModelHandoff(tmp_path / "handoff", Llm(events), ocr).session(monotonic() + 1):
+            pytest.fail("unknown resource admitted")
+    assert not events
+
+
+def test_native_ocr_resource_identity_is_stable_and_hides_endpoint_credentials():
+    from vision_bill.provider.ocr.paddleocr import PaddleOcrProvider
+
+    first = PaddleOcrProvider("http://user:secret@native:8000/")
+    assert first.lifecycle_identity == PaddleOcrProvider("http://user:secret@native:8000").lifecycle_identity
+    assert first.lifecycle_identity != PaddleOcrProvider("http://other-native:8000").lifecycle_identity
+    assert "secret" not in first.lifecycle_identity
+    assert "native" not in first.lifecycle_identity
+
+
+@pytest.mark.asyncio
+async def test_lost_load_response_must_park_before_any_llm_tracking(tmp_path):
+    from vision_bill.service.gpu_handoff import ModelHandoff
+
+    events = []
+    ocr = Ocr(events)
+    async def load(token, deadline):
+        raise ConnectionError("load response lost")
+    async def park(token, deadline):
+        raise RuntimeError("ocr_worker_unstoppable")
+    ocr.load, ocr.park = load, park
+    blocked = False
+    with pytest.raises(RuntimeError, match="ocr_worker_unstoppable"):
+        async with ModelHandoff(tmp_path / "handoff", Llm(events), ocr).session(monotonic() + 1) as owner:
+            with pytest.raises(ConnectionError):
+                await owner.ocr_phase()
+            try:
+                await owner.llm_phase("formatter")
+            except RuntimeError as error:
+                blocked = str(error) == "ocr_worker_unstoppable"
+    assert blocked
+    assert json.loads((tmp_path / "handoff.json").read_text())["models"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["coordinator", "generation", "unsettled", "ocr_pending", "resources", "json"])
+async def test_invalid_versioned_journal_fails_before_resource_calls(tmp_path, change):
+    from vision_bill.service.gpu_handoff import ModelHandoff
+
+    state = {"version": 2, "coordinator": "vision-bill-model-handoff-v2",
+             "resources": {"llm": "ollama:test", "ocr": "ocr:test"},
+             "models": [], "generation": 1, "unsettled": False, "ocr_pending": True}
+    if change == "coordinator":
+        del state["coordinator"]
+    elif change == "generation":
+        state[change] = True
+    elif change in ("unsettled", "ocr_pending"):
+        state[change] = "false"
+    elif change == "resources":
+        state["resources"].pop("ocr")
+    raw = "{" if change == "json" else json.dumps(state)
+    journal = tmp_path / "handoff.json"
+    journal.write_text(raw)
+    events = []
+    with pytest.raises(ValueError, match="model_handoff_invalid_journal"):
+        async with ModelHandoff(tmp_path / "handoff", Llm(events), Ocr(events)).session(monotonic() + 1):
+            pytest.fail("malformed journal admitted")
+    assert not events
+    assert journal.read_text() == raw
+
+
+@pytest.mark.asyncio
+async def test_changed_llm_resource_fails_before_even_claiming_ocr(tmp_path):
+    from vision_bill.service.gpu_handoff import ModelHandoff
+
+    events = []
+    llm, ocr = Llm(events), Ocr(events)
+    async with ModelHandoff(tmp_path / "handoff", llm, ocr).session(monotonic() + 1):
+        pass
+    original = (tmp_path / "handoff.json").read_text()
+    llm.lifecycle_identity = "ollama:other"
+    events.clear()
+    with pytest.raises(ValueError, match="model_handoff_llm_resource_changed"):
+        async with ModelHandoff(tmp_path / "handoff", llm, ocr).session(monotonic() + 1):
+            pytest.fail("changed LLM admitted")
+    assert not events
+    assert (tmp_path / "handoff.json").read_text() == original
+
+
+@pytest.mark.asyncio
+async def test_matching_resource_recovery_reaps_abandoned_native_before_load(tmp_path):
+    from ocr_service.worker import OcrWorkerManager
+    from test_ocr_worker_lifecycle import FakeContext
+
+    from vision_bill.service.gpu_handoff import ModelHandoff
+
+    context = FakeContext()
+    worker = OcrWorkerManager(mp_context=context, startup_timeout=.2)
+    class NativeOcr(Ocr):
+        async def claim(self, token, deadline):
+            worker.claim(token)
+
+        async def load(self, token, deadline):
+            worker.load(token)
+
+        async def park(self, token, deadline):
+            worker.park(token)
+
+    events = []
+    handoff = ModelHandoff(tmp_path / "handoff", Llm(events), NativeOcr(events))
+    try:
+        with pytest.raises(TimeoutError):
+            async with handoff.session(monotonic() + .03) as owner:
+                await owner.ocr_phase()
+                await asyncio.sleep(.1)
+        abandoned = context.processes[0]
+        assert abandoned.is_alive()
+        assert json.loads(handoff.journal.read_text())["ocr_pending"] is True
+        async with handoff.session(monotonic() + 1) as owner:
+            assert not abandoned.is_alive()
+            assert worker.readiness().reason_code == "ocr_parked"
+            assert json.loads(handoff.journal.read_text())["ocr_pending"] is False
+            await owner.ocr_phase()
+            assert len(context.processes) == 2
+        assert all(not process.is_alive() for process in context.processes)
+    finally:
+        worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_llm_phase_closes_ocr_reentry_until_fresh_session(tmp_path):
+    from vision_bill.service.gpu_handoff import ModelHandoff
+
+    events = []
+    handoff = ModelHandoff(tmp_path / "handoff", Llm(events), Ocr(events))
+    async with handoff.session(monotonic() + 1) as owner:
+        await owner.ocr_phase()
+        await owner.ocr_phase()  # Multiple photos reuse one OCR residency.
+        assert events.count("load_ocr") == 1
+        await owner.llm_phase("formatter")
+        before = list(events)
+        with pytest.raises(RuntimeError, match="model_handoff_ocr_phase_closed.*fresh session"):
+            await owner.ocr_phase()
+        assert events == before
+        assert owner.models == ["formatter"]
+    async with handoff.session(monotonic() + 1) as owner:
+        await owner.ocr_phase()
+    assert events.count("load_ocr") == 2
 
 
 @pytest.mark.asyncio
@@ -142,6 +380,28 @@ def test_worker_park_is_reversible_and_fences_stale_owner():
     worker.park("2:second")
     assert len(context.processes) == 2
     worker.stop()
+
+
+def test_failed_native_park_revokes_delayed_load_permission_before_teardown():
+    from ocr_service.worker import OcrWorkerError, OcrWorkerManager
+    from test_ocr_worker_lifecycle import FakeContext
+
+    context = FakeContext()
+    worker = OcrWorkerManager(mp_context=context, startup_timeout=.2)
+    worker.claim("1:first")
+    worker.load("1:first")
+    process = context.processes[-1]
+    context.ignore_terminate = True
+    process.kill = lambda: None
+    try:
+        with pytest.raises(OcrWorkerError, match="ocr_worker_unstoppable"):
+            worker.park("1:first")
+        with pytest.raises(OcrWorkerError, match="ocr_owner_phase_closed"):
+            worker.load("1:first")
+        assert len(context.processes) == 1
+    finally:
+        process.dead.set()
+        worker.stop()
 
 
 @pytest.mark.asyncio
@@ -521,7 +781,7 @@ async def test_review_frozen_managed_snapshot_waits_before_claim_when_production
     receipts.check_connection = AsyncMock(return_value=True)
     receipts.ocr_capabilities = AsyncMock()
     assert not await service.ready_for(claim.image)
-    db.set_wait_reason.assert_awaited_once_with(claim.image, "ocr_unavailable")
+    db.set_wait_reason.assert_awaited_once_with(claim.image, "execution_policy_changed")
     receipts.check_connection.assert_not_awaited()
     receipts.ocr_capabilities.assert_not_awaited()
     receipts.extract_receipt.assert_not_awaited()

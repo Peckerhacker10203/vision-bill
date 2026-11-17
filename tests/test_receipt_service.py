@@ -27,6 +27,39 @@ IMAGE_ID = UUID("00000000-0000-4000-8000-000000000003")
 OTHER_IMAGE_ID = UUID("00000000-0000-4000-8000-000000000004")
 
 
+@pytest.mark.parametrize("entry", ["path", "paths", "bytes", "all_models"])
+async def test_legacy_helpers_cannot_bypass_configured_ocr_on_failure(settings, tmp_path, entry):
+    from PIL import Image
+    from test_extraction_pipeline import formatter, sidecar
+
+    from vision_bill.config import OcrSettings
+
+    paths = [tmp_path / f"{i}.png" for i in range(2)]
+    for path in paths:
+        Image.new("RGB", (4, 5)).save(path)
+    llm = formatter()
+    ocr = sidecar(1 if entry == "paths" else 0)
+    service = ReceiptService(
+        settings.images, settings.pg, llm, ocr_provider=ocr,
+        ocr_settings=OcrSettings(enabled=True, allow_vision_fallback=True),
+    )
+    if entry == "all_models":
+        results = await service.extract_receipt_all_models(
+            UploadFile(file=io.BytesIO(paths[0].read_bytes()))
+        )
+        assert len(results) == 1
+        assert results[0].receipt is None and results[0].error == "ocr_page_failed"
+        assert llm.get_available_models.call_args_list[0].kwargs == {"capability": "text"}
+    else:
+        with pytest.raises(ValueError, match="ocr_page_failed"):
+            if entry == "bytes":
+                await service.analyse_receipt_from_model("fixture", paths[0].read_bytes())
+            else:
+                await service.analyse_receipt_from_path("fixture", paths if entry == "paths" else paths[0])
+    llm._client.chat.assert_not_awaited()
+    assert ocr.extract_page.await_count == (2 if entry == "paths" else 1)
+
+
 @pytest.fixture
 def mock_provider() -> MagicMock:
     """Fixture for a mocked LLM provider."""

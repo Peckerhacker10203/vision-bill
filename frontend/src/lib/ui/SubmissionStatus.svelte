@@ -12,7 +12,12 @@
 	let { id }: { id: string } = $props();
 	let retrying = $state(false);
 	let retryError = $state('');
-	let retryRequest: { id: string; expected_generation: number; request_key: string } | null = null;
+	let retryRequest: {
+		id: string;
+		expected_generation: number;
+		request_key: string;
+		policy: 'preserve' | 'current';
+	} | null = null;
 	let activeView: { id: string } | null = null;
 	let activeRetry: { id: string; generation: number; view: object } | null = null;
 
@@ -42,12 +47,19 @@
 		() => queryClient
 	);
 
-	async function retry() {
+	const policyHeld = $derived(
+		(job.data?.status === 'pending' || job.data?.status === 'processing') &&
+			job.data.wait_reason === 'execution_policy_changed' &&
+			!job.data.receipt_id
+	);
+
+	async function retry(policy: 'preserve' | 'current' = 'preserve') {
 		if (
 			!activeView ||
 			activeView.id !== id ||
 			retrying ||
-			!job.data?.terminal ||
+			!job.data ||
+			!(policy === 'current' ? policyHeld : job.data.terminal) ||
 			job.data.status === 'analyzed'
 		)
 			return;
@@ -61,17 +73,20 @@
 		try {
 			if (
 				retryRequest?.id !== request.id ||
-				retryRequest.expected_generation !== request.generation
+				retryRequest.expected_generation !== request.generation ||
+				retryRequest.policy !== policy
 			) {
 				retryRequest = {
 					id: request.id,
 					expected_generation: request.generation,
-					request_key: requestKey()
+					request_key: requestKey(),
+					policy
 				};
 			}
 			const result = await api.retrySubmission(request.id, {
 				expected_generation: retryRequest.expected_generation,
-				request_key: retryRequest.request_key
+				request_key: retryRequest.request_key,
+				...(retryRequest.policy === 'current' ? { policy: retryRequest.policy } : {})
 			});
 			if (!isCurrent()) return;
 			const cached = queryClient.getQueryData<SubmissionStatus>(key);
@@ -163,7 +178,15 @@
 				type="button"
 				class="mt-4 rounded-lg bg-primary px-4 py-2 text-on-primary disabled:opacity-50"
 				disabled={retrying}
-				onclick={retry}>{$t('submission.retry')}</button
+				onclick={() => retry()}>{$t('submission.retry')}</button
+			>
+		{/if}
+		{#if policyHeld}
+			<button
+				type="button"
+				class="mt-4 rounded-lg bg-primary px-4 py-2 text-on-primary disabled:opacity-50"
+				disabled={retrying}
+				onclick={() => retry('current')}>{$t('submission.retryCurrentPolicy')}</button
 			>
 		{/if}
 		{#if job.data.source_views?.length}

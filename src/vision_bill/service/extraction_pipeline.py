@@ -25,11 +25,11 @@ from ..provider.ocr.base import OcrProvider, compact_ocr_text
 from .gpu_handoff import ModelHandoff, current_owner
 
 
-def select_vision_model(models: Sequence[ModelInfo], requested_id: str, alternate_id: str | None = None) -> ModelInfo | None:
-    """Prefer the requested eligible vision model; use an explicitly permitted alternate."""
+def select_vision_model(models: Sequence[ModelInfo], requested_id: str) -> ModelInfo | None:
+    """Select the requested model only when discovery affirms vision support."""
     available = {m.id: m for m in models if m.capabilities and
                  any(c in m.capabilities for c in ("vision", "multimodal"))}
-    return available.get(requested_id) or (available.get(alternate_id) if alternate_id else None)
+    return available.get(requested_id)
 
 
 class OriginalSourceChangedError(ValueError):
@@ -244,23 +244,12 @@ class ExtractionPipeline:
                     formatted.telemetry.context_window_tokens = model.context_window_tokens
                     return self._finish(formatted, result, started)
                 result.provenance.fallback_reason = reason
-                allowed = (
-                    not self.settings.required
-                    and self.settings.allow_vision_fallback
-                    and options.allow_ocr_fallback
-                )
-                if not allowed:
-                    return self._failed(result, reason, started)
-                result.findings.append(
-                    ReviewFinding(id=reason, code=reason, severity="info", field_path="input")
-                )
+                return self._failed(result, reason, started)
             # Only discovered Vision models may receive originals/normalized image derivatives.
             models = await provider.get_available_models(capability="vision")
-            model = select_vision_model(models, model_id, self.settings.vision_fallback_model_id if use_ocr else None)
+            model = select_vision_model(models, model_id)
             if model is None:
-                if use_ocr:
-                    result.provenance.fallback_reason = "vision_fallback_unavailable"
-                return self._failed(result, "vision_fallback_unavailable" if use_ocr else "vision_model_unavailable", started)
+                return self._failed(result, "vision_model_unavailable", started)
             vision_id = model.id
             formatted = await provider.extract_receipt_input(
                 vision_id,
@@ -272,7 +261,6 @@ class ExtractionPipeline:
             )
             if [view.source_sha256 for view in formatted.input_views] != hashes:
                 raise OriginalSourceChangedError("vision_source_hash_mismatch")
-            result.provenance.fallback_used = use_ocr
             result.provenance.model_id = vision_id
             result.provenance.model_digest = model.digest
             formatted.telemetry.context_window_tokens = model.context_window_tokens

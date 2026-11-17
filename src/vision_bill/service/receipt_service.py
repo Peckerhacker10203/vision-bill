@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from time import monotonic
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -414,6 +415,18 @@ class ReceiptService:
         """Return True if the LLM backend is reachable, False otherwise."""
         return await self._provider.check_connection()
 
+    def managed_ocr_compatible(self) -> bool:
+        """Check the actual LLM's handoff contract without resource side effects."""
+        from .gpu_handoff import handoff_resource_identity
+
+        if not self._provider.supports_model_release:
+            return False
+        try:
+            handoff_resource_identity(self._provider, "llm")
+        except ValueError:
+            return False
+        return True
+
     async def _available_tags(self) -> list[str]:
         """The tag vocabulary for the prompt; empty when the database is unavailable."""
         if self._experiment_tags is not None:
@@ -446,30 +459,32 @@ class ReceiptService:
         )
 
     async def analyse_receipt_with_ocr(self, model_id: str, image_path: Path) -> Receipt:
-        """Compatibility wrapper: unwrap a complete shared pipeline result only."""
-        from time import monotonic
-
-        from ..model.experiment import ExperimentOptions
-        if self._ocr_provider is None and not self._ocr_settings.enabled:
-            return await self.analyse_receipt_from_path(model_id, image_path)
-        result = await self.extract_receipt(model_id, [image_path],
-            options=ExperimentOptions(allow_ocr_fallback=self._ocr_settings.allow_vision_fallback),
-            deadline=monotonic()+self._provider.analysis_timeout_seconds, tags=await self._available_tags())
-        if result.receipt is None:
-            raise ValueError(result.findings[-1].code if result.findings else "receipt_incomplete")
-        return result.receipt
+        """Compatibility entry point using the same server-selected normal policy."""
+        return await self.analyse_receipt_from_path(model_id, image_path)
 
     async def analyse_receipt_from_path(
         self, model_id: str, image_path: Path | Sequence[Path]
     ) -> Receipt:
-        """Run LLM extraction on an image file whose lifetime the caller owns."""
+        """Run normal extraction on caller-owned originals using configured OCR."""
         logger.info("Analysing receipt using model: %s", model_id)
         tags = await self._available_tags()
         try:
             async with asyncio.timeout(self._provider.analysis_timeout_seconds):
-                result = await self._provider.analyse_receipt_from_model(
-                    model_id, image_path, tags=tags
-                )
+                if self._ocr_settings.enabled:
+                    from ..model.experiment import ExperimentOptions
+
+                    paths = [image_path] if isinstance(image_path, Path) else list(image_path)
+                    envelope = await self.extract_receipt(
+                        model_id, paths, options=ExperimentOptions(),
+                        deadline=monotonic() + self._provider.analysis_timeout_seconds, tags=tags,
+                    )
+                    if envelope.receipt is None:
+                        raise ValueError(envelope.findings[-1].code if envelope.findings else "receipt_incomplete")
+                    result = envelope.receipt
+                else:
+                    result = await self._provider.analyse_receipt_from_model(
+                        model_id, image_path, tags=tags
+                    )
             logger.info("Successfully analysed receipt with model: %s", model_id)
             return result
         except (TimeoutError, httpx.TimeoutException, APITimeoutError) as exc:
@@ -490,17 +505,16 @@ class ReceiptService:
     async def extract_receipt_all_models(self, image: UploadFile) -> list[ModelResult]:
         """Run extraction concurrently across every available model."""
         logger.info("Starting concurrent extraction across all models for uploaded file")
-        models = await self.get_available_models()
-        tags = await self._available_tags()
+        models = await self.get_available_models(
+            capability="text" if self._ocr_settings.enabled else "vision"
+        )
         content = await image.read()
         tmp_path = self._image_service.store_tmp_image(content)
 
         async def run_one(model: ModelInfo) -> ModelResult:
             try:
                 logger.debug("Running extraction for model: %s", model.id)
-                receipt = await self._provider.analyse_receipt_from_model(
-                    model.id, tmp_path, tags=tags
-                )
+                receipt = await self.analyse_receipt_from_path(model.id, tmp_path)
                 return ModelResult(model_id=model.id, receipt=receipt)
             except ValueError as e:
                 logger.warning("receipt_model_failed: %s", type(e).__name__)

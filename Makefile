@@ -54,7 +54,7 @@ test-e2e: ## Run backend E2E in a unique owned stack
 fe-test-e2e: ## Run Playwright in a unique owned stack
 	$(NODE) uv run python e2e/run.py run --policy fallback $(E2E_OVERRIDE_ARG) -- npm --prefix frontend run test:e2e
 
-PYTHON_CHECK_PATHS := src paddleocr-service/ocr_service paddleocr-service/server.py \
+PYTHON_CHECK_PATHS := src paddleocr-service/ocr_contract paddleocr-service/ocr_service paddleocr-service/server.py distribution/ollama/probe.py \
 	paddleocr-service/build e2e scripts/ocr_harness \
 	scripts/receipt_split_experiment.py scripts/standalone_benchmark.py scripts/test_ocr_service.py
 
@@ -153,3 +153,11 @@ ocr-qualify-cuda: ## Run physical CUDA release gate against local cases/runtime 
 
 ocr-qualify-rocm: ## Run physical Radeon release gate for the actual selected GFX target
 	docker compose --profile ocr -f docker-compose.yml -f docker-compose.rocm.yml run --rm --no-deps -v "$$(pwd)/server_data/ocr-runtime:/var/lib/ocr" paddleocr-service python -m ocr_service.qualify --accelerator rocm --runtime /var/lib/ocr/candidate.runtime.json --cases /var/lib/ocr/fixtures.toml --output /var/lib/ocr/qualification.json
+
+.PHONY: distribution-test
+distribution-test: ## Test prebuilt bundle generation/Compose and release gates on CPU (no publication)
+	$(NODE) node --test scripts/distribution.test.mjs
+
+.PHONY: distribution-pid1-test
+distribution-pid1-test: ## Run native coordinator/provision software tests as CPU container PID1 (no GPU or weights)
+	$(NODE) node scripts/distribution-pid1-test.mjs

@@ -51,8 +51,8 @@
 	>
 	<p class="mt-2 text-xs text-on-surface-variant">
 		These settings apply only to this run. Extraction and classification are scored separately.
-		Normal upload inherits the server OCR and fallback policy. Direct vision skips OCR. OCR followed
-		by model requires OCR and stops on OCR failure.
+		Normal upload uses text from OCR when configured and stops on OCR failure. Direct vision skips
+		OCR. OCR followed by model requires OCR and stops on OCR failure.
 	</p>
 	{#if !ocrAvailable}<p class="mt-2 text-xs text-on-surface-variant">
 			The OCR extension is not configured. Normal upload currently uses direct vision.

@@ -258,3 +258,61 @@ async def test_capabilities_exposes_qualified_live_runtime(monkeypatch):
     assert (
         await PaddleOcrProvider("http://local", managed_lifecycle=False).get_capabilities()
     ).runtime_fingerprint == "qualified-runtime"
+
+
+@pytest.mark.parametrize("worker_ready", [False, True], ids=["parked", "ready"])
+@pytest.mark.parametrize("managed_lifecycle", [False, True], ids=["unmanaged", "managed"])
+@pytest.mark.parametrize(
+    "mode_fields,managed_compatible,unmanaged_compatible",
+    [
+        pytest.param({}, True, True, id="legacy-missing"),
+        pytest.param({"service_mode": "managed"}, True, False, id="managed-mode"),
+        pytest.param({"service_mode": "standalone"}, False, True, id="standalone-mode"),
+        pytest.param({"service_mode": None}, False, False, id="null-mode"),
+        pytest.param({"service_mode": "unknown"}, False, False, id="unknown-mode"),
+        pytest.param({"service_mode": ""}, False, False, id="empty-mode"),
+        pytest.param({"service_mode": False}, False, False, id="boolean-mode"),
+        pytest.param({"service_mode": 1}, False, False, id="numeric-mode"),
+        pytest.param({"service_mode": ["managed"]}, False, False, id="list-mode"),
+        pytest.param({"service_mode": {"mode": "managed"}}, False, False, id="object-mode"),
+    ],
+)
+async def test_capabilities_requires_compatible_explicit_service_mode(
+    monkeypatch, worker_ready, managed_lifecycle, mode_fields,
+    managed_compatible, unmanaged_compatible,
+):
+    requests = []
+    worker = {
+        "ready": worker_ready,
+        "generation": 1,
+        "profile_id": "fixed-profile" if worker_ready else None,
+        "reason_code": None if worker_ready else "ocr_parked",
+    }
+
+    def handler(request):
+        requests.append((request.method, request.url.path))
+        if request.url.path == "/info":
+            return httpx.Response(200, json={
+                "contract_version": 2,
+                "profile": {"max_new_tokens": 4096},
+                "worker": worker,
+                **mode_fields,
+            })
+        assert request.url.path == "/ready"
+        return httpx.Response(200 if worker_ready else 503, json=worker)
+
+    http_client(monkeypatch, handler)
+    provider = PaddleOcrProvider("http://local", managed_lifecycle=managed_lifecycle)
+    capabilities = await provider.get_capabilities()
+    compatible = managed_compatible if managed_lifecycle else unmanaged_compatible
+    assert capabilities.enabled and capabilities.configured and capabilities.reachable
+    if compatible:
+        assert capabilities.ready is worker_ready
+        assert capabilities.can_load is not worker_ready
+        assert capabilities.reason_code == worker["reason_code"]
+        assert requests == [("GET", "/info"), ("GET", "/ready")]
+    else:
+        assert not capabilities.ready
+        assert not capabilities.can_load
+        assert capabilities.reason_code == "ocr_unavailable"
+        assert requests == [("GET", "/info")]

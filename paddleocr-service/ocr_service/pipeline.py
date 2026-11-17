@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from vision_bill.model.ocr import OcrBlock, OcrResponse
+from ocr_contract import OcrBlock, OcrResponse
 
 from .fp32 import audit_dynamic_model, fp32_predictor_class, native_pipeline_class
 from .images import normalize_source, working_image

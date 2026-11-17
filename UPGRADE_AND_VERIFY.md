@@ -1,10 +1,11 @@
 # Unreleased package: upgrade and verification
 
-This guide covers the stabilized package and its subsequent lazy OCR/LLM handoff
-and optional OpenAI-compatible llama.cpp router lifecycle. The verification table
-below identifies its historical checkpoints; it does not attest later runtime
-changes. See [backend setup, ownership and changes](OPENAI_COMPATIBLE.md). This is
-an operator procedure, not an executed deployment. The original PR14 optional OCR integration has been stabilized here;
+This guide covers durable receipt processing, strict optional OCR, managed OCR/LLM
+handoff and independent prepared deployments. The verification table records the
+final software baseline with explicit component carry boundaries. See
+[backend setup, ownership and changes](OPENAI_COMPATIBLE.md). This is an operator
+procedure, not an executed deployment. The original PR14 optional OCR integration
+has been stabilized here;
 PR15's splitting experiments and historical results remain separate evidence.
 Those source imports are not described as remotely merged PRs. The colleague
 attachment supplied settings only; no colleague project logic was imported. The
@@ -20,7 +21,8 @@ maximum to 2,000,000 pixels.
    token and lease fencing.
 3. Normalize document pixels and extract all photos, using direct vision when OCR
    is off or the explicitly enabled native sidecar when OCR is selected. Persist
-   exact working views and a complete all-photo checkpoint only when valid.
+   exact working views and validated exact-prefix OCR checkpoints; formatting and
+   complete receipt output require all ordered photos.
    Managed OCR first confirms release of owned LLMs and later confirms native OCR
    worker exit before any LLM formatting request.
 4. Format nullable printed observations with the configured LLM. Reconcile only
@@ -34,8 +36,8 @@ maximum to 2,000,000 pixels.
 
 The accepted source reviews corrected failures that synchronous/verified-only
 instructions concealed: upload acknowledgement now follows commit; readiness waits
-do not exhaust attempts; later-photo failure cannot save a success prefix; fallback
-binds actual model identity and explicit consent; nullable observations survive
+do not exhaust attempts; later-photo failure cannot save a prefix as a completed
+receipt; OCR never grants ordinary image fallback; nullable observations survive
 classification; financial checks expose uncertainty without changing printed money;
 review and retry use revision/generation fences; deletion can resume owned cleanup;
 Gold freezes current human evidence rather than trusting a legacy verified bit.
@@ -125,7 +127,7 @@ Run from a prepared checkout/environment on a network that reaches the intended
 DB. Clear conflicting process/dotenv settings and use a private
 `VISION_BILL_CONFIG_PATH` as appropriate: process env > dotenv > YAML precedence
 still applies. No DSN/password needs to appear in public commands or shell history.
-The resulting head is **0018**. Before starting uvicorn with runtime credentials,
+The resulting head is **0019**. Before starting uvicorn with runtime credentials,
 complete owner migration and grants. The current image still executes Alembic at
 startup using the runtime `PG__*` identity; it can only check an already-current
 schema, not apply pending owner DDL. Future upgrades must repeat the owner step.
@@ -133,15 +135,16 @@ Do not temporarily leave the app serving as the owner to simplify migration.
 
 ### Fresh and legacy mapping
 
-Fresh installations apply 0001 through 0018. Existing supported 0010 installations
-apply additive workflow/review/reference/claim/deletion migrations 0011–0018.
+Fresh installations apply 0001 through 0019. Existing supported 0010 installations
+apply additive workflow/review/reference/claim/deletion migrations 0011–0019.
 Migration 0011 preserves linked receipts, verified flags, amounts and historical
 paths and marks their submissions analyzed; they are not re-OCRed. Receipt-free
 legacy failed/processing images become pending with attempt_count 0/max_attempts
 3, retaining prior status/error/processing history in `legacy_events`. Historical
 benchmark attempt counts that cannot be known are not invented by migration 0017.
 0014 retains exact Decimal/NUMERIC values; 0018 supplies durable owned deletion
-cleanup. Earlier existing migrations remain in the chain.
+cleanup; 0019 retains retry policy choice for replay-safe explicit policy adoption.
+Earlier existing migrations remain in the chain.
 
 After head/grants, start only the compatible new application. Verify login and
 owner/admin scope, polling of a new synthetic upload, a preserved old receipt and
@@ -154,10 +157,17 @@ raw traces out of general logs/reports.
 Keep workers stopped during a migration failure; fix owner credentials/grants or
 restore the coordinated backup to an isolated target before cutover. For a safe
 pause, stop the app/workers and retain database/files. To disable OCR for **new**
-uploads, remove the GPU overlay and set `OCR__ENABLED=false`,
-`OCR__REQUIRED=false`; restart deliberately. Existing submissions retain frozen
-intent and may keep waiting for their original capabilities. This is not a queue
-rewrite. Never start an old worker on the new queue/schema and never automate a
+uploads, set the canonical `OCR__ENDPOINT=` explicitly blank, ensure legacy
+`OCR__REQUIRED=false`, and restart deliberately. A nonblank canonical endpoint
+selects OCR and takes precedence over legacy `enabled`/`service_url`. Without it,
+legacy `OCR__ENABLED=false` can coexist with a retained URL without enabling OCR.
+Changed routing or historical fallback grants cause a policy hold before claim.
+Use an authorized retry with current `expected_generation`, new `request_key` and
+`policy: "current"` to adopt current policy explicitly. Default `preserve` retains
+intent. History keeps the original request and old effective snapshot; human-edited
+drafts, live claims and completed receipts cannot be overwritten. This is not a
+queue rewrite or historical reprocessing. Never start an old worker on the new
+queue/schema and never automate a
 destructive Alembic downgrade. Data-bearing downgrade guards intentionally refuse
 loss. Backout needs a compatible image or explicit restore of the coordinated
 pre-upgrade database/files, with new workers stopped and post-backup writes handled.
@@ -217,12 +227,14 @@ scoring versions, owner/actor identity and source evidence. Edits require curren
 qualification; run creation checks the current reference again transactionally.
 
 Admin runs explicitly select models/receipts and freeze source/model digests,
-profile/runtime, prompt/schema/source/output/context metadata, policy and alternate
-fallback identity. Direct vision needs vision capability; OCR needs text formatting;
+profile/runtime, prompt/schema/source/output/context metadata and policy. Direct
+vision needs vision capability; OCR needs text formatting;
 normal upload follows frozen OCR configuration. Replay must match every ordered
 photo/hash/profile/runtime and retained artifact; no expected/reference values enter
-inference. Fallback is off unless explicitly allowed by both policies and is labeled
-with actual model identity. Changed model digests wait rather than silently drifting.
+inference. Ordinary OCR is strict text/evidence-only, including failures, repairs
+and classification. Direct vision comparison is an explicit admin pipeline choice;
+legacy fallback fields/results are compatibility/history, not fresh upload permission.
+Changed model digests wait rather than silently drifting.
 Observed masks prevent absent reference observations from being treated as truth.
 
 V4 reports full-receipt correctness, occurrence-aware ordered item precision/recall,
@@ -236,32 +248,28 @@ native qualification/geometry. See the [harness guide](scripts/ocr_harness/READM
 
 ## Verification evidence
 
-Accepted source `7d82847` follows all fourteen planned tasks, the accepted
-whole-package review/repairs and four additional audits with twenty accepted repair
-dispositions. The preceding whole-package checkpoint `f116fe7` had fresh complete
-336 backend and 97 browser passes. Final additional-audit evidence is:
+The final code baseline is `0cae9678e4304257b2c5c46633b199d2cc8d7b4c`.
+Results below are local software evidence, not suites rerun for this prose change.
+Counts are per run and are not summed across repeated executions.
 
-| Gate | Accepted evidence and boundary |
+| Gate | Observed result and exact boundary |
 | --- | --- |
-| Backend E2E | Complete 343 passed in 849.93s on `da5c3cc`; carried only across unchanged backend/runtime/dependency inputs to `7d82847` |
-| Python unit/static | 1098 passing; Ruff clean and mypy 113 source files; carried only for unchanged components |
-| Frontend components | Fresh 31 files / 213 tests; Svelte 0 errors / 0 warnings, ESLint/Prettier and E2E TypeScript clean, static build at `7d82847` |
-| Browser | Fresh complete 97 passed in 7.3m on a new normally built current-source app image at `7d82847` |
-| Release/config | 14 release tests and three Compose validations carried only for unchanged components |
+| Python/static | Fresh at `0cae967`: 1437 passed; 11 host PID1 skips; 346 deselected. Ruff clean; mypy 128 files. |
+| Prepared app | Fresh rebuilt/attested `0cae967` image passed the original generated-bundle installation smoke without an API-key override: initialization, schema 0019, real admin login, ordinary registration, private secret mounts and repeat-init preservation. Explicit CPU provider stub/local images were used. |
+| Backend E2E | Full 354 passed at `6f1d55f`; carried to `0cae967` only through an exact init-only change proof. |
+| Browser E2E | Full 98 passed at `6f1d55f` against its attested fresh image; same init-only carry to `0cae967`. |
+| Frontend | 31 Vitest files / 215 tests, Svelte 0 errors/warnings, lint/format, E2E types and production build at `b11755f`; exact unchanged-component carry through both later fixes. |
+| Release/distribution | 14 release tests, 19 distribution tests, three Compose configurations and 42 actual container PID1 tests at `b11755f`; exact unchanged-component carry through later fixes. The PID1 gate covers the 11 host skips. |
 
-The backend command was the unfiltered private-stack `e2e/run.py run --no-build`
-execution against the attested normal app artifact, after two capacity-interrupted
-127-test attempts. The final browser command was canonical `make fe-test-e2e` with
-a private build override supplying only build-time CA trust for dependency fetches.
-Final image `sha256:2fb2149d728efe7dad04842a6fb1e8f92c96e65002a97b0aee5f4af99453c1c3`
-attested all 100 backend source identities and 83 frontend assets; unchanged base/
-dependency/backend layers justified backend carry. Owned cleanup finished with no
-remaining resources. A previous 96-pass/1-fail browser run remains failed history;
-it is not combined with the final pass. Nonblocking npm/Vite timing notices remain.
-These counts are historical package evidence, not suites rerun for documentation
-or evidence for the later lifecycle extensions. Follow the
-[current branch CI](https://github.com/Peckerhacker10203/vision-bill/actions?query=branch%3Acodex%2Fvision-bill-update-package)
-for subsequent GPU-handoff/OpenAI changes and read each job's actual conclusion.
+The final image attested 114 tracked runtime files and 83 static files. The
+prepared smoke validates the software bootstrap graph, not public immutable pulls
+or real model inference. The initial empty-key failure and workaround run are
+retained failure/history, not final installation success; the reviewed initializer
+fix passed the original no-override smoke. All unique owned E2E/smoke resources
+were removed. Backend/browser counts are explicitly carried, not claimed as fresh
+runs at `0cae967`. Public CI for the eventual published commit is separate; inspect
+the actual conclusions in
+[current branch CI](https://github.com/Peckerhacker10203/vision-bill/actions?query=branch%3Acodex%2Fvision-bill-update-package).
 
 Actual official CUDA wheel-lock resolution, CUDA/ROCm native compilation, physical
 GPU inference/qualification, current historical CPU image installation/inference,
@@ -272,7 +280,8 @@ scope is RX 6000+/RDNA2 and later selected candidates, each requiring its own re
 qualification. See [native prerequisites and commands](paddleocr-service/README.md).
 
 For future changes, canonical gates are `make lint`, `make test`, `make fe-verify`,
-`make release-test`, `make compose-check`, `make test-e2e`, `make fe-test-e2e`.
+`make release-test`, `make distribution-test`, `make distribution-pid1-test`,
+`make compose-check`, `make test-e2e`, `make fe-test-e2e`.
 Use isolated environments and unique owned E2E stacks. Safe documentation checks
 can run help/parsers, local links and synthetic effective Compose without launching
 services; they cannot replace real operator/hardware acceptance. Publishing remains

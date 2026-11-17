@@ -108,11 +108,15 @@ it('does not submit under a different authenticated owner if the session changes
 	expect(upload).not.toHaveBeenCalled();
 });
 
-it('offers unchecked fallback only when permitted and preserves recovered model/bypass options', async () => {
+it('offers no fallback choice and preserves the exact recovered legacy options', async () => {
 	const { prepareUpload } = await import('$lib/api/upload');
 	session.set({ id: 'owner', username: 'test', is_admin: false, can_see_all: false });
 	const file = new File(['same bytes'], 'photo.png');
-	await prepareUpload('owner', [file], { model_id: 'saved-model', bypass_review: false });
+	await prepareUpload('owner', [file], {
+		model_id: 'saved-model',
+		bypass_review: false,
+		allow_ocr_fallback: true
+	});
 	vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:fallback');
 	vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
 	vi.spyOn(api, 'getUiConfig').mockResolvedValue({
@@ -124,11 +128,7 @@ it('offers unchecked fallback only when permitted and preserves recovered model/
 	});
 	const upload = vi.spyOn(api, 'uploadImages').mockRejectedValue(new Error('lost response'));
 	const { container } = render(Upload);
-	const consent = await screen.findByRole('checkbox', {
-		name: 'Allow vision analysis if OCR fails'
-	});
-	expect((consent as HTMLInputElement).checked).toBe(false);
-	await fireEvent.click(consent);
+	await screen.findByText(/unknown outcome/);
 	await fireEvent.change(container.querySelector('input[type=file]')!, {
 		target: { files: [file] }
 	});
@@ -140,4 +140,5 @@ it('offers unchecked fallback only when permitted and preserves recovered model/
 			expect.any(String)
 		)
 	);
+	expect(screen.queryByRole('checkbox', { name: 'Allow vision analysis if OCR fails' })).toBeNull();
 });

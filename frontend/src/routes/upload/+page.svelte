@@ -28,8 +28,6 @@
 	let bypassReviewDefaultApplied = $state(false);
 	let uploading = $state(false);
 	let bypassTouched = $state(false);
-	let allowFallback = $state(false);
-	let fallbackTouched = $state(false);
 	let recoveryOwner = $state('');
 	let recovering = $state(false);
 	let uploadError = $state('');
@@ -49,8 +47,6 @@
 			const pending = readPendingUpload($session.id);
 			recovering = !!pending;
 			bypassTouched = false;
-			fallbackTouched = false;
-			allowFallback = pending?.options.allow_ocr_fallback ?? false;
 			bypassReviewDefaultApplied = false;
 			if (pending?.options.bypass_review !== undefined) {
 				bypassReview = pending.options.bypass_review;
@@ -111,11 +107,10 @@
 			const pending = await prepareUpload(
 				owner.id,
 				files,
-				bypassTouched || fallbackTouched
+				bypassTouched
 					? {
 							...readPendingUpload(owner.id)?.options,
-							...(bypassTouched ? { bypass_review: bypassReview } : {}),
-							...(fallbackTouched ? { allow_ocr_fallback: allowFallback } : {})
+							bypass_review: bypassReview
 						}
 					: undefined
 			);
@@ -170,21 +165,6 @@
 			<p class="mt-4 rounded-xl border border-outline-variant p-4 text-sm" role="status">
 				{$t('submission.recovery')}
 			</p>
-		{/if}
-
-		{#if uiConfig.data?.ocr_enabled && !uiConfig.data.ocr_required && uiConfig.data.ocr_allow_vision_fallback}
-			<label class="mt-4 flex items-center gap-2 text-sm">
-				<input
-					type="checkbox"
-					checked={allowFallback}
-					disabled={uploading}
-					onchange={(event) => {
-						allowFallback = event.currentTarget.checked;
-						fallbackTouched = true;
-					}}
-				/>
-				{$t('submission.allowFallback')}
-			</label>
 		{/if}
 
 		<!-- Dropzone / preview -->

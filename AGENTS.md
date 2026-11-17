@@ -27,7 +27,7 @@ experiment reports do not certify production hardware or accuracy.
 - `src/vision_bill/provider/db/`: raw SQL and transactional ownership/CAS/leases;
   services delegate DB access here. `provider/llm/`: model discovery, extraction,
   repairs/classification; services do not call provider SDKs directly.
-- `alembic/versions/`: migrations 0001–0018. No application DDL/autogenerate.
+- `alembic/versions/`: migrations 0001–0019. No application DDL/autogenerate.
 - `paddleocr-service/ocr_service/`: isolated native pipeline, qualification and
   disposable worker lifecycle. `build/` and locks pin runtime/build candidates.
 - `frontend/`: SvelteKit static SPA, TypeScript, Tailwind, Vitest, Playwright,
@@ -50,8 +50,8 @@ Entity IDs are UUIDs. DB-unavailable paths return 503.
 
 - `POST /images`: 1–10 repeated multipart `receipt` fields, at most 20 MB/photo;
   committed 202 + durable ID + Location for **all** uploads. Options `model_id`,
-  `bypass_review`, `allow_ocr_fallback` and owner-scoped `Idempotency-Key` preserve
-  explicit presence/intent, ordered hashes and first defaults.
+  `bypass_review`, deprecated compatibility `allow_ocr_fallback`, and owner-scoped
+  `Idempotency-Key` preserve explicit presence/intent, ordered hashes and first defaults.
 - `GET /images`, `GET /images/{id}`, `/file?part=N`, `/thumb`,
   `/views/{view_id}`, `/extractions/{extraction_id}` expose scoped state/evidence.
   No successful synchronous upload shortcut remains.
@@ -81,11 +81,15 @@ cap 300s, lease 900s; readiness/model-start waits can remain pending at zero att
 Stale completions are fenced; a later-photo failure never commits a successful
 prefix as a receipt or complete checkpoint. Legacy linked receipts are not re-OCRed.
 
-`extraction_pipeline.py` selects direct vision or explicit OCR followed by text
-formatting. Freeze requested/actual model digests and configured alternate identity.
-OCR fallback requires optional OCR plus global allow AND explicit request consent;
-required OCR prohibits it. All photos and their ordered hashes participate in
-identity/replay. Model startup/readiness failure must not silently switch models.
+`extraction_pipeline.py` selects direct vision only without OCR, otherwise OCR
+followed by strict text/evidence-only formatting, repair and classification. No
+ordinary failure path sends images to the LLM. Deprecated fallback request fields
+remain replay/history compatibility only; explicit admin direct benchmarks compare
+pipelines. Freeze execution identities and all ordered hashes. A validated exact
+OCR prefix can be reused, but formatting/completed output requires every photo.
+Policy mismatch holds work before claim; retry `policy: "current"` explicitly adopts
+the current snapshot with history/CAS/request replay. Never overwrite completed
+receipts, human edits or live claims. See the upload guide.
 
 Printed observations live in nullable `ExtractionDraft`; category/tags are optional
 downstream enrichment. Missing currency/amounts stay missing. The completed Receipt
@@ -121,7 +125,8 @@ extra sampling parameters. EXIF applies independently. Formatter output defaults
 `/health` is liveness; `/ready` is qualified-worker readiness; `/info` carries
 capability/profile/runtime identity. Serving uses target-sealed model/package/
 image/source/device evidence; invalidate/requalify after identity changes.
-Readiness polling detects idle death and schedules bounded coordinated replacement;
+Readiness polling detects an already-explicitly-loaded idle worker death and
+schedules bounded coordinated replacement;
 failed replacement qualification stays unready, no endless loop/shutdown revival.
 Actual CUDA/ROCm builds, official CUDA lock resolution, physical inference/quality
 and current CPU comparator installation/inference are unexecuted here.
@@ -141,7 +146,12 @@ loader contract; they do not become native OCR v2 by rerunning a CPU adapter.
 ## Configuration, lifecycle and migration credentials
 
 `config.py` precedence: process environment > `.env`/`.env.local` > persistent YAML.
-Nested names use `__`. `VISION_BILL_CONFIG_PATH` defaults `/app/config/config.yaml`;
+Nested names use `__`. Canonical `OCR__ENDPOINT` selects OCR when nonblank and
+direct vision when explicitly blank, overriding legacy enabled/service URL fields.
+Absent canonical endpoint preserves legacy disabled-URL parsing; a URL alone does
+not enable legacy OCR. Do not add an active blank endpoint to the source template:
+it would defeat existing GPU overlays. `VISION_BILL_CONFIG_PATH` defaults
+`/app/config/config.yaml`;
 admin writes are atomic/0600. OpenAI inference can opt into `LLM__MODEL_LIFECYCLE=llamacpp`
 for a dedicated router with exact canonical IDs, autoload on and eager loads off.
 The default `none` cannot release models for shared managed OCR; Ollama ignores this
@@ -158,8 +168,8 @@ Lifespan creates provider/services, initializes DB, bootstraps admin, starts ana
 and benchmark workers when ready; shutdown stops workers before closing DB.
 SPA fallback is registered after API routes. DB initialization failures are sanitized.
 
-Current migration head `0018`. Stop/drain old app/benchmark workers **before** 0011/0017
-queue migrations. Alembic uses settings `PG__*`, including on the image entrypoint;
+Current migration head `0019`. Stop/drain old app/benchmark/standalone workers
+**before** schema, queue or policy cutover; never run old/new workers concurrently. Alembic uses settings `PG__*`, including on the image entrypoint;
 `MIGRATION_DATABASE_URL` is only the grant tool input. Bootstrap missing group roles
 as admin/CREATEROLE, execute grants/default ACL as the actual migration owner,
 migrate with owner PG credentials, refresh grants, then run app with runtime login.
@@ -175,9 +185,16 @@ use a private `UV_PROJECT_ENVIRONMENT` in shared worktrees and do not sync a sha
 `make fe-install` uses npm ci; `make fe-dev` proxies 5173→8080; `make fe-sync` builds
 and copies static assets. Do not change locks/dependencies as a prose edit.
 
+Prepared bundles are the end-user path; source Compose is advanced development.
+See [distribution maintenance](distribution/README.md) for five variants, separate
+private bootstrap/model/native initializers, retained PID1 supervisors, crash fences
+and exact-source artifact gates. Native source contexts are independent of the app.
+No real native images/bundles were published or physically qualified here.
+
 Canonical checks: `make lint` (Ruff/mypy on app/native/build/e2e/harness/scripts),
 `make test` (non-E2E pytest), `make fe-verify` (Svelte/lint/format/Vitest/E2E types/build),
-`make release-test`, `make compose-check`, `make test-e2e`, `make fe-test-e2e`.
+`make release-test`, `make distribution-test`, `make distribution-pid1-test`,
+`make compose-check`, `make test-e2e`, `make fe-test-e2e`.
 E2E uses `e2e/run.py` to allocate unique projects, ports, private settings and fixture
 copies and clean only its owned resources. `make e2e-up/down` requires explicit
 `E2E_STATE`; no shared fixed stack may be adopted. Playwright can use

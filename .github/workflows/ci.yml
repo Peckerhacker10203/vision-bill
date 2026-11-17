@@ -35,6 +35,10 @@ jobs:
         run: make fe-install
       - name: Release driver tests (no publication)
         run: make release-test
+      - name: Prebuilt distribution tests (CPU, no publication)
+        run: make distribution-test
+      - name: Native coordinator as actual PID1 (CPU, no GPU or model weights)
+        run: make distribution-pid1-test
       - name: Lint + type check
         run: make lint
       - name: Validate deployment Compose overlays (CPU, no services)

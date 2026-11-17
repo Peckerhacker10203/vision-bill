@@ -69,3 +69,10 @@ def test_standalone_saved_view_references_are_collected_recursively():
     assert hasattr(workflow_db, "_nested_view_ids")
     view = uuid4()
     assert workflow_db._nested_view_ids({"telemetry": {"view_id": str(view)}}) == [view]
+
+
+def test_retry_policy_is_explicit_and_strict():
+    assert workflow.RetryRequest(expected_generation=1, request_key="r").policy == "preserve"
+    assert workflow.RetryRequest(expected_generation=1, request_key="r", policy="current").policy == "current"
+    with pytest.raises(ValidationError):
+        workflow.RetryRequest(expected_generation=1, request_key="r", policy="unknown")

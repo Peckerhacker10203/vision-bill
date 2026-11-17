@@ -39,6 +39,7 @@ from ...model.workflow import (
     SubmissionStatus,
     assert_metadata_only,
 )
+from ...service.execution_policy import EXECUTION_POLICY_VERSION, snapshot_ocr
 from ...service.receipt_review import evaluate_receipt, persistent_findings, receipt_from_draft
 from .deadline import connection
 from .receipt_db import OriginalChecker, ReceiptDB
@@ -500,7 +501,7 @@ class WorkflowDB:
         effective_options: dict[str, Any],
         deadline: float | None = None,
     ) -> ImageRow | None:
-        """Resolve an uninitialized legacy job once, under the original claim fence."""
+        """Resolve an unbound snapshot/model once under the original claim fence."""
         async with connection(self.pool, deadline=deadline, transaction=True) as conn:
             row = await self._lock_claim(conn, claim)
             if row is None:
@@ -517,11 +518,38 @@ class WorkflowDB:
                     _json(effective_options),
                     model_id,
                 )
+            elif row["model_id"] is None:
+                # Explicit current-policy adoption clears only a formerly resolved default.
+                # Bind its selection once without changing the already frozen policy.
+                row = await conn.fetchrow(
+                    "UPDATE images SET model_id=$2 WHERE id=$1 RETURNING *",
+                    claim.image.id, model_id,
+                )
             return ImageRow.model_validate(dict(row))
+
+    async def hold_claim_for_policy(
+        self, claim: AnalysisClaim, reason: str, *, deadline: float | None = None,
+    ) -> CommitResult:
+        """Return only this claim's reserved attempt; retain earlier real attempts and intent."""
+        if reason != "execution_policy_changed":
+            raise ValueError("invalid_wait_reason")
+        async with connection(self.pool, deadline=deadline, transaction=True) as conn:
+            observed = await self._lock_claim(conn, claim)
+            if observed is None or observed["receipt_id"] is not None or await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM receipts WHERE image_id=$1)", claim.image.id
+            ):
+                return CommitResult(stale=True)
+            row = await conn.fetchrow(
+                """UPDATE images SET status='pending',attempt_count=attempt_count-1,
+                claim_token=NULL,lease_expires_at=NULL,processing_at=NULL,retry_at=NULL,
+                wait_reason=$2 WHERE id=$1 RETURNING *""",
+                claim.image.id, reason,
+            )
+            return CommitResult(stale=False, submission=_status(row))
 
     async def set_wait_reason(self, image: ImageRow, reason: str | None) -> bool:
         """A readiness observation cannot mutate a successor generation or claimed state."""
-        if reason not in {None, "provider_unavailable", "ocr_unavailable", "vision_model_unavailable", "formatter_model_unavailable"}:
+        if reason not in {None, "provider_unavailable", "ocr_unavailable", "vision_model_unavailable", "formatter_model_unavailable", "execution_policy_changed"}:
             raise ValueError("invalid_wait_reason")
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -887,6 +915,7 @@ class WorkflowDB:
         request: RetryRequest,
         *,
         scope: AccessScope,
+        replacement_snapshot: dict[str, Any] | None = None,
     ) -> SubmissionStatus | None:
         async with self.pool.acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
@@ -903,7 +932,11 @@ class WorkflowDB:
                 request.request_key,
             )
             if old is not None:
-                if old["expected_generation"] != request.expected_generation:
+                old_options = _decoded(old["request_options"])
+                if (
+                    old["expected_generation"] != request.expected_generation
+                    or old_options.get("policy", "preserve") != request.policy
+                ):
                     raise ValueError("retry key payload conflict")
                 return SubmissionStatus.model_validate(_decoded(old["result"]))
             if row["generation"] != request.expected_generation:
@@ -917,23 +950,63 @@ class WorkflowDB:
             )
             if draft and (draft["human_edited"] or draft["finalized_receipt_id"] is not None):
                 raise ValueError("an edited draft cannot be retried")
-            if row["status"] not in {"failed", "timed_out", "unreadable", "needs_review"}:
+            expired_processing = row["status"] == "processing" and await conn.fetchval(
+                "SELECT $1::timestamptz<=clock_timestamp()", row["lease_expires_at"]
+            )
+            policy_held = row["wait_reason"] == "execution_policy_changed" and (
+                row["status"] == "pending" or expired_processing
+            )
+            if row["status"] not in {"failed", "timed_out", "unreadable", "needs_review"} and not (
+                policy_held and request.policy == "current"
+            ):
                 raise ValueError("submission is not terminal/retryable")
+            snapshot = _decoded(row["effective_options"])
+            model_id = row["model_id"]
+            history: list[dict[str, Any]] = []
+            if request.policy == "current":
+                if replacement_snapshot is None:
+                    raise ValueError("replacement policy required")
+                ocr = snapshot_ocr(replacement_snapshot)
+                if (
+                    replacement_snapshot.get("execution_policy_version") != EXECUTION_POLICY_VERSION
+                    or ocr.allow_vision_fallback or ocr.vision_fallback_model_id is not None
+                ):
+                    raise ValueError("execution_snapshot_invalid")
+                history = [{
+                    "event": "execution_policy_adopted", "generation": row["generation"],
+                    "effective_options": snapshot, "model_id": model_id,
+                    "requested_options": _decoded(row["requested_options"]),
+                    "request_fingerprint": row["request_fingerprint"],
+                }]
+                snapshot = replacement_snapshot
+                model_id = _decoded(row["requested_options"]).get("model_id")
+                if expired_processing:
+                    # Preserve the real abandoned attempt exactly as normal lease recovery does.
+                    await conn.execute(
+                        """INSERT INTO receipt_extractions(image_id,generation,attempt_number,
+                        outcome_kind,result_code) VALUES($1,$2,$3,$4,'lease_expired')
+                        ON CONFLICT(image_id,generation,attempt_number) DO NOTHING""",
+                        image_id, row["generation"], row["attempt_count"],
+                        "terminal" if row["attempt_count"] >= row["max_attempts"] else "retry",
+                    )
             updated = await conn.fetchrow(
                 """UPDATE images SET generation=generation+1,attempt_count=0,
                 status='pending',retry_at=NULL,claim_token=NULL,lease_expires_at=NULL,processing_at=NULL,
-                analyzed_at=NULL,error=NULL,result_code=NULL,wait_reason=NULL,ocr_checkpoint=NULL
+                analyzed_at=NULL,error=NULL,result_code=NULL,wait_reason=NULL,ocr_checkpoint=NULL,
+                effective_options=$2::jsonb,model_id=$3,legacy_events=legacy_events || $4::jsonb
                 WHERE id=$1 RETURNING *""",
                 image_id,
+                _json(snapshot), model_id, _json(history),
             )
             result = _status(updated)
             await conn.execute(
-                """INSERT INTO image_retry_requests(image_id,request_key,expected_generation,result)
-                VALUES($1,$2,$3,$4::jsonb)""",
+                """INSERT INTO image_retry_requests(image_id,request_key,expected_generation,result,request_options)
+                VALUES($1,$2,$3,$4::jsonb,$5::jsonb)""",
                 image_id,
                 request.request_key,
                 request.expected_generation,
                 result.model_dump_json(),
+                _json({"policy": request.policy}),
             )
             return result
 

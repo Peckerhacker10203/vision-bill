@@ -12,6 +12,18 @@
 # keeps this safe when orchestrated.
 set -e
 
+# Prepared-install commands must work before any database or settings exist.
+case "${1:-}" in
+    init)
+        shift
+        exec python -m vision_bill.distribution.bootstrap "$@"
+        ;;
+    provision-model)
+        shift
+        exec python -m vision_bill.distribution.models "$@"
+        ;;
+esac
+
 # Dependencies are installed during the image build. Startup must not resolve
 # or rebuild packages before running the migrations from that locked environment.
 alembic upgrade head

@@ -67,6 +67,7 @@ def sidecar(fail_at=None, blank=False):
         return OcrResponse.model_validate(wire_page(photo_index, source_sha256))
 
     return SimpleNamespace(
+        lifecycle_identity="ocr:extraction-fixture",
         get_capabilities=AsyncMock(
             return_value=OcrCapabilities(
                 enabled=True,
@@ -93,6 +94,7 @@ async def test_explicit_direct_never_calls_ocr(photos):
     ocr.extract_page.assert_not_awaited()
     ocr.get_capabilities.assert_not_awaited()
     assert result.provenance.source_image_count == 2
+    assert len(llm._client.chat.call_args.kwargs["messages"][0]["images"]) == 2
 
 
 @pytest.mark.parametrize("blank", [False, True])
@@ -115,9 +117,15 @@ async def test_second_photo_failure_is_not_a_complete_prefix(photos, blank):
     assert not result.provenance.fallback_used
 
 
-async def test_optional_failure_falls_back_for_whole_receipt(photos):
+@pytest.mark.parametrize("failure", ["blank", "transport", "timeout"])
+async def test_optional_failure_stops_without_images_despite_legacy_grants(photos, failure):
+    import httpx
+
     llm = formatter()
-    result = await pipeline(llm, sidecar(1), allow_vision_fallback=True).extract(
+    ocr = sidecar(1, blank=failure == "blank")
+    if failure == "timeout":
+        ocr.extract_page.side_effect = httpx.ReadTimeout("OCR timed out")
+    result = await pipeline(llm, ocr, allow_vision_fallback=True).extract(
         "fixture",
         photos,
         options=ExperimentOptions(
@@ -126,10 +134,10 @@ async def test_optional_failure_falls_back_for_whole_receipt(photos):
         deadline=time.monotonic() + 2,
         tags=[],
     )
-    assert result.receipt is not None
-    assert result.provenance.fallback_used
+    assert result.receipt is None
+    assert not result.provenance.fallback_used
     assert result.provenance.fallback_reason == "ocr_page_failed"
-    assert len(llm._client.chat.call_args.kwargs["messages"][0]["images"]) == 2
+    llm._client.chat.assert_not_awaited()
 
 
 async def test_text_only_ocr_formats_all_marked_photos_without_png(photos):
@@ -163,7 +171,7 @@ async def test_text_only_model_never_receives_fallback_images(photos):
         tags=[],
     )
     assert result.receipt is None
-    assert result.provenance.fallback_reason == "vision_fallback_unavailable"
+    assert result.provenance.fallback_reason == "ocr_page_failed"
     llm._client.chat.assert_not_awaited()
 
 
@@ -250,7 +258,7 @@ async def test_ocr_discovery_accepts_text_model_and_records_known_context(photos
     assert result.provenance.model_digest == "model-digest"
 
 
-async def test_explicit_vision_fallback_model_is_used_for_text_formatter(photos):
+async def test_legacy_vision_alternate_is_never_dispatched_after_ocr_failure(photos):
     llm = formatter(False)
     vision = ModelInfo("vision-fallback")
     vision.capabilities = ["vision"]
@@ -267,12 +275,13 @@ async def test_explicit_vision_fallback_model_is_used_for_text_formatter(photos)
         deadline=time.monotonic() + 2,
         tags=[],
     )
-    assert result.provenance.model_id == "vision-fallback"
+    assert result.receipt is None
+    assert result.provenance.model_id == "fixture"
     assert result.provenance.requested_model_id == "fixture"
-    assert result.provenance.model_digest == "alternate-digest"
-    assert llm._client.chat.call_args.kwargs["model"] == "vision-fallback"
-    assert result.telemetry.calls[0]["requested_model"] == "vision-fallback"
-    assert len(result.input_views) == 2
+    assert result.provenance.model_digest is None
+    llm._client.chat.assert_not_awaited()
+    llm.get_available_models.assert_not_awaited()
+    assert result.input_views == []
 
 
 @pytest.mark.parametrize("fmt", ["PNG", "JPEG", "WEBP", "GIF", "HEIF"])
@@ -305,40 +314,31 @@ async def test_ocr_transport_keeps_every_original_format(monkeypatch, tmp_path, 
     assert result.source_sha256 == digest and path.read_bytes() == raw
 
 
-async def test_fallback_preserves_ocr_failure_as_stable_finding(photos):
-    result = await pipeline(formatter(), sidecar(1), allow_vision_fallback=True).extract(
-        "fixture",
-        photos,
-        options=ExperimentOptions(
-            pipeline="ocr", allow_ocr_fallback=True, include_classification=False
-        ),
-        deadline=time.monotonic() + 2,
-        tags=[],
-    )
-    assert result.receipt is not None
-    assert any(f.code == "ocr_page_failed" for f in result.findings)
+def test_saved_historical_fallback_finding_survives_review(photos):
     from pathlib import Path
 
-    from vision_bill.model.review import OriginalAvailability
+    from vision_bill.model.review import AmountPolicy, OriginalAvailability, ReviewFinding
     from vision_bill.service.receipt_review import evaluate_receipt, persistent_findings
 
     # The UI fixture is the actual retained saved-review wire shape. The ID is
     # material-dependent, so assert its producer/review lifecycle separately.
     expected = json.loads((Path(__file__).parents[1] / "frontend/src/lib/test-fixtures/retained-ocr-finding.json").read_text())
+    historical = receipt()
+    findings = [ReviewFinding(id="ocr_page_failed", **expected)]
     originals = [
         OriginalAvailability(part_id=None, photo_index=i, available=True, sha256_matches=True)
         for i in range(len(photos))
     ]
     review = evaluate_receipt(
-        result.receipt, result.amount_policy, result.field_sources, result.overlap_decisions,
+        historical, AmountPolicy(), {}, [],
         originals,
-        retained_findings=result.findings,
+        retained_findings=findings,
     )
     retained = next(f for f in persistent_findings(review.findings) if f.code == "ocr_page_failed")
     assert retained.model_dump(mode="json", exclude={"id"}) == expected
     assert len(retained.id) == 64 and retained.id != "ocr_page_failed"
     repeated = evaluate_receipt(
-        result.receipt, result.amount_policy, result.field_sources, result.overlap_decisions,
+        historical, AmountPolicy(), {}, [],
         originals,
         retained_findings=persistent_findings(review.findings),
     )
@@ -419,9 +419,13 @@ async def test_configured_standard_openai_vision_model_reaches_inference(
         deadline=time.monotonic() + 2,
         tags=[],
     )
-    assert result.receipt is not None
-    assert result.provenance.fallback_used is fallback
-    assert len(llm._client.chat.completions.create.call_args.kwargs["messages"][0]["content"]) == 3
+    assert result.provenance.fallback_used is False
+    if fallback:
+        assert result.receipt is None
+        llm._client.chat.completions.create.assert_not_awaited()
+    else:
+        assert result.receipt is not None
+        assert len(llm._client.chat.completions.create.call_args.kwargs["messages"][0]["content"]) == 3
 
 
 @pytest.mark.parametrize("stage", ["hash", "normalization"])
@@ -645,7 +649,8 @@ async def test_changed_runtime_between_readiness_and_page_never_falls_back(photo
     llm._client.chat.assert_not_awaited()
 
 
-async def test_saved_formatter_controls_repair_and_enrichment_without_shared_mutation(photos):
+@pytest.mark.parametrize("intent", ["direct_vision", "ocr"])
+async def test_saved_formatter_controls_repair_and_enrichment_without_shared_mutation(photos, intent):
     llm = formatter()
     llm.update_runtime_settings(temperature=0.99)
     llm.max_output_tokens = 9999
@@ -657,11 +662,11 @@ async def test_saved_formatter_controls_repair_and_enrichment_without_shared_mut
         return valid
 
     llm._client.chat.side_effect = reply
-    result = await pipeline(llm).extract(
+    result = await pipeline(llm, sidecar() if intent == "ocr" else None).extract(
         "fixture",
         photos,
         options=ExperimentOptions(
-            pipeline="direct_vision", temperature=0.13, include_classification=True
+            pipeline=intent, temperature=0.13, include_classification=True
         ),
         deadline=time.monotonic() + 2,
         tags=["food"],
@@ -671,6 +676,8 @@ async def test_saved_formatter_controls_repair_and_enrichment_without_shared_mut
     assert llm._client.chat.await_count >= 3  # formatter, repair, enrichment
     for call in llm._client.chat.call_args_list:
         assert call.kwargs["options"] == {"temperature": 0.13, "num_predict": 1234}
+        if intent == "ocr":
+            assert all("images" not in message for message in call.kwargs["messages"])
     assert llm._temperature == 0.99 and llm.max_output_tokens == 9999
     assert llm.experiment_options is None and llm.experiment_trace is None
 

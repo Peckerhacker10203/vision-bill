@@ -3,15 +3,13 @@ export type ExperimentSettings = {
 	temperature: number | undefined;
 	thinking: 'default' | 'on' | 'off';
 	includeClassification: boolean;
-	allowFallback: boolean;
 };
 
 export const defaultExperiment = (): ExperimentSettings => ({
 	pipeline: 'upload',
 	temperature: undefined,
 	thinking: 'default',
-	includeClassification: true,
-	allowFallback: false
+	includeClassification: true
 });
 
 export function experimentRequest(settings: ExperimentSettings) {
@@ -20,7 +18,7 @@ export function experimentRequest(settings: ExperimentSettings) {
 		temperature: settings.temperature ?? null,
 		think: settings.thinking === 'default' ? null : settings.thinking === 'on',
 		include_classification: settings.includeClassification,
-		allow_ocr_fallback: settings.allowFallback
+		allow_ocr_fallback: false
 	};
 }
 

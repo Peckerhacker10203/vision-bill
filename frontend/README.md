@@ -24,7 +24,9 @@ statistics, benchmarks and settings. Uploads always use durable 202/status polli
 ordered row identities, original/current descriptions and local receipt times
 including valid seconds/microseconds. Source views distinguish original and working
 coordinates; unknown inverse transforms remain null. EN/DE findings explain checks2,
-readiness waits and fallback outcomes. See [workflow](../MULTI_IMAGE_RECEIPTS.md).
+readiness waits, policy holds and explicit current-policy retries. The upload UI
+has no fallback permission checkbox; compatibility fields do not enable it. See
+[workflow](../MULTI_IMAGE_RECEIPTS.md).
 
 Auth requests are serialized and guarded by session generation. Account changes
 cancel/clear queries and remount authenticated views; delayed replies cannot attach

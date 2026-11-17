@@ -5,10 +5,10 @@ import os
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import yaml
-from pydantic import BaseModel, Field, PostgresDsn, computed_field, model_validator
+from pydantic import AnyHttpUrl, BaseModel, Field, PostgresDsn, computed_field, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -105,6 +105,24 @@ class OcrSettings(BaseModel):
     vision_fallback_model_id: str | None = None
     coordination_path: Path = Field(default_factory=lambda: get_config_path().parent / "gpu-handoff.lock")
     manage_model_lifecycle: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def canonical_endpoint(cls, value: Any) -> Any:
+        """An explicitly supplied endpoint selects OCR; legacy URLs do not."""
+        if isinstance(value, dict) and "endpoint" in value:
+            value = dict(value)
+            endpoint = value.pop("endpoint")
+            if not isinstance(endpoint, str):
+                raise ValueError("OCR endpoint must be a string")
+            value["service_url"] = endpoint.strip()
+            if value["service_url"]:
+                parsed = urlsplit(value["service_url"])
+                if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                    raise ValueError("OCR endpoint must be an absolute HTTP(S) URL")
+                AnyHttpUrl(value["service_url"])
+            value["enabled"] = bool(value["service_url"])
+        return value
 
     @model_validator(mode="after")
     def required_needs_enabled(self) -> Self:

@@ -199,10 +199,31 @@ def complete(*, total="90071992547.91"):
 async def test_bootstrap_and_empty_downgrade(db):
     migrate(db)
     conn = await asyncpg.connect(db.pg_dsn)
-    assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0018"
+    assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0019"
     await conn.close()
     migrate(db, "0010", "downgrade")
     migrate(db)
+
+
+async def test_retry_policy_migration_preserves_legacy_identity_and_refuses_lossy_backout(db):
+    import json
+    migrate(db, "0018")
+    conn = await asyncpg.connect(db.pg_dsn)
+    try:
+        image = await conn.fetchval("INSERT INTO images(status) VALUES('failed') RETURNING id")
+        result = json.dumps({"id": str(image), "generation": 2})
+        await conn.execute("INSERT INTO image_retry_requests(image_id,request_key,expected_generation,result) VALUES($1,'legacy',1,$2::jsonb)", image, result)
+        migrate(db)
+        assert json.loads(await conn.fetchval("SELECT request_options FROM image_retry_requests")) == {}
+        assert json.loads(await conn.fetchval("SELECT result FROM image_retry_requests")) == json.loads(result)
+        migrate(db, "0018", "downgrade")
+        migrate(db)
+        await conn.execute("UPDATE image_retry_requests SET request_options=$1::jsonb", json.dumps({"policy": "current"}))
+        refused = migrate(db, "0018", "downgrade", check=False)
+        assert refused.returncode != 0 and "adoption downgrade refused" in refused.stderr
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0019"
+    finally:
+        await conn.close()
 
 
 async def test_due_only_skip_locked_concurrent_claims(workflow_db):
@@ -299,6 +320,148 @@ async def test_retry_key_replay_survives_later_generations(workflow_db):
     assert await w.retry_submission(image.id, request, scope=AccessScope(user_id=uuid4())) is None
 
 
+@pytest.mark.parametrize("requested", [{}, {"model_id": "requested-model", "allow_ocr_fallback": True}])
+async def test_policy_hold_and_adoption_fence_snapshot_history_and_replay(workflow_db, settings, requested):
+    import json
+
+    from vision_bill.config import OcrSettings
+    from vision_bill.service.execution_policy import current_snapshot
+
+    w, scope = workflow_db
+    old = current_snapshot(settings)
+    create = submission().model_copy(update={"effective_options": old, "requested_options": requested, "model_id": "old-resolved"})
+    image = (await w.enqueue_submission(create, scope=scope, idempotency_key="upload")).submission
+    # A previous real attempt must remain counted; a policy race only returns its own reservation.
+    await w.finish_attempt(await w.claim_next(), AttemptOutcome(kind="retry", retry_delay_seconds=0))
+    claim = await w.claim_next()
+    held = await w.hold_claim_for_policy(claim, "execution_policy_changed")
+    assert not held.stale and held.submission.status == "pending"
+    assert held.submission.attempt_count == 1 and held.submission.generation == 1
+    async with w.pool.acquire() as conn:
+        assert json.loads(await conn.fetchval("SELECT effective_options FROM images WHERE id=$1", image.id)) == old
+    assert (await w.finish_attempt(claim, complete())).stale
+    assert (await w.hold_claim_for_policy(claim, "execution_policy_changed")).stale
+    settings.ocr = OcrSettings(enabled=True)
+    replacement = current_snapshot(settings)
+    request = RetryRequest(expected_generation=1, request_key="adopt", policy="current")
+    adopted = await w.retry_submission(image.id, request, scope=scope, replacement_snapshot=replacement)
+    assert adopted.generation == 2 and adopted.attempt_count == 0
+    assert adopted.model_id == requested.get("model_id")
+    assert "effective_options" not in adopted.model_dump()
+    async with w.pool.acquire() as conn:
+        saved = await conn.fetchrow("SELECT * FROM images WHERE id=$1", image.id)
+        assert json.loads(saved["effective_options"]) == replacement
+        assert json.loads(saved["requested_options"]) == requested
+        history = json.loads(saved["legacy_events"])[-1]
+        assert history["event"] == "execution_policy_adopted"
+        assert history["generation"] == 1 and history["model_id"] == "old-resolved"
+        assert history["effective_options"] == old and history["requested_options"] == requested
+        identity = await conn.fetchval("SELECT request_options FROM image_retry_requests WHERE image_id=$1", image.id)
+        assert json.loads(identity) == {"policy": "current"}
+    # No current settings or replacement validation can affect an already committed replay.
+    assert await w.retry_submission(image.id, request, scope=scope, replacement_snapshot=None) == adopted
+    with pytest.raises(ValueError, match="conflict"):
+        await w.retry_submission(image.id, request.model_copy(update={"policy": "preserve"}), scope=scope)
+    assert (await w.finish_attempt(claim, complete())).stale
+    assert (await w.enqueue_submission(create, scope=scope, idempotency_key="upload")).submission.generation == 2
+    # Selection binding is one-time and cannot replace the adopted frozen formatter policy.
+    next_claim = await w.claim_next()
+    bound = await w.ensure_execution_snapshot(next_claim, model_id="current-default", effective_options={})
+    assert bound.model_id == requested.get("model_id", "current-default")
+    assert bound.effective_options == replacement
+    rebound = await w.ensure_execution_snapshot(next_claim, model_id="later-default", effective_options={})
+    assert rebound == bound
+
+
+async def test_legacy_retry_identity_defaults_to_preserve(workflow_db):
+    w, scope = workflow_db
+    image = await enqueue(w, scope)
+    await w.finish_attempt(await w.claim_next(), AttemptOutcome(kind="terminal"))
+    request = RetryRequest(expected_generation=1, request_key="legacy")
+    first = await w.retry_submission(image.id, request, scope=scope)
+    async with w.pool.acquire() as conn:
+        await conn.execute("UPDATE image_retry_requests SET request_options='{}' WHERE image_id=$1", image.id)
+    assert await w.retry_submission(image.id, request, scope=scope) == first
+    with pytest.raises(ValueError, match="conflict"):
+        await w.retry_submission(image.id, request.model_copy(update={"policy": "current"}), scope=scope)
+
+
+async def test_current_policy_cannot_replace_live_or_completed_work(workflow_db, settings):
+    from vision_bill.service.execution_policy import current_snapshot
+    w, scope = workflow_db
+    image = await enqueue(w, scope)
+    request = RetryRequest(expected_generation=1, request_key="adopt", policy="current")
+    with pytest.raises(ValueError, match="retryable"):
+        await w.retry_submission(image.id, request, scope=scope, replacement_snapshot=current_snapshot(settings))
+    claim = await w.claim_next()
+    await w.finish_attempt(claim, complete())
+    with pytest.raises(ValueError, match="receipt"):
+        await w.retry_submission(image.id, request, scope=scope, replacement_snapshot=current_snapshot(settings))
+
+
+async def test_expired_processing_policy_hold_can_adopt_but_live_claim_cannot(workflow_db, settings):
+    from vision_bill.service.execution_policy import current_snapshot
+    w, scope = workflow_db
+    image = await enqueue(w, scope)
+    claim = await w.claim_next()
+    assert await w.set_wait_reason(claim.image, "execution_policy_changed")
+    request = RetryRequest(expected_generation=1, request_key="adopt-expired", policy="current")
+    with pytest.raises(ValueError, match="retryable"):
+        await w.retry_submission(image.id, request, scope=scope, replacement_snapshot=current_snapshot(settings))
+    async with w.pool.acquire() as conn:
+        await conn.execute("UPDATE images SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", image.id)
+    adopted = await w.retry_submission(image.id, request, scope=scope, replacement_snapshot=current_snapshot(settings))
+    assert adopted.generation == 2 and adopted.status == "pending" and adopted.attempt_count == 0
+    assert (await w.finish_attempt(claim, complete())).stale
+    async with w.pool.acquire() as conn:
+        event = await conn.fetchrow("SELECT generation,attempt_number,result_code FROM receipt_extractions WHERE image_id=$1", image.id)
+        assert dict(event) == {"generation": 1, "attempt_number": 1, "result_code": "lease_expired"}
+
+
+async def test_policy_adoption_rechecks_extended_lease_under_row_lock(workflow_db, settings):
+    from vision_bill.service.execution_policy import current_snapshot
+    w, scope = workflow_db
+    image = await enqueue(w, scope)
+    claim = await w.claim_next()
+    assert await w.set_wait_reason(claim.image, "execution_policy_changed")
+    async with w.pool.acquire() as conn:
+        await conn.execute("UPDATE images SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", image.id)
+        async with conn.transaction():
+            await conn.fetchrow("SELECT id FROM images WHERE id=$1 FOR UPDATE", image.id)
+            attempt = asyncio.create_task(w.retry_submission(
+                image.id, RetryRequest(expected_generation=1, request_key="race", policy="current"),
+                scope=scope, replacement_snapshot=current_snapshot(settings),
+            ))
+            # Wait for PostgreSQL to observe the blocked retry, avoiding a timing-only race test.
+            for _ in range(100):
+                if await conn.fetchval("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'SELECT * FROM images WHERE id=%')"):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("retry did not wait on the owned image lock")
+            await conn.execute("UPDATE images SET lease_expires_at=clock_timestamp()+interval '5 minutes' WHERE id=$1", image.id)
+        with pytest.raises(ValueError, match="retryable"):
+            await attempt
+        saved = await conn.fetchrow("SELECT generation,status,claim_token FROM images WHERE id=$1", image.id)
+        assert dict(saved) == {"generation": 1, "status": "processing", "claim_token": claim.claim_token}
+        assert await conn.fetchval("SELECT count(*) FROM image_retry_requests WHERE image_id=$1", image.id) == 0
+
+
+async def test_claim_policy_hold_does_not_change_a_concurrently_linked_receipt(workflow_db):
+    w, scope = workflow_db
+    image = await enqueue(w, scope)
+    claim = await w.claim_next()
+    async with w.pool.acquire() as conn:
+        receipt = await conn.fetchval("INSERT INTO receipts(merchant_name,date,total,image_id) VALUES('human','2026-01-01',1.23,$1) RETURNING id", image.id)
+        await conn.execute("UPDATE images SET receipt_id=$2 WHERE id=$1", image.id, receipt)
+    result = await w.hold_claim_for_policy(claim, "execution_policy_changed")
+    assert result.stale
+    async with w.pool.acquire() as conn:
+        saved = await conn.fetchrow("SELECT status,attempt_count,receipt_id FROM images WHERE id=$1", image.id)
+        assert dict(saved) == {"status": "processing", "attempt_count": 1, "receipt_id": receipt}
+        assert await conn.fetchval("SELECT total FROM receipts WHERE id=$1", receipt) == Decimal("1.23")
+
+
 async def test_finish_atomic_decimal_and_immutable_history(workflow_db, db):
     w, scope = workflow_db
     image = await enqueue(w, scope)
@@ -324,7 +487,7 @@ async def test_finish_atomic_decimal_and_immutable_history(workflow_db, db):
         )
     assert migrate(db, "0010", "downgrade", check=False).returncode != 0
     async with w.pool.acquire() as conn:
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0018"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0019"
         assert await conn.fetchval("SELECT count(*) FROM receipt_review_revisions") == 1
 
 
@@ -466,9 +629,11 @@ async def test_finish_requires_saved_artifacts_and_real_source_refs(workflow_db)
         assert str(view.part_id) in raw and str(view.metadata.view_id) in raw
 
 
-async def test_partial_draft_human_edits_and_receipt_link_are_preserved(workflow_db):
+@pytest.mark.parametrize("policy", ["preserve", "current"])
+async def test_partial_draft_human_edits_and_receipt_link_are_preserved(workflow_db, settings, policy):
     from vision_bill.model.extraction import ExtractionDraft
     from vision_bill.model.review import ReviewFinding
+    from vision_bill.service.execution_policy import current_snapshot
 
     w, scope = workflow_db
     image = await enqueue(w, scope)
@@ -496,7 +661,8 @@ async def test_partial_draft_human_edits_and_receipt_link_are_preserved(workflow
         )
     with pytest.raises(ValueError, match="edited draft"):
         await w.retry_submission(
-            image.id, RetryRequest(expected_generation=1, request_key="human"), scope=scope
+            image.id, RetryRequest(expected_generation=1, request_key="human", policy=policy), scope=scope,
+            replacement_snapshot=current_snapshot(settings) if policy == "current" else None,
         )
     async with w.pool.acquire() as conn:
         assert (
@@ -622,7 +788,7 @@ async def test_upgrade_0010_preserves_precise_local_times_and_legacy_evidence(db
                 assert await conn.fetchval("SELECT image_path FROM images WHERE id=$1", image) == str(original)
         finally:
             await reader.destroy_db()
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0018"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0019"
     finally:
         await conn.close()
 

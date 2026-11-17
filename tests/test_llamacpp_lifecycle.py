@@ -181,6 +181,8 @@ async def test_failed_unload_is_not_accepted(monkeypatch, code, body):
 
 
 class Ocr:
+    lifecycle_identity = "ocr:llamacpp-fixture"
+
     def __init__(self, events):
         self.events = events
         self.active = False

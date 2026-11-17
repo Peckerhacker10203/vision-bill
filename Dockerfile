@@ -31,6 +31,7 @@ RUN uv sync --frozen --no-install-project
 
 # Now copy the source (plus the alembic migration tooling the app relies on)
 COPY ./src ./src
+COPY ./paddleocr-service/ocr_contract ./paddleocr-service/ocr_contract
 COPY alembic.ini ./
 COPY ./alembic ./alembic
 

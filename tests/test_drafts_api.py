@@ -8,6 +8,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
+from vision_bill.config import Settings
 from vision_bill.security.dependencies import get_current_user
 from vision_bill.security.models import User
 
@@ -28,6 +29,7 @@ def setup_api():
     )
     service = SimpleNamespace(
         db=db,
+        settings=Settings(),
         get_draft=AsyncMock(return_value=None),
         patch_draft=AsyncMock(return_value=None),
         finalize_draft=AsyncMock(return_value=None),
@@ -91,3 +93,20 @@ async def test_stale_draft_conflict_and_incomplete_finalize(setup_api):
                 path + "/finalize", json={"expected_revision": 1, "request_key": "key"}
             )
         ).status_code == 422
+
+
+@pytest.mark.parametrize("policy", ["preserve", "current"])
+async def test_retry_passes_explicit_policy_and_current_snapshot_only_when_adopting(setup_api, policy):
+    from vision_bill.service.execution_policy import current_snapshot
+
+    app, service, user = setup_api
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"/api/v1/images/{uuid4()}/retry",
+            json={"expected_generation": 1, "request_key": "key", "policy": policy},
+        )
+    assert response.status_code == 404
+    call = service.db.retry_submission.call_args
+    assert call.args[1].policy == policy
+    assert call.kwargs["scope"].user_id == user.id
+    assert call.kwargs["replacement_snapshot"] == (current_snapshot(service.settings) if policy == "current" else None)

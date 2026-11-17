@@ -48,6 +48,7 @@ def context(settings, tmp_path):
         bind_source_parts=AsyncMock(return_value=[part]),
         get_ocr_checkpoint=AsyncMock(return_value=None),
         finish_attempt=AsyncMock(return_value=CommitResult(stale=False)),
+        hold_claim_for_policy=AsyncMock(return_value=CommitResult(stale=False)),
         clear_ocr_checkpoint=AsyncMock(return_value=True),
         save_ocr_checkpoint=AsyncMock(return_value=True),
     )
@@ -178,6 +179,7 @@ async def test_preclaim_ocr_text_model_is_eligible_but_missing_model_waits(setti
     claim.image.effective_options["ocr"] = OcrSettings(enabled=True, required=True, manage_model_lifecycle=False).model_dump(
         mode="json"
     )
+    settings.ocr = OcrSettings.model_validate(claim.image.effective_options["ocr"])
     receipts.check_connection = AsyncMock(return_value=True)
     model = ModelInfo("saved-model")
     model.capabilities = ["vision", "completion"]
@@ -274,7 +276,7 @@ async def test_checkpoint_transport_failure_does_not_clear_cache_or_run_ocr(sett
 
 
 @pytest.mark.parametrize("permission", [None, False, True, "true"])
-async def test_saved_fallback_permission_used_in_readiness_and_execution(
+async def test_saved_fallback_permission_cannot_enable_vision_readiness_or_execution(
     settings, tmp_path, permission
 ):
     from vision_bill.model.ocr import OcrCapabilities
@@ -284,6 +286,7 @@ async def test_saved_fallback_permission_used_in_readiness_and_execution(
     claim.image.effective_options["ocr"] = OcrSettings(
         enabled=True, allow_vision_fallback=True, manage_model_lifecycle=False
     ).model_dump(mode="json")
+    settings.ocr = OcrSettings.model_validate(claim.image.effective_options["ocr"])
     if permission is not None:
         claim.image.effective_options["allow_ocr_fallback"] = permission
     snapshot = dict(claim.image.effective_options)
@@ -294,23 +297,23 @@ async def test_saved_fallback_permission_used_in_readiness_and_execution(
     model = ModelInfo("saved-model")
     model.capabilities = ["vision", "completion"]
     receipts.get_available_models = AsyncMock(return_value=[model])
-    assert await service.ready_for(claim.image) is (
-        permission is True or isinstance(permission, str)
-    )
+    assert await service.ready_for(claim.image) is isinstance(permission, str)
     receipts.extract_receipt.side_effect = TimeoutError()
     await service.process_claim(claim)
     if isinstance(permission, str):
         receipts.extract_receipt.assert_not_awaited()
         assert db.finish_attempt.call_args.args[1].result_code == "analysis_contract_failed"
+    elif permission is True:
+        db.hold_claim_for_policy.assert_awaited_once()
+        receipts.extract_receipt.assert_not_awaited()
+        db.finish_attempt.assert_not_awaited()
     else:
-        assert receipts.extract_receipt.call_args.kwargs["options"].allow_ocr_fallback is (
-            permission is True
-        )
+        assert receipts.extract_receipt.call_args.kwargs["options"].allow_ocr_fallback is False
     assert claim.image.effective_options == snapshot
 
 
-@pytest.mark.parametrize("vision,alternate,expected", [(True,False,True),(False,False,False),(False,True,True)])
-async def test_readiness_selects_same_vision_model_as_execution(settings,tmp_path,vision,alternate,expected):
+@pytest.mark.parametrize("vision,alternate", [(True, False), (False, False), (False, True)])
+async def test_ocr_readiness_never_uses_a_vision_alternate(settings,tmp_path,vision,alternate):
     from vision_bill.model.ocr import OcrCapabilities
     from vision_bill.provider.llm.base import ModelInfo
     service, receipts, _db, claim, _ = context(settings,tmp_path)
@@ -321,7 +324,23 @@ async def test_readiness_selects_same_vision_model_as_execution(settings,tmp_pat
     requested=ModelInfo("saved-model");requested.capabilities=["vision"] if vision else ["completion"]
     other=ModelInfo("alternate");other.capabilities=["vision"]
     receipts.get_available_models=AsyncMock(return_value=[requested]+([other] if alternate else []))
-    assert await service.ready_for(claim.image) is expected
+    assert not await service.ready_for(claim.image)
+    receipts.get_available_models.assert_not_awaited()
+
+
+async def test_current_snapshot_reaches_attempt_with_frozen_formatter_settings(settings, tmp_path):
+    from vision_bill.service.execution_policy import current_snapshot
+
+    service, receipts, db, claim, _ = context(settings, tmp_path)
+    settings.llm.temperature = 0.27
+    settings.llm.max_output_tokens = 4321
+    claim.image.effective_options = current_snapshot(settings)
+    settings.llm.temperature = 0.91
+    receipts.extract_receipt.side_effect = TimeoutError()
+    await service.process_claim(claim)
+    assert receipts.extract_receipt.call_args.kwargs["options"].temperature == 0.27
+    assert receipts.extract_receipt.call_args.kwargs["max_output_tokens"] == 4321
+    assert db.finish_attempt.call_args.args[1].kind == "retry"
 
 
 async def test_readiness_wait_is_persisted_and_cleared_without_attempt(settings,tmp_path):
@@ -339,3 +358,89 @@ async def test_readiness_wait_is_persisted_and_cleared_without_attempt(settings,
     assert await service.ready_for(claim.image)
     assert waits[-1][-1] is None
     assert claim.image.attempt_count == 0
+
+
+@pytest.mark.parametrize("version", [None, 2])
+async def test_policy_change_holds_before_claim_and_dispatch(settings, tmp_path, version):
+    from copy import deepcopy
+
+    from vision_bill.service.execution_policy import current_snapshot
+
+    service, receipts, db, claim, _ = context(settings, tmp_path)
+    snapshot = current_snapshot(settings)
+    if version is None:
+        snapshot.pop("execution_policy_version")
+    claim.image.effective_options = snapshot
+    before = deepcopy(snapshot)
+    settings.ocr = OcrSettings(enabled=True)
+    db.hold_claim_for_policy = AsyncMock(return_value=CommitResult(stale=False))
+    assert not await service.ready_for(claim.image)
+    db.set_wait_reason.assert_awaited_once_with(claim.image, "execution_policy_changed")
+    assert not (await service.process_claim(claim)).stale
+    db.hold_claim_for_policy.assert_awaited_once()
+    receipts.extract_receipt.assert_not_awaited()
+    db.bind_source_parts.assert_not_awaited()
+    db.finish_attempt.assert_not_awaited()
+    assert claim.image.effective_options == before
+
+
+async def test_policy_change_during_preparation_holds_before_extraction(settings, tmp_path):
+    service, receipts, db, claim, part = context(settings, tmp_path)
+
+    async def bind(*args, **kwargs):
+        settings.ocr = OcrSettings(enabled=True)
+        return [part]
+
+    db.bind_source_parts.side_effect = bind
+    await service.process_claim(claim)
+    receipts.extract_receipt.assert_not_awaited()
+    db.finish_attempt.assert_not_awaited()
+    db.hold_claim_for_policy.assert_awaited_once()
+
+
+async def test_adopted_default_resolves_once_without_changing_frozen_policy(settings, tmp_path):
+    from vision_bill.provider.llm.base import ModelInfo
+    from vision_bill.service.execution_policy import current_snapshot
+
+    service, receipts, db, claim, _ = context(settings, tmp_path)
+    claim.image.model_id = None
+    claim.image.effective_options = current_snapshot(settings)
+    saved = claim.image.model_copy(update={"model_id": settings.llm.model_name})
+    db.ensure_execution_snapshot = AsyncMock(return_value=saved)
+    model = ModelInfo(settings.llm.model_name)
+    model.capabilities = ["vision"]
+    receipts.get_available_models = AsyncMock(return_value=[model])
+    receipts.extract_receipt.side_effect = TimeoutError()
+    await service.process_claim(claim)
+    assert db.ensure_execution_snapshot.call_args.kwargs["effective_options"] == claim.image.effective_options
+    assert receipts.extract_receipt.call_args.args[0] == settings.llm.model_name
+
+
+async def test_adopted_default_waits_for_exact_configured_model(settings, tmp_path):
+    from vision_bill.provider.llm.base import ModelInfo
+    from vision_bill.service.execution_policy import current_snapshot
+
+    service, receipts, db, claim, _ = context(settings, tmp_path)
+    claim.image.model_id = None
+    claim.image.effective_options = current_snapshot(settings)
+    receipts.check_connection = AsyncMock(return_value=True)
+    model = ModelInfo("different")
+    model.capabilities = ["vision"]
+    receipts.get_available_models = AsyncMock(return_value=[model])
+    assert not await service.ready_for(claim.image)
+    db.set_wait_reason.assert_awaited_once_with(claim.image, "vision_model_unavailable")
+
+
+async def test_policy_change_after_a_real_dispatch_keeps_the_attempt_counted(settings, tmp_path):
+    from vision_bill.service.extraction_pipeline import OcrRuntimeChangedError
+    service, receipts, db, claim, _ = context(settings, tmp_path)
+
+    async def extract(*args, **kwargs):
+        settings.ocr = OcrSettings(enabled=True)
+        raise OcrRuntimeChangedError("ocr_runtime_changed")
+
+    receipts.extract_receipt.side_effect = extract
+    await service.process_claim(claim)
+    receipts.extract_receipt.assert_awaited_once()
+    db.hold_claim_for_policy.assert_not_awaited()
+    assert db.finish_attempt.call_args.args[1].kind == "retry"

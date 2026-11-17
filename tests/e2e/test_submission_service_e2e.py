@@ -20,6 +20,7 @@ from vision_bill.model.db.image import ImagePart
 from vision_bill.model.workflow import SubmissionCreate
 from vision_bill.security.dependencies import get_current_user
 from vision_bill.security.models import User
+from vision_bill.service.execution_policy import current_snapshot
 from vision_bill.service.extraction_pipeline import ExtractionPipeline
 from vision_bill.service.image_service import ImageService
 from vision_bill.service.receipt_service import ReceiptService
@@ -41,16 +42,15 @@ async def setup(w, scope, settings, tmp_path, *, ocr=True):
         Image.new("RGB", (4, 5), (i, 0, 0)).save(path)
     hashes = [hashlib.sha256(p.read_bytes()).hexdigest() for p in paths]
     config = OcrSettings(enabled=ocr, required=ocr, manage_model_lifecycle=False)
+    settings.ocr = config
+    settings.llm.temperature = 0.13
+    settings.llm.max_output_tokens = 1234
     upload = SubmissionCreate(
         id=uuid4(),
         parts=[ImagePart(image_path=str(p)) for p in paths],
         source_manifest=[{"photo_index": i, "source_sha256": h} for i, h in enumerate(hashes)],
         requested_options={},
-        effective_options={
-            "ocr": config.model_dump(mode="json"),
-            "temperature": 0.13,
-            "max_output_tokens": 1234,
-        },
+        effective_options=current_snapshot(settings),
         request_fingerprint=uuid4().hex,
         model_id="fixture",
         bypass_review=True,
@@ -509,7 +509,7 @@ async def test_scheduler_initial_legacy_model_resolution_is_frozen_once(workflow
         assert saved['attempt_count']==1 and saved['receipt_id'] is not None, (saved['status'],saved['result_code'],saved['model_id'])
         assert saved['model_id']=='fixture'
         snapshot=json.loads(saved['effective_options'])
-        assert snapshot==service.legacy_snapshot() and snapshot.get('allow_ocr_fallback',False) is False
+        assert snapshot==current_snapshot(settings) and snapshot['allow_ocr_fallback'] is False
         assert llm._client.chat.call_args.kwargs['model']=='fixture'
         assert await w.claim_next() is None
     else:

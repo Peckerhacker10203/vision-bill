@@ -16,8 +16,9 @@ def test_separate_digest_pinned_native_images_and_cuda_lock():
         assert path.is_file(), f"{accelerator} image missing"
         text = path.read_text()
         assert re.search(r"FROM \S+@sha256:[0-9a-f]{64}", text)
-        assert "COPY paddleocr-service/ocr_service/" in text
-        assert "COPY src/vision_bill/model/ocr.py" in text
+        assert "COPY ocr_service/" in text
+        assert "COPY ocr_contract/" in text
+        assert "vision_bill" not in text and "COPY paddleocr-service/" not in text
         assert "/health" in text
     cuda = (SERVICE / "requirements.cuda.lock").read_text()
     assert "paddlepaddle_gpu-3.3.1" in cuda and "cu126" in cuda
@@ -49,21 +50,23 @@ def test_rocm_exact_pins_full_sdk_targets_and_no_spoofing():
     assert "WITH_ROCM AND WITH_FLASHATTN" in patch
 
 
-def test_sidecar_root_context_cache_and_internal_readiness():
+def test_sidecar_independent_context_cache_and_internal_readiness():
     base = yaml.safe_load((ROOT / "docker-compose.yml").read_text())
     service = base["services"]["paddleocr-service"]
-    assert service["build"]["context"] == "."
+    assert service["build"]["context"] == "./paddleocr-service"
+    assert service["build"]["dockerfile"] == "Dockerfile"
     assert not service.get("ports")
     assert service["environment"]["PADDLE_PDX_CACHE_HOME"] == "/var/cache/paddlex"
     assert any("/var/cache/paddlex" in volume for volume in service["volumes"])
     assert "/health" in str(service["healthcheck"])
-    ignore = (ROOT / ".dockerignore").read_text().splitlines()
-    assert "*" in ignore and "!paddleocr-service/ocr_service/*.py" in ignore
-    assert "!paddleocr-service/**" not in ignore
+    ignore = (SERVICE / ".dockerignore").read_text().splitlines()
+    assert "*" in ignore and "!ocr_contract/*.py" in ignore
+    assert "!ocr_service/*.py" in ignore and "!**" not in ignore
     for accelerator in ("cuda", "rocm"):
         overlay = yaml.safe_load((ROOT / f"docker-compose.{accelerator}.yml").read_text())
         ocr = overlay["services"]["paddleocr-service"]
-        assert ocr["build"]["dockerfile"] == f"paddleocr-service/Dockerfile.{accelerator}"
+        assert ocr["build"]["context"] == "./paddleocr-service"
+        assert ocr["build"]["dockerfile"] == f"Dockerfile.{accelerator}"
         assert not ocr.get("ports") and not ocr.get("privileged")
     rocm = yaml.safe_load((ROOT / "docker-compose.rocm.yml").read_text())["services"][
         "paddleocr-service"
@@ -170,12 +173,8 @@ def test_runtime_lock_hashes_match_committed_inputs():
 
 
 def test_sidecar_directory_negations_do_not_reinclude_private_descendants():
-    lines = (ROOT / ".dockerignore").read_text().splitlines()
-    for directory in (
-        "paddleocr-service",
-        "paddleocr-service/ocr_service",
-        "paddleocr-service/build",
-    ):
+    lines = (SERVICE / ".dockerignore").read_text().splitlines()
+    for directory in ("ocr_contract", "ocr_service", "build"):
         index = lines.index("!" + directory + "/")
         assert lines[index + 1] == directory + "/**", (
             "Docker negated directory otherwise re-includes all descendants"

@@ -11,10 +11,9 @@ from tempfile import TemporaryDirectory
 from typing import Any
 from uuid import uuid4
 
+from ocr_contract import WorkingImage
+from ocr_contract.document_image import NORMALIZER_VERSION, document_rgb
 from PIL import Image, ImageOps
-
-from vision_bill.helper.document_image import NORMALIZER_VERSION, document_rgb
-from vision_bill.model.ocr import WorkingImage
 
 
 @dataclass(frozen=True)

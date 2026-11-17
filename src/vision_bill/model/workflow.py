@@ -114,6 +114,7 @@ class AnalysisClaim(BaseModel):
 class RetryRequest(BaseModel):
     expected_generation: int = Field(ge=1)
     request_key: str = Field(min_length=1)
+    policy: Literal["preserve", "current"] = "preserve"
 
 
 class DraftPatch(BaseModel):

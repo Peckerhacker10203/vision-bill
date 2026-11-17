@@ -345,7 +345,7 @@ async def test_ocr_benchmark_discovers_text_only_formatter_models(settings):
     [
         ("upload", False, False, "direct_vision"),
         ("upload", True, False, "ocr"),
-        ("upload", True, True, "direct_vision"),
+        ("upload", True, True, None),
         ("direct_vision", True, False, "direct_vision"),
         ("ocr", False, False, "ocr"),
         ("ocr", False, True, None),
@@ -391,7 +391,9 @@ async def test_serialized_experiment_intent_preserves_effective_ocr_policy(
     else:
         result = await execute_submission(service, "fixture", paths, options, [])
         assert result.metadata["used_pipeline"] == expected
-        assert result.metadata["fallback_used"] is (intent == "upload" and fail_second)
+        assert result.metadata["fallback_used"] is False
+        if intent == "direct_vision":
+            assert len(service._provider._client.chat.call_args.kwargs["messages"][0]["images"]) == 2
     if intent == "direct_vision" or (intent == "upload" and not enabled):
         ocr.extract_page.assert_not_awaited()
     if intent == "ocr":
@@ -443,24 +445,69 @@ def test_upload_experiment_does_not_invent_frozen_fallback_permission(
     )
     before = options.model_dump()
     _, _, effective = effective_policy(service, options)
-    assert effective.allow_ocr_fallback is (global_permission and permission is True)
+    assert effective.allow_ocr_fallback is False
     assert options.model_dump() == before
 
 
-async def test_fallback_pipeline_identity_binds_eligible_alternate_digest(settings,tmp_path):
+async def test_pipeline_identity_ignores_unused_legacy_alternate_digest(settings):
     from test_extraction_pipeline import formatter, sidecar
+
     from vision_bill.config import OcrSettings
     from vision_bill.provider.llm.base import ModelInfo
-    from vision_bill.service.receipt_service import ReceiptService
     from vision_bill.service.experiment_execution import pipeline_identity
-    provider=formatter(False)
-    alternate=ModelInfo('alternate');alternate.digest='first';alternate.capabilities=['vision']
+    from vision_bill.service.receipt_service import ReceiptService
+    provider = formatter(False)
+    alternate = ModelInfo("alternate")
+    alternate.digest = "first"
+    alternate.capabilities = ["vision"]
     provider.get_available_models.return_value.append(alternate)
-    service=ReceiptService(settings.images, settings.pg, provider, ocr_provider=sidecar(),
-        ocr_settings=OcrSettings(enabled=True,allow_vision_fallback=True,vision_fallback_model_id='alternate'))
-    options=ExperimentOptions(pipeline='upload',allow_ocr_fallback=True)
-    first=await pipeline_identity(service, options)
-    alternate.digest='changed'
-    second=await pipeline_identity(service, options)
-    assert first != second
-    assert first['vision_fallback_model'] == {'id':'alternate','digest':'first'}
+    service = ReceiptService(
+        settings.images, settings.pg, provider, ocr_provider=sidecar(),
+        ocr_settings=OcrSettings(enabled=True, allow_vision_fallback=True,
+                                 vision_fallback_model_id="alternate"),
+    )
+    options = ExperimentOptions(pipeline="upload", allow_ocr_fallback=True)
+    first = await pipeline_identity(service, options)
+    alternate.digest = "changed"
+    second = await pipeline_identity(service, options)
+    assert first == second
+    assert "vision_fallback_model" not in first
+    provider.get_available_models.assert_not_awaited()
+
+
+async def test_unmanifested_benchmark_reevaluation_requires_explicit_new_run():
+    from types import SimpleNamespace
+
+    from vision_bill.service.benchmark_service import BenchmarkService
+
+    run_id, receipt_id = uuid4(), uuid4()
+    service = object.__new__(BenchmarkService)
+    service._db = SimpleNamespace(
+        run=AsyncMock(return_value=SimpleNamespace(receipt_ids=[receipt_id], model_ids=["model"])),
+        manifest=AsyncMock(return_value=None),
+    )
+    service._provider = SimpleNamespace(analyse_receipt_with_metadata=AsyncMock())
+    service._expected_receipt_and_path = AsyncMock(side_effect=AssertionError("must not infer"))
+    with pytest.raises(ValueError, match="create a new run"):
+        await service.reevaluate(run_id, receipt_id, "model", scope=AccessScope(user_id=uuid4()))
+    service._provider.analyse_receipt_with_metadata.assert_not_awaited()
+
+
+async def test_unmanifested_benchmark_worker_terminalizes_without_inference(settings):
+    import asyncio
+    from types import SimpleNamespace
+
+    from vision_bill.service.benchmark_service import BenchmarkService
+
+    service = object.__new__(BenchmarkService)
+    service._settings = settings.worker
+    service._db = SimpleNamespace(finish_task=AsyncMock(), retry_task=AsyncMock())
+    service._provider = SimpleNamespace(get_available_models=AsyncMock(),
+                                        analyse_receipt_with_metadata=AsyncMock())
+    task = {"inference_attempt_count": 0, "inference_started": False}
+    started = asyncio.get_running_loop().time()
+    await service._execute_reserved(task, SimpleNamespace(), None, started, started + 600)
+    service._db.finish_task.assert_awaited_once_with(task, success=False, deadline=started + 600)
+    service._db.retry_task.assert_not_awaited()
+    service._provider.get_available_models.assert_not_awaited()
+    service._provider.analyse_receipt_with_metadata.assert_not_awaited()

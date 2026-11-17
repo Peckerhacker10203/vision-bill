@@ -7,8 +7,8 @@ services:
       OCR__ALLOW_VISION_FALLBACK: "${OCR__ALLOW_VISION_FALLBACK:-false}"
   paddleocr-service:
     build:
-      context: .
-      dockerfile: paddleocr-service/Dockerfile.rocm
+      context: ./paddleocr-service
+      dockerfile: Dockerfile.rocm
       args:
         BUILD_JOBS: ${OCR_BUILD_JOBS:-8}
         AMDGPU_TARGETS: ${OCR_AMDGPU_TARGETS:-}

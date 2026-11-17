@@ -27,12 +27,15 @@ LLM__HOST=http://host.docker.internal:8083/v1
 LLM__API_KEY=none
 LLM__MODEL_NAME=receipt-formatter
 LLM__MODEL_LIFECYCLE=llamacpp
-OCR__ENABLED=true
+OCR__ENDPOINT=http://your-private-managed-ocr:8082
 OCR__MANAGE_MODEL_LIFECYCLE=true
 ```
 
-The URL must reach your deliberately deployed router. The example uses the Docker
-host gateway; a host process can use `http://127.0.0.1:8083/v1`. A host router must
+The LLM URL must reach your deliberately deployed router. Set the OCR endpoint to
+your actual managed service; an independent OCR-only bundle must use
+`OCR_SERVICE_MODE=managed` when paired with VisionBill. Combined bundles fix it
+to managed. See [prepared installation](distribution/README.md). The example uses the
+Docker host gateway; a host process can use `http://127.0.0.1:8083/v1`. A host router must
 listen on an interface reachable from the app container and remain on a trusted
 private network. `none` is a placeholder for a router without authentication;
 otherwise use its configured API key in the ignored private configuration.
@@ -40,8 +43,10 @@ The same Bearer key authenticates inference and lifecycle requests.
 
 Replace `receipt-formatter` with its exact canonical `id` from the router's
 `GET /models` response. Managed release does not resolve aliases. OCR formatting
-can use a text-only model. Direct vision or an explicitly configured vision
-fallback needs an image-capable model. For older servers with absent capability
+can use a text-only model and remains text/evidence-only on all ordinary failure,
+repair and classification paths. Direct vision without OCR, or an explicit admin
+direct-vision comparison, needs an image-capable model. For older servers with
+absent capability
 metadata, `LLM__VISION_MODEL_IDS=["receipt-vision"]` can declare known image support;
 it never overrides explicit contrary metadata. Output/context limits still apply;
 this setting does not give a text model vision support.
@@ -91,21 +96,26 @@ query/fragment components and ambiguous encoded/dot paths are rejected.
 
 `LLM__MODEL_LIFECYCLE=none` is the default for OpenAI-compatible providers without
 an implemented unload API. Pure LLM operation remains supported. Managed native
-OCR refuses unsupported unloading. Selecting `llamacpp` alone does not enable
-automatic unloading while production managed OCR is off. An explicitly unmanaged
-CPU/replay or separate-resource policy makes no shared-GPU handoff claim and
-cannot activate the shipped parked native sidecar without ownership.
+OCR waits before claim when unloading support or stable identities are missing;
+no attempt is spent and coordination is never silently disabled. Selecting
+`llamacpp` alone does not enable automatic unloading while production managed
+OCR is off. An explicitly unmanaged
+CPU/replay test policy makes no shared-GPU handoff claim. Do not use lifecycle
+opt-out for a native shared pair; a cold unmanaged native pipeline waits before
+claim and cannot activate the parked worker without ownership.
 Ollama uses its own lifecycle and ignores a retained OpenAI-only lifecycle option.
 
 Drain and stop all owners before changing provider, endpoint or lifecycle mode.
 Reconcile outstanding requests and owned models on the **old endpoint** first;
 the existing journal binds its endpoint identity. Only after confirmed release,
-with all owners stopped, archive the old lock/journal as described in recovery,
-change configuration and restart. Lifecycle configuration requires a restart.
+with all owners stopped, archive/reset the old handoff journal as described in
+recovery. Keep the lockfile inode intact, change configuration and restart. Lifecycle configuration requires a restart.
 
-Build/install and ordinary service startup do not run receipt comparisons,
-historical colleague/Gemma benchmarks or live inference tests. After building,
-test your own uploads through the web UI. Software CI uses CPU doubles; these
-contracts do not certify a real llama.cpp deployment or CUDA/ROCm hardware.
+Build/install and ordinary API startup do not run unsolicited comparisons or
+historical colleague/Gemma benchmarks. Persisted explicit pending work can resume
+under readiness/policy guards. Prepared native first setup separately runs full
+required qualification; model provisioning uses pull/tags data checks only. After
+installation, test your own uploads through the web UI. Software CI uses CPU
+doubles; these contracts do not certify a real llama.cpp deployment or CUDA/ROCm hardware.
 The context-budget diagnostic remains Ollama-only; the app and standalone
 benchmark use the configured provider.

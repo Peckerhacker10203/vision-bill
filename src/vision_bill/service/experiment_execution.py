@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 from ..config import OcrSettings
 from ..model.experiment import ExperimentOptions, ExtractionPipeline
 from ..model.receipt import Receipt
+from .execution_policy import EXECUTION_POLICY_VERSION
 
 if TYPE_CHECKING:
     from .receipt_service import ReceiptService
@@ -66,7 +67,10 @@ def effective_policy(
     options: ExperimentOptions,
 ) -> tuple[Any, OcrSettings, ExperimentOptions]:
     """Keep upload policy, explicit direct vision and strict OCR distinct."""
-    settings = service._ocr_settings
+    settings = service._ocr_settings.model_copy(update={
+        "allow_vision_fallback": False, "vision_fallback_model_id": None,
+    })
+    options = options.model_copy(update={"allow_ocr_fallback": False})
     ocr = service._ocr_provider
     if options.pipeline == ExtractionPipeline.OCR:
         settings = settings.model_copy(
@@ -80,13 +84,6 @@ def effective_policy(
             from ..provider.factory import get_ocr_provider
 
             ocr = get_ocr_provider(settings)
-        options = options.model_copy(update={"allow_ocr_fallback": False})
-    elif options.pipeline == ExtractionPipeline.UPLOAD:
-        options = options.model_copy(
-            update={
-                "allow_ocr_fallback": settings.allow_vision_fallback and options.allow_ocr_fallback
-            }
-        )
     # Direct vision still coordinates with the configured OCR sidecar; it simply
     # skips its load phase. This also protects direct benchmark jobs.
     return ocr, settings, options
@@ -200,16 +197,8 @@ async def pipeline_identity(
             capabilities = {key: capabilities[key] for key in (
                 "profile_id", "runtime_fingerprint", "ocr_max_new_tokens"
             )}
-    alternate_identity = None
-    if (settings.enabled and not settings.required and settings.allow_vision_fallback
-            and effective_options.allow_ocr_fallback and settings.vision_fallback_model_id):
-        from .extraction_pipeline import select_vision_model
-        alternate = select_vision_model(await provider.get_available_models(capability="vision"),
-                                        settings.vision_fallback_model_id)
-        if alternate is not None:
-            alternate_identity = {"id": alternate.id, "digest": alternate.digest}
     return {
-        "vision_fallback_model": alternate_identity,
+        "execution_policy_version": EXECUTION_POLICY_VERSION,
         "version": 1,
         "normalizer_version": NORMALIZER_VERSION,
         "schema_version": EXTRACTION_SCHEMA_VERSION,

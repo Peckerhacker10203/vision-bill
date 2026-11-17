@@ -37,7 +37,7 @@ async def test_0010_upgrade_preserves_reports_and_unknown_legacy_poll_baseline(d
         reports = [await conn.fetch("SELECT to_jsonb(t)::text AS payload FROM " + table + " t ORDER BY run_id") for table in ("benchmark_results", "benchmark_summaries")]
         historic_run = await conn.fetchval("SELECT (to_jsonb(r)-'owner_id')::text FROM benchmark_runs r WHERE id=$1", runs[-1])
         migrate(db)
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0018"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0019"
         for table, before in zip(("benchmark_results", "benchmark_summaries"), reports, strict=True):
             assert await conn.fetch("SELECT to_jsonb(t)::text AS payload FROM " + table + " t ORDER BY run_id") == before
         assert await conn.fetchval("SELECT (to_jsonb(r)-'owner_id')::text FROM benchmark_runs r WHERE id=$1", runs[-1]) == historic_run
@@ -52,8 +52,8 @@ async def test_0010_upgrade_preserves_reports_and_unknown_legacy_poll_baseline(d
                 assert task["leased_until"] is None
                 assert task["retry_at"] <= await conn.fetchval("SELECT clock_timestamp()")
         assert await conn.fetchval("SELECT experiment_manifest FROM benchmark_runs WHERE id=$1", runs[1]) == json.dumps({"options": {}, "historical": "unchanged"})
-        # Execute the migrated no-manifest task through the actual worker. Its
-        # 431 historical polls are neither an exhaustion count nor lifetime proof.
+        # Unmanifested historical work stops without inference. Its 431 historical
+        # polls remain historical metadata, never an inference count or lifetime proof.
         from vision_bill.config import ImageSettings
         from vision_bill.provider.llm.base import ModelInfo
         from vision_bill.provider.llm.ollama import OllamaProvider
@@ -69,17 +69,14 @@ async def test_0010_upgrade_preserves_reports_and_unknown_legacy_poll_baseline(d
         try:
             service = BenchmarkService(provider, receipts)
             await conn.execute("UPDATE benchmark_tasks SET retry_at=clock_timestamp()+interval '1 day' WHERE run_id=$1", runs[1])
-            for attempt in (1, 2, 3):
-                task = await service._db.lease_task()
-                assert task["run_id"] == runs[0]
-                await service._execute(dict(task))
-                summary = (await service._db.summaries(runs[0]))[0]
-                assert summary.completed == (7 if attempt < 3 else 8)
-                if attempt < 3:
-                    current = await conn.fetchrow("SELECT * FROM benchmark_tasks WHERE run_id=$1", runs[0])
-                    assert current["attempts"] == 431 and current["inference_attempt_count"] == attempt
-                    await conn.execute("UPDATE benchmark_tasks SET retry_at=clock_timestamp() WHERE run_id=$1", runs[0])
-            assert provider.analyse_receipt_with_metadata.await_count == 3
+            task = await service._db.lease_task()
+            assert task["run_id"] == runs[0]
+            assert task["attempts"] == 431 and task["inference_attempt_count"] == 0
+            await service._execute(dict(task))
+            summary = (await service._db.summaries(runs[0]))[0]
+            assert summary.completed == 8
+            assert await conn.fetchrow("SELECT * FROM benchmark_tasks WHERE run_id=$1", runs[0]) is None
+            provider.analyse_receipt_with_metadata.assert_not_awaited()
             assert await service._db.lease_task() is None
             assert summary.succeeded == 5 and summary.failed == 3
             assert summary.average_score == .7 and summary.all_case_average_score is None
@@ -104,7 +101,7 @@ async def test_0017_downgrade_refuses_to_discard_tracked_unfinished_state(db, st
             await conn.execute("INSERT INTO benchmark_tasks(run_id,model_id,receipt_id,inference_attempt_count) VALUES($1,'old',$2,1)", run, receipt)
         result = migrate(db, "0016", "downgrade", check=False)
         assert result.returncode != 0 and "destructive benchmark claim downgrade refused" in result.stderr
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0018"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0019"
         assert await conn.fetchval("SELECT count(*) FROM benchmark_tasks") == 1
     finally:
         await conn.close()

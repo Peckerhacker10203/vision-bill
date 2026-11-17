@@ -24,10 +24,10 @@
 		"waitReason": "Waiting for service / retry",
 		"resultCode": "Analysis result",
 		"retry": "Retry analysis",
+		"retryCurrentPolicy": "Retry using current server settings",
 		"openDraft": "Open receipt draft",
 		"recovery": "An earlier upload has an unknown outcome. Check Queue first. To recover it, select the same photos in the same order and click Upload. Its original options and request key will be reused. No upload is sent automatically.",
-		"ownerChanged": "Your account changed. Select the photos again before uploading.",
-		"allowFallback": "Allow vision analysis if OCR fails"
+		"ownerChanged": "Your account changed. Select the photos again before uploading."
 	},
 	"app": {
 		"name": "Vision Bill"
@@ -540,6 +540,7 @@
 			"ocr_inference_failed": "OCR could not complete inference for this request.",
 			"ocr_runtime_changed": "The OCR runtime identity changed during processing. A fresh attempt is required.",
 			"retry_backoff": "Waiting for the scheduled retry after a failed attempt.",
+			"execution_policy_changed": "Processing is paused because the server settings changed. Retry using current server settings to continue.",
 			"source_integrity_failed": "The original source could not be verified. Processing is blocked.",
 			"timed_out": "The processing deadline was reached.",
 			"unreadable": "The receipt could not be read reliably. Check the file or try clearer photos.",

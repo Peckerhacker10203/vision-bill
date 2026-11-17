@@ -6,6 +6,8 @@
   "hipblaslt_empty_target_fallback": "gfx1100",
   "input_sha256": {
     "build/hip-rdna2-v1.patch": "017f955eb5a9d2adec5e416ab0dc17b58a9fd128e4665da28af2e730eba6306a",
+    "ocr_contract/__init__.py": "d87c51b68d0594f0bc022f0ae65a40bc86735c93a07dfdf5721430e937bf1f5c",
+    "ocr_contract/document_image.py": "f5949c08bc03b0a168619bbfce19ac26fc009e4319227856bf5779c5562128c7",
     "requirements.bootstrap.lock": "ea0463cbcbd31b0f368bd61ecca40ab60afe376dbfc6f6af4734eab20aa134f3",
     "requirements.build.lock": "69689dc39bd5e96aff805a1fc556fab5d786b3de7330d1ab3b21cd954833872d",
     "requirements.runtime.lock": "c6d6471af279f271daac0e46017aea566af881493d0e43404d1ab0c9a6b15b88"

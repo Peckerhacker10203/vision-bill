@@ -29,6 +29,33 @@ afterEach(() => {
 	vi.useRealTimers();
 });
 
+it.each(['pending', 'processing'])(
+	'explicitly adopts current processing policy on a held %s job and retains retry identity',
+	async (state) => {
+		setLocale('en');
+		vi.spyOn(api, 'getImage').mockResolvedValue(
+			status({ status: state, wait_reason: 'execution_policy_changed', retry_at: null }) as never
+		);
+		const retry = vi
+			.spyOn(api, 'retrySubmission')
+			.mockRejectedValue(new ApiError(0, 'connection lost'));
+		render(SubmissionStatus, { id: 'job' });
+		const button = await screen.findByRole('button', {
+			name: 'Retry using current server settings'
+		});
+		expect(screen.queryByRole('button', { name: 'Retry analysis' })).toBeNull();
+		await fireEvent.click(button);
+		await screen.findByRole('alert');
+		await fireEvent.click(button);
+		await waitFor(() => expect(retry).toHaveBeenCalledTimes(2));
+		expect(retry.mock.calls[0]).toEqual(retry.mock.calls[1]);
+		expect(retry.mock.calls[0]).toEqual([
+			'job',
+			{ expected_generation: 1, request_key: expect.any(String), policy: 'current' }
+		]);
+	}
+);
+
 describe('SubmissionStatus', () => {
 	it.each(['en', 'de'] as const)(
 		'explains model unreadability despite a valid working image in %s',

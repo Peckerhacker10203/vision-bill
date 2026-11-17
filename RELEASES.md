@@ -1,15 +1,22 @@
-# Manual releases to GHCR
+# Release procedures
+
+For the five verified prebuilt installation variants and their input producer,
+physical qualification and assets-last publication gates, use the
+[distribution guide](distribution/README.md). The source/gates now exist, but no
+actual qualified native images or prepared bundles were published here. The older
+app-image workflow below remains separate; it cannot qualify or publish a native
+installation bundle.
 
 ## Unreleased package
 
 Durable 202 uploads/retries, source-preserving review/checks2, exact money, explicit
-Gold/v4 diagnostics, opt-in qualified native OCR candidates and account/view
+Gold/v4 diagnostics, strict optional OCR, independent native OCR candidates and prepared distribution gates and account/view
 isolation are integrated in this local package. Historical split/CPU results retain
 their original meaning. See [upgrade prerequisites and accepted evidence](UPGRADE_AND_VERIFY.md).
 No version/tag/release or deployment has been authorized by this documentation
 update. In particular, publishing the app image does not qualify CUDA/ROCm OCR.
 
-After merging this workflow, open **Actions → Release → Run workflow**, select the
+After maintainers deliberately adopt this workflow on the default branch, open **Actions → Release → Run workflow**, select the
 repository's default branch, and choose `patch`, `minor`, or `major`. Merging a PR
 or adding a label never publishes a release. Only users with repository write
 access can dispatch workflows; protect the default branch and workflow changes

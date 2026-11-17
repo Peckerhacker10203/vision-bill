@@ -47,7 +47,7 @@ def test_experiment_persists_scores_and_uses_frozen_verified_data(http_factory):
         json={
             "model_ids": ["e2e-vision"],
             "receipt_ids": [receipt_id],
-            "experiment": {"temperature": 0, "include_classification": False},
+            "experiment": {"pipeline": "direct_vision", "temperature": 0, "include_classification": False},
         },
     )
     assert response.status_code == 202, response.text
@@ -80,10 +80,10 @@ def test_experiment_persists_scores_and_uses_frozen_verified_data(http_factory):
     assert reevaluate.json()["expected"]["merchant_name"] == case.expected_receipt.merchant_name
 
 
-def test_forced_ocr_rejected_without_extension_and_results_are_admin_only(http_factory):
+def test_forced_ocr_obeys_capabilities_and_results_are_admin_only(http_factory):
     client = admin(http_factory)
     capabilities = client.get(f"{API}/benchmarks/capabilities").json()
-    assert capabilities == {"ocr_available": False, "ocr_enabled": False, "thinking_control": False}
+    assert capabilities["thinking_control"] is False
     receipt_id, _ = verified_receipt(client)
     response = client.post(
         f"{API}/benchmarks",
@@ -93,7 +93,7 @@ def test_forced_ocr_rejected_without_extension_and_results_are_admin_only(http_f
             "experiment": {"pipeline": "ocr"},
         },
     )
-    assert response.status_code == 422
+    assert response.status_code == (202 if capabilities["ocr_available"] else 422), response.text
     response = client.post(
         f"{API}/benchmarks",
         json={

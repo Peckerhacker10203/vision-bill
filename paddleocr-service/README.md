@@ -107,8 +107,11 @@ absolute container paths, `cache_dir: /var/cache/paddlex`,
 `qualification_manifest: /var/lib/ocr/static-manifest.json`,
 `expected_packages: {}` for initial sealing,
 `expected_paddle_commit: 7688495538f4d6c1893f084dd238a402e8f68ab6`, and
-`image_identity` containing the actual immutable built image digest. Obtain the
-local image content ID with `docker image inspect --format '{{.Id}}' IMAGE`.
+`image_identity` containing the actual image identity expected by the selected
+qualification route. For prepared releases this is the immutable registry manifest
+reference; the separate config blob hash must equal the actual local Docker `.Id`.
+`docker image inspect --format '{{.Id}}' IMAGE` returns the config ID, not the
+registry manifest digest. Never substitute it for a published image reference.
 The qualifier fills the exact installed active dependency versions/content hashes;
 a nonempty supplied map must match exactly. The sealer includes `paddlex[ocr]`
 and all active marker/extras-aware transitive dependencies, with exactly one
@@ -178,42 +181,83 @@ model/image/runtime identities, actual device/GFX, source hashes, timing and aud
 counts/digests. It contains no OCR text or images. Only the actual target is added
 to `qualified_targets`; repeat the release gate on each physical target.
 
-## Startup handoff
+## Independent service and client
 
-Use the generated `qualification.runtime.json`, the sealed manifest, exact model
-bytes and exact upright image for deployment. Compose mounts runtime inputs
-read-only and exposes no OCR host port. The service starts parked with no native
-child or loaded models. Build targets only build/install; service startup and
-`/health`, `/ready`, `/info` polling never start a benchmark or initially load OCR.
-Healthchecks use `/health`. `/ready` stays false with `ocr_parked` until an explicit
-processing/qualification request loads and qualifies the native child. `/info`
-also exposes the last qualified identity as historical evidence, not GPU readiness.
-A model/package/image/source/target change invalidates the seal and requires fresh
-qualification, never an automatic backend/precision fallback. While OCR is loaded,
-readiness/capability polling observes an idle worker death and schedules one coordinated bounded
-replacement, waiting for in-flight ownership/retirement. Failed replacement
-qualification stays unready without an endless retry loop; shutdown does not revive
-workers. Parking disables recovery until a new explicit load. The application
-distinguishes parked availability (`can_load`) from qualified readiness and can
-wait on OCR/provider/model startup without spending
-an analysis attempt. The base stack keeps OCR optional
-under profile `ocr`; explicitly select a CUDA/ROCm overlay and configure the
-application OCR enabled/required/fallback policy. Never silently activate OCR or
-reprocess stored receipts as part of packaging. Explicit overlay deployment after
-successful target qualification is:
+The service, neutral `ocr_contract` and HTTP-only client build from the independent
+`paddleocr-service/` context; they do not import the VisionBill application. Prefer
+verified [prepared OCR bundles](../distribution/README.md) for installation once
+actually released. No such native release was produced here.
 
-```sh
-docker compose --profile ocr -f docker-compose.yml -f docker-compose.cuda.yml up -d
-# Or use docker-compose.rocm.yml for a separately qualified ROCm target.
+OCR-only bundles default to `OCR_SERVICE_MODE=standalone`. One request owns the
+whole serial native load/infer/park lifecycle and returns validated original/working
+identity and geometry. Managed owner tokens/lifecycle routes are rejected in this
+mode. For a VisionBill pair, explicitly set `OCR_SERVICE_MODE=managed` before start:
+the app/client supplies generation-fenced lifecycle ownership. Combined bundles
+always use managed mode. Never mix standalone HTTP ownership with a managed pair.
+
+From a prepared Python environment in the source checkout, an explicit standalone
+request is:
+
+```bash
+python paddleocr-service/client.py /private/synthetic.png \
+  --url http://127.0.0.1:8082 --timeout-seconds 600
 ```
 
-Overlays set application `OCR__ENABLED=true`; `OCR__REQUIRED` and
-`OCR__ALLOW_VISION_FALLBACK` default false. Required OCR forbids fallback. Optional
-fallback needs global permission AND explicit per-upload `allow_ocr_fallback=true`;
-a text formatter may require `OCR__VISION_FALLBACK_MODEL_ID`. Model/digest and
-alternate identity are frozen, not silently changed. The default sidecar Dockerfile
-intentionally fails: base Compose alone is not a CPU runtime. For upgrades, first
-follow [owner migrations/worker drain](../UPGRADE_AND_VERIFY.md).
+`--media-type` can override MIME inference. The client sends the exact original
+once with request UUID, photo index and SHA256, validates the matching response,
+and prints JSON that may contain receipt text/pixels; keep output private. It needs
+HTTP/contract dependencies, no app or native framework import. The endpoint must
+actually be exposed by your standalone deployment; source Compose publishes no
+OCR host port. The app's optional endpoint selector is independent of service mode.
+
+## First setup and serving handoff
+
+Prepared bundles run `ocr_service.initialize` separately before serving. It checks
+[pinned release assets](release-bundle.schema.json), image config/source identities,
+licenses and model/fixture inventories, provisions their verified bytes, and runs
+the full fixed native qualification. Successful complete state selects runtime and
+smoke paths; an exact matching cached installation is reused. This initializer is
+required first setup, never an unsolicited historical/Gemma model comparison or
+part of a 600-second receipt attempt. See [bundle ordering](../distribution/README.md).
+
+Serving starts parked with no native child/loaded models. `/health` is passive;
+`/ready` stays false with `ocr_parked` until explicitly loaded and qualified. `/info`
+can expose last qualified identity as history, not current GPU readiness. Polling
+never cold-loads OCR merely to answer readiness. An already-explicitly-loaded idle
+worker's death can schedule one bounded coordinated replacement, fenced against
+active inference/park; failed qualification stays unready without an endless loop.
+Parking disables recovery until a new explicit load; shutdown does not revive workers.
+
+Model/package/image/source/target changes invalidate the seal and require fresh
+qualification. The app distinguishes parked `can_load` from qualified readiness,
+waits before claim on unavailable/incompatible managed pairs, and does not silently
+opt out. A cold unmanaged native pipeline also waits before claim.
+
+Advanced source deployments can use the existing manual `make ocr-qualify-cuda` or
+`make ocr-qualify-rocm` path above, then run the selected Compose overlay. Those
+commands preserve the native entrypoint supervisor, with explicit
+`OCR_RUNTIME_SETTINGS_PATH` and `OCR_QUALIFICATION_IMAGE_PATH`; these variables select
+the manual runtime route instead of requiring automatic selected-state discovery.
+They do not create a prepared release. The direct `ocr_service.qualify` CLI is the
+manual qualifier, while `ocr_service.initialize` consumes release bundle/config/ID
+inputs and supervises setup as container PID1. Do not substitute one CLI's flags
+for the other. The default native Dockerfile intentionally fails; base source
+Compose is not a CPU runtime. Source GPU overlays enable legacy OCR; canonical
+`OCR__ENDPOINT` wins if explicitly present. Ordinary OCR never permits image fallback,
+regardless of deprecated required/allow/alternate fields. To change policy, follow
+[worker drain and explicit adoption](../UPGRADE_AND_VERIFY.md#disable-pause-and-recover).
+
+The initializer, OCR entrypoint and derived Ollama supervisor retain PID1 with
+`init: false`; do not insert Docker `--init` or detach their owned native processes.
+An exclusive installation lock excludes initialization from serving; per-role locks
+exclude duplicate initializer/OCR/Ollama roles. Durable markers survive hard death.
+`initialize --force` requests requalification only after serving stops and does not
+clear crash fences. Ordinary startup never clears them by age or missing local PID.
+After hard death, externally confirm **all** managed initializer/OCR/Ollama containers
+using the volume are removed and all their descendants are gone. Only then archive/
+remove `/coord/installation.active-*.json` markers; retain the installation and role
+lockfiles. Never delete live lockfiles or run `compose down --volumes` on user data.
+This installation fence is distinct from the app's model-handoff journal below.
 
 ## Internal model ownership
 
@@ -242,12 +286,14 @@ failures. OpenAI-compatible inference has no standard unload contract. Its defau
 enables the dedicated router protocol and waits for exact-ID `unloaded` confirmation.
 A successful unload POST, sleeping state or missing model is insufficient. See
 [OpenAI-compatible backend setup](../OPENAI_COMPATIBLE.md). Pure LLM OpenAI operation
-remains supported. `OCR__MANAGE_MODEL_LIFECYCLE=false` is an explicit CPU-only or
-separate-resource policy, used by software E2E stubs; it makes no GPU handoff claim
-and cannot activate the shipped parked native sidecar without ownership.
+remains supported. `OCR__MANAGE_MODEL_LIFECYCLE=false` is used by explicit CPU/replay
+software stubs;
+it makes no GPU handoff claim. Do not recommend it for a native shared pair; a cold
+unmanaged pipeline waits before claim and cannot activate the parked worker.
 
 Managed forced-OCR benchmarks, standalone OCR and frozen OCR-enabled uploads
-require current production `OCR__ENABLED=true` and
+require current production OCR selected (canonical nonblank endpoint or legacy
+`OCR__ENABLED=true`) and
 `OCR__MANAGE_MODEL_LIFECYCLE=true` on every app worker. Otherwise ordinary direct
 LLM work would not share their ownership. Forced qualification/execution fails
 before any load; previously frozen managed uploads wait before claim without
@@ -272,8 +318,12 @@ sidecar, then establish that the dedicated LLM endpoint has no outstanding
 requests (restart only that dedicated endpoint if necessary). Unload/verify only
 the journal's owned model IDs using `/api/ps` for Ollama or exact-ID
 `GET /models` status `unloaded` for llama.cpp. Only after those checks, with all owners stopped,
-archive/remove the lock and adjacent `.json` journal and restart parked services.
-Never reset ownership while workers are active or restart a shared foreign runtime.
+archive/reset only the adjacent `.json` handoff journal and restart parked services;
+retain the lockfile inode so all participants continue locking the same file.
+Never reset ownership while workers are active, delete live lockfiles or restart a
+shared foreign runtime. Installation crash markers require the stricter external
+all-managed-containers-removed procedure above; clearing the app journal does not
+clear that fence.
 
 The historical CPU PP-OCR comparator has an independent hashed build target in
 `scripts/ocr_harness/Dockerfile`, selected with

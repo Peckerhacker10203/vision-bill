@@ -23,6 +23,7 @@ class PaddleOcrProvider(OcrProvider):
 
     def __init__(self, service_url: str, timeout: int = 300, *, managed_lifecycle: bool = True):
         self.service_url = service_url.rstrip("/")
+        self.lifecycle_identity = "paddleocr:" + hashlib.sha256(self.service_url.encode()).hexdigest()
         self.timeout = timeout
         self.managed_lifecycle = managed_lifecycle
 
@@ -55,6 +56,10 @@ class PaddleOcrProvider(OcrProvider):
                     or not isinstance(info.get("profile"), dict)
                     or not isinstance(info.get("worker", {}), dict)
                 ):
+                    raise ValueError("ocr_contract_mismatch")
+                # Older v2 services omit mode; explicit ownership must match this client.
+                expected_mode = "managed" if self.managed_lifecycle else "standalone"
+                if "service_mode" in info and info["service_mode"] != expected_mode:
                     raise ValueError("ocr_contract_mismatch")
                 response = await client.get(f"{self.service_url}/ready")
                 if response.status_code not in (200, 503):

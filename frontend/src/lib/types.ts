@@ -148,6 +148,7 @@ export interface UploadOptions {
 export interface RetryRequest {
 	expected_generation: number;
 	request_key: string;
+	policy?: 'preserve' | 'current';
 }
 export interface ReviewRequest {
 	expected_operation_revision?: number;

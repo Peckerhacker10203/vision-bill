@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from vision_bill.model.ocr import OcrResponse, WorkerReadiness
+from ocr_contract import OcrResponse, WorkerReadiness
 
 from .profile import RuntimeSettings, load_profile
 
@@ -151,7 +151,9 @@ def _worker_main(
             message.update(kind="result", artifact=publish_result(result, reply_directory))
         except Exception:  # noqa: BLE001 - native boundary must hide exception details
             if not adapter.qualified:
-                message.update(kind="qualification_invalidated", code="ocr_qualification_invalidated")
+                message.update(
+                    kind="qualification_invalidated", code="ocr_qualification_invalidated"
+                )
                 output_channel.put(message)
                 return
             message.update(kind="error", code="ocr_inference_failed")
@@ -178,6 +180,9 @@ class OcrWorkerManager:
         self._control = threading.RLock()
         self._state = threading.Lock()
         self._active = threading.Lock()
+        self._admission = threading.Lock()
+        self._standalone_admitted = 0
+        self._standalone_session = False
         self._stopped = threading.Event()
         self._generation = 0
         self._idle_recovery_generation: int | None = None
@@ -186,6 +191,7 @@ class OcrWorkerManager:
         self._parked = True
         self._owner: str | None = None
         self._owner_generation = 0
+        self._owner_load_allowed = False
         self.last_identity: dict[str, str | None] = {}
         self._profile_id: str | None = None
         self._runtime_fingerprint: str | None = None
@@ -216,7 +222,10 @@ class OcrWorkerManager:
             elif self._ready and not alive and not self._parked:
                 reason = "ocr_worker_crashed"
                 self._ready, self._reason = False, reason
-                if self._idle_recovery_generation != self._generation:
+                if (
+                    not self._standalone_session
+                    and self._idle_recovery_generation != self._generation
+                ):
                     self._idle_recovery_generation = self._generation
                     recover_generation = self._generation
             observation = WorkerReadiness(
@@ -246,7 +255,9 @@ class OcrWorkerManager:
     def _restart_generation(self, generation: int) -> None:
         with self._control:
             if (
-                self._stopped.is_set() or self._parked
+                self._stopped.is_set()
+                or self._parked
+                or self._standalone_session
                 or generation != self._generation
                 or self._recovery_attempted_generation == generation
             ):
@@ -265,7 +276,12 @@ class OcrWorkerManager:
             self._ready, self._reason, self._profile_id = False, reason, None
             self._runtime_fingerprint = None
 
-    def start(self) -> None:
+    def start(
+        self,
+        *,
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         """Bounded initialization, called off the HTTP event loop."""
         with self._control:
             if self._stopped.is_set() or self.readiness().ready:
@@ -296,10 +312,20 @@ class OcrWorkerManager:
                 )
                 self._proc.start()
                 deadline = time.monotonic() + self._startup_timeout
+                if deadline_monotonic is not None:
+                    deadline = min(deadline, deadline_monotonic)
                 while not self._stopped.is_set():
+                    if cancel_event is not None and cancel_event.is_set():
+                        self._set_unready("ocr_cancelled")
+                        break
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        self._set_unready("ocr_startup_timeout")
+                        self._set_unready(
+                            "ocr_deadline_exceeded"
+                            if deadline_monotonic is not None
+                            and time.monotonic() >= deadline_monotonic
+                            else "ocr_startup_timeout"
+                        )
                         break
                     try:
                         message = self._out_q.get(timeout=min(0.05, remaining))
@@ -316,8 +342,10 @@ class OcrWorkerManager:
                             self._reason = None if self._ready else "ocr_stopped"
                             self._profile_id = message["profile_id"]
                             self._runtime_fingerprint = message.get("runtime_fingerprint")
-                            self.last_identity = {"profile_id": self._profile_id,
-                                                  "runtime_fingerprint": self._runtime_fingerprint}
+                            self.last_identity = {
+                                "profile_id": self._profile_id,
+                                "runtime_fingerprint": self._runtime_fingerprint,
+                            }
                         if self._ready:
                             return
                     self._set_unready("ocr_init_failed")
@@ -357,11 +385,13 @@ class OcrWorkerManager:
             self._reply_directory.cleanup()
             self._reply_directory = None
 
-    def _recover(self, reason: str) -> None:
+    def _recover(self, reason: str, *, restart: bool = True) -> None:
         with self._control:
             generation = self._generation
             self._set_unready(reason)
             self._teardown()
+        if not restart:
+            return
         # A new generation is qualified separately; never replay the failed request.
         threading.Thread(
             target=self._restart_generation,
@@ -381,25 +411,114 @@ class OcrWorkerManager:
             self._set_unready("ocr_parked")
             self._owner = owner
             self._owner_generation = generation
+            self._owner_load_allowed = True
 
-    def load(self, owner: str) -> None:
+    def load(
+        self,
+        owner: str,
+        *,
+        deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         with self._control:
             if self._owner != owner:
                 raise OcrWorkerError("ocr_stale_owner", 409)
-            self.start()
+            if not self._owner_load_allowed:
+                raise OcrWorkerError("ocr_owner_phase_closed", 409)
+            self.start(deadline_monotonic=deadline_monotonic, cancel_event=cancel_event)
             ready = self.readiness()
             if not ready.ready:
-                raise OcrWorkerError(ready.reason_code or "ocr_not_ready", 503)
+                raise OcrWorkerError(
+                    ready.reason_code or "ocr_not_ready",
+                    504 if ready.reason_code == "ocr_deadline_exceeded" else 503,
+                )
 
     def park(self, owner: str) -> None:
         with self._active, self._control:
             if self._owner != owner:
                 raise OcrWorkerError("ocr_stale_owner", 409)
+            # Revoke before teardown, including a failed reap. A delayed load
+            # HTTP request must never resurrect this phase after park returns.
+            self._owner_load_allowed = False
             self._parked = True
             self._teardown()
             self._set_unready("ocr_parked")
 
-    def infer(self, request: OcrRequest, *, deadline_monotonic: float, owner: str | None = None) -> OcrResponse:
+    @staticmethod
+    def _check_request(deadline_monotonic: float, cancel_event: threading.Event | None) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise OcrWorkerError("ocr_cancelled", 499)
+        if time.monotonic() >= deadline_monotonic:
+            raise OcrWorkerError("ocr_deadline_exceeded", 504)
+
+    def infer_standalone(
+        self,
+        request: OcrRequest,
+        *,
+        deadline_monotonic: float,
+        cancel_event: threading.Event | None = None,
+    ) -> OcrResponse:
+        """Own a cold request through positively confirmed native teardown."""
+        self._check_request(deadline_monotonic, cancel_event)
+        with self._state:
+            if self._standalone_admitted >= 5:
+                raise OcrWorkerError("ocr_queue_full", 429)
+            self._standalone_admitted += 1
+        acquired = False
+        try:
+            # This lock covers claim/load/infer/park. infer and park acquire
+            # _active themselves; nesting _active here would deadlock.
+            while not acquired:
+                self._check_request(deadline_monotonic, cancel_event)
+                acquired = self._admission.acquire(
+                    timeout=min(0.05, max(0, deadline_monotonic - time.monotonic()))
+                )
+            self._check_request(deadline_monotonic, cancel_event)
+            with self._control, self._state:
+                # Polls may mark a crash unready, but only this request owns
+                # teardown. Block both fresh and previously queued recovery.
+                self._standalone_session = True
+                owner = f"{self._owner_generation + 1}:{uuid4()}"
+            self.claim(owner)
+            try:
+                self._check_request(deadline_monotonic, cancel_event)
+                self.load(owner, deadline_monotonic=deadline_monotonic, cancel_event=cancel_event)
+                result = self.infer(
+                    request,
+                    deadline_monotonic=deadline_monotonic,
+                    owner=owner,
+                    cancel_event=cancel_event,
+                    recover=False,
+                )
+                self._check_request(deadline_monotonic, cancel_event)
+            finally:
+                # A failed park must preserve request artifacts, even if an
+                # earlier inference error appeared safe to clean up.
+                try:
+                    self.park(owner)
+                except Exception:  # noqa: BLE001 - unconfirmed death forbids artifact cleanup
+                    raise OcrWorkerError(
+                        "ocr_worker_unstoppable", 503, cleanup_safe=False
+                    ) from None
+            self._check_request(deadline_monotonic, cancel_event)
+            return result
+        finally:
+            if acquired:
+                with self._control, self._state:
+                    self._standalone_session = False
+                self._admission.release()
+            with self._state:
+                self._standalone_admitted -= 1
+
+    def infer(
+        self,
+        request: OcrRequest,
+        *,
+        deadline_monotonic: float,
+        owner: str | None = None,
+        cancel_event: threading.Event | None = None,
+        recover: bool = True,
+    ) -> OcrResponse:
         if time.monotonic() >= deadline_monotonic:
             raise OcrWorkerError("ocr_deadline_exceeded", 504)
         with self._state:
@@ -436,16 +555,19 @@ class OcrWorkerManager:
                 try:
                     in_q.put(request, block=False)
                 except (OSError, ValueError, queue.Full):
-                    self._recover("ocr_worker_crashed")
+                    self._recover("ocr_worker_crashed", restart=recover)
                     raise OcrWorkerError("ocr_worker_crashed", 503) from None
             while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    self._recover("ocr_cancelled", restart=recover)
+                    raise OcrWorkerError("ocr_cancelled", 499)
                 if self._stopped.is_set():
                     with self._control:
                         self._teardown()
                     raise OcrWorkerError("ocr_stopped", 503)
                 remaining = deadline_monotonic - time.monotonic()
                 if remaining <= 0:
-                    self._recover("ocr_deadline_exceeded")
+                    self._recover("ocr_deadline_exceeded", restart=recover)
                     raise OcrWorkerError("ocr_deadline_exceeded", 504)
                 try:
                     message = out_q.get(timeout=min(0.05, remaining))
@@ -455,7 +577,7 @@ class OcrWorkerManager:
                             self._teardown()
                             raise OcrWorkerError("ocr_stopped", 503) from None
                         if proc is not self._proc or not proc.is_alive():
-                            self._recover("ocr_worker_crashed")
+                            self._recover("ocr_worker_crashed", restart=recover)
                             raise OcrWorkerError("ocr_worker_crashed", 503) from None
                     continue
                 except (OSError, ValueError, TypeError, RecursionError):
@@ -463,14 +585,14 @@ class OcrWorkerManager:
                         with self._control:
                             self._teardown()
                         raise OcrWorkerError("ocr_stopped", 503) from None
-                    self._recover("ocr_worker_crashed")
+                    self._recover("ocr_worker_crashed", restart=recover)
                     raise OcrWorkerError("ocr_worker_crashed", 503) from None
                 if message.get("generation") != generation or message.get("request_id") != str(
                     request.request_id
                 ):
                     continue
                 if message.get("kind") == "qualification_invalidated":
-                    self._recover("ocr_qualification_invalidated")
+                    self._recover("ocr_qualification_invalidated", restart=recover)
                     raise OcrWorkerError("ocr_qualification_invalidated", 503)
                 if message.get("kind") != "result":
                     raise OcrWorkerError("ocr_inference_failed", 502)
@@ -487,10 +609,10 @@ class OcrWorkerManager:
                         with self._control:
                             self._teardown()
                         raise OcrWorkerError("ocr_stopped", 503) from None
-                    self._recover("ocr_invalid_result")
+                    self._recover("ocr_invalid_result", restart=recover)
                     raise OcrWorkerError("ocr_invalid_result", 502) from None
                 if time.monotonic() >= deadline_monotonic:
-                    self._recover("ocr_deadline_exceeded")
+                    self._recover("ocr_deadline_exceeded", restart=recover)
                     raise OcrWorkerError("ocr_deadline_exceeded", 504)
                 return result
         finally:

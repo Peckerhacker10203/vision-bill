@@ -5,8 +5,7 @@ import { ensureSession, confirmDialog } from '../helpers/ui';
 import { awaitSubmission, uploadViaApi } from '../helpers/api';
 import type { ReceiptWithDetails } from '../../src/lib/types';
 
-// Uses the real durable direct-vision fallback and existing deterministic fixtures.
-// Native OCR unwarped evidence requires Task14's OCR stub; see Task12 report.
+// Uses server-selected OCR/direct extraction and deterministic CPU stub evidence.
 test.describe('draft review and versioned receipt editing', () => {
 	stubGuard();
 	test('partial observations stay nullable until explicitly completed; finalize yields one unverified receipt', async ({

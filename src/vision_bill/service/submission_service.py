@@ -36,6 +36,7 @@ from ..model.workflow import (
 from ..provider.llm.base import ModelInfo
 from ..provider.llm.errors import AnalysisTimeoutError, UnreadableReceiptError
 from ..provider.ocr.base import compact_ocr_text
+from .execution_policy import current_snapshot, policy_hold_reason, snapshot_ocr
 from .extraction_pipeline import (
     OcrRuntimeChangedError,
     OriginalSourceChangedError,
@@ -56,6 +57,10 @@ class SourceIntegrityError(Exception):
     """Original bytes/path/order no longer match the durable submission."""
 
 
+class PolicyHoldError(Exception):
+    """The operator policy changed after readiness or while preparing dispatch."""
+
+
 class SubmissionService:
     def __init__(self, settings: Settings, receipts: ReceiptService, images: ImageService):
         self.settings = settings
@@ -73,13 +78,9 @@ class SubmissionService:
 
     @staticmethod
     def _fallback_permission(snapshot: dict[str, Any]) -> bool:
-        old = {"ocr", "temperature", "max_output_tokens"}
-        if set(snapshot) not in (old, old | {"allow_ocr_fallback"}):
-            raise ValueError("execution_snapshot_invalid")
-        permission = snapshot.get("allow_ocr_fallback", False)
-        if type(permission) is not bool:
-            raise ValueError("execution_snapshot_invalid")
-        return permission
+        snapshot_ocr(snapshot)
+        # Legacy intent stays in the saved request, never in effective execution.
+        return False
 
     @staticmethod
     def _initial_model(models: list[ModelInfo], preferred: str, *, vision: bool) -> ModelInfo | None:
@@ -105,8 +106,10 @@ class SubmissionService:
         """Readiness precedes claim, and therefore never spends the attempt budget."""
         snapshot = image.effective_options or self.legacy_snapshot()
         try:
-            permission = self._fallback_permission(snapshot)
-            ocr = OcrSettings.model_validate(snapshot["ocr"])
+            reason = policy_hold_reason(snapshot, self.settings.ocr)
+            if reason:
+                return reason
+            ocr = snapshot_ocr(snapshot)
         except (ValueError, KeyError):
             # Claim malformed saved options to record a terminal safe diagnostic.
             return None
@@ -114,29 +117,27 @@ class SubmissionService:
             from .gpu_handoff import managed_ocr_enabled
             if ocr.enabled and ocr.manage_model_lifecycle and not managed_ocr_enabled():
                 return "ocr_unavailable"
+            if ocr.enabled and ocr.manage_model_lifecycle and not self.receipts.managed_ocr_compatible():
+                return "provider_unavailable"
             if not await self.receipts.check_connection():
                 return "provider_unavailable"
             capability = "vision"
-            alternate = None
             selected = image.model_id or self.settings.llm.model_name
             if ocr.enabled:
                 capabilities = await self.receipts.ocr_capabilities(ocr)
-                if not (capabilities.ready or capabilities.can_load) and (
-                    ocr.required or not ocr.allow_vision_fallback or not permission
+                if not (
+                    capabilities.ready or (ocr.manage_model_lifecycle and capabilities.can_load)
                 ):
                     return "ocr_unavailable"
-                if capabilities.ready or capabilities.can_load:
-                    capability = "text"
-                else:
-                    alternate = ocr.vision_fallback_model_id
+                capability = "text"
             models = await self.receipts.get_available_models(capability=capability)
-            if not image.effective_options and (not ocr.enabled or capability == "text"):
+            if not image.effective_options:
                 model = self._initial_model(models, selected, vision=capability == "vision")
                 if model is not None:
                     return None
                 return "vision_model_unavailable" if capability == "vision" else "formatter_model_unavailable"
             if capability == "vision":
-                return None if select_vision_model(models, selected, alternate) is not None else "vision_model_unavailable"
+                return None if select_vision_model(models, selected) is not None else "vision_model_unavailable"
             return None if any(model.id == selected for model in models) else "formatter_model_unavailable"
         except (httpx.HTTPError, OSError, ValueError, KeyError):
             return "provider_unavailable"
@@ -199,6 +200,10 @@ class SubmissionService:
                 return await self.db.finish_attempt(claim, outcome, deadline=db_deadline)
         except StaleClaimError:
             return CommitResult(stale=True)
+        except PolicyHoldError:
+            return await self.db.hold_claim_for_policy(
+                claim, "execution_policy_changed", deadline=db_deadline
+            )
         except (SourceIntegrityError, OriginalSourceChangedError):
             outcome = AttemptOutcome(kind="terminal", result_code="source_integrity_failed")
         except (TimeoutError, AnalysisTimeoutError):
@@ -236,19 +241,24 @@ class SubmissionService:
         *, db_deadline: float,
     ) -> AttemptOutcome:
         image = claim.image
-        if not image.effective_options:
-            # Resolve legacy model selection from affirmative provider discovery.
+        snapshot = image.effective_options or current_snapshot(self.settings)
+        if policy_hold_reason(snapshot, self.settings.ocr):
+            raise PolicyHoldError
+        if not image.effective_options or image.model_id is None:
+            # Resolve an unbound selection from affirmative provider discovery.
             # This is repeated under the attempt budget and saved exactly once.
-            legacy_ocr = OcrSettings.model_validate(self.legacy_snapshot()["ocr"])
+            legacy_ocr = snapshot_ocr(snapshot)
             models = await self.receipts.get_available_models(
                 capability="text" if legacy_ocr.enabled else "vision"
             )
             preferred = image.model_id or self.settings.llm.model_name
+            if image.effective_options:
+                models = [model for model in models if model.id == preferred]
             selected = self._initial_model(models, preferred, vision=not legacy_ocr.enabled)
             if selected is None:
                 raise RuntimeError("model_unavailable")
             saved = await self.db.ensure_execution_snapshot(
-                claim, model_id=selected.id, effective_options=self.legacy_snapshot(), deadline=db_deadline
+                claim, model_id=selected.id, effective_options=snapshot, deadline=db_deadline
             )
             if saved is None:
                 raise StaleClaimError
@@ -303,6 +313,12 @@ class SubmissionService:
         tags = await self.receipts.list_tags(deadline=db_deadline)
         for retry in range(2):
             try:
+                if policy_hold_reason(snapshot, self.settings.ocr):
+                    if retry:
+                        # A real dispatch already happened in this whole attempt.
+                        # Keep it counted; the next readiness cycle will persist the hold.
+                        raise OcrRuntimeChangedError("ocr_runtime_changed")
+                    raise PolicyHoldError
                 envelope = await self.receipts.extract_receipt(
                     image.model_id,
                     [Path(p.image_path) for p in parts],
