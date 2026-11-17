@@ -42,6 +42,7 @@ from .profile import (
     load_profile,
     verify_dependencies,
 )
+from .supervision import qualification_is_supervised
 from .targets import validate_profile
 
 PROFILE = Path(__file__).resolve().parents[1] / "profile.json"
@@ -456,6 +457,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--stage", choices=["inspect", "collect", "replay"], help=argparse.SUPPRESS)
     parser.add_argument("--stage-input", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--supervisor-fd", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.stage:
         payload = json.loads(args.stage_input.read_bytes())
@@ -475,6 +477,11 @@ def main() -> None:
             result = replay(payload)
         write_json(args.output, result)
         return
+    if not qualification_is_supervised(args.supervisor_fd):
+        parser.error(
+            "Run full qualification through ocr_service.initialize maintain "
+            "or ocr_service.source_maintenance with explicit maintenance intent"
+        )
     if not args.runtime or not args.cases or not args.accelerator:
         parser.error("--runtime (or OCR_RUNTIME_SETTINGS_PATH), --accelerator and --cases required")
     runtime = RuntimeSettings.model_validate_json(args.runtime.read_bytes())

@@ -489,11 +489,14 @@ def test_cli_exits_nonzero_when_serving_runtime_publication_fails(
         original(path, value)
 
     monkeypatch.setattr(module, "write_json", fail_write)
+    monkeypatch.setattr(module, "qualification_is_supervised", lambda descriptor: descriptor == 3)
     monkeypatch.setattr(
         module.sys,
         "argv",
         [
             "qualify",
+            "--supervisor-fd",
+            "3",
             "--accelerator",
             "cuda",
             "--runtime",

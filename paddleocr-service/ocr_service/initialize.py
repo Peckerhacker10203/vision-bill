@@ -29,7 +29,12 @@ from .provision import (
     verify_tree,
 )
 from .supervision import ManagedInterrupted as InitializationInterrupted
-from .supervision import check_fences, installation_lock, managed_installation, run_owned
+from .supervision import (
+    check_fences,
+    installation_lock,
+    managed_installation,
+    run_owned_qualification,
+)
 
 
 class InitializationFailed(RuntimeError):
@@ -39,7 +44,7 @@ class InitializationFailed(RuntimeError):
 
 
 def owned_qualification_process(command: list[str]) -> int:
-    return run_owned(command, quiet=True)
+    return run_owned_qualification(command, quiet=True)
 
 
 def verify_image(bundle: ReleaseBundle, config: Path, image_id: str) -> None:

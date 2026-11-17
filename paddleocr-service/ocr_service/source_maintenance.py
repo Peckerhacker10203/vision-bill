@@ -5,7 +5,12 @@ import sys
 from pathlib import Path
 
 from .initialization_lock import maintenance_handoff
-from .supervision import ManagedInterrupted, lock_path, managed_installation, run_owned
+from .supervision import (
+    ManagedInterrupted,
+    lock_path,
+    managed_installation,
+    run_owned_qualification,
+)
 
 APP_CONFIG = Path("/app/config")
 
@@ -52,7 +57,7 @@ def main(argv: list[str] | None = None) -> None:
     ]
     try:
         with maintenance_handoff(handoff), managed_installation("initializer", lock_path()):
-            code = run_owned(command)
+            code = run_owned_qualification(command)
     except ManagedInterrupted as exc:
         raise SystemExit(128 + exc.signum) from None
     except RuntimeError as exc:

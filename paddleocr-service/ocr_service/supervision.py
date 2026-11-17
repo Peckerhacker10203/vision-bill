@@ -22,6 +22,7 @@ from uuid import uuid4
 Role = Literal["initializer", "ocr"]
 ROLES = ("initializer", "ocr")
 _ACTIVE = False
+_INITIALIZER_LOCK_FD: int | None = None
 _BASELINE: set[int] = set()
 
 
@@ -140,11 +141,11 @@ def _drain_owned() -> None:
 
 @contextmanager
 def managed_installation(role: Role, lock: Path) -> Iterator[None]:
-    global _ACTIVE, _BASELINE
+    global _ACTIVE, _BASELINE, _INITIALIZER_LOCK_FD
     if role not in ROLES:
         raise ValueError("Unknown managed native role")
     with (
-        installation_lock(lock, exclusive=role == "initializer"),
+        installation_lock(lock, exclusive=role == "initializer") as lock_fd,
         installation_lock(role_lock_path(lock, role), exclusive=True),
     ):
         check_fences(lock, role)
@@ -178,6 +179,8 @@ def managed_installation(role: Role, lock: Path) -> Iterator[None]:
                 os.fsync(output.fileno())
             _sync_directory(lock.parent)
             _ACTIVE = True
+            if role == "initializer":
+                _INITIALIZER_LOCK_FD = lock_fd
             yield
         finally:
             for number in handlers:
@@ -185,6 +188,7 @@ def managed_installation(role: Role, lock: Path) -> Iterator[None]:
             # Any failure of positive cleanup deliberately leaves the marker.
             _drain_owned()
             _ACTIVE = False
+            _INITIALIZER_LOCK_FD = None
             if created:
                 marker.unlink()
                 _sync_directory(lock.parent)
@@ -192,7 +196,9 @@ def managed_installation(role: Role, lock: Path) -> Iterator[None]:
                 signal.signal(number, handler)
 
 
-def run_owned(command: list[str], *, quiet: bool = False) -> int:
+def run_owned(
+    command: list[str], *, quiet: bool = False, pass_fds: tuple[int, ...] = (),
+) -> int:
     if not _ACTIVE or os.getpid() != 1:
         raise RuntimeError("Native command requires an active PID 1 managed installation scope")
     process: subprocess.Popen[bytes] | None = None
@@ -202,12 +208,43 @@ def run_owned(command: list[str], *, quiet: bool = False) -> int:
             stdout=subprocess.DEVNULL if quiet else None,
             stderr=subprocess.DEVNULL if quiet else None,
             start_new_session=True,
+            pass_fds=pass_fds,
         )
         return process.wait()
     finally:
         _drain_owned()
         if process is not None:
             process.wait()
+
+
+def run_owned_qualification(command: list[str], *, quiet: bool = False) -> int:
+    """Make the initializer's original exclusive lock available to its child."""
+    descriptor = _INITIALIZER_LOCK_FD
+    if descriptor is None:
+        raise RuntimeError("Native qualification requires an active initializer")
+    return run_owned(
+        [*command, "--supervisor-fd", str(descriptor)],
+        quiet=quiet,
+        pass_fds=(descriptor,),
+    )
+
+
+def qualification_is_supervised(descriptor: int | None) -> bool:
+    """Check the child still has the parent's locked installation inode."""
+    if descriptor is None or os.getppid() != 1:
+        return False
+    path = lock_path()
+    try:
+        if not os.path.samestat(os.fstat(descriptor), path.stat()):
+            return False
+        if not marker_path(path, "initializer").is_file():
+            return False
+        with installation_lock(path, exclusive=False):
+            return False  # The initializer's exclusive lock was not held.
+    except InstallationBusy:
+        return True
+    except OSError:
+        return False
 
 
 def main() -> None:

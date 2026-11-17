@@ -22,7 +22,7 @@ def test_requires_intent_and_original_pairing_mode_before_qualification(
     from ocr_service import source_maintenance
 
     launch = Mock()
-    monkeypatch.setattr(source_maintenance, "run_owned", launch)
+    monkeypatch.setattr(source_maintenance, "run_owned_qualification", launch)
     with pytest.raises(SystemExit, match="2"):
         source_maintenance.main([*arguments(tmp_path), *intent])
     launch.assert_not_called()
@@ -46,7 +46,7 @@ def test_source_qualification_leaves_previous_outputs_untouched_while_fenced(
     monkeypatch.setenv("OCR_INSTALLATION_LOCK_PATH", str(native))
     monkeypatch.setattr(source_maintenance, "APP_CONFIG", app.parent)
     launch = Mock()
-    monkeypatch.setattr(source_maintenance, "run_owned", launch)
+    monkeypatch.setattr(source_maintenance, "run_owned_qualification", launch)
     with ExitStack() as held:
         if fence == "running_ocr":
             held.enter_context(supervision.installation_lock(native, exclusive=False))
@@ -94,7 +94,7 @@ def test_source_qualifier_holds_both_original_locks_through_its_child(tmp_path, 
         return 0
 
     launch = Mock(side_effect=child)
-    monkeypatch.setattr(source_maintenance, "run_owned", launch)
+    monkeypatch.setattr(source_maintenance, "run_owned_qualification", launch)
     with pytest.raises(SystemExit, match="0"):
         source_maintenance.main([
             *arguments(tmp_path),
@@ -108,3 +108,105 @@ def test_source_qualifier_holds_both_original_locks_through_its_child(tmp_path, 
         supervision.installation_lock(app, exclusive=True),
     ):
         pass
+
+
+def test_old_direct_qualification_leaves_outputs_untouched(tmp_path, monkeypatch, capsys):
+    import sys
+    from types import SimpleNamespace
+
+    from ocr_service import qualify
+
+    (tmp_path / "candidate.json").write_text("{}")
+    output = tmp_path / "qualification.json"
+    output.write_bytes(b"existing qualification")
+    monkeypatch.setattr(sys, "argv", ["qualify", *arguments(tmp_path)])
+    monkeypatch.setattr(
+        qualify.RuntimeSettings, "model_validate_json", lambda _: SimpleNamespace(accelerator="cuda")
+    )
+    launch = Mock(return_value=SimpleNamespace(qualified=True))
+    monkeypatch.setattr(qualify, "qualify_runtime", launch)
+    with pytest.raises(SystemExit, match="2"):
+        qualify.main()
+    assert "source_maintenance" in capsys.readouterr().err
+    launch.assert_not_called()
+    assert output.read_bytes() == b"existing qualification"
+
+
+def test_native_qualifier_accepts_only_a_live_initializer_inode(tmp_path, monkeypatch):
+    from ocr_service import supervision
+
+    lock = tmp_path / "installation.lock"
+    monkeypatch.setenv("OCR_INSTALLATION_LOCK_PATH", str(lock))
+    monkeypatch.setattr(supervision.os, "getppid", lambda: 1)
+    monkeypatch.setattr(supervision.os, "getpid", lambda: 1)
+    monkeypatch.setattr(supervision, "_descendants", lambda: set())
+    launch = Mock(return_value=0)
+    monkeypatch.setattr(supervision, "run_owned", launch)
+    with supervision.managed_installation("initializer", lock):
+        assert supervision.run_owned_qualification(["fake-qualification"]) == 0
+        command = launch.call_args.args[0]
+        descriptor, = launch.call_args.kwargs["pass_fds"]
+        assert command == ["fake-qualification", "--supervisor-fd", str(descriptor)]
+        assert supervision.qualification_is_supervised(descriptor)
+        assert not supervision.qualification_is_supervised(None)
+        other = tmp_path / "different.lock"
+        with other.open("w") as unrelated:
+            assert not supervision.qualification_is_supervised(unrelated.fileno())
+    assert not supervision.qualification_is_supervised(descriptor)
+
+
+def test_native_qualification_child_and_local_stage_routes_remain_available(tmp_path, monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    from ocr_service import qualify, supervision
+
+    lock = tmp_path / "installation.lock"
+    monkeypatch.setenv("OCR_INSTALLATION_LOCK_PATH", str(lock))
+    monkeypatch.setattr(supervision.os, "getppid", lambda: 1)
+    (tmp_path / "candidate.json").write_text("{}")
+    monkeypatch.setattr(
+        qualify.RuntimeSettings, "model_validate_json", lambda _: SimpleNamespace(accelerator="cuda")
+    )
+    launch = Mock(return_value=SimpleNamespace(qualified=True))
+    monkeypatch.setattr(qualify, "qualify_runtime", launch)
+    with supervision.installation_lock(lock, exclusive=True) as descriptor:
+        supervision.marker_path(lock, "initializer").write_text("{}")
+        monkeypatch.setattr(sys, "argv", [
+            "qualify", *arguments(tmp_path), "--supervisor-fd", str(descriptor),
+        ])
+        with pytest.raises(SystemExit, match="0"):
+            qualify.main()
+    launch.assert_called_once()
+
+    output = tmp_path / "stage.json"
+    monkeypatch.setattr(qualify, "collect", lambda _: {"synthetic": True})
+    monkeypatch.setattr(sys, "argv", [
+        "qualify", "--stage", "collect", "--stage-input", str(tmp_path / "candidate.json"),
+        "--output", str(output),
+    ])
+    qualify.main()
+    assert '"synthetic": true' in output.read_text()
+
+
+def test_qualifier_child_receives_the_live_descriptor(tmp_path, monkeypatch):
+    import sys
+
+    from ocr_service import supervision
+
+    lock = tmp_path / "installation.lock"
+    monkeypatch.setenv("OCR_INSTALLATION_LOCK_PATH", str(lock))
+    monkeypatch.setattr(supervision.os, "getpid", lambda: 1)
+    monkeypatch.setattr(supervision, "_descendants", lambda: set())
+    package = Path(supervision.__file__).resolve().parents[1]
+    code = """
+import os
+import sys
+sys.path.insert(0, sys.argv[1])
+from ocr_service.supervision import qualification_is_supervised
+os.getppid = lambda: 1
+assert sys.argv[2] == "--supervisor-fd"
+assert qualification_is_supervised(int(sys.argv[3]))
+"""
+    with supervision.managed_installation("initializer", lock):
+        assert supervision.run_owned_qualification([sys.executable, "-c", code, str(package)]) == 0
