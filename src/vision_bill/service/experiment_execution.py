@@ -167,6 +167,7 @@ async def execute_submission(
 async def pipeline_identity(
     service: "ReceiptService", options: ExperimentOptions, *, qualify: bool = False,
     managed_model_ids: Sequence[str] = (),
+    expected_binding_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Freeze effective local execution contracts without receipt/reference observations."""
     import inspect
@@ -184,12 +185,16 @@ async def pipeline_identity(
     handoff = ReceiptExtractionPipeline(provider, ocr, settings).coordinator()
     binding_sha256 = None
     if handoff is not None:
-        binding = handoff.require_binding(None)
+        binding = handoff.require_binding(expected_binding_sha256)
         if qualify and any(model not in binding.model_ids for model in managed_model_ids):
             raise HandoffWait(HandoffStatus(
                 state="configuration_required", reason_code="model_handoff_model_not_adopted",
             ))
         binding_sha256 = handoff.binding_sha256(binding)
+    elif expected_binding_sha256 is not None:
+        raise HandoffWait(HandoffStatus(
+            state="configuration_required", reason_code="execution_policy_changed",
+        ))
     capabilities = None
     if ocr is not None and options.pipeline != ExtractionPipeline.DIRECT:
         if qualify and handoff is not None:

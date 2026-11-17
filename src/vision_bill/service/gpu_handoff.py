@@ -331,6 +331,8 @@ class ModelHandoff:
     async def require_residency(self, recorded: list[str], deadline: float, *, admission: bool = True) -> None:
         try:
             async with asyncio.timeout(max(0, deadline - monotonic())):
+                if monotonic() >= deadline:
+                    raise TimeoutError
                 resident = await self.provider.resident_model_ids(deadline=deadline)
             if not isinstance(resident, frozenset) or any(
                 not isinstance(model, str) or not model.strip() or model != model.strip() for model in resident
@@ -373,9 +375,18 @@ class ModelHandoff:
         except (ValueError, OSError):
             return HandoffStatus(state="recovery_required", reason_code="model_handoff_invalid_configuration")
 
-    async def require_ocr_mode(self) -> None:
+    async def require_ocr_mode(self, deadline: float) -> None:
         capabilities = getattr(self.ocr, "get_capabilities", None)
-        if capabilities is not None and (await capabilities()).reason_code == "ocr_mode_mismatch":
+        if capabilities is None:
+            return
+        try:
+            async with asyncio.timeout(max(0, deadline - monotonic())):
+                if monotonic() >= deadline:
+                    raise TimeoutError
+                status = await capabilities()
+        except TimeoutError:
+            raise HandoffWait(HandoffStatus(state="configuration_required", reason_code="ocr_unavailable")) from None
+        if status.reason_code == "ocr_mode_mismatch":
             raise HandoffWait(HandoffStatus(state="configuration_required", reason_code="ocr_mode_mismatch"))
 
     @asynccontextmanager
@@ -432,11 +443,8 @@ class ModelHandoff:
             raise ValueError("model_release_unsupported: managed OCR requires an unload-capable provider")
         token = None
         owner = HandoffOwner(self, deadline)
-        async with self.exclusion(
-            min(deadline, lock_deadline) if lock_deadline is not None else deadline,
-            admission=lock_deadline is not None,
-        ):
-            timeout.reschedule(expires_at)
+        admission_limit = min(deadline, lock_deadline) if lock_deadline is not None else deadline
+        async with self.exclusion(admission_limit, admission=lock_deadline is not None):
             if self.resources != resources:
                 raise ValueError("model_handoff_identity_changed")
             if expected_binding_sha256 is not None:
@@ -464,9 +472,12 @@ class ModelHandoff:
                 raise HandoffWait(HandoffStatus(
                     state="recovery_required", reason_code="model_handoff_recorded_model_not_adopted",
                 ))
-            await self.require_residency(owner.models, deadline)
+            await self.require_residency(owner.models, admission_limit)
             if lock_deadline is not None:
-                await self.require_ocr_mode()
+                await self.require_ocr_mode(admission_limit)
+            # Read-only admission has its own earlier clock. Start the full
+            # work timer before any durable attempt or external mutation.
+            timeout.reschedule(expires_at)
             if before_dispatch is not None:
                 await before_dispatch()
             owner.token = f"{owner.generation}:{owner.token}"

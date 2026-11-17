@@ -22,6 +22,7 @@ HANDOFF_WAIT_REASONS = frozenset({
     "model_handoff_residency_unknown",
     "model_request_unsettled",
     "ocr_mode_mismatch",
+    "ocr_unavailable",
 })
 
 

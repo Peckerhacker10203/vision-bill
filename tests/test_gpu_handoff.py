@@ -835,3 +835,62 @@ async def test_review_cleanup_passes_remaining_absolute_deadline_on_body_error(t
     assert monotonic() - started < .15
     assert park_deadlines == [deadline]
     assert json.loads((tmp_path / "handoff.json").read_text())["models"] == ["own"]
+
+
+@pytest.mark.parametrize("blocked_probe", ["residency", "ocr_mode"])
+@pytest.mark.parametrize("caller_cancels", [False, True])
+async def test_extraction_admission_probe_expires_before_outer_work_timeout(
+    photos, tmp_path, monkeypatch, blocked_probe, caller_cancels,
+):
+    from unittest.mock import AsyncMock
+
+    from test_extraction_pipeline import formatter, sidecar
+
+    from vision_bill.config import OcrSettings
+    from vision_bill.model.experiment import ExperimentOptions
+    from vision_bill.model.handoff import HandoffWait
+    from vision_bill.service.extraction_pipeline import ExtractionPipeline
+    from vision_bill.service.gpu_handoff import ModelHandoff
+
+    llm, ocr = formatter(), sidecar()
+    enable_managed_ocr(monkeypatch)
+    ocr.managed_lifecycle = True
+    ocr.claim, ocr.load, ocr.park = AsyncMock(), AsyncMock(), AsyncMock()
+    settings = OcrSettings(enabled=True, coordination_path=tmp_path / "handoff.lock")
+    llm.handoff = ModelHandoff(settings.coordination_path, llm, ocr)
+    entered = asyncio.Event()
+
+    async def stall(**kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    if blocked_probe == "residency":
+        llm.resident_model_ids = stall
+        reason = "model_handoff_residency_unknown"
+    else:
+        ocr.get_capabilities = stall
+        reason = "ocr_unavailable"
+
+    pipeline = ExtractionPipeline(llm, ocr, settings)
+    deadline = monotonic() + 0.6
+
+    async def extract():
+        async with asyncio.timeout(0.5):
+            await pipeline.extract(
+                "fixture", photos, options=ExperimentOptions(), deadline=deadline,
+                handoff_deadline=deadline - 0.1, tags=[],
+            )
+
+    if caller_cancels:
+        task = asyncio.create_task(extract())
+        await asyncio.wait_for(entered.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        with pytest.raises(HandoffWait, match=reason):
+            await extract()
+    assert entered.is_set() and monotonic() < deadline
+    assert not llm.handoff.journal.exists()
+    for effect in (ocr.claim, ocr.load, ocr.park, llm._client.chat):
+        effect.assert_not_awaited()

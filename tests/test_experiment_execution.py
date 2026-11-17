@@ -513,3 +513,94 @@ async def test_unmanifested_benchmark_worker_terminalizes_without_inference(sett
     service._db.retry_task.assert_not_awaited()
     service._provider.get_available_models.assert_not_awaited()
     service._provider.analyse_receipt_with_metadata.assert_not_awaited()
+
+
+@pytest.mark.parametrize("change", ["rebind", "llm_endpoint", "ocr_client", "standalone"])
+async def test_managed_benchmark_topology_change_is_a_pre_dispatch_wait(
+    settings, tmp_path, monkeypatch, change,
+):
+    import hashlib
+    import json
+    from time import monotonic
+
+    from PIL import Image
+    from test_experiment_scoring import receipt
+    from test_extraction_pipeline import formatter, sidecar
+    from test_handoff_binding import adopt
+
+    from vision_bill import config
+    from vision_bill.config import OcrSettings
+    from vision_bill.model.handoff import HandoffWait
+    from vision_bill.model.receipt import Receipt
+    from vision_bill.provider.llm.experiment import endpoint_fingerprint
+    from vision_bill.service.benchmark_service import BenchmarkService
+    from vision_bill.service.experiment_execution import image_digest, ocr_fingerprint, pipeline_identity
+    from vision_bill.service.gpu_handoff import ModelHandoff
+    from vision_bill.service.receipt_service import ReceiptService
+
+    settings.ocr = OcrSettings(enabled=True, required=True, coordination_path=tmp_path / "handoff.lock")
+    monkeypatch.setattr(config, "settings", settings)
+    llm, ocr = formatter(), sidecar()
+    ocr.managed_lifecycle = True
+    ocr.service_url, ocr.timeout = "http://fixture", 300
+    ocr.get_capabilities.return_value.runtime_fingerprint = "cpu-runtime"
+    ocr.claim, ocr.park, ocr.load = AsyncMock(), AsyncMock(), AsyncMock()
+    llm.handoff = ModelHandoff(settings.ocr.coordination_path, llm, ocr)
+    await adopt(llm.handoff, ("fixture",))
+    service = ReceiptService(settings.images, settings.pg, llm, ocr, settings.ocr)
+    benchmark = object.__new__(BenchmarkService)
+    benchmark._provider = llm
+    benchmark._receipts = service
+
+    photo = tmp_path / "original.png"
+    Image.new("RGB", (3, 4)).save(photo)
+    receipt_id = uuid4()
+    options = ExperimentOptions(pipeline="ocr", include_classification=False)
+    manifest = {
+        "provider": type(llm).__name__,
+        "endpoint_fingerprint": endpoint_fingerprint(llm),
+        "ocr_fingerprint": ocr_fingerprint(ocr),
+        "validation_schema_sha256": hashlib.sha256(
+            json.dumps(Receipt.model_json_schema(), sort_keys=True).encode()
+        ).hexdigest(),
+        "inputs": [{
+            "receipt_id": str(receipt_id),
+            "pipeline": "ocr",
+            "expected": receipt().model_dump(mode="json"),
+            "images": [{"path": str(photo), "sha256": image_digest(photo)}],
+        }],
+        "options": options.model_dump(mode="json"),
+        "identity": await pipeline_identity(service, options),
+        "tags": [],
+        "prompt_hashes": {"1": hashlib.sha256(
+            llm.for_experiment(options).build_prompt([], image_count=1).encode()
+        ).hexdigest()},
+    }
+    if change == "rebind":
+        inspect = ModelHandoff.inspect
+
+        async def inspect_then_readopt(coordinator, **kwargs):
+            status = await inspect(coordinator, **kwargs)
+            assert status.state == "ready"
+            await adopt(coordinator, ("fixture", "replacement"))
+            return status
+
+        monkeypatch.setattr(ModelHandoff, "inspect", inspect_then_readopt)
+    elif change == "llm_endpoint":
+        llm._client._client.base_url = "http://replacement.invalid"
+    elif change == "ocr_client":
+        ocr.timeout += 1
+    else:
+        service._ocr_settings = settings.ocr.model_copy(update={"manage_model_lifecycle": False})
+        ocr.managed_lifecycle = False
+        llm.handoff = None
+
+    begin = AsyncMock()
+    with pytest.raises(HandoffWait, match="execution_policy_changed"):
+        await benchmark._run_experiment(
+            manifest, receipt_id, "fixture", before_inference=begin,
+            inference_deadline=monotonic() + 2, managed_model_ids=["fixture"],
+        )
+    begin.assert_not_awaited()
+    for effect in (ocr.claim, ocr.park, ocr.load, ocr.extract_page, llm._client.chat):
+        effect.assert_not_awaited()

@@ -547,3 +547,86 @@ async def test_cold_benchmark_qualification_obeys_the_frozen_contract_and_attemp
         assert row["status"] == "retrying" and row["inference_attempt_count"] == 1
         assert (await benchmark._db.summaries(run.id))[0].completed == 0
     llm._client.chat.assert_not_awaited()
+
+
+@pytest.mark.parametrize("change", ["rebind", "restarted_endpoint"])
+async def test_frozen_benchmark_managed_topology_drift_keeps_reservation(
+    workflow_db,
+    tmp_path,
+    managed,
+    monkeypatch,
+    change,
+):
+    w, scope = workflow_db
+    llm, native, _, _, _, benchmark = managed()
+    await adopt(llm.handoff, ("fixture",))
+    run = await queued_benchmark(w, scope, tmp_path, benchmark)
+    manifest = await benchmark._db.manifest(run.id)
+    expected_reasons = []
+
+    if change == "rebind":
+        inspect = ModelHandoff.inspect
+
+        async def inspect_then_readopt(coordinator, **kwargs):
+            status = await inspect(coordinator, **kwargs)
+            assert status.state == "ready"
+            await adopt(coordinator, ("fixture", "replacement"))
+            return status
+
+        monkeypatch.setattr(ModelHandoff, "inspect", inspect_then_readopt)
+    else:
+        llm, _, _, _, _, benchmark = managed(native)
+        llm._client._client.base_url = "http://replacement.invalid"
+        llm.lifecycle_identity = "ollama:restarted-fixture"
+
+    hold = benchmark._db.hold_before_inference
+
+    async def record_hold(task, reason, *, deadline=None):
+        expected_reasons.append(reason)
+        return await hold(task, reason, deadline=deadline)
+
+    benchmark._db.hold_before_inference = record_hold
+    task = await benchmark._db.lease_task()
+    await benchmark._execute(dict(task))
+
+    held = await claims.saved(w, run.id)
+    assert held is not None and held["status"] == "waiting_for_model"
+    assert held["claim_token"] is None and held["leased_until"] is None
+    assert not held["inference_started"] and held["inference_attempt_count"] == 0
+    assert expected_reasons == ["execution_policy_changed"]
+    assert await benchmark._db.manifest(run.id) == manifest
+    assert await benchmark._db.results(run.id) == []
+    assert (await benchmark._db.summaries(run.id))[0].completed == 0
+    assert native.events == [] and not llm.handoff.journal.exists()
+    llm._client.chat.assert_not_awaited()
+
+
+async def test_upload_session_stalled_probe_refunds_live_claim(
+    workflow_db, settings, tmp_path, managed
+):
+    w, scope = workflow_db
+    llm, native, _, submissions, scheduler, _ = managed()
+    await adopt(llm.handoff, ("fixture",))
+    snapshot = frozen(settings, llm.handoff)
+    image = await upload(w, scope, tmp_path, snapshot)
+    reached = asyncio.Event()
+    ready_for = submissions.ready_for
+
+    async def stall(**kwargs):
+        reached.set()
+        await asyncio.Event().wait()
+
+    async def ready_then_stall(candidate):
+        ready = await ready_for(candidate)
+        assert ready
+        llm.resident_model_ids = stall
+        return ready
+
+    submissions.ready_for = ready_then_stall
+    await scheduler.process_pending()
+
+    assert reached.is_set()
+    row = await assert_upload_held(w, scope, image, "model_handoff_residency_unknown")
+    assert json.loads(row["effective_options"]) == snapshot
+    assert native.events == [] and not llm.handoff.journal.exists()
+    llm._client.chat.assert_not_awaited()

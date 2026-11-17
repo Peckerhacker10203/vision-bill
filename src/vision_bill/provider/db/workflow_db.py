@@ -46,7 +46,7 @@ from .deadline import connection
 from .receipt_db import OriginalChecker, ReceiptDB
 
 READINESS_WAIT_REASONS = HANDOFF_WAIT_REASONS | {
-    "provider_unavailable", "ocr_unavailable", "vision_model_unavailable", "formatter_model_unavailable",
+    "provider_unavailable", "vision_model_unavailable", "formatter_model_unavailable",
 }
 
 

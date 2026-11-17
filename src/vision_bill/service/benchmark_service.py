@@ -367,15 +367,43 @@ class BenchmarkService:
         before_inference: Callable[[], Awaitable[None]] | None = None,
         inference_deadline: float, managed_model_ids: Sequence[str],
     ) -> tuple[Receipt, Any]:
-        if manifest.get("endpoint_fingerprint") != endpoint_fingerprint(self._provider):
-            raise ValueError("Provider endpoint changed since run creation; create a new run")
-        if manifest["provider"] != type(self._provider).__name__:
-            raise ValueError("Provider changed since run creation; create a new run")
         item = next((x for x in manifest["inputs"] if x["receipt_id"] == str(receipt_id)), None)
         if item is None:
             raise ValueError("Receipt is absent from the frozen benchmark inputs")
-        if item["pipeline"] != "direct_vision" and manifest.get("ocr_fingerprint") != ocr_fingerprint(getattr(self._receipts, "_ocr_provider", None)):
-            raise ValueError("OCR provider endpoint or client settings changed; create a new run")
+        options = ExperimentOptions.model_validate(manifest["options"])
+        ocr, settings, _ = effective_policy(self._receipts, options)
+        uses_ocr = settings.enabled and options.pipeline != ExtractionPipeline.DIRECT
+        frozen_identity = manifest.get("identity")
+        frozen_binding = (frozen_identity or {}).get("managed_binding_sha256")
+        frozen_ocr = (frozen_identity or {}).get("ocr_settings") or {}
+        was_managed = frozen_binding is not None or (
+            frozen_ocr.get("enabled") is True and frozen_ocr.get("manage_model_lifecycle") is True
+        )
+        handoff = self._managed_coordinator(settings)
+        was_or_is_managed = was_managed or handoff is not None
+        frozen_path = frozen_ocr.get("coordination_path")
+        coordinator_changed = was_managed and (
+            handoff is None or (
+                isinstance(frozen_path, str) and Path(frozen_path).resolve() != handoff.path.resolve()
+            )
+        )
+        topology_error = None
+        if coordinator_changed:
+            topology_error = "Managed coordinator changed since run creation"
+        elif manifest.get("endpoint_fingerprint") != endpoint_fingerprint(self._provider):
+            topology_error = "Provider endpoint changed since run creation"
+        elif manifest["provider"] != type(self._provider).__name__:
+            topology_error = "Provider changed since run creation"
+        elif (item["pipeline"] != "direct_vision" or was_or_is_managed) and (
+            manifest.get("ocr_fingerprint") != ocr_fingerprint(self._receipts._ocr_provider)
+        ):
+            topology_error = "OCR provider endpoint or client settings changed"
+        if topology_error is not None:
+            if was_or_is_managed:
+                raise HandoffWait(HandoffStatus(
+                    state="configuration_required", reason_code="execution_policy_changed",
+                ))
+            raise ValueError(f"{topology_error}; create a new run")
         schema_hash = sha256(json.dumps(Receipt.model_json_schema(), sort_keys=True).encode()).hexdigest()
         if manifest["validation_schema_sha256"] != schema_hash:
             raise ValueError("Receipt validation schema changed; create a new run")
@@ -385,16 +413,10 @@ class BenchmarkService:
         for path, image in zip(paths, item["images"], strict=True):
             if await asyncio.to_thread(image_digest, path) != image["sha256"]:
                 raise ValueError("Receipt image changed since run creation")
-        options = ExperimentOptions.model_validate(manifest["options"])
-        ocr, settings, _ = effective_policy(self._receipts, options)
-        uses_ocr = settings.enabled and options.pipeline != ExtractionPipeline.DIRECT
-        frozen_identity = manifest.get("identity")
-        frozen_binding = (frozen_identity or {}).get("managed_binding_sha256")
-        handoff = self._managed_coordinator(settings)
         if handoff is not None:
             # Historical direct vision may still use the current dedicated
             # coordinator. Historical managed OCR must prove its own binding.
-            if uses_ocr and not frozen_binding:
+            if (uses_ocr or "managed_binding_sha256" in (frozen_identity or {})) and not frozen_binding:
                 frozen_binding = ""
             status = await handoff.inspect(
                 model_id=model_id, deadline=admission_deadline(inference_deadline),
@@ -402,7 +424,13 @@ class BenchmarkService:
             )
             if status.state != "ready":
                 raise HandoffWait(status)
-        current_identity = await pipeline_identity(self._receipts, options)
+        current_identity = await pipeline_identity(
+            self._receipts, options, expected_binding_sha256=frozen_binding,
+        )
+        if (current_identity["managed_binding_sha256"] is not None) != (handoff is not None):
+            raise HandoffWait(HandoffStatus(
+                state="configuration_required", reason_code="execution_policy_changed",
+            ))
         runtime = current_identity.get("ocr_runtime") or {}
         if uses_ocr and runtime.get("reason_code") == "ocr_mode_mismatch":
             raise HandoffWait(HandoffStatus(
