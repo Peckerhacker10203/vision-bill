@@ -394,10 +394,6 @@ class BenchmarkService:
             topology_error = "Provider endpoint changed since run creation"
         elif manifest["provider"] != type(self._provider).__name__:
             topology_error = "Provider changed since run creation"
-        elif (item["pipeline"] != "direct_vision" or was_or_is_managed) and (
-            manifest.get("ocr_fingerprint") != ocr_fingerprint(self._receipts._ocr_provider)
-        ):
-            topology_error = "OCR provider endpoint or client settings changed"
         if topology_error is not None:
             if was_or_is_managed:
                 raise HandoffWait(HandoffStatus(
@@ -424,6 +420,14 @@ class BenchmarkService:
             )
             if status.state != "ready":
                 raise HandoffWait(status)
+        if (item["pipeline"] != "direct_vision" or was_or_is_managed) and (
+            manifest.get("ocr_fingerprint") != ocr_fingerprint(self._receipts._ocr_provider)
+        ):
+            # The client fingerprint includes the request timeout.
+            # Recheck dedication because inspection released the lock.
+            if handoff is not None:
+                handoff.require_binding(frozen_binding)
+            raise ValueError("OCR provider endpoint or client settings changed; create a new run")
         current_identity = await pipeline_identity(
             self._receipts, options, expected_binding_sha256=frozen_binding,
         )

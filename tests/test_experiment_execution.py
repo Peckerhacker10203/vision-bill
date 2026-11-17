@@ -515,8 +515,10 @@ async def test_unmanifested_benchmark_worker_terminalizes_without_inference(sett
     service._provider.analyse_receipt_with_metadata.assert_not_awaited()
 
 
-@pytest.mark.parametrize("change", ["rebind", "llm_endpoint", "ocr_client", "standalone"])
-async def test_managed_benchmark_topology_change_is_a_pre_dispatch_wait(
+@pytest.mark.parametrize(
+    "change", ["rebind", "rebind_and_timeout", "llm_endpoint", "ocr_endpoint", "ocr_timeout", "standalone"]
+)
+async def test_managed_benchmark_distinguishes_topology_from_frozen_client_drift(
     settings, tmp_path, monkeypatch, change,
 ):
     import hashlib
@@ -533,16 +535,25 @@ async def test_managed_benchmark_topology_change_is_a_pre_dispatch_wait(
     from vision_bill.model.handoff import HandoffWait
     from vision_bill.model.receipt import Receipt
     from vision_bill.provider.llm.experiment import endpoint_fingerprint
+    from vision_bill.provider.ocr.paddleocr import PaddleOcrProvider
     from vision_bill.service.benchmark_service import BenchmarkService
-    from vision_bill.service.experiment_execution import image_digest, ocr_fingerprint, pipeline_identity
+    from vision_bill.service.experiment_execution import (
+        image_digest,
+        ocr_fingerprint,
+        pipeline_identity,
+    )
     from vision_bill.service.gpu_handoff import ModelHandoff
     from vision_bill.service.receipt_service import ReceiptService
 
-    settings.ocr = OcrSettings(enabled=True, required=True, coordination_path=tmp_path / "handoff.lock")
+    settings.ocr = OcrSettings(
+        enabled=True, required=True, service_url="http://fixture.invalid",
+        coordination_path=tmp_path / "handoff.lock",
+    )
     monkeypatch.setattr(config, "settings", settings)
     llm, ocr = formatter(), sidecar()
     ocr.managed_lifecycle = True
-    ocr.service_url, ocr.timeout = "http://fixture", 300
+    ocr.service_url, ocr.timeout = settings.ocr.service_url, settings.ocr.timeout_seconds
+    ocr.lifecycle_identity = PaddleOcrProvider(ocr.service_url).lifecycle_identity
     ocr.get_capabilities.return_value.runtime_fingerprint = "cpu-runtime"
     ocr.claim, ocr.park, ocr.load = AsyncMock(), AsyncMock(), AsyncMock()
     llm.handoff = ModelHandoff(settings.ocr.coordination_path, llm, ocr)
@@ -576,7 +587,11 @@ async def test_managed_benchmark_topology_change_is_a_pre_dispatch_wait(
             llm.for_experiment(options).build_prompt([], image_count=1).encode()
         ).hexdigest()},
     }
-    if change == "rebind":
+    if change in ("ocr_timeout", "rebind_and_timeout"):
+        ocr.timeout += 1
+        service._ocr_settings = settings.ocr.model_copy(update={"timeout_seconds": ocr.timeout})
+        assert llm.handoff.binding_sha256() == manifest["identity"]["managed_binding_sha256"]
+    if change in ("rebind", "rebind_and_timeout"):
         inspect = ModelHandoff.inspect
 
         async def inspect_then_readopt(coordinator, **kwargs):
@@ -588,19 +603,29 @@ async def test_managed_benchmark_topology_change_is_a_pre_dispatch_wait(
         monkeypatch.setattr(ModelHandoff, "inspect", inspect_then_readopt)
     elif change == "llm_endpoint":
         llm._client._client.base_url = "http://replacement.invalid"
-    elif change == "ocr_client":
-        ocr.timeout += 1
-    else:
+    elif change == "ocr_endpoint":
+        ocr.service_url = "http://ocr-replacement.invalid"
+        ocr.lifecycle_identity = PaddleOcrProvider(ocr.service_url).lifecycle_identity
+        service._ocr_settings = settings.ocr.model_copy(update={"service_url": ocr.service_url})
+    elif change == "standalone":
         service._ocr_settings = settings.ocr.model_copy(update={"manage_model_lifecycle": False})
         ocr.managed_lifecycle = False
         llm.handoff = None
 
     begin = AsyncMock()
-    with pytest.raises(HandoffWait, match="execution_policy_changed"):
+    expected_exception, expected_reason = (
+        (ValueError, "OCR provider endpoint or client settings changed")
+        if change == "ocr_timeout" else (HandoffWait, "execution_policy_changed")
+    )
+    with pytest.raises(expected_exception, match=expected_reason) as caught:
         await benchmark._run_experiment(
             manifest, receipt_id, "fixture", before_inference=begin,
             inference_deadline=monotonic() + 2, managed_model_ids=["fixture"],
         )
+    if change == "ocr_timeout":
+        assert not benchmark._retryable(caught.value)
+    if change in ("rebind", "rebind_and_timeout"):
+        assert llm.handoff.read_binding().model_ids == ["fixture", "replacement"]
     begin.assert_not_awaited()
     for effect in (ocr.claim, ocr.park, ocr.load, ocr.extract_page, llm._client.chat):
         effect.assert_not_awaited()
