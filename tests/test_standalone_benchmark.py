@@ -1,11 +1,95 @@
-"""Run benchmark SQL against a test-owned, in-memory relational schema."""
+"""Exercise standalone benchmark settings and SQL without external services."""
 
 import re
 import sqlite3
+import sys
+from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
+from scripts import standalone_benchmark as script
 from scripts.standalone_benchmark import fetch_receipt_details, fetch_verified_receipts
+from vision_bill import config
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected_overrides"),
+    [
+        ([], {}),
+        (["--model", "alternate"], {"model_name": "alternate"}),
+        (["--llm-host", "http://alternate.test/v1"], {"host": "http://alternate.test/v1"}),
+    ],
+)
+def test_llm_settings_preserve_loaded_backend_and_only_apply_cli_overrides(
+    monkeypatch, settings, flags, expected_overrides
+):
+    loaded = config.LLMSettings(
+        provider="openai",
+        host="http://router.test/v1",
+        api_key="fixture-key",
+        model_name="selected",
+        temperature=0.37,
+        model_lifecycle="llamacpp",
+        max_output_tokens=2234,
+        vision_model_ids=["declared-vision"],
+        analysis_timeout_seconds=42.5,
+    )
+    monkeypatch.setattr(config, "settings", settings.model_copy(update={"llm": loaded}))
+    monkeypatch.setattr(sys, "argv", ["benchmark", "--user-id", str(uuid4()), *flags])
+
+    result = script.get_llm_settings(script.parse_args())
+
+    assert result.model_lifecycle == "llamacpp"
+    assert result.max_output_tokens == 2234
+    assert result.model_dump() == loaded.model_dump() | expected_overrides
+    result.vision_model_ids.append("local-edit")
+    assert loaded.vision_model_ids == ["declared-vision"]
+    assert loaded.model_name == "selected"
+    assert loaded.host == "http://router.test/v1"
+
+
+@pytest.mark.parametrize("flag", ["--model", "--llm-host"])
+def test_blank_cli_llm_override_fails_canonical_validation(monkeypatch, flag):
+    monkeypatch.setattr(sys, "argv", ["benchmark", "--user-id", str(uuid4()), flag, ""])
+
+    with pytest.raises(ValidationError, match="explicitly selected and nonblank"):
+        script.get_llm_settings(script.parse_args())
+
+
+@pytest.mark.parametrize(
+    ("flag_url", "env_url", "expected_url"),
+    [
+        (None, None, "http://localhost:8082"),
+        (None, "http://manual.test:8082", "http://manual.test:8082"),
+        ("http://cli.test:8082", "http://manual.test:8082", "http://cli.test:8082"),
+    ],
+)
+def test_manual_ocr_url_precedence_preserves_coordination(
+    monkeypatch, settings, tmp_path, flag_url, env_url, expected_url
+):
+    coordination_path = tmp_path / "shared.lock"
+    loaded = config.OcrSettings.model_validate({
+        "endpoint": "http://production.test:8082",
+        "coordination_path": coordination_path,
+        "manage_model_lifecycle": True,
+    })
+    monkeypatch.setattr(config, "settings", settings.model_copy(update={"ocr": loaded}))
+    if env_url is None:
+        monkeypatch.delenv("OCR__SERVICE_URL", raising=False)
+    else:
+        monkeypatch.setenv("OCR__SERVICE_URL", env_url)
+    argv = ["benchmark", "--user-id", str(uuid4())]
+    if flag_url is not None:
+        argv.extend(["--ocr-url", flag_url])
+    monkeypatch.setattr(sys, "argv", argv)
+
+    result = script.get_ocr_settings(script.parse_args())
+
+    assert result.service_url == expected_url
+    assert result.enabled and result.manage_model_lifecycle
+    assert result.coordination_path == coordination_path
+    assert loaded.service_url == "http://production.test:8082"
 
 
 class LocalQueryPool:
@@ -109,9 +193,9 @@ async def test_details_keep_tax_rate_and_position_order(query_pool):
 
 
 async def test_standalone_uses_all_ordered_photos_in_common_pipeline(settings, tmp_path):
-    from scripts import standalone_benchmark as script
-    from test_extraction_pipeline import formatter, sidecar
     from PIL import Image
+    from test_extraction_pipeline import formatter, sidecar
+
     paths = [tmp_path / f'{i}.png' for i in range(2)]
     for p in paths:
         Image.new('RGB',(3,4)).save(p)
@@ -124,14 +208,13 @@ async def test_standalone_uses_all_ordered_photos_in_common_pipeline(settings, t
 
 @pytest.mark.parametrize("failure", ["inference", "reference", "source"])
 async def test_standalone_failure_denominator_and_logs_exclude_receipt_content(settings,tmp_path,monkeypatch,caplog,failure):
-    import sys
-    import logging
     import hashlib
+    import logging
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
-    from uuid import uuid4
-    from scripts import standalone_benchmark as script
+
     from test_experiment_scoring import receipt
+
     from vision_bill.service.experiment_execution import ExperimentResult
     from vision_bill.service.experiment_scoring import OBSERVABLE_FIELDS
     owner=uuid4()

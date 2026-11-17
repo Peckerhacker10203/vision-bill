@@ -161,22 +161,15 @@ def get_ocr_settings(args: argparse.Namespace) -> OcrSettings:
 
 
 def get_llm_settings(args: argparse.Namespace) -> LLMSettings:
-    """Build LLMSettings from environment or command-line args."""
-    from vision_bill.config import LLMProviderEnum
+    """Copy loaded LLM settings and validate explicit CLI overrides."""
+    from vision_bill.config import settings
 
-    provider = os.getenv("LLM__PROVIDER", "ollama")
-    try:
-        provider_enum = LLMProviderEnum(provider)
-    except ValueError:
-        provider_enum = LLMProviderEnum.OLLAMA
-
-    return LLMSettings(
-        provider=provider_enum,
-        host=args.llm_host or os.getenv("LLM__HOST", "http://localhost:11434"),
-        api_key=os.getenv("LLM__API_KEY", ""),
-        model_name=args.model or os.getenv("LLM__MODEL_NAME", ""),
-        temperature=float(os.getenv("LLM__TEMPERATURE", "0.0")),
-    )
+    overrides = {
+        field: value
+        for field, value in {"host": args.llm_host, "model_name": args.model}.items()
+        if value is not None
+    }
+    return LLMSettings.model_validate(settings.llm.model_dump() | overrides)
 
 
 async def fetch_verified_receipts(

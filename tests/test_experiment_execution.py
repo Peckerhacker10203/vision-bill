@@ -30,6 +30,82 @@ def test_experiment_provider_settings_do_not_mutate_live_provider():
     assert "spending_category" in live.build_prompt(["deposit", "food"])
 
 
+async def test_standalone_qualifies_with_production_llamacpp_binding(settings, tmp_path, monkeypatch):
+    from argparse import Namespace
+    from time import monotonic
+
+    from scripts import standalone_benchmark as script
+    from vision_bill import config
+    from vision_bill.distribution.handoff import adopt_binding
+    from vision_bill.model.ocr import OcrCapabilities
+    from vision_bill.provider.llm.base import ModelInfo
+    from vision_bill.provider.llm.openai import OpenAIProvider
+    from vision_bill.provider.ocr.paddleocr import PaddleOcrProvider
+    from vision_bill.service.gpu_handoff import ModelHandoff
+
+    llm_settings = config.LLMSettings(
+        provider="openai",
+        host="http://router.test/v1",
+        api_key="fixture-key",
+        model_name="selected",
+        temperature=0.37,
+        model_lifecycle="llamacpp",
+        max_output_tokens=2234,
+        analysis_timeout_seconds=42.5,
+    )
+    ocr_settings = config.OcrSettings(
+        enabled=True, service_url="http://ocr.test:8082", coordination_path=tmp_path / "shared.lock",
+    )
+    monkeypatch.setattr(
+        config, "settings", settings.model_copy(update={"llm": llm_settings, "ocr": ocr_settings}),
+    )
+    monkeypatch.setenv("LLM__PROVIDER", "openai")
+    monkeypatch.setenv("LLM__HOST", llm_settings.host)
+    monkeypatch.setenv("LLM__MODEL_NAME", llm_settings.model_name)
+    monkeypatch.setenv("OCR__SERVICE_URL", ocr_settings.service_url)
+    monkeypatch.setattr(script, "ImageSettings", lambda: settings.images)
+
+    monkeypatch.setattr(OpenAIProvider, "get_available_models", AsyncMock(
+        return_value=[ModelInfo("selected"), ModelInfo("unadopted")],
+    ))
+    monkeypatch.setattr(OpenAIProvider, "resident_model_ids", AsyncMock(return_value=frozenset()))
+    monkeypatch.setattr(OpenAIProvider, "release_model", AsyncMock())
+    monkeypatch.setattr(PaddleOcrProvider, "_lifecycle", AsyncMock())
+    monkeypatch.setattr(PaddleOcrProvider, "get_capabilities", AsyncMock(return_value=OcrCapabilities(
+        enabled=True, configured=True, reachable=True, ready=True,
+        profile_id="profile", runtime_fingerprint="runtime", ocr_max_new_tokens=4096,
+    )))
+
+    application_llm = script.get_llm_provider(llm_settings)
+    application_ocr = script.get_ocr_provider(ocr_settings)
+    handoff = ModelHandoff(ocr_settings.coordination_path, application_llm, application_ocr)
+    args = Namespace(model=None, llm_host=None, ocr_url=None)
+    cli_settings = script.get_llm_settings(args)
+    cli_llm = script.get_llm_provider(cli_settings)
+    cli_ocr_settings = script.get_ocr_settings(args)
+    cli_ocr = script.get_ocr_provider(cli_ocr_settings)
+    try:
+        await adopt_binding(
+            handoff, ["selected"], dedicated_coordinated_requests=True,
+            external_eager_loading_disabled=True, deadline=monotonic() + 5,
+        )
+        binding_bytes = handoff.binding_path.read_bytes()
+        identity = await script.execution_identity(
+            cli_llm, cli_ocr, settings.pg, cli_ocr_settings, cli_settings.model_name, qualify=True,
+        )
+    finally:
+        await application_llm._client.close()
+        await cli_llm._client.close()
+
+    assert identity["requested_model"]["id"] == "selected"
+    assert identity["pipeline"]["formatter_output_tokens"] == 2234
+    assert identity["pipeline"]["analysis_timeout_seconds"] == 42.5
+    assert identity["pipeline"]["ocr_runtime"]["runtime_fingerprint"] == "runtime"
+    assert handoff.binding_path.read_bytes() == binding_bytes
+    journal = handoff.read_journal()
+    assert journal is not None and journal.models == [] and not journal.ocr_pending
+
+
 async def test_thinking_override_is_sent_as_top_level_option():
     live = OllamaProvider("http://localhost:11434", temperature=0.7)
     probe = live.for_experiment(ExperimentOptions(think=False))
