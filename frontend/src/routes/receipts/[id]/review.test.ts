@@ -611,3 +611,51 @@ it('preserves dirty values but blocks saving or verifying a stale editor until e
 		false
 	);
 });
+
+it.each([row, verifiedByBypass])(
+	'never publishes new $status revisions with cached children after a failed refresh and remount',
+	async (previous) => {
+		const original = { ...detail(previous), line_items: [item] };
+		const saved = { ...previous, operation_revision: 8, review_revision: 4 };
+		const latest = { ...detail(saved), line_items: [{ ...item, description: 'Corrected item' }] };
+		const next = deferred<ReceiptWithDetails>();
+		vi.mocked(api.getReceipt)
+			.mockResolvedValueOnce(original)
+			.mockRejectedValueOnce(new ApiError(503, 'Detail refresh unavailable'))
+			.mockReturnValue(next.promise);
+		vi.spyOn(api, 'updateReceipt').mockResolvedValue(saved);
+		const preview = vi.spyOn(api, 'previewHumanReview').mockResolvedValue({
+			operation_revision: 8,
+			review_revision: 4,
+			findings: []
+		});
+		const verify = vi.spyOn(api, 'verifyReceipt').mockResolvedValue(saved);
+		const first = render(Page);
+		const description = await screen.findByDisplayValue(item.description);
+		await fireEvent.input(description, { target: { value: 'Corrected item' } });
+		await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+		await screen.findByRole('alert');
+		expect(queryClient.getQueryData(queryKeys.receipt(row.id))).toEqual(original);
+
+		first.unmount();
+		render(Page);
+		await screen.findByDisplayValue(item.description);
+		await waitFor(() => expect(api.getReceipt).toHaveBeenCalledTimes(3));
+		expect(verify).not.toHaveBeenCalled();
+		expect(preview).not.toHaveBeenCalled();
+		next.resolve(latest);
+		await screen.findByDisplayValue('Corrected item');
+		const label = previous.verified ? 'Review as human' : 'Verify';
+		await fireEvent.click(screen.getByRole('button', { name: label }));
+		await fireEvent.click(
+			within(await screen.findByRole('dialog')).getByRole('button', { name: label })
+		);
+		await waitFor(() =>
+			expect(verify).toHaveBeenCalledWith(row.id, {
+				expected_operation_revision: 8,
+				expected_review_revision: 4,
+				acknowledgements: []
+			})
+		);
+	}
+);

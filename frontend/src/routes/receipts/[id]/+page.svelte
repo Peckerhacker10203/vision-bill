@@ -187,10 +187,12 @@
 			acknowledgementReset++;
 			acknowledgements = [];
 			needsReload = true;
-			queryClient.setQueryData<import('$lib/types').ReceiptWithDetails>(
-				queryKeys.receipt(requestId),
-				(old) => (old ? { ...old, receipt: saved! } : old)
-			);
+			// Only a full detail response may advance the cache's review revisions.
+			void queryClient.invalidateQueries({
+				queryKey: queryKeys.receipt(requestId),
+				exact: true,
+				refetchType: 'none'
+			});
 			snackbar.notify('success', translate('receipt.saved'));
 			await refresh(requestId, view);
 			if (!isCurrentView(view)) return;
