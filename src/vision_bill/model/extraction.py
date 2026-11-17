@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .item_category import SpendingCategory, llm_category
 from .ocr import OcrPageMetadata, OcrResponse, Sha256, SourceRef, WorkingImage
@@ -17,6 +17,41 @@ SOURCE_PROJECTION_VERSION = "2"
 PaymentMethod = Literal[
     "cash", "credit_card", "debit_card", "mobile_payment", "check", "other", "unknown"
 ]
+EnrichmentReason = Literal[
+    "invalid_response",
+    "request_rejected",
+    "not_dispatched",
+    "classification_budget_exhausted",
+    "classification_disabled",
+    "incomplete_observations",
+    "recovered_without_classification",
+]
+
+
+class ClassificationEnrichment(BaseModel):
+    """Safe status and field paths for optional receipt and row labels."""
+
+    model_config = ConfigDict(extra="forbid")
+    state: Literal["not_recorded", "pending", "completed", "unavailable", "skipped"] = "not_recorded"
+    reason_code: EnrichmentReason | None = None
+    missing_fields: list[str] = Field(default_factory=list)
+
+
+def assert_metadata_only(value: Any) -> None:
+    """Reject transport image payloads from arbitrary persisted metadata."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raise ValueError("image bytes belong in saved artifacts")  # noqa: TRY004
+    if isinstance(value, BaseModel):
+        assert_metadata_only(value.model_dump(serialize_as_any=True))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            assert_metadata_only(key)
+            if str(key).lower() in {"png_base64", "image_base64", "image_bytes"}:
+                raise ValueError("raw image payload belongs in saved artifacts")
+            assert_metadata_only(item)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            assert_metadata_only(item)
 
 
 class DraftLineItem(BaseModel):
@@ -118,7 +153,7 @@ class DerivedInputView(BaseModel):
     working_image: WorkingImage
 
 
-class InferenceEnvelope(BaseModel):
+class _InferenceMetadata(BaseModel):
     source_projection_version: str = "1"  # Missing identity in historical envelopes stays legacy.
     raw_field_sources: dict[str, list[SourceRef]] = Field(default_factory=dict)
     draft: ExtractionDraft | None = None
@@ -129,8 +164,36 @@ class InferenceEnvelope(BaseModel):
     findings: list[ReviewFinding] = Field(default_factory=list)
     provenance: PipelineProvenance
     telemetry: InferenceTelemetry
+    classification_enrichment: ClassificationEnrichment = Field(
+        default_factory=ClassificationEnrichment
+    )
+
+
+class InferenceEnvelope(_InferenceMetadata):
     ocr_pages: list[OcrResponse] = Field(default_factory=list, repr=False)
     input_views: list[DerivedInputView] = Field(default_factory=list, repr=False, exclude=True)
+
+
+class PersistedInferenceEnvelope(_InferenceMetadata):
+    """Validated observation and attempt metadata. Saved view manifests live separately."""
+
+    model_config = ConfigDict(extra="forbid", revalidate_instances="always")
+    ocr_pages: list[OcrPageMetadata] = Field(default_factory=list, repr=False)
+
+    @model_validator(mode="before")
+    @classmethod
+    def metadata_only(cls, value: Any) -> Any:
+        assert_metadata_only(value)
+        return value
+
+
+def pack_inference_metadata(envelope: InferenceEnvelope) -> PersistedInferenceEnvelope:
+    """Project wire OCR pages and exclude independently stored input derivatives."""
+    payload = envelope.model_dump(exclude={"ocr_pages", "input_views"})
+    payload["ocr_pages"] = [
+        page.model_dump(exclude={"working_image": {"png_base64"}}) for page in envelope.ocr_pages
+    ]
+    return PersistedInferenceEnvelope.model_validate(payload)
 
 
 class DraftView(BaseModel):

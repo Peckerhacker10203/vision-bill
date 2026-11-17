@@ -44,7 +44,8 @@ from .extraction_pipeline import (
     select_vision_model,
 )
 from .image_service import ImageService
-from .receipt_review import evaluate_receipt, receipt_from_draft
+from .observation_admission import admit_observations
+from .receipt_review import evaluate_receipt
 from .receipt_service import ReceiptService
 
 logger = logging.getLogger(__name__)
@@ -478,8 +479,16 @@ class SubmissionService:
         originals: list[OriginalAvailability],
     ) -> AttemptOutcome:
         document = envelope.draft
-        if document is None and envelope.receipt is not None:
+        admission = envelope
+        if (
+            document is None
+            and envelope.receipt is not None
+            and envelope.source_projection_version == "1"
+            and envelope.classification_enrichment.state == "not_recorded"
+        ):
+            # Historical receipt-only adapters predate nullable observation provenance.
             document = ExtractionDraft.model_validate(envelope.receipt.model_dump())
+            admission = envelope.model_copy(update={"draft": document})
         if document is None:
             code = envelope.findings[-1].code if envelope.findings else "analysis_incomplete"
             if code not in {
@@ -494,23 +503,20 @@ class SubmissionService:
             return AttemptOutcome(
                 kind="retry", result_code=code, envelope=envelope, persisted_views=views
             )
-        reviewed: Receipt | ExtractionDraft = document
-        if envelope.receipt is not None:
-            try:
-                receipt_from_draft(document)
-            except ValueError:
-                pass  # Missing observations must not acquire final Receipt defaults.
-            else:
-                reviewed = envelope.receipt  # Already reconciled by the explicit overlap producer.
+        admitted: Receipt | None
+        try:
+            admitted = admit_observations(admission)
+        except ValueError:
+            admitted = None
         review = evaluate_receipt(
-            reviewed,
+            admitted if admitted is not None else document,
             envelope.amount_policy,
             envelope.field_sources,
             envelope.overlap_decisions,
             originals,
             retained_findings=envelope.findings,
         )
-        if envelope.receipt is not None and review.can_finalize:
+        if admitted is not None and review.can_finalize:
             return AttemptOutcome(
                 kind="complete", envelope=envelope, review=review, persisted_views=views
             )

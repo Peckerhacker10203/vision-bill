@@ -18,7 +18,12 @@ from pydantic import TypeAdapter, ValidationError
 from ...config import PGSettings, WorkerSettings
 from ...model.db.image import ImageRow
 from ...model.db.receipt import ReceiptRow
-from ...model.extraction import DraftView, ExtractionDraft
+from ...model.extraction import (
+    DraftView,
+    ExtractionDraft,
+    assert_metadata_only,
+    pack_inference_metadata,
+)
 from ...model.handoff import HANDOFF_WAIT_REASONS
 from ...model.ocr import OcrPageMetadata, Sha256, SourceRef, WorkingImageMetadata
 from ...model.review import AmountPolicy, OriginalAvailability, SourceView
@@ -38,7 +43,6 @@ from ...model.workflow import (
     SourcePartBinding,
     SubmissionCreate,
     SubmissionStatus,
-    assert_metadata_only,
 )
 from ...service.execution_policy import EXECUTION_POLICY_VERSION, snapshot_ocr
 from ...service.receipt_review import evaluate_receipt, persistent_findings, receipt_from_draft
@@ -810,14 +814,7 @@ class WorkflowDB:
                     self._require_view(
                         parts, views, view.photo_index, view.source_sha256, view.working_image
                     )
-                payload = envelope.model_dump(mode="json", exclude={"ocr_pages", "input_views"})
-                payload["ocr_pages"] = [
-                    OcrPageMetadata.model_validate(page.model_dump()).model_dump(mode="json")
-                    for page in envelope.ocr_pages
-                ]
-                payload["input_views"] = [
-                    view.model_dump(mode="json") for view in outcome.persisted_views
-                ]
+                payload = pack_inference_metadata(envelope).model_dump(mode="json")
             review_payload = outcome.review.model_dump(mode="json") if outcome.review else None
             saved_views = [view.model_dump(mode="json") for view in outcome.persisted_views]
             await self._validate_metadata_refs(

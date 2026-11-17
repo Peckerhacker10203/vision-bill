@@ -102,6 +102,34 @@ async def test_upload_execution_preserves_all_photo_paths_and_frozen_tags(settin
     assert result.metadata["calls"][0]["eval_ms"] == 20
 
 
+@pytest.mark.parametrize("explicit_null", [False, True])
+async def test_experiment_rejects_unobserved_taxes_before_scoring(settings, tmp_path, explicit_null):
+    import json
+
+    from PIL import Image
+    from test_experiment_scoring import receipt
+    from test_extraction_pipeline import formatter
+
+    from vision_bill.service.experiment_execution import ExperimentFailure, execute_submission
+    from vision_bill.service.receipt_service import ReceiptService
+
+    path = tmp_path / "receipt.png"
+    Image.new("RGB", (3, 4)).save(path)
+    provider = formatter()
+    payload = receipt().model_dump(mode="json")
+    if explicit_null:
+        payload["taxes"] = None
+    else:
+        del payload["taxes"]
+    provider.send_message = AsyncMock(return_value=json.dumps(payload))
+    service = ReceiptService(settings.images, settings.pg, provider)
+    with pytest.raises(ExperimentFailure, match="draft_incomplete") as exc:
+        await execute_submission(service, "fixture", [path], ExperimentOptions(), [])
+    assert exc.value.metadata["draft"]["taxes"] is None
+    assert exc.value.metadata["classification_enrichment"]["reason_code"] == "incomplete_observations"
+    assert provider.send_message.await_count == 1
+
+
 async def test_forced_ocr_is_not_silently_replaced_with_vision(settings, tmp_path, monkeypatch):
     from vision_bill.service.experiment_execution import execute_submission
     from vision_bill.service.receipt_service import ReceiptService

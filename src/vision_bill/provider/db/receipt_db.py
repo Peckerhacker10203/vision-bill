@@ -18,7 +18,13 @@ from ...model.db.receipt import (
     ReceiptWithDetails,
     TaxLineRow,
 )
-from ...model.extraction import DraftLineItem, DraftTaxLine, ExtractionDraft
+from ...model.extraction import (
+    ClassificationEnrichment,
+    DraftLineItem,
+    DraftTaxLine,
+    ExtractionDraft,
+    assert_metadata_only,
+)
 from ...model.item_category import CATEGORY_CODE_SET, normalize_history_key
 from ...model.ocr import SourceRef
 from ...model.receipt import Receipt
@@ -31,7 +37,7 @@ from ...model.statistics import (
     WeekdayStatistics,
     WeeklyStatistics,
 )
-from ...model.workflow import AccessScope, ReviewRequest, assert_metadata_only
+from ...model.workflow import AccessScope, ReviewRequest
 from ...service.receipt_review import (
     evaluate_receipt,
     material_document,
@@ -144,9 +150,11 @@ GET_RECEIPT_BY_IMAGE_ID_SQL = (
 # Join the images table so the detail response can expose the resolved
 # image_path without a second round-trip.
 GET_RECEIPT_WITH_IMAGE_SQL = """
-    SELECT r.*, i.image_path, i.thumbnail_path
+    SELECT r.*, i.image_path, i.thumbnail_path,
+           e.envelope -> 'classification_enrichment' AS classification_enrichment
     FROM receipts r
     LEFT JOIN images i ON i.id = r.image_id
+    LEFT JOIN receipt_extractions e ON e.id = r.extraction_id AND e.image_id = r.image_id
     WHERE r.id = $1
 """
 LIST_RECEIPTS_BASE_SQL = (
@@ -1299,6 +1307,9 @@ class ReceiptDB:
         image_path: str | None = d.get("image_path")
         receipt = self._receipt_row_from_record(row)
         collection_ids = [r["collection_id"] for r in coll_rows]
+        raw_enrichment = d.get("classification_enrichment")
+        if isinstance(raw_enrichment, str):
+            raw_enrichment = json.loads(raw_enrichment)
 
         return ReceiptWithDetails(
             receipt=receipt,
@@ -1306,6 +1317,10 @@ class ReceiptDB:
             taxes=[self._tax_row_from_record(r) for r in tax_rows],
             image_path=image_path,
             collection_ids=collection_ids,
+            classification_enrichment=(
+                ClassificationEnrichment.model_validate(raw_enrichment)
+                if raw_enrichment is not None else ClassificationEnrichment()
+            ),
         )
 
     async def list_tags(self, *, deadline: float | None = None) -> list[str]:

@@ -8,25 +8,11 @@ from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validat
 
 from .db.image import ImagePart, ImageRow
 from .db.receipt import ReceiptRow
-from .extraction import InferenceEnvelope
+from .extraction import InferenceEnvelope, assert_metadata_only
 from .ocr import OcrPageMetadata, OcrResponse, Sha256, WorkingImageMetadata
 from .review import FindingAcknowledgement, ReviewEvaluation, SourceView
 
 TERMINAL_STATES = frozenset({"analyzed", "needs_review", "failed", "timed_out", "unreadable"})
-
-
-def assert_metadata_only(value: Any) -> None:
-    """Reject transport image payloads from arbitrary persisted metadata."""
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        raise ValueError("image bytes belong in saved artifacts")  # noqa: TRY004
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if str(key).lower() in {"png_base64", "image_base64", "image_bytes"}:
-                raise ValueError("raw image payload belongs in saved artifacts")
-            assert_metadata_only(item)
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            assert_metadata_only(item)
 
 
 class SourcePartBinding(BaseModel):

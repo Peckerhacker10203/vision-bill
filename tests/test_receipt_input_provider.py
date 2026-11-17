@@ -150,7 +150,7 @@ async def test_source_aware_overlap_keeps_original_draft_and_verified_decisions(
         source_refs=[*inp.source_refs, ref],
     )
     payload = extraction([item(), item(), item(source=1), item("Bread", source=1)], [(1, 2)])
-    payload.update(currency="EUR", discount_total="0", tax_total="0")
+    payload.update(currency="EUR", discount_total="0", tax_total="0", taxes=[], payment_method="cash")
     payload["overlap_decisions"] = [{"reason": "printed suffix and prefix"}]
     provider = OllamaProvider("http://local").for_experiment(
         ExperimentOptions(include_classification=False)
@@ -165,6 +165,87 @@ async def test_source_aware_overlap_keeps_original_draft_and_verified_decisions(
     assert result.field_sources["line_items.2"] == [ref]
     assert result.overlap_decisions[-1]["verified"] is True
     assert result.overlap_decisions[-1]["removed_index"] == 2
+
+    from vision_bill.service.observation_admission import admit_observations
+
+    assert [row.description for row in admit_observations(result).line_items] == ["Milk", "Milk", "Bread"]
+
+
+@pytest.mark.parametrize("field", ["taxes", "payment_method", "currency", "discount_total", "tax_total", "subtotal", "total"])
+@pytest.mark.parametrize("explicit_null", [False, True])
+async def test_unobserved_mandatory_values_do_not_dispatch_classification(field, explicit_null):
+    from test_experiment_scoring import receipt
+
+    values = receipt().model_dump(mode="json")
+    if explicit_null:
+        values[field] = None
+    else:
+        del values[field]
+    provider = OllamaProvider("http://local")
+    provider.send_message = AsyncMock(return_value=json.dumps(values))
+    result = await provider.extract_receipt_input(
+        "requested", ocr_input(), tags=[], deadline=time.monotonic() + 2
+    )
+    assert result.receipt is None
+    assert result.draft is not None
+    assert getattr(result.draft, field) is None
+    assert provider.send_message.await_count == 1
+    assert result.classification_enrichment.state == "skipped"
+    assert result.classification_enrichment.reason_code == "incomplete_observations"
+
+
+async def test_observation_stage_preserves_receipt_and_empty_tag_enrichment():
+    from test_experiment_scoring import receipt
+
+    values = receipt(("Milk",)).model_dump(mode="json")
+    del values["category"]
+    del values["line_items"][0]["spending_category"]
+    del values["line_items"][0]["tags"]
+    labels = {"category": "grocery", "line_items": [{"spending_category": "milk", "tags": []}]}
+    provider = OllamaProvider("http://local")
+    provider.send_message = AsyncMock(side_effect=[json.dumps(values), json.dumps(labels)])
+    deadline = time.monotonic() + 2
+    observed = await provider.extract_observations("requested", ocr_input(), tags=[], deadline=deadline)
+    assert provider.send_message.await_count == 1
+    assert observed.classification_enrichment.state == "pending"
+    assert observed.classification_enrichment.missing_fields == [
+        "category", "line_items.0.spending_category", "line_items.0.tags",
+    ]
+    enriched = await provider.enrich_observations("requested", observed, [], work_deadline=deadline)
+    assert enriched.classification_enrichment.state == "completed"
+    assert enriched.classification_enrichment.missing_fields == []
+    assert enriched.receipt.category == "grocery"
+    assert enriched.receipt.line_items[0].tags == []
+    assert enriched.draft.line_items[0].tags is None
+    assert observed.classification_enrichment.state == "pending"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        pytest.param("{", id="malformed-json"),
+        pytest.param('{"category":"grocery","line_items":[]}', id="wrong-row-count"),
+        pytest.param("[" * 10000 + "]" * 10000, id="nested-json"),
+    ],
+)
+async def test_bad_classification_is_unavailable_without_erasing_labels_or_creating_findings(response):
+    from test_experiment_scoring import receipt
+
+    values = receipt(("Milk",)).model_dump(mode="json")
+    del values["category"]
+    values["line_items"][0]["spending_category"] = "milk"
+    values["line_items"][0]["tags"] = ["observed"]
+    provider = OllamaProvider("http://local")
+    provider.send_message = AsyncMock(side_effect=[json.dumps(values), response])
+    result = await provider.extract_receipt_input(
+        "requested", ocr_input(), tags=[], deadline=time.monotonic() + 2
+    )
+    assert result.receipt.line_items[0].spending_category == "milk"
+    assert result.receipt.line_items[0].tags == ["observed"]
+    assert result.findings == []
+    assert result.classification_enrichment.state == "unavailable"
+    assert result.classification_enrichment.reason_code == "invalid_response"
+    assert result.classification_enrichment.missing_fields == ["category"]
 
 
 async def test_unknown_source_ref_cannot_survive_as_valid_draft():
@@ -224,6 +305,11 @@ async def test_classification_is_separate_cannot_change_observations_and_is_in_t
     ]
     assert len(result.telemetry.calls) == 2
     assert result.telemetry.calls[1]["stage"] == "classification"
+    assert result.classification_enrichment.state == "unavailable"
+    assert result.classification_enrichment.missing_fields == [
+        "line_items.0.spending_category", "line_items.1.spending_category",
+    ]
+    assert all(row.tags == ["food"] for row in result.receipt.line_items)
 
 
 async def test_supplied_and_explicit_null_fields_are_distinguished():
@@ -588,7 +674,9 @@ async def test_final_rows_project_distinct_blocks_after_accepted_boundary_overla
             sources[f"line_items.{i * 2 + j}.description"] = [source.model_dump(mode="json")]
     inp = ReceiptInput(mode="ocr", image_paths=["a", "b"], ocr_pages=pages, source_refs=refs)
     payload = extraction([item("A"), item("B"), item("B", source=1), item("C", source=1)], [(1, 2)])
-    payload.update(currency="EUR", discount_total="0", tax_total="0")
+    payload.update(
+        currency="EUR", discount_total="0", tax_total="0", taxes=[], payment_method="cash"
+    )
     payload["field_sources"] = sources
     provider = OllamaProvider("http://local").for_experiment(
         ExperimentOptions(include_classification=False)

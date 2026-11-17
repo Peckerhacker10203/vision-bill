@@ -17,11 +17,13 @@ from typing import TYPE_CHECKING, Any
 
 from ..config import OcrSettings
 from ..model.experiment import ExperimentOptions, ExtractionPipeline
+from ..model.extraction import pack_inference_metadata
 from ..model.handoff import HandoffStatus, HandoffWait
 from ..model.receipt import Receipt
 from .execution_policy import EXECUTION_POLICY_VERSION
 from .extraction_pipeline import ExtractionPipeline as ReceiptExtractionPipeline
 from .gpu_handoff import admission_deadline
+from .observation_admission import admit_observations
 
 if TYPE_CHECKING:
     from .receipt_service import ReceiptService
@@ -126,31 +128,30 @@ async def execute_submission(
                 deadline=monotonic() + provider.analysis_timeout_seconds,
                 tags=tags,
             )
-            metadata.update(envelope.provenance.model_dump(mode="json"))
-            metadata["calls"] = envelope.telemetry.calls
-            metadata["telemetry"] = envelope.telemetry.model_dump(mode="json")
-            metadata["source_projection_version"] = envelope.source_projection_version
-            metadata["draft"] = envelope.draft.model_dump(mode="json") if envelope.draft else None
+            persisted = pack_inference_metadata(envelope)
+            metadata.update(persisted.provenance.model_dump(mode="json"))
+            metadata["calls"] = persisted.telemetry.calls
+            metadata["telemetry"] = persisted.telemetry.model_dump(mode="json")
+            metadata["source_projection_version"] = persisted.source_projection_version
+            metadata["draft"] = persisted.draft.model_dump(mode="json") if persisted.draft else None
             metadata["raw_field_sources"] = {
                 key: [ref.model_dump(mode="json") for ref in refs]
-                for key, refs in envelope.raw_field_sources.items()
+                for key, refs in persisted.raw_field_sources.items()
             }
             metadata["field_sources"] = {
                 key: [ref.model_dump(mode="json") for ref in refs]
-                for key, refs in envelope.field_sources.items()
+                for key, refs in persisted.field_sources.items()
             }
-            metadata["overlap_decisions"] = envelope.overlap_decisions
-            metadata["findings"] = [f.model_dump(mode="json") for f in envelope.findings]
-            from ..model.ocr import OcrPageMetadata
-
-            metadata["ocr_pages"] = [
-                OcrPageMetadata.model_validate(page.model_dump()).model_dump(mode="json")
-                for page in envelope.ocr_pages
-            ]
-            if envelope.receipt is None:
-                code = envelope.findings[-1].code if envelope.findings else "receipt_incomplete"
+            metadata["overlap_decisions"] = persisted.overlap_decisions
+            metadata["findings"] = [f.model_dump(mode="json") for f in persisted.findings]
+            metadata["ocr_pages"] = [page.model_dump(mode="json") for page in persisted.ocr_pages]
+            metadata["classification_enrichment"] = persisted.classification_enrichment.model_dump(
+                mode="json"
+            )
+            if persisted.draft is None and persisted.receipt is None:
+                code = persisted.findings[-1].code if persisted.findings else "receipt_incomplete"
                 raise ValueError(code)
-            receipt = envelope.receipt
+            receipt = admit_observations(persisted)
     except HandoffWait:
         raise
     except Exception as exc:

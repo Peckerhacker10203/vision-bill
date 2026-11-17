@@ -14,7 +14,7 @@ from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic, perf_counter
-from typing import Any, TypeVar
+from typing import Any, TypeVar, get_args
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -27,6 +27,7 @@ from ...helper.duplicates import verify_duplicate
 from ...model.experiment import ExperimentOptions
 from ...model.extraction import (
     SOURCE_PROJECTION_VERSION,
+    ClassificationEnrichment,
     DerivedInputView,
     ExtractionDraft,
     InferenceEnvelope,
@@ -34,11 +35,13 @@ from ...model.extraction import (
     PipelineProvenance,
     ReceiptInput,
 )
-from ...model.item_category import CATEGORY_CODES, CATEGORY_DEFINITIONS
+from ...model.item_category import CATEGORY_CODE_SET, CATEGORY_CODES, CATEGORY_DEFINITIONS
 from ...model.ocr import SourceRef, WorkingImage
-from ...model.receipt import Receipt
+from ...model.receipt import Category, LineItem, Receipt
 from ...model.receipt_extraction import DuplicateCandidate, MultiImageReceipt, validate_overlap
 from ...model.review import AmountPolicy, ReviewFinding
+from ...service.observation_admission import admit_observations
+from ...service.receipt_review import observation_values
 from .errors import UnreadableReceiptError
 from .experiment import extraction_prompt, source_extraction_prompt
 
@@ -281,14 +284,21 @@ class LLMProvider(ABC):
         self, model_id: str, input: ReceiptInput, *, tags: Sequence[str], deadline: float
     ) -> InferenceEnvelope:
         """Extract observations first; classification is an independent enrichment call."""
+        started = perf_counter()
         async with asyncio.timeout(max(0, deadline - monotonic())), (
             self.handoff.session(deadline, model_id=model_id) if self.handoff is not None else nullcontext()
         ):
-            return await self._extract_receipt_input_owned(model_id, input, tags=tags, deadline=deadline)
+            result = await self.extract_observations(model_id, input, tags=tags, deadline=deadline)
+            if result.classification_enrichment.state == "pending":
+                result = await self.enrich_observations(model_id, result, tags, work_deadline=deadline)
+            check_deadline(deadline)
+            result.telemetry.elapsed_ms = (perf_counter() - started) * 1000
+            return result
 
-    async def _extract_receipt_input_owned(
+    async def extract_observations(
         self, model_id: str, input: ReceiptInput, *, tags: Sequence[str], deadline: float
     ) -> InferenceEnvelope:
+        """Prepare and format all inputs under the caller's existing model owner."""
         started = perf_counter()
         probe = copy(self)
         probe.experiment_trace = []
@@ -304,6 +314,7 @@ class LLMProvider(ABC):
             model_id=model_id,
         )
         result = InferenceEnvelope(
+            source_projection_version=SOURCE_PROJECTION_VERSION,
             provenance=provenance,
             telemetry=InferenceTelemetry(elapsed_ms=0, max_output_tokens=self.max_output_tokens),
             field_sources={"input": input.source_refs},
@@ -341,10 +352,16 @@ class LLMProvider(ABC):
             if attempts
             else None,
         )
-        if result.receipt is not None and (
-            self.experiment_options is None or self.experiment_options.include_classification
-        ):
-            result = await probe._enrich_classification(model_id, result, tags, deadline)
+        if result.receipt is None:
+            result.classification_enrichment = ClassificationEnrichment(
+                state="skipped", reason_code="incomplete_observations"
+            )
+        elif self.experiment_options and not self.experiment_options.include_classification:
+            result.classification_enrichment = ClassificationEnrichment(
+                state="skipped",
+                reason_code="classification_disabled",
+                missing_fields=result.classification_enrichment.missing_fields,
+            )
         check_deadline(deadline)
         result.input_views = views
         result.telemetry.elapsed_ms = (perf_counter() - started) * 1000
@@ -533,7 +550,10 @@ class LLMProvider(ABC):
         decisions = payload.get("overlap_decisions", [])
         if not isinstance(decisions, list) or any(not isinstance(d, dict) for d in decisions):
             raise ValueError("invalid_overlap_decisions")
+        observed_values = observation_values(draft)
         if count > 1:
+            if "duplicate_candidates" in values:
+                observed_values["duplicate_candidates"] = candidates
             rows = values.get("line_items")
             if rows is not None:
                 sources = [row.get("source_image") for row in rows]
@@ -545,6 +565,7 @@ class LLMProvider(ABC):
                     sources, [DuplicateCandidate.model_validate(pair) for pair in candidates]
                 )
                 for index, source in enumerate(sources):
+                    observed_values["line_items"][index]["source_image"] = source
                     if source < len(input.source_refs):
                         field_sources.setdefault(f"line_items.{index}", [input.source_refs[source]])
         result.amount_policy = AmountPolicy.model_validate(payload.get("amount_policy", {}))
@@ -557,11 +578,7 @@ class LLMProvider(ABC):
             for pair in candidates
             if isinstance(pair, dict)
         ]
-        # These financial observations cannot inherit final-business EUR/zero defaults.
-        observed_values = {
-            **values,
-            **{key: getattr(draft, key) for key in ("currency", "discount_total", "tax_total")},
-        }
+        removed: set[int] = set()
         try:
             if count > 1:
                 multi = MultiImageReceipt.model_validate(observed_values)
@@ -615,6 +632,24 @@ class LLMProvider(ABC):
         except ValueError as exc:
             raise _PartialDraftError(result) from exc
         result.receipt = receipt
+        try:
+            admit_observations(result)
+        except ValueError as exc:
+            result.receipt = None
+            raise _PartialDraftError(result) from exc
+
+        missing = ["category"] if draft.category is None else []
+        remaining_rows = (
+            row for index, row in enumerate(draft.line_items or []) if index not in removed
+        )
+        for index, row in enumerate(remaining_rows):
+            if row.spending_category in (None, "unknown"):
+                missing.append(f"line_items.{index}.spending_category")
+            if row.tags is None:
+                missing.append(f"line_items.{index}.tags")
+        result.classification_enrichment = ClassificationEnrichment(
+            state="pending", missing_fields=missing
+        )
         return result
 
     def _build_image_messages(
@@ -639,47 +674,80 @@ class LLMProvider(ABC):
     def _parse_classification(content: str, result: InferenceEnvelope) -> InferenceEnvelope:
         result = result.model_copy(deep=True)
         assert result.receipt is not None
+        missing = set(result.classification_enrichment.missing_fields)
+        result.classification_enrichment = ClassificationEnrichment(
+            state="unavailable", reason_code="invalid_response", missing_fields=sorted(missing)
+        )
+        if not content or len(content) > 200000:
+            return result
         try:
             payload = json.loads(content)
-            rows = payload.get("line_items", [])
-            if len(rows) != len(result.receipt.line_items):
-                return result
-            updated = result.receipt.model_dump()
-            updated["category"] = payload.get("category", updated["category"])
-            for row, additions in zip(updated["line_items"], rows, strict=True):
-                for key in ("spending_category", "tags"):
-                    if key in additions:
-                        row[key] = additions[key]
-            result.receipt = Receipt.model_validate(updated)
-            # Raw observations, including null classification and overlapping rows, stay unchanged.
-        except (ValueError, TypeError, AttributeError):
+        except (ValueError, RecursionError):
+            return result
+        rows = payload.get("line_items") if isinstance(payload, dict) else None
+        if (
+            not isinstance(rows, list)
+            or len(rows) != len(result.receipt.line_items)
+            or any(not isinstance(row, dict) for row in rows)
+        ):
             return result
 
+        updated = result.receipt.model_dump()
+        incomplete = False
+        if payload.get("category") in get_args(Category):
+            updated["category"] = payload["category"]
+            missing.discard("category")
+        else:
+            incomplete = True
+        for index, (row, additions) in enumerate(zip(updated["line_items"], rows, strict=True)):
+            category = additions.get("spending_category")
+            if isinstance(category, str) and category in CATEGORY_CODE_SET and category != "unknown":
+                row["spending_category"] = category
+                missing.discard(f"line_items.{index}.spending_category")
+            else:
+                incomplete = True
+            tags = additions.get("tags")
+            if isinstance(tags, list) and all(isinstance(tag, str) for tag in tags):
+                normalized = LineItem._normalize_tags(tags)
+                if normalized or not tags:
+                    row["tags"] = normalized
+                    missing.discard(f"line_items.{index}.tags")
+                    continue
+            incomplete = True
+        result.receipt = Receipt.model_validate(updated)
+        result.classification_enrichment = ClassificationEnrichment(
+            state="unavailable" if incomplete else "completed",
+            reason_code="invalid_response" if incomplete else None,
+            missing_fields=sorted(missing),
+        )
         return result
 
-    async def _enrich_classification(
-        self, model_id: str, result: InferenceEnvelope, tags: Sequence[str], deadline: float
+    async def enrich_observations(
+        self, model_id: str, result: InferenceEnvelope, tags: Sequence[str], *, work_deadline: float
     ) -> InferenceEnvelope:
-        prompt = await run_sync_before(deadline, self._classification_prompt, result, tuple(tags))
-        before = len(self.experiment_trace or [])
-        async with asyncio.timeout(max(0, deadline - monotonic())):
-            content = await self.send_message(model_id, [{"role": "user", "content": prompt}])
-        check_deadline(deadline)
-        call = (
-            dict(self.experiment_trace[-1])
-            if self.experiment_trace and len(self.experiment_trace) > before
-            else {}
-        )
+        """Classify admitted observations with text under the caller's model owner."""
+        if result.classification_enrichment.state != "pending":
+            return result
+        started = perf_counter()
+        await run_sync_before(work_deadline, admit_observations, result)
+        probe = copy(self)
+        probe.experiment_trace = []
+        prompt = await run_sync_before(work_deadline, probe._classification_prompt, result, tuple(tags))
+        async with asyncio.timeout(max(0, work_deadline - monotonic())):
+            content = await probe.send_message(model_id, [{"role": "user", "content": prompt}])
+        check_deadline(work_deadline)
+        call = dict(probe.experiment_trace[-1]) if probe.experiment_trace else {}
         call.update(
             stage="classification",
             requested_model=model_id,
             raw_response=content[:200000],
             response_truncated=len(content) > 200000,
         )
-        result = await run_sync_before(deadline, self._parse_classification, content, result)
+        result = await run_sync_before(work_deadline, probe._parse_classification, content, result)
         result.telemetry.calls.append(call)
         if isinstance(call.get("elapsed_ms"), (float, int)):
             result.telemetry.stage_ms["classification"] = call["elapsed_ms"]
+        result.telemetry.elapsed_ms += (perf_counter() - started) * 1000
         return result
 
     def _ocr_result_to_text(self, ocr_result: dict[str, Any]) -> str:

@@ -16,6 +16,21 @@ export type Category =
 export type PaymentMethod =
 	'cash' | 'credit_card' | 'debit_card' | 'mobile_payment' | 'check' | 'other' | 'unknown';
 
+export type EnrichmentReason =
+	| 'invalid_response'
+	| 'request_rejected'
+	| 'not_dispatched'
+	| 'classification_budget_exhausted'
+	| 'classification_disabled'
+	| 'incomplete_observations'
+	| 'recovered_without_classification';
+
+export interface ClassificationEnrichment {
+	state: 'not_recorded' | 'pending' | 'completed' | 'unavailable' | 'skipped';
+	reason_code: EnrichmentReason | null;
+	missing_fields: string[];
+}
+
 export interface SourceView {
 	view_id: string;
 	photo_index: number;
@@ -256,6 +271,7 @@ export interface ReceiptWithDetails {
 	image_path: string | null;
 	/** Ids of the collections this receipt belongs to (detail view only). */
 	collection_ids: string[];
+	classification_enrichment: ClassificationEnrichment;
 }
 
 /** Authenticated principal (mirrors the backend `User` model). */

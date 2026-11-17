@@ -235,3 +235,72 @@ def test_direct_input_views_are_internal_and_cannot_dump_png():
     assert envelope.input_views[0].working_image.png_base64
     assert "input_views" not in envelope.model_dump()
     assert "png_base64" not in envelope.model_dump_json()
+
+
+def test_historical_enrichment_defaults_to_not_recorded_in_receipt_details():
+    from test_experiment_scoring import receipt
+
+    from vision_bill.model.db.receipt import ReceiptWithDetails
+    from vision_bill.model.extraction import InferenceEnvelope
+
+    history = {
+        "provenance": {
+            "requested_pipeline": "ocr", "used_pipeline": "ocr", "source_image_count": 1,
+            "ordered_source_sha256": ["a" * 64], "model_id": "private-model",
+        },
+        "telemetry": {"elapsed_ms": 1, "max_output_tokens": 8192},
+    }
+    envelope = InferenceEnvelope.model_validate(history)
+    assert envelope.classification_enrichment.state == "not_recorded"
+    details = ReceiptWithDetails.model_validate({
+        "receipt": receipt().model_dump() | {"id": uuid4()}, "line_items": [], "taxes": [],
+    })
+    assert details.classification_enrichment.state == "not_recorded"
+    assert "private-model" not in details.model_dump_json()
+
+
+def test_inference_metadata_projection_keeps_ocr_identity_without_transport_payloads():
+    from test_ocr_provider import wire_page
+
+    from vision_bill.model.extraction import (
+        DerivedInputView,
+        InferenceEnvelope,
+        PersistedInferenceEnvelope,
+        pack_inference_metadata,
+    )
+    from vision_bill.model.ocr import OcrPageMetadata
+
+    page = OcrResponse.model_validate(wire_page())
+    envelope = InferenceEnvelope.model_validate({
+        "provenance": {
+            "requested_pipeline": "ocr", "used_pipeline": "ocr", "source_image_count": 1,
+            "ordered_source_sha256": [page.source_sha256], "model_id": "model",
+        },
+        "telemetry": {"elapsed_ms": 1, "max_output_tokens": 8192},
+        "ocr_pages": [page],
+        "input_views": [DerivedInputView(photo_index=0, source_sha256=page.source_sha256,
+                                        working_image=page.working_image)],
+    })
+    persisted = pack_inference_metadata(envelope)
+    assert type(persisted.ocr_pages[0]) is OcrPageMetadata
+    assert persisted.ocr_pages[0].working_image.view_id == page.working_image.view_id
+    assert persisted.ocr_pages[0].text == page.text
+    assert "input_views" not in persisted.model_dump()
+    assert "png_base64" not in persisted.model_dump_json()
+    assert envelope.ocr_pages[0].working_image.png_base64
+    with pytest.raises(ValidationError):
+        PersistedInferenceEnvelope.model_validate(envelope.model_dump())
+    with pytest.raises(ValidationError):
+        PersistedInferenceEnvelope.model_validate(persisted.model_dump() | {"input_views": []})
+    persisted.telemetry.calls.append({"image_bytes": "embedded"})
+    with pytest.raises(ValidationError):
+        PersistedInferenceEnvelope.model_validate(persisted)
+    for transport in ({"x": [b"image"]}, {"x": [{"png_base64": "image"}]}):
+        envelope.telemetry.calls = [transport]
+        with pytest.raises(ValueError):
+            pack_inference_metadata(envelope)
+
+    envelope.telemetry.calls = []
+    page.working_image.transforms = [{"image_bytes": "embedded"}]
+    with pytest.raises(ValueError):
+        pack_inference_metadata(envelope)

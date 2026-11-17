@@ -304,6 +304,15 @@ def test_approved_overlap_reviews_final_receipt_without_reinterpreting_raw_rows(
     incomplete = SubmissionService._outcome(envelope, [], ORIGINALS)
     assert not incomplete.review.can_finalize and incomplete.kind == "partial"
 
+    from vision_bill.model.extraction import SOURCE_PROJECTION_VERSION
+    from vision_bill.service.observation_admission import admit_observations
+
+    with pytest.raises(ValueError, match="draft_incomplete"):
+        admit_observations(envelope)
+    envelope.draft = None
+    envelope.source_projection_version = SOURCE_PROJECTION_VERSION
+    assert SubmissionService._outcome(envelope, [], ORIGINALS).kind == "retry"
+
 
 async def test_legacy_availability_does_not_fabricate_persisted_part_ids(tmp_path):
     from vision_bill.model.db.image import ImagePart

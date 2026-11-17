@@ -56,7 +56,8 @@ const detail = (receipt = row): ReceiptWithDetails => ({
 	line_items: [],
 	taxes: [],
 	collection_ids: [],
-	image_path: null
+	image_path: null,
+	classification_enrichment: { state: 'not_recorded', reason_code: null, missing_fields: [] }
 });
 beforeEach(() => {
 	queryClient.clear();

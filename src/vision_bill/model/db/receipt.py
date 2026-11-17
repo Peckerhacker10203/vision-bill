@@ -5,6 +5,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
+from ..extraction import ClassificationEnrichment
 from ..ocr import SourceRef
 from ..review import AmountPolicy, FindingAcknowledgement, ReviewFinding
 
@@ -95,3 +96,6 @@ class ReceiptWithDetails(BaseModel):
     taxes: list[TaxLineRow]
     image_path: str | None = None
     collection_ids: list[UUID] = Field(default_factory=list)
+    classification_enrichment: ClassificationEnrichment = Field(
+        default_factory=ClassificationEnrichment
+    )
