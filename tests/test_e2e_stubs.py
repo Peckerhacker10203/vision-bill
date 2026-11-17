@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import sys
+from http.client import HTTPResponse
 from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
@@ -26,6 +27,115 @@ def module(name, path):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+class StubConnection:
+    """Run the real stdlib HTTP handler against an in-memory connection."""
+
+    def __init__(self, request):
+        self.request = BytesIO(request)
+        self.response = BytesIO()
+
+    def makefile(self, mode, buffering=None):
+        return self.response if buffering is None else self.request
+
+    def sendall(self, data):
+        self.response.write(data)
+
+
+def llm_request(server, path, *, model=None, authorization=None):
+    headers = ["Host: llm-stub"]
+    body = b""
+    method = "GET"
+    if model is not None:
+        raw = (ROOT / "e2e/llm_stub/fixtures/a.png").read_bytes()
+        image_url = "data:image/png;base64," + base64.b64encode(raw).decode()
+        body = json.dumps(
+            {
+                "model": model,
+                "messages": [
+                    {"content": [{"type": "image_url", "image_url": {"url": image_url}}]}
+                ],
+            }
+        ).encode()
+        headers.append(f"Content-Length: {len(body)}")
+        method = "POST"
+    if authorization is not None:
+        headers.append(f"Authorization: {authorization}")
+    wire_request = "\r\n".join([f"{method} {path} HTTP/1.0", *headers, "", ""]).encode()
+    connection = StubConnection(wire_request + body)
+    server.Handler(connection, ("127.0.0.1", 0), None)
+    connection.response.seek(0)
+    response = HTTPResponse(connection)
+    response.begin()
+    return response.status, json.load(response)
+
+
+def test_llm_stub_accepts_only_opt_in_exact_model_without_credentials(monkeypatch):
+    monkeypatch.setenv("VB_E2E_LLM_MODEL_ID", "Operator/team-receipt:smoke-v1")
+    monkeypatch.delenv("VB_E2E_LLM_BEARER_TOKEN", raising=False)
+    server = module("llm_stub_prepared_model", "e2e/llm_stub/server.py")
+    status, discovery = llm_request(server, "/v1/models")
+    assert status == 200
+    assert [model["id"] for model in discovery["data"]] == ["Operator/team-receipt:smoke-v1"]
+    assert "image" in discovery["data"][0]["architecture"]["input_modalities"]
+
+    for invalid_model in ("operator/team-receipt:smoke-v1", "e2e-vision"):
+        status, _ = llm_request(server, "/v1/chat/completions", model=invalid_model)
+        assert status == 422
+    assert not server.requests_log
+
+    status, completion = llm_request(
+        server,
+        "/v1/chat/completions",
+        model="Operator/team-receipt:smoke-v1",
+        authorization="Bearer none",
+    )
+    assert status == 200
+    assert completion["model"] == "Operator/team-receipt:smoke-v1"
+    receipt = json.loads(completion["choices"][0]["message"]["content"])
+    assert receipt["merchant_name"] == "Aldi Test"
+
+
+def test_llm_stub_requires_opt_in_bearer_for_models_and_completions(monkeypatch, capsys):
+    monkeypatch.delenv("VB_E2E_LLM_MODEL_ID", raising=False)
+    token = "prepared-fixture-only-synthetic"
+    monkeypatch.setenv("VB_E2E_LLM_BEARER_TOKEN", token)
+    server = module("llm_stub_prepared_auth", "e2e/llm_stub/server.py")
+    endpoints = [
+        ("/v1/models", None),
+        ("/v1/chat/completions", "e2e-vision"),
+    ]
+
+    for path, model in endpoints:
+        for unauthorized in (None, "Bearer none", f"Basic {token}", f"Bearer {token}x"):
+            status, body = llm_request(server, path, model=model, authorization=unauthorized)
+            assert status == 401
+            assert token not in json.dumps(body)
+    assert not server.requests_log
+
+    for path, model in endpoints:
+        status, body = llm_request(server, path, model=model, authorization=f"Bearer {token}")
+        assert status == 200
+        assert token not in json.dumps(body)
+    status, body = llm_request(server, "/__requests")
+    assert status == 200
+    assert len(body["requests"]) == 1
+    assert token not in json.dumps(body)
+    captured = capsys.readouterr()
+    assert token not in captured.out + captured.err
+
+
+def test_llm_stub_stock_wire_behavior_without_opt_in(monkeypatch):
+    monkeypatch.delenv("VB_E2E_LLM_MODEL_ID", raising=False)
+    monkeypatch.delenv("VB_E2E_LLM_BEARER_TOKEN", raising=False)
+    server = module("llm_stub_stock_wire", "e2e/llm_stub/server.py")
+    status, discovery = llm_request(server, "/v1/models")
+    assert status == 200
+    assert [model["id"] for model in discovery["data"]] == ["e2e-vision", "e2e-text"]
+    status, completion = llm_request(server, "/v1/chat/completions", model="e2e-text")
+    assert status == 200
+    assert completion["model"] == "e2e-vision"
 
 
 def test_exact_ocr_v2_and_same_bytes_distinct_photo_plans():

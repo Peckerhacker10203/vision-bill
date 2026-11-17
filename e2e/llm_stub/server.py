@@ -3,6 +3,7 @@
 Aliases are registered before requests. Direct images use their actual normalized
 bytes; OCR text uses the exact typed source packet. Unknown sources fail closed.
 No scenario controls are sent to the application or inferred by production code.
+Prepared-app checks may set VB_E2E_LLM_MODEL_ID and VB_E2E_LLM_BEARER_TOKEN.
 """
 
 import base64
@@ -21,6 +22,8 @@ ALIASES = json.loads(
     Path(os.environ.get("VB_E2E_ALIASES", Path(__file__).parent / "aliases.json")).read_text()
 )
 MODES = ("ok", "down", "repair_first", "broken", "unreadable", "slow")
+EXACT_MODEL_ID = os.environ.get("VB_E2E_LLM_MODEL_ID")
+BEARER_TOKEN = os.environ.get("VB_E2E_LLM_BEARER_TOKEN")
 MODELS = [
     {
         "id": "e2e-vision",
@@ -35,6 +38,8 @@ MODELS = [
         "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
     },
 ]
+if EXACT_MODEL_ID:
+    MODELS = [{**MODELS[0], "id": EXACT_MODEL_ID}]
 
 # `broken` tracks which image digests already got their one broken response in
 # the current repair_first mode (cleared on every mode change) so the "first
@@ -219,6 +224,12 @@ def _content_for(body: dict[str, Any]) -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _authorized(self) -> bool:
+        if not BEARER_TOKEN or self.headers.get_all("Authorization") == [f"Bearer {BEARER_TOKEN}"]:
+            return True
+        self._send(401, {"error": "unauthorized"})
+        return False
+
     def _send(self, status: int, payload: dict[str, Any]) -> None:
         data = json.dumps(payload).encode("utf-8")
         self.send_response(status)
@@ -255,7 +266,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(503, {"error": "stub is in down mode"})
             return
         if self.path == "/v1/models":
-            self._send(200, {"object": "list", "data": MODELS})
+            if self._authorized():
+                self._send(200, {"object": "list", "data": MODELS})
         elif self.path == "/__requests":
             self._send(200, {"requests": requests_log})
         elif self.path.startswith("/__fixtures/"):
@@ -288,8 +300,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(503, {"error": "stub is in down mode"})
             return
         if self.path == "/v1/chat/completions":
+            if not self._authorized():
+                return
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length))
+            if EXACT_MODEL_ID and body.get("model") != EXACT_MODEL_ID:
+                self._send(422, {"error": "unexpected model"})
+                return
             try:
                 content = _content_for(body)
             except (ValueError, KeyError, IndexError) as exc:
@@ -301,7 +318,7 @@ class Handler(BaseHTTPRequestHandler):
                     "id": "e2e-stub",
                     "object": "chat.completion",
                     "created": int(time.time()),
-                    "model": "e2e-vision",
+                    "model": EXACT_MODEL_ID or "e2e-vision",
                     "choices": [
                         {
                             "index": 0,
