@@ -219,8 +219,9 @@ class PaddleOcrProvider(OcrProvider):
         from ...service.gpu_handoff import ModelHandoff
         from ..factory import get_llm_provider
         provider = get_llm_provider(settings.llm)
-        async with ModelHandoff(settings.ocr.coordination_path, provider, self).session(deadline) as owner:
-            owner.track(settings.llm.model_name)
+        model_id = settings.llm.model_name
+        async with ModelHandoff(settings.ocr.coordination_path, provider, self).session(deadline, model_id=model_id) as owner:
+            owner.track(model_id)
             await owner.ocr_phase()
             page = await self.extract_page(
                 image, photo_index=0, source_sha256=digest, deadline=deadline

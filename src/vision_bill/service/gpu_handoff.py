@@ -29,6 +29,12 @@ from ..model.handoff import (
 
 _current: ContextVar["HandoffOwner | None"] = ContextVar("model_handoff", default=None)
 
+
+def _handoff_error(status: HandoffStatus, *, admission: bool) -> RuntimeError:
+    """Only a pre-work admission rejection can be treated as a wait."""
+    return HandoffWait(status) if admission else RuntimeError(status.reason_code or status.state)
+
+
 class HandoffJournal(BaseModel):
     """No legacy endpoint key: old coordinators must fail before dispatch."""
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -82,6 +88,7 @@ class HandoffOwner:
         self.generation = 1
         self.unsettled = False
         self.dispatch_disposition: DispatchDisposition = "not_dispatched"
+        self.model_work_started = False
         self.ocr_loaded = False
         self.ocr_phase_closed = False
         self.ocr_pending = True  # Claim has not yet confirmed an abandoned worker parked.
@@ -119,10 +126,13 @@ class HandoffOwner:
         if self.ocr_phase_closed:
             raise RuntimeError("model_handoff_ocr_phase_closed: start a fresh session for further OCR")
         await self.release_models()
-        await self.coordinator.require_residency(self.models, self.deadline)
+        await self.coordinator.require_residency(
+            self.models, self.deadline, admission=not self.model_work_started,
+        )
         if not self.ocr_loaded:
             self.ocr_pending = True
             self.save()  # Durable before load HTTP can create native residency.
+            self.model_work_started = True
             await self.coordinator.ocr.load(self.token, self.deadline)
             self.ocr_loaded = True
 
@@ -146,9 +156,9 @@ class HandoffOwner:
 
     def require_model(self, model: str) -> None:
         if self.binding is None or model not in self.binding.model_ids:
-            raise HandoffWait(HandoffStatus(
+            raise _handoff_error(HandoffStatus(
                 state="configuration_required", reason_code="model_handoff_model_not_adopted",
-            ))
+            ), admission=not self.model_work_started)
 
     def require_release(self, model: str) -> None:
         self.require_model(model)
@@ -159,6 +169,7 @@ class HandoffOwner:
         self.dispatch_disposition = "not_dispatched"
 
     async def model_call(self, call: Coroutine[Any, Any, Any]) -> Any:
+        self.model_work_started = True
         self.dispatch_disposition = "unknown"
         self.unsettled = True
         self.save()
@@ -268,7 +279,7 @@ class ModelHandoff:
             ))
         return binding
 
-    async def require_residency(self, recorded: list[str], deadline: float) -> None:
+    async def require_residency(self, recorded: list[str], deadline: float, *, admission: bool = True) -> None:
         try:
             async with asyncio.timeout(max(0, deadline - monotonic())):
                 resident = await self.provider.resident_model_ids(deadline=deadline)
@@ -277,13 +288,13 @@ class ModelHandoff:
             ):
                 raise ValueError("invalid_residency")
         except Exception:  # noqa: BLE001 - unknown provider evidence must remain fenced, without URL/credential output.
-            raise HandoffWait(HandoffStatus(
+            raise _handoff_error(HandoffStatus(
                 state="recovery_required", reason_code="model_handoff_residency_unknown",
-            )) from None
+            ), admission=admission) from None
         if resident.difference(recorded):
-            raise HandoffWait(HandoffStatus(
+            raise _handoff_error(HandoffStatus(
                 state="recovery_required", reason_code="model_handoff_foreign_residency",
-            ))
+            ), admission=admission)
 
     async def inspect(self, *, model_id: str, deadline: float) -> HandoffStatus:
         """Read-only admission evidence; never claim, release, or advance a journal."""

@@ -316,3 +316,47 @@ async def test_capabilities_requires_compatible_explicit_service_mode(
         assert not capabilities.can_load
         assert capabilities.reason_code == "ocr_unavailable"
         assert requests == [("GET", "/info")]
+
+
+async def test_managed_extract_text_checks_selected_model_before_native_effects(monkeypatch, tmp_path):
+    import json
+    from unittest.mock import AsyncMock
+
+    from test_handoff_binding import ResidentLlm
+
+    from vision_bill.config import settings
+    from vision_bill.distribution.handoff import adopt_binding
+    from vision_bill.model.handoff import HandoffWait
+    from vision_bill.service.gpu_handoff import ModelHandoff
+
+    path = image_file(tmp_path)
+    events = []
+    provider = PaddleOcrProvider("http://owned-native.local")
+    provider.claim = AsyncMock(side_effect=lambda *args: events.append("claim"))
+    provider.park = AsyncMock(side_effect=lambda *args: events.append("park"))
+    provider.load = AsyncMock(side_effect=lambda *args: events.append("load"))
+    provider.extract_page = AsyncMock()
+    llm = ResidentLlm(events)
+    handoff = ModelHandoff(tmp_path / "handoff.lock", llm, provider)
+    await adopt_binding(handoff, ["own"], dedicated_coordinated_requests=True,
+                        external_eager_loading_disabled=True, deadline=time.monotonic() + 1)
+    state = {"version": 2, "coordinator": "vision-bill-model-handoff-v2", "resources": handoff.resources.model_dump(),
+             "models": ["own"], "generation": 7, "unsettled": False, "ocr_pending": False}
+    handoff.journal.write_text(json.dumps(state))
+    before = handoff.journal.read_bytes()
+    events.clear()
+    monkeypatch.setattr(settings.ocr, "enabled", True)
+    monkeypatch.setattr(settings.ocr, "manage_model_lifecycle", True)
+    monkeypatch.setattr(settings.ocr, "coordination_path", handoff.path)
+    monkeypatch.setattr(settings.llm, "model_name", "unadopted")
+    monkeypatch.setattr("vision_bill.provider.factory.get_llm_provider", lambda config: llm)
+    with pytest.raises(HandoffWait) as caught:
+        await provider.extract_text(path)
+    assert caught.value.status.reason_code == "model_handoff_model_not_adopted"
+    assert events == []
+    provider.claim.assert_not_awaited()
+    provider.load.assert_not_awaited()
+    provider.park.assert_not_awaited()
+    provider.extract_page.assert_not_awaited()
+    assert handoff.journal.read_bytes() == before
+    assert json.loads(handoff.journal.read_bytes())["generation"] == 7

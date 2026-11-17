@@ -375,3 +375,45 @@ async def test_cli_foreign_residency_asks_operator_to_quiesce_without_unloading(
     assert "quiesce" in output.err.lower()
     assert json.loads(output.out)["reason_code"] == "model_handoff_foreign_residency"
     assert events == ["residency"]
+
+
+@pytest.mark.asyncio
+async def test_later_unadopted_model_after_ocr_load_is_not_an_admission_wait(tmp_path):
+    from vision_bill.model.handoff import HandoffWait
+    events = []
+    handoff = ModelHandoff(tmp_path / "handoff.lock", ResidentLlm(events), Ocr(events))
+    await adopt(handoff)
+    async with handoff.session(monotonic() + 1, model_id="own") as owner:
+        await owner.ocr_phase()
+        before = handoff.journal.read_bytes()
+        with pytest.raises(RuntimeError, match="model_handoff_model_not_adopted") as caught:
+            await owner.llm_phase("unadopted")
+        assert not isinstance(caught.value, HandoffWait)
+        assert handoff.journal.read_bytes() == before
+        assert events.count("load_ocr") == 1
+        assert ("unload", "unadopted") not in events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evidence", ["failed", "foreign"])
+async def test_residency_failure_after_ocr_load_is_not_an_admission_wait(tmp_path, evidence):
+    from vision_bill.model.handoff import HandoffWait
+    events = []
+    llm = ResidentLlm(events)
+    handoff = ModelHandoff(tmp_path / "handoff.lock", llm, Ocr(events))
+    await adopt(handoff)
+    async with handoff.session(monotonic() + 1, model_id="own") as owner:
+        await owner.ocr_phase()
+        before = handoff.journal.read_bytes()
+        if evidence == "failed":
+            async def failed_residency(*, deadline):
+                raise ConnectionError("read-only evidence unavailable")
+            llm.resident_model_ids = failed_residency
+        else:
+            llm.resident = frozenset({"foreign"})
+        with pytest.raises(RuntimeError, match="model_handoff_.*residency") as caught:
+            await owner.ocr_phase()
+        assert not isinstance(caught.value, HandoffWait)
+        assert handoff.journal.read_bytes() == before
+        assert events.count("load_ocr") == 1
+        assert all(not isinstance(event, tuple) for event in events)
