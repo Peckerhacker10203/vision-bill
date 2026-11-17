@@ -25,7 +25,8 @@ GET_COLLECTION_SQL = "SELECT * FROM collections WHERE id = $1"
 # correlated subquery exposed as `cnt`.
 LIST_COLLECTIONS_BASE_SQL = (
     "SELECT c.*, (SELECT COUNT(*)::int FROM receipt_collections rc "
-    "WHERE rc.collection_id = c.id) AS cnt FROM collections c"
+    "JOIN receipts r ON r.id = rc.receipt_id WHERE rc.collection_id = c.id{receipt_scope}) "
+    "AS cnt FROM collections c WHERE 1=1{collection_scope} ORDER BY c.name"
 )
 # Placeholder numbering must be contiguous from $1: an argument that is passed
 # but never referenced (the old `WHERE id = $2` + duplicated id) makes Postgres
@@ -40,7 +41,7 @@ COLLECTION_OWNER_CHECK_SQL = "SELECT 1 AS x FROM collections WHERE id = $1 AND u
 TOTALS_PER_CURRENCY_SQL = (
     "SELECT r.currency AS currency, SUM(r.total) AS total "
     "FROM receipt_collections rc JOIN receipts r ON r.id = rc.receipt_id "
-    "WHERE rc.collection_id = $1 GROUP BY r.currency ORDER BY total DESC"
+    "WHERE rc.collection_id = $1"
 )
 RECEIPTS_IN_COLLECTION_SQL = (
     "SELECT r.* FROM receipts r JOIN receipt_collections rc "
@@ -81,11 +82,13 @@ class CollectionDB:
             created_at=row["created_at"].date() if row["created_at"] is not None else None,
         )
 
-    def _owner_scope(self, args: list[Any], user_id: UUID | None, can_see_all: bool) -> str:
+    def _owner_scope(
+        self, args: list[Any], user_id: UUID | None, can_see_all: bool, *, column: str = "user_id"
+    ) -> str:
         """Return an extra WHERE fragment restricting to the owner when needed."""
         if not can_see_all and user_id is not None:
             args.append(user_id)
-            return f" AND user_id = ${len(args)}"
+            return f" AND {column} = ${len(args)}"
         return ""
 
     def _scoped_returning(
@@ -124,8 +127,9 @@ class CollectionDB:
         self, user_id: UUID | None, can_see_all: bool
     ) -> list[CollectionSummary]:
         args: list[Any] = []
-        sql = LIST_COLLECTIONS_BASE_SQL + (
-            " WHERE 1=1" + self._owner_scope(args, user_id, can_see_all) + " ORDER BY name"
+        sql = LIST_COLLECTIONS_BASE_SQL.format(
+            receipt_scope=self._owner_scope(args, user_id, can_see_all, column="r.user_id"),
+            collection_scope=self._owner_scope(args, user_id, can_see_all, column="c.user_id"),
         )
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(sql, *args)
@@ -134,11 +138,7 @@ class CollectionDB:
                 base = self._collection_from_row(row)
                 count = int(row["cnt"])
                 if count > 0:
-                    total_rows = await conn.fetch(TOTALS_PER_CURRENCY_SQL, row["id"])
-                    totals = [
-                        CurrencyTotal(currency=r["currency"], total=Decimal(r["total"]))
-                        for r in total_rows
-                    ]
+                    totals = await self._currency_totals(conn, row["id"], user_id, can_see_all)
                 else:
                     totals = []
                 summaries.append(
@@ -349,7 +349,9 @@ class CollectionDB:
         self, collection_id: UUID, user_id: UUID | None, can_see_all: bool
     ) -> list[ReceiptRow]:
         args: list[Any] = [collection_id]
-        sql = RECEIPTS_IN_COLLECTION_SQL + self._owner_scope(args, user_id, can_see_all)
+        sql = RECEIPTS_IN_COLLECTION_SQL + self._owner_scope(
+            args, user_id, can_see_all, column="r.user_id"
+        )
         sql += " ORDER BY r.date DESC"
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(sql, *args)
@@ -361,6 +363,16 @@ class CollectionDB:
 
         return ReceiptDB._receipt_row_from_record(row)
 
+    async def _currency_totals(
+        self, conn: asyncpg.Connection, collection_id: UUID, user_id: UUID | None, can_see_all: bool
+    ) -> list[CurrencyTotal]:
+        args: list[Any] = [collection_id]
+        sql = TOTALS_PER_CURRENCY_SQL + self._owner_scope(
+            args, user_id, can_see_all, column="r.user_id"
+        )
+        rows = await conn.fetch(sql + " GROUP BY r.currency ORDER BY total DESC", *args)
+        return [CurrencyTotal(currency=r["currency"], total=Decimal(r["total"])) for r in rows]
+
     # Convenience detail assembly used by the service.
     async def get_detail(
         self, collection_id: UUID, user_id: UUID | None, can_see_all: bool
@@ -369,9 +381,6 @@ class CollectionDB:
         if coll is None:
             return None
         async with self.pool.acquire() as conn:
-            total_rows = await conn.fetch(TOTALS_PER_CURRENCY_SQL, collection_id)
+            totals = await self._currency_totals(conn, collection_id, user_id, can_see_all)
         receipts = await self.receipts_in_collection(collection_id, user_id, can_see_all)
-        totals = [
-            CurrencyTotal(currency=r["currency"], total=Decimal(r["total"])) for r in total_rows
-        ]
         return CollectionDetail(**coll.model_dump(), totals=totals, receipts=receipts)

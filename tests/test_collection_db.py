@@ -305,3 +305,27 @@ async def test_deactivate_scopes_owner_before_returning(db: CollectionDB) -> Non
     sql = conn.fetchrow.call_args.args[0]
     assert "AND user_id = $2" in sql
     assert sql.index("AND user_id = $2") < sql.index(" RETURNING ")
+
+
+@pytest.mark.asyncio
+async def test_owner_scope_includes_every_collection_receipt_aggregate(db: CollectionDB) -> None:
+    data = _collection_row()
+    data["cnt"] = 1
+    conn = AsyncMock()
+    conn.fetchrow = AsyncMock(return_value=data)
+    conn.fetch = AsyncMock(side_effect=[
+        [data], [{"currency": "EUR", "total": Decimal("7")}],
+        [{"currency": "EUR", "total": Decimal("7")}], [_receipt_row()],
+    ])
+    db._pool = _make_pool(conn)
+    await db.list_with_totals(UID, False)
+    await db.get_detail(CID, UID, False)
+
+    list_query, list_totals, detail_totals, detail_receipts = (
+        call.args for call in conn.fetch.call_args_list
+    )
+    assert "r.user_id = $" in list_query[0]
+    assert "c.user_id = $" in list_query[0]
+    for sql, collection_id, owner in (list_totals, detail_totals, detail_receipts):
+        assert "r.user_id = $2" in sql
+        assert collection_id == CID and owner == UID

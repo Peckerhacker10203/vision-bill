@@ -122,3 +122,60 @@ async def test_receipt_collection_filter_respects_membership_and_owner(db) -> No
         ]
     finally:
         await receipts.destroy_db()
+
+
+async def test_collection_totals_match_visible_receipts_with_mixed_membership(db) -> None:
+    from vision_bill.provider.db.collection_db import CollectionDB
+
+    pg_fixtures.migrate(db)
+    receipts = ReceiptDB(db)
+    await receipts.init_db()
+    try:
+        owner, foreign, admin = uuid4(), uuid4(), uuid4()
+        collection, foreign_only = uuid4(), uuid4()
+        own_receipt, foreign_receipt = uuid4(), uuid4()
+        async with receipts.pool.acquire() as conn:
+            await conn.executemany(
+                "INSERT INTO users(id, username, hashed_password, is_admin) "
+                "VALUES($1, $2, 'fixture', $3)",
+                [(owner, "owner", False), (foreign, "foreign", False), (admin, "admin", True)],
+            )
+            await conn.executemany(
+                "INSERT INTO collections(id, user_id, name) VALUES($1, $2, $3)",
+                [(collection, owner, "Mixed"), (foreign_only, owner, "Other")],
+            )
+            await conn.executemany(
+                "INSERT INTO receipts(id, user_id, merchant_name, date, total, currency, "
+                "status, verified) VALUES($1, $2, 'Fixture', CURRENT_DATE, $3, $4, 'verified', TRUE)",
+                [
+                    (own_receipt, owner, Decimal("3.25"), "EUR"),
+                    (foreign_receipt, foreign, Decimal("7.10"), "CHF"),
+                ],
+            )
+
+        collections = CollectionDB(receipts.pool)
+        await collections.assign(collection, own_receipt, user_id=owner)
+        await collections.assign(collection, foreign_receipt, user_id=admin, can_see_all=True)
+        await collections.assign(foreign_only, foreign_receipt, user_id=admin, can_see_all=True)
+
+        for actor, see_all, expected in (
+            (owner, False, {own_receipt: ("EUR", Decimal("3.25"))}),
+            (admin, True, {
+                own_receipt: ("EUR", Decimal("3.25")),
+                foreign_receipt: ("CHF", Decimal("7.10")),
+            }),
+        ):
+            summaries = {summary.id: summary for summary in await collections.list_with_totals(actor, see_all)}
+            for ident, members in (
+                (collection, expected),
+                (foreign_only, {rid: total for rid, total in expected.items() if rid == foreign_receipt}),
+            ):
+                summary = summaries[ident]
+                detail = await collections.get_detail(ident, actor, see_all)
+                assert detail is not None
+                assert summary.receipt_count == len(members)
+                assert {row.id for row in detail.receipts} == members.keys()
+                assert {(total.currency, total.total) for total in summary.totals} == set(members.values())
+                assert detail.totals == summary.totals
+    finally:
+        await receipts.destroy_db()
