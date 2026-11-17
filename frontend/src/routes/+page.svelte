@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { createQuery } from '@tanstack/svelte-query';
+	import { sessionViewGuard } from '$lib/session-view';
 	import { resolve } from '$app/paths';
 	import { t, translate } from '$lib/i18n';
 	import { api } from '$lib/api/client';
@@ -10,6 +11,8 @@
 	import { formatMoney } from '$lib/ui/money';
 	import { snackbar } from '$lib/ui/snackbar.svelte';
 	import CollectionPicker from '$lib/ui/CollectionPicker.svelte';
+
+	const isCurrentView = sessionViewGuard();
 
 	const statistics = createQuery(
 		() => ({
@@ -65,33 +68,35 @@
 	let activating = $state(false);
 
 	async function invalidateCapture(): Promise<void> {
+		if (!isCurrentView()) return;
 		await queryClient.invalidateQueries({ queryKey: queryKeys.collectionsActive() });
+		if (!isCurrentView()) return;
 		await queryClient.invalidateQueries({ queryKey: queryKeys.collections() });
 	}
 
 	async function stopCapturing(): Promise<void> {
-		if (stopping || !activeCollection) return;
+		if (!isCurrentView() || stopping || !activeCollection) return;
 		stopping = true;
 		try {
 			await api.deactivateCollection(activeCollection.id);
 			await invalidateCapture();
 		} catch {
-			snackbar.notify('error', translate('collections.deactivateFailed'));
+			if (isCurrentView()) snackbar.notify('error', translate('collections.deactivateFailed'));
 		} finally {
-			stopping = false;
+			if (isCurrentView()) stopping = false;
 		}
 	}
 
 	async function activate(collectionId: string): Promise<void> {
-		if (activating || !collectionId) return;
+		if (!isCurrentView() || activating || !collectionId) return;
 		activating = true;
 		try {
 			await api.activateCollection(collectionId);
 			await invalidateCapture();
 		} catch {
-			snackbar.notify('error', translate('collections.activateFailed'));
+			if (isCurrentView()) snackbar.notify('error', translate('collections.activateFailed'));
 		} finally {
-			activating = false;
+			if (isCurrentView()) activating = false;
 		}
 	}
 </script>

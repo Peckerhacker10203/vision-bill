@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { createQuery } from '@tanstack/svelte-query';
+	import { sessionViewGuard } from '$lib/session-view';
 	import { page } from '$app/state';
 	import { resolve } from '$app/paths';
 	import { goto } from '$app/navigation';
@@ -16,6 +17,7 @@
 	import StatisticsCharts from '$lib/ui/StatisticsCharts.svelte';
 	import type { CollectionDetail, ReceiptRow } from '$lib/types';
 
+	const isCurrentView = sessionViewGuard();
 	let id = $derived(page.url.pathname.split('/').pop() ?? '');
 	const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -48,7 +50,7 @@
 		};
 	});
 	const isCurrent = (view: { id: string } | null) =>
-		view !== null && activeView === view && id === view.id;
+		isCurrentView() && view !== null && activeView === view && id === view.id;
 
 	const detail = createQuery(
 		() => ({

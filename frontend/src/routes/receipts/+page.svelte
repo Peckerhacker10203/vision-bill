@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { createQuery } from '@tanstack/svelte-query';
+	import { sessionViewGuard } from '$lib/session-view';
 	import { resolve } from '$app/paths';
 	import { t, translate } from '$lib/i18n';
 	import { api, ApiError } from '$lib/api/client';
@@ -14,6 +15,8 @@
 	import Icon from '$lib/ui/Icon.svelte';
 	import ReceiptImage from '$lib/ui/ReceiptImage.svelte';
 	import type { ReceiptRow, ReceiptStatus } from '$lib/types';
+
+	const isCurrentView = sessionViewGuard();
 
 	type StatusFilter = '' | ReceiptStatus;
 
@@ -31,17 +34,20 @@
 	}
 
 	async function removeReceipt() {
-		if (!confirmDelete || deleting) {
+		if (!isCurrentView() || !confirmDelete || deleting) {
 			return;
 		}
 		deleting = true;
 		try {
 			await api.deleteReceipt(confirmDelete.id);
+			if (!isCurrentView()) return;
 			snackbar.notify('success', translate('receipt.deleted'));
 			confirmDelete = null;
 			await queryClient.invalidateQueries({ queryKey: ['receipts'] });
+			if (!isCurrentView()) return;
 			await queryClient.invalidateQueries({ queryKey: ['images'] });
 		} catch (error) {
+			if (!isCurrentView()) return;
 			snackbar.notify(
 				'error',
 				error instanceof ApiError && error.status === 409
@@ -49,7 +55,7 @@
 					: translate('receipt.deleteFailed')
 			);
 		} finally {
-			deleting = false;
+			if (isCurrentView()) deleting = false;
 		}
 	}
 

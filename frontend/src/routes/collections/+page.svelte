@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { createQuery } from '@tanstack/svelte-query';
+	import { sessionViewGuard } from '$lib/session-view';
 	import { resolve } from '$app/paths';
 	import { t, translate } from '$lib/i18n';
 	import { api } from '$lib/api/client';
@@ -11,6 +12,8 @@
 	import ConfirmDialog from '$lib/ui/ConfirmDialog.svelte';
 	import Icon from '$lib/ui/Icon.svelte';
 	import type { CollectionSummary } from '$lib/types';
+
+	const isCurrentView = sessionViewGuard();
 
 	let dialogOpen = $state(false);
 	let creating = $state(false);
@@ -55,7 +58,7 @@
 	}
 
 	async function submitForm(): Promise<void> {
-		if (creating) return;
+		if (!isCurrentView() || creating) return;
 		if (!name.trim()) {
 			formError = translate('collections.name');
 			return;
@@ -73,43 +76,47 @@
 				start_date: startDate || null,
 				end_date: endDate || null
 			});
+			if (!isCurrentView()) return;
 			await queryClient.invalidateQueries({ queryKey: queryKeys.collections() });
-			dialogOpen = false;
+			if (isCurrentView()) dialogOpen = false;
 		} catch {
-			snackbar.notify('error', translate('collections.createFailed'));
+			if (isCurrentView()) snackbar.notify('error', translate('collections.createFailed'));
 		} finally {
-			creating = false;
+			if (isCurrentView()) creating = false;
 		}
 	}
 
 	async function toggleActive(c: CollectionSummary): Promise<void> {
-		if (togglingId) return;
+		if (!isCurrentView() || togglingId) return;
 		togglingId = c.id;
 		try {
 			if (c.active) await api.deactivateCollection(c.id);
 			else await api.activateCollection(c.id);
+			if (!isCurrentView()) return;
 			await queryClient.invalidateQueries({ queryKey: queryKeys.collections() });
 		} catch {
+			if (!isCurrentView()) return;
 			snackbar.notify(
 				'error',
 				translate(c.active ? 'collections.deactivateFailed' : 'collections.activateFailed')
 			);
 		} finally {
-			togglingId = null;
+			if (isCurrentView()) togglingId = null;
 		}
 	}
 
 	async function removeCollection(): Promise<void> {
-		if (!confirmDelete || deleting) return;
+		if (!isCurrentView() || !confirmDelete || deleting) return;
 		deleting = true;
 		try {
 			await api.deleteCollection(confirmDelete.id);
+			if (!isCurrentView()) return;
 			confirmDelete = null;
 			await queryClient.invalidateQueries({ queryKey: queryKeys.collections() });
 		} catch {
-			snackbar.notify('error', translate('collections.deleteFailed'));
+			if (isCurrentView()) snackbar.notify('error', translate('collections.deleteFailed'));
 		} finally {
-			deleting = false;
+			if (isCurrentView()) deleting = false;
 		}
 	}
 </script>

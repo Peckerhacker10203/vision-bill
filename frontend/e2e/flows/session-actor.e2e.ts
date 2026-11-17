@@ -201,6 +201,66 @@ test.describe('browser session actor', () => {
 		}
 	});
 
+	test('keeps a committed deletion from notifying the successor tab', async ({
+		browser,
+		context,
+		page,
+		baseURL
+	}) => {
+		const independent = await browser.newContext({ baseURL });
+		try {
+			const bob = await registerUser(independent, 'actor-delete-bob');
+			await registerUser(context, 'actor-delete-alice');
+			const receipt = await uploadFixture(page, context, await loadFixture('a'), {
+				verify: false
+			});
+			const endpoint = `/api/v1/receipts/${receipt}`;
+			let markCommitted!: (status: number) => void;
+			const committed = new Promise<number>((resolve) => (markCommitted = resolve));
+			let release!: () => void;
+			const held = new Promise<void>((resolve) => (release = resolve));
+			await page.route(`**${endpoint}`, async (route) => {
+				if (route.request().method() !== 'DELETE') {
+					await route.continue();
+					return;
+				}
+				const response = await route.fetch();
+				markCommitted(response.status());
+				await held;
+				await route.fulfill({ response });
+			});
+			const switcher = await context.newPage();
+			await switcher.goto('/');
+			await page.goto('/receipts');
+			await page.getByRole('button', { name: 'Remove' }).click();
+			await page
+				.getByRole('dialog', { name: 'Delete receipt?' })
+				.getByRole('button', { name: 'Delete' })
+				.click();
+			expect(await committed).toBe(200);
+			expect((await context.request.get(endpoint)).status()).toBe(404);
+
+			await accountChange(switcher, bob);
+			await expect(page.getByText(`Signed in as ${bob.username}`, { exact: true })).toBeVisible();
+			const delivery = page.waitForResponse(
+				(response) => response.url().endsWith(endpoint) && response.request().method() === 'DELETE'
+			);
+			release();
+			expect((await delivery).status()).toBe(200);
+			await page.bringToFront();
+			await page.evaluate(
+				() =>
+					new Promise<void>((resolve) =>
+						requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+					)
+			);
+			await expect(page.getByText('Deleting failed', { exact: true })).toHaveCount(0);
+			await expect(page.getByText('Receipt deleted', { exact: true })).toHaveCount(0);
+		} finally {
+			await independent.close();
+		}
+	});
+
 	test('stops the old benchmark after a real qualification finishes across an account change', async ({
 		browser,
 		context,

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { diagnosticLabel } from '$lib/diagnostics';
 	import { createQuery } from '@tanstack/svelte-query';
+	import { sessionViewGuard } from '$lib/session-view';
 	import { resolve } from '$app/paths';
 	import { t, translate } from '$lib/i18n';
 	import { api, ApiError } from '$lib/api/client';
@@ -12,6 +13,8 @@
 	import Icon from '$lib/ui/Icon.svelte';
 	import ReceiptImage from '$lib/ui/ReceiptImage.svelte';
 	import type { ImageRow, ImageStatus } from '$lib/types';
+
+	const isCurrentView = sessionViewGuard();
 
 	const statuses: ImageStatus[] = [
 		'pending',
@@ -37,13 +40,14 @@
 	let analyzeError = $state('');
 
 	async function analyzeNow() {
-		if (analyzing) {
+		if (!isCurrentView() || analyzing) {
 			return;
 		}
 		analyzing = true;
 		analyzeError = '';
 		try {
 			const response = await api.analyzePending();
+			if (!isCurrentView()) return;
 			if (response.results.length > 0) {
 				const failed = response.results.filter((r) => r.status === 'failed').length;
 				snackbar.notify(
@@ -52,28 +56,32 @@
 				);
 			}
 			await queryClient.invalidateQueries({ queryKey: ['images'] });
+			if (!isCurrentView()) return;
 			await queryClient.invalidateQueries({ queryKey: ['receipts'] });
 		} catch (error) {
+			if (!isCurrentView()) return;
 			analyzeError =
 				error instanceof ApiError && error.status === 503
 					? translate('upload.errorDb')
 					: translate('queue.analyzeFailed');
 		} finally {
-			analyzing = false;
+			if (isCurrentView()) analyzing = false;
 		}
 	}
 
 	async function removeImage() {
-		if (!confirmDelete || deleting) {
+		if (!isCurrentView() || !confirmDelete || deleting) {
 			return;
 		}
 		deleting = true;
 		try {
 			await api.deleteImage(confirmDelete.id);
+			if (!isCurrentView()) return;
 			snackbar.notify('success', translate('queue.deleted'));
 			confirmDelete = null;
 			await queryClient.invalidateQueries({ queryKey: ['images'] });
 		} catch (error) {
+			if (!isCurrentView()) return;
 			snackbar.notify(
 				'error',
 				error instanceof ApiError && error.status === 409
@@ -81,7 +89,7 @@
 					: translate('queue.deleteFailed')
 			);
 		} finally {
-			deleting = false;
+			if (isCurrentView()) deleting = false;
 		}
 	}
 </script>

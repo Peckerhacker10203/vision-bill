@@ -3,11 +3,14 @@
 	import { resolve } from '$app/paths';
 	import { createQuery } from '@tanstack/svelte-query';
 	import { session } from '$lib/auth';
+	import { sessionViewGuard } from '$lib/session-view';
 	import { api, ApiError } from '$lib/api/client';
 	import { t } from '$lib/i18n';
 	import { queryClient } from '$lib/query/client';
 	import { queryKeys } from '$lib/query/keys';
 	import type { SettingsUpdate } from '$lib/types';
+
+	const isCurrentView = sessionViewGuard();
 
 	const settings = createQuery(
 		() => ({
@@ -69,20 +72,22 @@
 	}
 
 	async function save() {
-		if (saving) return;
+		if (!isCurrentView() || saving) return;
 		saving = true;
 		saved = false;
 		error = '';
 		try {
 			const result = await api.updateSettings(form);
+			if (!isCurrentView()) return;
 			form = { llm: { ...result.llm }, allow_registration: result.allow_registration };
 			queryClient.setQueryData(queryKeys.settings(), result);
 			await queryClient.invalidateQueries({ queryKey: queryKeys.uiConfig() });
-			saved = true;
+			if (isCurrentView()) saved = true;
 		} catch (cause) {
+			if (!isCurrentView()) return;
 			error = cause instanceof ApiError ? cause.detail : $t('settings.saveError');
 		} finally {
-			saving = false;
+			if (isCurrentView()) saving = false;
 		}
 	}
 </script>

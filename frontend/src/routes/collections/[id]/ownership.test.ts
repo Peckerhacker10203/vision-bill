@@ -3,6 +3,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { tick } from 'svelte';
 import { page } from '$app/state';
 import { goto } from '$app/navigation';
+import { session } from '$lib/session-lifetime';
 import { api } from '$lib/api/client';
 import { queryClient } from '$lib/query/client';
 import { snackbar } from '$lib/ui/snackbar.svelte';
@@ -32,6 +33,7 @@ const collection = (id: string) => ({
 	receipt_count: 0
 });
 beforeEach(() => {
+	session.set({ id: 'owner', username: 'alice', is_admin: false, can_see_all: false });
 	queryClient.clear();
 	page.url.pathname = `/collections/${a}`;
 	vi.spyOn(api, 'getCollection').mockImplementation(async (id) => collection(id));

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { SvelteSet } from 'svelte/reactivity';
 	import { createQuery } from '@tanstack/svelte-query';
+	import { sessionViewGuard } from '$lib/session-view';
 	import { t, translate } from '$lib/i18n';
 	import { api } from '$lib/api/client';
 	import { queryClient } from '$lib/query/client';
@@ -176,6 +177,8 @@
 		onSource?: (sources: SourceRef[]) => void;
 		onPendingChange?: (pending: boolean) => void;
 	} = $props();
+
+	const isCurrentView = sessionViewGuard();
 
 	function initialForm(): EditorForm {
 		return buildForm(receipt, lineItems, taxes, collectionIds);
@@ -568,20 +571,22 @@
 					placeholder={$t('collections.searchPlaceholder')}
 					onchange={(v) => (form.collection_ids = v as string[])}
 					oncreate={async (name) => {
+						if (!isCurrentView()) return;
 						const mutation = {};
 						const target = form;
 						const receiptId = receipt.id;
+						const isCurrentForm = () =>
+							isCurrentView() && form === target && receipt.id === receiptId;
 						pendingCollections.add(mutation);
 						try {
 							const created = await api.createCollection({ name });
-							if (form !== target || receipt.id !== receiptId) return;
+							if (!isCurrentForm()) return;
 							form.collection_ids = [...form.collection_ids, created.id];
 							await queryClient.invalidateQueries({ queryKey: queryKeys.collections() });
 						} catch {
-							if (form === target && receipt.id === receiptId)
-								snackbar.notify('error', translate('collections.createFailed'));
+							if (isCurrentForm()) snackbar.notify('error', translate('collections.createFailed'));
 						} finally {
-							pendingCollections.delete(mutation);
+							if (isCurrentView()) pendingCollections.delete(mutation);
 						}
 					}}
 				/>
