@@ -469,3 +469,27 @@ async def test_second_extraction_wait_does_not_refund_an_earlier_dispatch(settin
     db.hold_claim_for_readiness.assert_not_awaited()
     outcome = db.finish_attempt.call_args.args[1]
     assert outcome.kind == "retry" and outcome.result_code == "ocr_runtime_changed"
+
+
+async def test_bound_direct_model_disappearance_holds_without_dispatch(settings, tmp_path):
+    from test_extraction_pipeline import formatter
+
+    from vision_bill.service.receipt_service import ReceiptService
+
+    service, _, db, claim, _ = context(settings, tmp_path)
+    llm = formatter()
+    selected = llm.get_available_models.return_value[0]
+    selected.id = claim.image.model_id
+    receipts = ReceiptService(settings.images, settings.pg, llm)
+    receipts.list_tags = AsyncMock(return_value=[])
+    receipts.check_connection = AsyncMock(return_value=True)
+    service.receipts = receipts
+    llm.get_available_models.side_effect = [[selected], [], [selected]]
+
+    assert await service.ready_for(claim.image)
+    await service.process_claim(claim)
+    db.hold_claim_for_readiness.assert_awaited_once()
+    assert db.hold_claim_for_readiness.await_args.args == (claim, "vision_model_unavailable")
+    db.finish_attempt.assert_not_awaited()
+    llm._client.chat.assert_not_awaited()
+    assert await service.ready_for(claim.image)

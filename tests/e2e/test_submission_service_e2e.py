@@ -605,3 +605,32 @@ async def test_scheduler_initial_legacy_model_resolution_is_frozen_once(workflow
         assert json.loads(saved['effective_options'])==frozen
         assert saved['wait_reason']=='vision_model_unavailable'
         llm._client.chat.assert_not_awaited()
+
+
+async def test_bound_direct_model_vanishing_before_dispatch_refunds_reservation(
+    workflow_db, settings, tmp_path,
+):
+    w, scope = workflow_db
+    image, _, llm, _, service = await setup(w, scope, settings, tmp_path, ocr=False)
+    selected = llm.get_available_models.return_value
+    llm.get_available_models.side_effect = [selected, [], selected, selected]
+    service.receipts.check_connection = AsyncMock(return_value=True)
+    before = (await w.due_candidates())[0]
+    assert await service.ready_for(before)
+    claim = await w.claim_next(image_id=image.id)
+    assert claim is not None and claim.attempt_number == 1
+    await service.process_claim(claim)
+
+    waiting = await w.get_submission(image.id, scope=scope)
+    assert waiting.status == "pending" and waiting.wait_reason == "vision_model_unavailable"
+    assert waiting.attempt_count == 0 and waiting.receipt_id is None
+    llm._client.chat.assert_not_awaited()
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM receipt_extractions WHERE image_id=$1", image.id) == 0
+
+    assert await service.ready_for((await w.due_candidates())[0])
+    resumed = await w.claim_next(image_id=image.id)
+    assert resumed is not None and resumed.attempt_number == 1
+    result = await service.process_claim(resumed)
+    assert result.receipt is not None and result.submission.attempt_count == 1
+    assert llm._client.chat.await_args.kwargs["model"] == "fixture"

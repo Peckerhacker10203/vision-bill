@@ -60,6 +60,7 @@ from .execution_policy import (
 from .extraction_pipeline import (
     OcrRuntimeChangedError,
     OriginalSourceChangedError,
+    ReadinessHoldError,
     select_vision_model,
 )
 from .gpu_handoff import ModelHandoff, managed_ocr_enabled
@@ -81,10 +82,6 @@ class SourceIntegrityError(Exception):
 
 class PolicyHoldError(Exception):
     """The operator policy changed after readiness or while preparing dispatch."""
-
-
-class ReadinessHoldError(Exception):
-    """The explicitly selected legacy model disappeared before its initial binding."""
 
 
 class CheckpointRecoveryError(Exception):
@@ -562,7 +559,7 @@ class SubmissionService:
                 manifests.clear()
                 if retry:
                     raise
-            except HandoffWait as exc:
+            except (HandoffWait, ReadinessHoldError) as exc:
                 if retry:
                     raise OcrRuntimeChangedError("ocr_runtime_changed") from exc
                 raise

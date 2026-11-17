@@ -37,6 +37,10 @@ def select_vision_model(models: Sequence[ModelInfo], requested_id: str) -> Model
     return available.get(requested_id)
 
 
+class ReadinessHoldError(ValueError):
+    """The selected model disappeared before new inference was dispatched."""
+
+
 class OriginalSourceChangedError(ValueError):
     """The current originals no longer match their supplied persisted binding."""
 
@@ -297,6 +301,8 @@ class ExtractionPipeline:
             models = await provider.get_available_models(capability="vision")
             model = select_vision_model(models, model_id)
             if model is None:
+                if current_owner() is None:
+                    raise ReadinessHoldError("vision_model_unavailable")
                 return self._failed(result, "vision_model_unavailable", started)
             vision_id = model.id
             formatted = await provider.extract_observations(
