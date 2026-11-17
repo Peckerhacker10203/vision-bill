@@ -534,7 +534,7 @@ async def test_pipeline_real_handoff_orders_all_photos_before_formatter(photos, 
         deadline=monotonic() + 3, tags=[],
     )
     assert result.receipt is not None
-    assert events == ["claim_park", ("unload", "fixture"), "load_ocr", "photo0", "photo1",
+    assert events == ["claim_park", "load_ocr", "photo0", "photo1",
                       "park_ocr", "llm", "park_ocr", ("unload", "fixture")]
 
 
@@ -710,6 +710,7 @@ async def test_review_disabled_production_rejects_forced_ocr_before_concurrent_d
 
     from vision_bill.config import OcrSettings, settings
     from vision_bill.model.experiment import ExperimentOptions
+    from vision_bill.model.handoff import HandoffWait
     from vision_bill.service.experiment_execution import pipeline_identity
 
     monkeypatch.setattr(settings.ocr, "enabled", False)
@@ -731,7 +732,7 @@ async def test_review_disabled_production_rejects_forced_ocr_before_concurrent_d
     await entered.wait()
     try:
         assert llm.handoff is None
-        with pytest.raises(ValueError, match="managed_ocr_requires_production_ocr"):
+        with pytest.raises(HandoffWait, match="model_handoff_managed_ocr_required"):
             await pipeline_identity(service, ExperimentOptions(pipeline="ocr"),
                                     qualify=True, managed_model_ids=["fixture"])
         ocr.claim.assert_not_awaited()

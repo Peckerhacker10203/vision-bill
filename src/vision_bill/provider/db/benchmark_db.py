@@ -20,6 +20,7 @@ from ...model.benchmark import (
     GoldSnapshot,
     ReferencePreview,
 )
+from ...model.handoff import HANDOFF_WAIT_REASONS
 from ...model.workflow import AccessScope
 from .deadline import connection
 from .receipt_db import ReceiptDB
@@ -130,6 +131,22 @@ class BenchmarkDB:
                 AND NOT inference_started AND inference_attempt_count<$5 RETURNING *""",
                 task["run_id"], task["model_id"], task["receipt_id"], task.get("claim_token"), self._worker.max_attempts)
             return dict(row) if row else None
+
+    async def hold_before_inference(
+        self, task: Mapping[str, Any], reason: str, *, deadline: float | None = None,
+    ) -> bool:
+        if reason not in HANDOFF_WAIT_REASONS:
+            raise ValueError("invalid_wait_reason")
+        async with connection(self._pool, deadline=deadline, transaction=True) as conn:
+            await self._lock_task(conn, task)
+            changed = await conn.execute("""UPDATE benchmark_tasks SET
+                status='waiting_for_model', claim_token=NULL, leased_until=NULL,
+                retry_at=clock_timestamp()+make_interval(secs => $5)
+                WHERE run_id=$1 AND model_id=$2 AND receipt_id=$3 AND claim_token=$4
+                AND status='running' AND leased_until>clock_timestamp() AND NOT inference_started""",
+                task["run_id"], task["model_id"], task["receipt_id"], task.get("claim_token"),
+                min(30, self._worker.retry_backoff_cap_seconds))
+            return bool(changed == "UPDATE 1")
 
     async def retry_task(self, task: Mapping[str, Any], waiting: bool = False, *, deadline: float | None = None) -> bool:
         async with connection(self._pool, deadline=deadline, transaction=True) as conn:

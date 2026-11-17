@@ -113,6 +113,8 @@ class AnalysisScheduler:
                     self._deferred_image_ids.add(image.id)
                     continue
                 result = await self._submissions.process_claim(claim)
+                if result.submission is not None and result.submission.wait_reason:
+                    self._deferred_image_ids.add(image.id)
                 if result.submission is not None and (
                     scope is None or scope.can_see_all or claim.image.user_id == scope.user_id
                 ):

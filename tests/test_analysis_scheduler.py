@@ -178,7 +178,7 @@ async def test_retry_due_during_long_second_job_rescans_without_provider_down_ho
 @pytest.mark.parametrize("managed_lifecycle", [False, True], ids=["unmanaged", "managed"])
 @pytest.mark.parametrize("attempt_count", [0, 2], ids=["new", "last-attempt"])
 async def test_incompatible_ocr_mode_waits_before_claim_and_preserves_attempt_budget(
-    settings, monkeypatch, worker_ready, managed_lifecycle, attempt_count,
+    settings, monkeypatch, tmp_path, worker_ready, managed_lifecycle, attempt_count,
 ):
     from test_ocr_provider import http_client
 
@@ -191,6 +191,7 @@ async def test_incompatible_ocr_mode_waits_before_claim_and_preserves_attempt_bu
 
     settings.ocr = OcrSettings(
         enabled=True, service_url="http://local", manage_model_lifecycle=managed_lifecycle,
+        coordination_path=tmp_path / "handoff.lock",
     )
     # Enable the real global managed-ownership guard when this client requires it.
     monkeypatch.setattr(config, "settings", settings)
@@ -203,6 +204,7 @@ async def test_incompatible_ocr_mode_waits_before_claim_and_preserves_attempt_bu
     formatter = SimpleNamespace(
         supports_model_release=True,
         lifecycle_identity="cpu-fixture:formatter",
+        resident_model_ids=AsyncMock(return_value=frozenset()),
         check_connection=AsyncMock(return_value=True),
         get_available_models=AsyncMock(return_value=[model]),
     )
@@ -223,6 +225,11 @@ async def test_incompatible_ocr_mode_waits_before_claim_and_preserves_attempt_bu
         claim_next=AsyncMock(side_effect=claim_next),
     )
     receipts = ReceiptService(settings.images, settings.pg, formatter)
+    if managed_lifecycle:
+        from test_handoff_binding import adopt
+
+        await adopt(receipts.execution_handoff(settings.ocr), ("formatter",))
+        image.effective_options = receipts.current_execution_snapshot(settings)
     receipts._workflow_db = db
     submissions = SubmissionService(settings, receipts, receipts._image_service)
     submissions.process_claim = AsyncMock(return_value=CommitResult(stale=False))
@@ -253,9 +260,9 @@ async def test_incompatible_ocr_mode_waits_before_claim_and_preserves_attempt_bu
     db.claim_next.assert_not_awaited()
     submissions.process_claim.assert_not_awaited()
     assert image.attempt_count == attempt_count
-    assert image.status == "pending" and image.wait_reason == "ocr_unavailable"
+    assert image.status == "pending" and image.wait_reason == "ocr_mode_mismatch"
     assert db.set_wait_reason.await_count == image.max_attempts + 1
     for call in db.set_wait_reason.await_args_list:
-        assert call.args == (image, "ocr_unavailable")
+        assert call.args == (image, "ocr_mode_mismatch")
     assert requests == [("GET", "/info")] * (image.max_attempts + 1)
     formatter.check_connection.assert_awaited()

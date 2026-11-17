@@ -18,11 +18,12 @@ from ..model.extraction import (
     PipelineProvenance,
     ReceiptInput,
 )
+from ..model.handoff import HandoffStatus, HandoffWait
 from ..model.ocr import OcrPageMetadata, OcrResponse, SourceRef
 from ..model.review import ReviewFinding
 from ..provider.llm.base import LLMProvider, ModelInfo
 from ..provider.ocr.base import OcrProvider, compact_ocr_text
-from .gpu_handoff import ModelHandoff, current_owner
+from .gpu_handoff import ModelHandoff, admission_deadline, current_owner
 
 
 def select_vision_model(models: Sequence[ModelInfo], requested_id: str) -> ModelInfo | None:
@@ -51,6 +52,25 @@ class ExtractionPipeline:
         self.ocr = ocr_provider
         self.settings = ocr_settings or OcrSettings(enabled=ocr_provider is not None)
 
+    def coordinator(self) -> ModelHandoff | None:
+        configured = getattr(self.provider, "handoff", None)
+        if self.ocr is None or not getattr(self.ocr, "managed_lifecycle", False):
+            if isinstance(configured, ModelHandoff) and self.ocr is not None:
+                raise HandoffWait(HandoffStatus(
+                    state="configuration_required", reason_code="execution_policy_changed",
+                ))
+            return configured if isinstance(configured, ModelHandoff) else None
+        handoff = ModelHandoff(self.settings.coordination_path, self.provider, self.ocr)
+        if not self.provider.supports_model_release:
+            raise HandoffWait(HandoffStatus(
+                state="configuration_required", reason_code="model_release_unsupported",
+            ))
+        if isinstance(configured, ModelHandoff) and not handoff.matches(configured):
+            raise HandoffWait(HandoffStatus(
+                state="configuration_required", reason_code="execution_policy_changed",
+            ))
+        return handoff
+
     async def extract(
         self,
         model_id: str,
@@ -63,15 +83,18 @@ class ExtractionPipeline:
         resume_pages: Sequence[OcrResponse] = (),
         source_refs: Sequence[SourceRef] = (),
         max_output_tokens: int | None = None,
+        expected_binding_sha256: str | None = None,
+        handoff_deadline: float | None = None,
     ) -> InferenceEnvelope:
-        handoff = getattr(self.provider, "handoff", None)
-        if self.ocr is not None and getattr(self.ocr, "managed_lifecycle", False):
-            handoff = ModelHandoff(self.settings.coordination_path, self.provider, self.ocr)
+        handoff = self.coordinator()
         async with asyncio.timeout(max(0, deadline - monotonic())), (
-            handoff.session(deadline) if handoff is not None else nullcontext()
-        ) as owner:
-            if owner is not None:
-                owner.track(model_id)
+            handoff.session(
+                deadline, model_id=model_id,
+                expected_binding_sha256=expected_binding_sha256,
+                lock_deadline=admission_deadline(min(deadline, handoff_deadline)
+                    if handoff_deadline is not None else deadline),
+            ) if handoff is not None else nullcontext()
+        ):
             result = await self._extract(
                 model_id,
                 tuple(paths),
@@ -152,10 +175,16 @@ class ExtractionPipeline:
                 return self._failed(result, "ocr_disabled", started)
             reason: str | None = None
             if use_ocr:
+                owner = current_owner()
+                model = None
+                if owner is not None:
+                    models = await provider.get_available_models(capability="text")
+                    model = next((m for m in models if m.id == model_id), None)
+                    if model is None:
+                        return self._failed(result, "formatter_model_unavailable", started)
                 if self.ocr is None:
                     reason = "ocr_unavailable"
                 else:
-                    owner = current_owner()
                     if owner is not None:
                         await owner.ocr_phase()
                     capabilities = await self.ocr.get_capabilities()
@@ -222,8 +251,9 @@ class ExtractionPipeline:
                     owner = current_owner()
                     if owner is not None:
                         await owner.llm_phase(model_id)
-                    models = await provider.get_available_models(capability="text")
-                    model = next((m for m in models if m.id == model_id), None)
+                    if owner is None:
+                        models = await provider.get_available_models(capability="text")
+                        model = next((m for m in models if m.id == model_id), None)
                     if model is None:
                         return self._failed(result, "formatter_model_unavailable", started)
                     result.provenance.model_digest = model.digest

@@ -17,8 +17,11 @@ from typing import TYPE_CHECKING, Any
 
 from ..config import OcrSettings
 from ..model.experiment import ExperimentOptions, ExtractionPipeline
+from ..model.handoff import HandoffStatus, HandoffWait
 from ..model.receipt import Receipt
 from .execution_policy import EXECUTION_POLICY_VERSION
+from .extraction_pipeline import ExtractionPipeline as ReceiptExtractionPipeline
+from .gpu_handoff import admission_deadline
 
 if TYPE_CHECKING:
     from .receipt_service import ReceiptService
@@ -148,6 +151,8 @@ async def execute_submission(
                 code = envelope.findings[-1].code if envelope.findings else "receipt_incomplete"
                 raise ValueError(code)
             receipt = envelope.receipt
+    except HandoffWait:
+        raise
     except Exception as exc:
         metadata.setdefault("calls", provider.experiment_trace or [])
         metadata["elapsed_ms"] = (perf_counter() - started) * 1000
@@ -176,15 +181,23 @@ async def pipeline_identity(
 
     ocr, settings, effective_options = effective_policy(service, options)
     provider = service._provider.for_experiment(effective_options)
+    handoff = ReceiptExtractionPipeline(provider, ocr, settings).coordinator()
+    binding_sha256 = None
+    if handoff is not None:
+        binding = handoff.require_binding(None)
+        if qualify and any(model not in binding.model_ids for model in managed_model_ids):
+            raise HandoffWait(HandoffStatus(
+                state="configuration_required", reason_code="model_handoff_model_not_adopted",
+            ))
+        binding_sha256 = handoff.binding_sha256(binding)
     capabilities = None
     if ocr is not None and options.pipeline != ExtractionPipeline.DIRECT:
-        if qualify and getattr(ocr, "managed_lifecycle", False):
-            from .gpu_handoff import ModelHandoff
-            async with ModelHandoff(settings.coordination_path, provider, ocr).session(
-                monotonic() + provider.analysis_timeout_seconds
+        if qualify and handoff is not None:
+            deadline = monotonic() + provider.analysis_timeout_seconds
+            async with handoff.session(
+                deadline, model_ids=managed_model_ids, expected_binding_sha256=binding_sha256,
+                lock_deadline=admission_deadline(deadline),
             ) as owner:
-                for model_id in managed_model_ids:
-                    owner.track(model_id)
                 await owner.ocr_phase()
                 qualified = await ocr.get_capabilities()
                 if not qualified.ready or not qualified.runtime_fingerprint:
@@ -199,6 +212,7 @@ async def pipeline_identity(
             )}
     return {
         "execution_policy_version": EXECUTION_POLICY_VERSION,
+        "managed_binding_sha256": binding_sha256,
         "version": 1,
         "normalizer_version": NORMALIZER_VERSION,
         "schema_version": EXTRACTION_SCHEMA_VERSION,

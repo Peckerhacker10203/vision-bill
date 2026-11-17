@@ -7,6 +7,23 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 ResourceIdentity = Annotated[str, Field(min_length=1)]
 DispatchDisposition = Literal["not_dispatched", "settled", "unknown"]
 
+HANDOFF_WAIT_REASONS = frozenset({
+    "execution_policy_changed",
+    "model_release_unsupported",
+    "model_handoff_binding_required",
+    "model_handoff_binding_changed",
+    "model_handoff_busy",
+    "model_handoff_foreign_residency",
+    "model_handoff_invalid_binding",
+    "model_handoff_invalid_configuration",
+    "model_handoff_managed_ocr_required",
+    "model_handoff_model_not_adopted",
+    "model_handoff_recorded_model_not_adopted",
+    "model_handoff_residency_unknown",
+    "model_request_unsettled",
+    "ocr_mode_mismatch",
+})
+
 
 class HandoffResources(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)

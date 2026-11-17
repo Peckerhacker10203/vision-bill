@@ -8,9 +8,10 @@ Only explicit Vision Bill model IDs are recorded; discovery is never ownership.
 import asyncio
 import json
 import os
-from collections.abc import AsyncIterator, Coroutine
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from hashlib import sha256
 from pathlib import Path
 from time import monotonic
 from typing import Any, Literal
@@ -33,6 +34,12 @@ _current: ContextVar["HandoffOwner | None"] = ContextVar("model_handoff", defaul
 def _handoff_error(status: HandoffStatus, *, admission: bool) -> RuntimeError:
     """Only a pre-work admission rejection can be treated as a wait."""
     return HandoffWait(status) if admission else RuntimeError(status.reason_code or status.state)
+
+
+def admission_deadline(deadline: float) -> float:
+    """Leave time inside the caller's budget to record a contended admission."""
+    now = monotonic()
+    return min(now + 0.25, now + max(0.0, deadline - now) / 2)
 
 
 def _unique_json_members(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -218,8 +225,13 @@ class ModelHandoff:
             ocr=handoff_resource_identity(self.ocr, "ocr"),
         )
 
+    def matches(self, other: "ModelHandoff") -> bool:
+        return self.path.resolve() == other.path.resolve() and self.resources == other.resources
+
     @asynccontextmanager
-    async def exclusion(self, deadline: float, *, wait: bool = True) -> AsyncIterator[None]:
+    async def exclusion(
+        self, deadline: float, *, wait: bool = True, admission: bool = False,
+    ) -> AsyncIterator[None]:
         """Use the original lock inode for inspection, adoption and sessions."""
         import fcntl
 
@@ -242,6 +254,10 @@ class ModelHandoff:
             current, opened = self.path.stat(), os.fstat(descriptor)
             if ((current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
                     or self.path.resolve() != path_identity or self.resources != resources):
+                if admission:
+                    raise HandoffWait(HandoffStatus(
+                        state="configuration_required", reason_code="execution_policy_changed",
+                    ))
                 raise ValueError("model_handoff_identity_changed")
             yield
         finally:
@@ -289,6 +305,29 @@ class ModelHandoff:
             ))
         return binding
 
+    def binding_sha256(self, binding: HandoffBinding | None = None) -> str:
+        """Hash the validated credential-free dedication, independently of file formatting."""
+        data = (binding if binding is not None else self.read_binding()).model_dump(mode="json")
+        data["model_ids"] = sorted(data["model_ids"])
+        return sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    def require_binding(self, expected: str | None) -> HandoffBinding:
+        # None is a live selection without a frozen policy. An empty expected
+        # hash is frozen work that never obtained a verified dedication.
+        try:
+            binding = self.read_binding()
+        except HandoffWait as exc:
+            if expected and exc.status.reason_code == "model_handoff_binding_changed":
+                raise HandoffWait(HandoffStatus(
+                    state="configuration_required", reason_code="execution_policy_changed",
+                )) from None
+            raise
+        if expected is not None and expected != self.binding_sha256(binding):
+            raise HandoffWait(HandoffStatus(
+                state="configuration_required", reason_code="execution_policy_changed",
+            ))
+        return binding
+
     async def require_residency(self, recorded: list[str], deadline: float, *, admission: bool = True) -> None:
         try:
             async with asyncio.timeout(max(0, deadline - monotonic())):
@@ -310,14 +349,16 @@ class ModelHandoff:
                 state="recovery_required", reason_code="model_handoff_foreign_residency",
             ), admission=admission)
 
-    async def inspect(self, *, model_id: str, deadline: float) -> HandoffStatus:
+    async def inspect(
+        self, *, model_id: str, deadline: float, expected_binding_sha256: str | None = None,
+    ) -> HandoffStatus:
         """Read-only admission evidence; never claim, release, or advance a journal."""
         if not self.provider.supports_model_release:
             return HandoffStatus(state="configuration_required", reason_code="model_release_unsupported")
         try:
             async with self.exclusion(deadline, wait=False):
+                binding = self.require_binding(expected_binding_sha256)
                 saved = self.read_journal()
-                binding = self.read_binding()
                 if model_id not in binding.model_ids:
                     return HandoffStatus(state="configuration_required", reason_code="model_handoff_model_not_adopted")
                 if saved is not None and saved.unsettled:
@@ -332,21 +373,41 @@ class ModelHandoff:
         except (ValueError, OSError):
             return HandoffStatus(state="recovery_required", reason_code="model_handoff_invalid_configuration")
 
+    async def require_ocr_mode(self) -> None:
+        capabilities = getattr(self.ocr, "get_capabilities", None)
+        if capabilities is not None and (await capabilities()).reason_code == "ocr_mode_mismatch":
+            raise HandoffWait(HandoffStatus(state="configuration_required", reason_code="ocr_mode_mismatch"))
+
     @asynccontextmanager
-    async def session(self, deadline: float, *, model_id: str | None = None) -> AsyncIterator[HandoffOwner]:
+    async def session(
+        self, deadline: float, *, model_id: str | None = None, model_ids: Sequence[str] = (),
+        lock_deadline: float | None = None, expected_binding_sha256: str | None = None,
+        before_dispatch: Callable[[], Awaitable[None]] | None = None,
+    ) -> AsyncIterator[HandoffOwner]:
         # Exclusion owns its retry deadline. Activate cancellation only once we own the lock.
+        selected = ((model_id,) if model_id is not None else ()) + tuple(model_ids)
         async with asyncio.timeout(None) as timeout:
-            async with self._session(deadline, model_id=model_id, timeout=timeout) as owner:
+            async with self._session(
+                deadline, selected=selected, lock_deadline=lock_deadline,
+                expected_binding_sha256=expected_binding_sha256, before_dispatch=before_dispatch,
+                timeout=timeout,
+            ) as owner:
                 yield owner
             if monotonic() >= deadline:
                 raise TimeoutError("model_handoff_deadline")
 
     @asynccontextmanager
     async def _session(
-        self, deadline: float, *, model_id: str | None, timeout: asyncio.Timeout,
+        self, deadline: float, *, selected: Sequence[str], lock_deadline: float | None,
+        expected_binding_sha256: str | None, before_dispatch: Callable[[], Awaitable[None]] | None,
+        timeout: asyncio.Timeout,
     ) -> AsyncIterator[HandoffOwner]:
         expires_at = asyncio.get_running_loop().time() + (deadline - monotonic())
         if getattr(self.ocr, "managed_lifecycle", False) and not managed_ocr_enabled():
+            if expected_binding_sha256 is not None or before_dispatch is not None:
+                raise HandoffWait(HandoffStatus(
+                    state="configuration_required", reason_code="model_handoff_managed_ocr_required",
+                ))
             raise ValueError(
                 "managed_ocr_requires_production_ocr: enable OCR__ENABLED and "
                 "OCR__MANAGE_MODEL_LIFECYCLE for every application worker"
@@ -355,25 +416,43 @@ class ModelHandoff:
         existing = current_owner()
         if existing is not None:
             timeout.reschedule(expires_at)
-            if (existing.coordinator.path != self.path
-                    or existing.coordinator.resources != resources):
+            if not existing.coordinator.matches(self):
                 raise ValueError("model_handoff_identity_changed")
-            if model_id is not None:
-                existing.require_model(model_id)
+            if expected_binding_sha256 is not None:
+                self.require_binding(expected_binding_sha256)
+            for model in selected:
+                existing.require_model(model)
             yield existing
             return
         if not self.provider.supports_model_release:
+            if expected_binding_sha256 is not None or before_dispatch is not None:
+                raise HandoffWait(HandoffStatus(
+                    state="configuration_required", reason_code="model_release_unsupported",
+                ))
             raise ValueError("model_release_unsupported: managed OCR requires an unload-capable provider")
         token = None
         owner = HandoffOwner(self, deadline)
-        async with self.exclusion(deadline):
+        async with self.exclusion(
+            min(deadline, lock_deadline) if lock_deadline is not None else deadline,
+            admission=lock_deadline is not None,
+        ):
             timeout.reschedule(expires_at)
             if self.resources != resources:
                 raise ValueError("model_handoff_identity_changed")
-            saved = self.read_journal()
-            owner.binding = self.read_binding()
-            if model_id is not None:
-                owner.require_model(model_id)
+            if expected_binding_sha256 is not None:
+                owner.binding = self.require_binding(expected_binding_sha256)
+            try:
+                saved = self.read_journal()
+            except (ValueError, OSError):
+                if lock_deadline is None:
+                    raise
+                raise HandoffWait(HandoffStatus(
+                    state="recovery_required", reason_code="model_handoff_invalid_configuration",
+                )) from None
+            if owner.binding is None:
+                owner.binding = self.require_binding(None)
+            for model in selected:
+                owner.require_model(model)
             if saved is not None:
                 owner.models = saved.models
                 owner.generation = saved.generation + 1
@@ -381,31 +460,41 @@ class ModelHandoff:
                 owner.ocr_pending = saved.ocr_pending
             if owner.unsettled:
                 raise HandoffWait(HandoffStatus(state="recovery_required", reason_code="model_request_unsettled"))
-            for model in owner.models:
-                owner.require_model(model)
+            if any(model not in owner.binding.model_ids for model in owner.models):
+                raise HandoffWait(HandoffStatus(
+                    state="recovery_required", reason_code="model_handoff_recorded_model_not_adopted",
+                ))
             await self.require_residency(owner.models, deadline)
+            if lock_deadline is not None:
+                await self.require_ocr_mode()
+            if before_dispatch is not None:
+                await before_dispatch()
             owner.token = f"{owner.generation}:{owner.token}"
             owner.save()
             token = _current.set(owner)
             try:
                 # Claim parks abandoned native workers and fences old HTTP requests.
-                await self.ocr.claim(owner.token, deadline)
-                owner.ocr_pending = False
-                owner.save()
-                await owner.release_models()
-                owner.save()
+                try:
+                    await self.ocr.claim(owner.token, deadline)
+                    owner.ocr_pending = False
+                    owner.save()
+                    await owner.release_models()
+                    owner.save()
+                except HandoffWait as exc:
+                    raise _handoff_error(exc.status, admission=False) from exc
                 try:
                     yield owner
                 except BaseException as body_error:
                     # Preserve ordinary body failures. A wait must account for cleanup dispatch.
                     cause = body_error
+                    cleaned = False
                     try:
-                        await self._cleanup(owner, deadline)
+                        cleaned = await self._cleanup(owner, deadline)
                     except BaseException as cleanup_error:
                         if isinstance(body_error, HandoffWait) and isinstance(cleanup_error, asyncio.CancelledError):
                             raise
                         cause = cleanup_error
-                    if isinstance(body_error, HandoffWait) and owner.model_work_started:
+                    if isinstance(body_error, HandoffWait) and (owner.model_work_started or not cleaned):
                         raise _handoff_error(body_error.status, admission=False) from cause
                     raise
                 else:
@@ -414,7 +503,7 @@ class ModelHandoff:
                 if token is not None:
                     _current.reset(token)
 
-    async def _cleanup(self, owner: HandoffOwner, deadline: float) -> None:
+    async def _cleanup(self, owner: HandoffOwner, deadline: float) -> bool:
         # Cancellation interrupts inference, not the ownership barrier.
         cleanup_deadline = min(deadline, monotonic() + 30)
         if monotonic() < cleanup_deadline:
@@ -425,3 +514,5 @@ class ModelHandoff:
                 owner.ocr_pending = False
                 owner.save()
                 await owner.release_models()
+            return True
+        return False

@@ -34,6 +34,9 @@ def setup_api():
         patch_draft=AsyncMock(return_value=None),
         finalize_draft=AsyncMock(return_value=None),
     )
+    from vision_bill.service.execution_policy import current_snapshot
+
+    service.current_snapshot = lambda: current_snapshot(service.settings)
     app.state.submission_service = service
     app.state.analysis_scheduler = SimpleNamespace(trigger=lambda: None)
     return app, service, user

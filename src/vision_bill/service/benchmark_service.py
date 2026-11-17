@@ -2,10 +2,11 @@
 import asyncio
 import json
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import suppress
 from hashlib import sha256
 from pathlib import Path
+from time import monotonic
 from typing import Any
 from uuid import UUID
 
@@ -13,7 +14,7 @@ import httpx
 from ollama import ResponseError
 from openai import APIConnectionError, APIStatusError
 
-from ..config import WorkerSettings
+from ..config import OcrSettings, WorkerSettings
 from ..model.benchmark import (
     BenchmarkCreate,
     BenchmarkRun,
@@ -22,6 +23,7 @@ from ..model.benchmark import (
     ReferencePreview,
 )
 from ..model.experiment import ExperimentOptions, ExtractionPipeline
+from ..model.handoff import HandoffStatus, HandoffWait
 from ..model.receipt import LineItem, Receipt, TaxLine
 from ..model.workflow import AccessScope
 from ..provider.db.benchmark_db import BenchmarkDB
@@ -39,6 +41,7 @@ from .experiment_execution import (
 )
 from .experiment_scoring import DETAIL_SCORING_VERSION, detailed_score, detailed_score_v3
 from .extraction_pipeline import OcrRuntimeChangedError, OriginalSourceChangedError
+from .gpu_handoff import ModelHandoff, admission_deadline, handoff_resource_identity
 from .receipt_service import ReceiptService
 
 logger = logging.getLogger(__name__)
@@ -104,6 +107,7 @@ class BenchmarkService:
         counts = {len(item["images"]) for item in inputs}
         for item in inputs:
             item["pipeline"] = options.pipeline.value
+        self._managed_coordinator(effective_policy(self._receipts, options)[1])
         manifest = {"identity": await pipeline_identity(self._receipts, options, qualify=True, managed_model_ids=selected_models), "options": options.model_dump(mode="json"), "tags": tags, "inputs": inputs,
                     "provider": type(self._provider).__name__,
                     "endpoint_fingerprint": endpoint_fingerprint(self._provider),
@@ -141,8 +145,12 @@ class BenchmarkService:
             digest = (await self._run_digests(run)).get(model_id)
             if current is None or (digest and current.digest and digest != current.digest):
                 raise ValueError("Selected model is unavailable or its digest changed; create a new run")
-            expected, result = await asyncio.wait_for(
-                self._run_experiment(manifest, receipt_id, model_id), timeout=await self._timeout(run))
+            budget = await self._timeout(run)
+            async with asyncio.timeout(budget):
+                expected, result = await self._run_experiment(
+                    manifest, receipt_id, model_id, managed_model_ids=run.model_ids,
+                    inference_deadline=monotonic() + budget,
+                )
             detail = self._score(manifest, receipt_id, expected, result.receipt)
             item = next(item for item in manifest["inputs"] if item["receipt_id"] == str(receipt_id))
             return {"receipt_id": receipt_id, "model_id": model_id, **detail,
@@ -236,7 +244,11 @@ class BenchmarkService:
                 expected_digest = (await self._run_digests(run, deadline=deadline)).get(task["model_id"])
                 if model is None or (expected_digest and expected_digest != model.digest):
                     raise _ReadinessWait("model_unavailable_or_changed")
-                await self._execute_experiment(task, manifest, deadline)
+                inference_deadline = monotonic() + max(0, deadline - reserve - asyncio.get_running_loop().time())
+                await self._execute_experiment(
+                    task, manifest, deadline, inference_deadline=inference_deadline,
+                    managed_model_ids=run.model_ids,
+                )
         except _StaleClaim:
             return
         except Exception as exc:
@@ -244,7 +256,10 @@ class BenchmarkService:
                 raise TimeoutError("benchmark_attempt_deadline") from exc
             before_inference = not task["inference_started"]
             retryable = self._retryable(exc)
-            if before_inference and (isinstance(exc, _ReadinessWait) or retryable):
+            if before_inference and isinstance(exc, HandoffWait):
+                if await self._db.hold_before_inference(task, str(exc), deadline=deadline):
+                    logger.debug("Benchmark held before inference (%s)", exc.status.reason_code)
+            elif before_inference and (isinstance(exc, _ReadinessWait) or retryable):
                 await self._db.retry_task(task, waiting=True, deadline=deadline)
             elif retryable and task["inference_attempt_count"] < self._settings.max_attempts:
                 await self._db.retry_task(task, deadline=deadline)
@@ -267,7 +282,7 @@ class BenchmarkService:
                 return False
             if BenchmarkService._retryable(exc.__cause__):
                 return True
-        if isinstance(exc, (TimeoutError, ConnectionError, httpx.TransportError, APIConnectionError, OcrRuntimeChangedError)):
+        if isinstance(exc, (TimeoutError, ConnectionError, httpx.TransportError, APIConnectionError, OcrRuntimeChangedError, HandoffWait)):
             return True
         if isinstance(exc, (APIStatusError, ResponseError)):
             return exc.status_code == 429 or bool(exc.status_code and exc.status_code >= 500)
@@ -339,8 +354,19 @@ class BenchmarkService:
                 "images": reference.sources, "reference": reference.model_dump(mode="json"),
                 "scored_fields": reference.scored_fields}
 
-    async def _run_experiment(self, manifest: dict[str, Any], receipt_id: UUID, model_id: str,
-                              *, before_inference: Callable[[], Awaitable[None]] | None = None) -> tuple[Receipt, Any]:
+    def _managed_coordinator(self, settings: OcrSettings) -> ModelHandoff | None:
+        handoff = self._receipts.execution_handoff(settings)
+        if handoff is not None and handoff_resource_identity(self._provider, "llm") != handoff.resources.llm:
+            raise HandoffWait(HandoffStatus(
+                state="configuration_required", reason_code="execution_policy_changed",
+            ))
+        return handoff
+
+    async def _run_experiment(
+        self, manifest: dict[str, Any], receipt_id: UUID, model_id: str, *,
+        before_inference: Callable[[], Awaitable[None]] | None = None,
+        inference_deadline: float, managed_model_ids: Sequence[str],
+    ) -> tuple[Receipt, Any]:
         if manifest.get("endpoint_fingerprint") != endpoint_fingerprint(self._provider):
             raise ValueError("Provider endpoint changed since run creation; create a new run")
         if manifest["provider"] != type(self._provider).__name__:
@@ -360,49 +386,104 @@ class BenchmarkService:
             if await asyncio.to_thread(image_digest, path) != image["sha256"]:
                 raise ValueError("Receipt image changed since run creation")
         options = ExperimentOptions.model_validate(manifest["options"])
-        current_identity = await pipeline_identity(self._receipts, options)
         ocr, settings, _ = effective_policy(self._receipts, options)
         uses_ocr = settings.enabled and options.pipeline != ExtractionPipeline.DIRECT
+        frozen_identity = manifest.get("identity")
+        frozen_binding = (frozen_identity or {}).get("managed_binding_sha256")
+        handoff = self._managed_coordinator(settings)
+        if handoff is not None:
+            # Historical direct vision may still use the current dedicated
+            # coordinator. Historical managed OCR must prove its own binding.
+            if uses_ocr and not frozen_binding:
+                frozen_binding = ""
+            status = await handoff.inspect(
+                model_id=model_id, deadline=admission_deadline(inference_deadline),
+                expected_binding_sha256=frozen_binding,
+            )
+            if status.state != "ready":
+                raise HandoffWait(status)
+        current_identity = await pipeline_identity(self._receipts, options)
         runtime = current_identity.get("ocr_runtime") or {}
-        if ocr is not None and getattr(ocr, "managed_lifecycle", False):
+        if uses_ocr and runtime.get("reason_code") == "ocr_mode_mismatch":
+            raise HandoffWait(HandoffStatus(
+                state="configuration_required", reason_code="ocr_mode_mismatch",
+            ))
+        qualify_runtime = False
+        if uses_ocr and handoff is not None and ocr is not None:
             available = await ocr.get_capabilities()
-            if uses_ocr and available.can_load and not runtime.get("runtime_fingerprint"):
-                # After a sidecar restart, only an explicit queued execution may
-                # establish missing identity; passive readiness never loads OCR.
-                current_identity = await pipeline_identity(
-                    self._receipts, options, qualify=True, managed_model_ids=[model_id]
-                )
-                runtime = current_identity.get("ocr_runtime") or {}
+            if available.reason_code == "ocr_mode_mismatch":
+                raise HandoffWait(HandoffStatus(
+                    state="configuration_required", reason_code="ocr_mode_mismatch",
+                ))
+            qualify_runtime = available.can_load and not runtime.get("runtime_fingerprint")
             runtime = {**runtime, "ready": available.ready or available.can_load}
         if uses_ocr and not runtime.get("ready"):
             # Check readiness BEFORE frozen identity: an outage is a wait, not
             # evidence that a different runtime permanently replaced this one.
             raise _ReadinessWait("ocr_unavailable")
-        frozen_identity = manifest.get("identity")
-        if frozen_identity is not None and not uses_ocr:
-            # Direct processing does not consume an OCR runtime.
-            current_identity["ocr_runtime"] = frozen_identity.get("ocr_runtime")
-        if frozen_identity is not None and frozen_identity != current_identity:
-            raise ValueError("Effective pipeline identity changed; create a new run")
+        if frozen_identity is not None:
+            if not uses_ocr:
+                current_identity["ocr_runtime"] = frozen_identity.get("ocr_runtime")
+            elif qualify_runtime:
+                # A parked worker can still report partial identity. Check it
+                # before authorizing the load that supplies its fingerprint.
+                saved_runtime = frozen_identity.get("ocr_runtime") or {}
+                observed_runtime = current_identity.get("ocr_runtime") or {}
+                if any(value is not None and value != saved_runtime.get(key)
+                       for key, value in observed_runtime.items()):
+                    raise ValueError("Effective pipeline identity changed; create a new run")
+                current_identity["ocr_runtime"] = saved_runtime
+            if frozen_identity.get("execution_policy_version") in (None, 2):
+                current_identity.pop("managed_binding_sha256")
+                if "execution_policy_version" in frozen_identity:
+                    current_identity["execution_policy_version"] = 2
+                else:
+                    current_identity.pop("execution_policy_version")
+            if frozen_identity != current_identity:
+                raise ValueError("Effective pipeline identity changed; create a new run")
         probe = self._provider.for_experiment(options)
         current_prompt = sha256(probe.build_prompt(list(manifest["tags"]), image_count=len(paths)).encode()).hexdigest()
         if current_prompt != manifest["prompt_hashes"][str(len(paths))]:
             raise ValueError("Extraction prompt changed since run creation; create a new run")
         options = options.model_copy(update={"pipeline": ExtractionPipeline(item["pipeline"])})
         expected = Receipt.model_validate(item["expected"])
-        if not uses_ocr:
-            try:
-                models = await self._provider.get_available_models(capability="vision")
-            except Exception as exc:
-                raise _ReadinessWait("vision_model_discovery_unavailable") from exc
-            vision = {model.id for model in models if model.capabilities and
-                      any(capability in model.capabilities for capability in ("vision", "multimodal"))}
-            if model_id not in vision:
-                raise _ReadinessWait("vision_model_unavailable")
-        # The outer run deadline includes OCR, LLM generation and repair attempts.
-        if before_inference is not None:
-            await before_inference()
-        result = await self._receipts.analyse_submission_with_metadata(model_id, paths, options, list(manifest["tags"]))
+        capability = "text" if uses_ocr else "vision"
+        try:
+            models = await self._provider.get_available_models(capability=capability)
+        except Exception as exc:
+            raise _ReadinessWait(f"{capability}_model_discovery_unavailable") from exc
+        available_ids = {model.id for model in models if uses_ocr or (
+            model.capabilities and any(c in model.capabilities for c in ("vision", "multimodal"))
+        )}
+        if model_id not in available_ids:
+            raise _ReadinessWait(f"{capability}_model_unavailable")
+
+        async def infer() -> Any:
+            return await self._receipts.analyse_submission_with_metadata(
+                model_id, paths, options, list(manifest["tags"]),
+            )
+
+        if handoff is None:
+            if before_inference is not None:
+                await before_inference()
+            result = await infer()
+        else:
+            async with handoff.session(
+                inference_deadline, model_id=model_id, model_ids=managed_model_ids,
+                expected_binding_sha256=frozen_binding, before_dispatch=before_inference,
+                lock_deadline=admission_deadline(inference_deadline),
+            ) as owner:
+                if qualify_runtime and ocr is not None:
+                    await owner.ocr_phase()
+                    live = await ocr.get_capabilities()
+                    frozen_runtime = (frozen_identity or {}).get("ocr_runtime") or {}
+                    if not live.ready or not live.runtime_fingerprint:
+                        raise ValueError("ocr_unavailable")
+                    if any(frozen_runtime.get(key) != getattr(live, key) for key in (
+                        "profile_id", "runtime_fingerprint", "ocr_max_new_tokens",
+                    )):
+                        raise ValueError("Effective pipeline identity changed; create a new run")
+                result = await infer()
         if manifest.get("identity") is not None:
             if result.metadata.get("ordered_source_sha256") != [image["sha256"] for image in item["images"]]:
                 raise ValueError("Executed source identity differs from frozen input")
@@ -425,11 +506,16 @@ class BenchmarkService:
         return detailed_score(item["expected"], actual, classification=manifest["options"]["include_classification"],
                               scored_fields=item.get("scored_fields"))
 
-    async def _execute_experiment(self, task: dict[str, Any], manifest: dict[str, Any], deadline: float) -> None:
+    async def _execute_experiment(
+        self, task: dict[str, Any], manifest: dict[str, Any], deadline: float,
+        *, inference_deadline: float, managed_model_ids: Sequence[str],
+    ) -> None:
         async def begin() -> None:
             await self._begin(task, deadline)
         expected, result = await self._run_experiment(
-            manifest, task["receipt_id"], task["model_id"], before_inference=begin)
+            manifest, task["receipt_id"], task["model_id"], before_inference=begin,
+            inference_deadline=inference_deadline, managed_model_ids=managed_model_ids,
+        )
         detail = self._score(manifest, task["receipt_id"], expected, result.receipt)
         result.metadata.update(self._attempt_metadata(task))
         payload = {**detail, "expected": next(x["expected"] for x in manifest["inputs"] if x["receipt_id"] == str(task["receipt_id"])),

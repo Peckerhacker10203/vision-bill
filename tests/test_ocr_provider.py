@@ -314,7 +314,10 @@ async def test_capabilities_requires_compatible_explicit_service_mode(
     else:
         assert not capabilities.ready
         assert not capabilities.can_load
-        assert capabilities.reason_code == "ocr_unavailable"
+        assert capabilities.reason_code == (
+            "ocr_mode_mismatch" if mode_fields.get("service_mode") in ("managed", "standalone")
+            else "ocr_unavailable"
+        )
         assert requests == [("GET", "/info")]
 
 

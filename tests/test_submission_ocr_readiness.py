@@ -22,11 +22,15 @@ from vision_bill.service.receipt_service import ReceiptService
 from vision_bill.service.submission_service import SubmissionService
 
 
-def submission_context(settings, monkeypatch, *, managed):
+async def submission_context(settings, monkeypatch, tmp_path, *, managed):
     from vision_bill import config
 
     settings.ocr = OcrSettings(
-        enabled=True, required=True, manage_model_lifecycle=managed, service_url="http://ocr"
+        enabled=True,
+        required=True,
+        manage_model_lifecycle=managed,
+        service_url="http://ocr",
+        coordination_path=tmp_path / "handoff.lock",
     )
     monkeypatch.setattr(config, "settings", settings)
     image = ImageRow(
@@ -38,9 +42,15 @@ def submission_context(settings, monkeypatch, *, managed):
         supports_model_release=True,
         lifecycle_identity="cpu-fixture:formatter",
         check_connection=AsyncMock(return_value=True),
+        resident_model_ids=AsyncMock(return_value=frozenset()),
         get_available_models=AsyncMock(return_value=[model]),
     )
     receipts = ReceiptService(settings.images, settings.pg, llm)
+    if managed:
+        from test_handoff_binding import adopt
+
+        await adopt(receipts.execution_handoff(settings.ocr), (image.model_id,))
+        image.effective_options = receipts.current_execution_snapshot(settings)
     db = SimpleNamespace(is_ready=True, due_candidates=AsyncMock(return_value=[image]))
     waits = []
 
@@ -66,10 +76,10 @@ def submission_context(settings, monkeypatch, *, managed):
 
 @pytest.mark.parametrize("managed", [False, True])
 async def test_real_parked_service_only_admitted_with_managed_load_path(
-    settings, monkeypatch, managed
+    settings, monkeypatch, tmp_path, managed
 ):
-    service, receipts, llm, image, waits, claims = submission_context(
-        settings, monkeypatch, managed=managed
+    service, receipts, llm, image, waits, claims = await submission_context(
+        settings, monkeypatch, tmp_path, managed=managed
     )
     context = FakeContext()
     worker = OcrWorkerManager(mp_context=context, startup_timeout=0.2)
@@ -116,10 +126,10 @@ async def test_real_parked_service_only_admitted_with_managed_load_path(
 
 @pytest.mark.parametrize("service_mode", [None, "standalone"])
 async def test_ready_unmanaged_service_including_legacy_missing_mode_is_eligible(
-    settings, monkeypatch, service_mode
+    settings, monkeypatch, tmp_path, service_mode
 ):
-    service, _receipts, llm, image, waits, claims = submission_context(
-        settings, monkeypatch, managed=False
+    service, _receipts, llm, image, waits, claims = await submission_context(
+        settings, monkeypatch, tmp_path, managed=False
     )
     ready = {
         "ready": True,

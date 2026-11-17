@@ -253,7 +253,8 @@ async def test_fallback_permission_is_separate_frozen_intent(upload_context, set
         )
         assert response.status_code == 202
         saved = queue.creates[0]
-        assert saved.effective_options["execution_policy_version"] == 2
+        assert saved.effective_options["execution_policy_version"] == 3
+        assert saved.effective_options["managed_binding_sha256"] is None
         assert saved.effective_options["allow_ocr_fallback"] is False
         assert ("allow_ocr_fallback" in saved.requested_options) is (permission is not None)
         settings.ocr.allow_vision_fallback = False

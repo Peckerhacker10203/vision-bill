@@ -5,7 +5,7 @@ import hashlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
@@ -49,11 +49,13 @@ def context(settings, tmp_path):
         get_ocr_checkpoint=AsyncMock(return_value=None),
         finish_attempt=AsyncMock(return_value=CommitResult(stale=False)),
         hold_claim_for_policy=AsyncMock(return_value=CommitResult(stale=False)),
+        hold_claim_for_readiness=AsyncMock(return_value=CommitResult(stale=False)),
         clear_ocr_checkpoint=AsyncMock(return_value=True),
         save_ocr_checkpoint=AsyncMock(return_value=True),
     )
     receipt = SimpleNamespace(
-        workflow_db=db, extract_receipt=AsyncMock(), list_tags=AsyncMock(return_value=[])
+        workflow_db=db, extract_receipt=AsyncMock(), list_tags=AsyncMock(return_value=[]),
+        execution_handoff=Mock(return_value=None),
     )
     service = SubmissionService(settings, receipt, ImageService(settings.images))
     return service, receipt, db, claim, part
@@ -346,7 +348,9 @@ async def test_current_snapshot_reaches_attempt_with_frozen_formatter_settings(s
 async def test_readiness_wait_is_persisted_and_cleared_without_attempt(settings,tmp_path):
     service, receipts, db, claim, _ = context(settings,tmp_path)
     waits=[]
-    async def persist(image, reason): waits.append((image.id,image.generation,image.status,reason))
+    async def persist(image, reason):
+        waits.append((image.id, image.generation, image.status, reason))
+        return True
     db.set_wait_reason=persist
     receipts.check_connection=AsyncMock(return_value=False)
     assert not await service.ready_for(claim.image)
@@ -368,8 +372,11 @@ async def test_policy_change_holds_before_claim_and_dispatch(settings, tmp_path,
 
     service, receipts, db, claim, _ = context(settings, tmp_path)
     snapshot = current_snapshot(settings)
+    snapshot.pop("managed_binding_sha256")
     if version is None:
         snapshot.pop("execution_policy_version")
+    else:
+        snapshot["execution_policy_version"] = version
     claim.image.effective_options = snapshot
     before = deepcopy(snapshot)
     settings.ocr = OcrSettings(enabled=True)
@@ -444,3 +451,21 @@ async def test_policy_change_after_a_real_dispatch_keeps_the_attempt_counted(set
     receipts.extract_receipt.assert_awaited_once()
     db.hold_claim_for_policy.assert_not_awaited()
     assert db.finish_attempt.call_args.args[1].kind == "retry"
+
+
+async def test_second_extraction_wait_does_not_refund_an_earlier_dispatch(settings, tmp_path):
+    from vision_bill.model.handoff import HandoffStatus, HandoffWait
+    from vision_bill.service.extraction_pipeline import OcrRuntimeChangedError
+
+    service, receipts, db, claim, _ = context(settings, tmp_path)
+    receipts.extract_receipt.side_effect = [
+        OcrRuntimeChangedError("ocr_runtime_changed"),
+        HandoffWait(HandoffStatus(state="busy", reason_code="model_handoff_busy")),
+    ]
+
+    await service.process_claim(claim)
+
+    assert receipts.extract_receipt.await_count == 2
+    db.hold_claim_for_readiness.assert_not_awaited()
+    outcome = db.finish_attempt.call_args.args[1]
+    assert outcome.kind == "retry" and outcome.result_code == "ocr_runtime_changed"

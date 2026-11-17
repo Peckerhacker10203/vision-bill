@@ -162,7 +162,8 @@ test.describe('explicit current policy adoption', () => {
 			expect(after[key]).toEqual(before[key]);
 		expect(after.requested_options.allow_ocr_fallback).toBe(true);
 		expect(after.effective_options).toMatchObject({
-			execution_policy_version: 2,
+			execution_policy_version: 3,
+			managed_binding_sha256: null,
 			allow_ocr_fallback: false,
 			ocr: { enabled: true, allow_vision_fallback: false }
 		});

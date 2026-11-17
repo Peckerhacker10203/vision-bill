@@ -621,3 +621,19 @@ async def test_ollama_restart_recovers_only_recorded_implicit_latest(tmp_path, o
                 pytest.fail("foreign resident authorized session entry")
         assert handoff.journal.read_bytes() == before
         assert unloads == events == []
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_cleanup_cannot_escape_as_refundable_wait(tmp_path):
+    from unittest.mock import AsyncMock
+
+    events = []
+    ocr = Ocr(events)
+    ocr.park = AsyncMock(side_effect=RuntimeError("cleanup uncertain"))
+    handoff = ModelHandoff(tmp_path / "handoff.lock", ResidentLlm(events), ocr)
+    await adopt(handoff)
+    with pytest.raises(RuntimeError, match="model_handoff_model_not_adopted") as caught:
+        async with handoff.session(monotonic() + 1) as owner:
+            owner.require_model("not-adopted")
+    assert not isinstance(caught.value, HandoffWait)
+    assert str(caught.value.__cause__) == "cleanup uncertain"

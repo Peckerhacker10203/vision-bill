@@ -67,7 +67,8 @@ def test_new_snapshot_disables_effective_fallback_and_is_accepted(settings):
         enabled=True, allow_vision_fallback=True, vision_fallback_model_id="old-alternate"
     )
     snapshot = current_snapshot(settings)
-    assert snapshot["execution_policy_version"] == 2
+    assert snapshot["execution_policy_version"] == 3
+    assert snapshot["managed_binding_sha256"] is None
     assert snapshot["allow_ocr_fallback"] is False
     assert snapshot["ocr"]["allow_vision_fallback"] is False
     assert snapshot["ocr"]["vision_fallback_model_id"] is None
@@ -75,7 +76,9 @@ def test_new_snapshot_disables_effective_fallback_and_is_accepted(settings):
     assert settings.ocr.allow_vision_fallback  # building the snapshot never mutates live settings
 
 
-@pytest.mark.parametrize("version,permission", [(1, False), (3, False), (True, False), (2, True)])
+@pytest.mark.parametrize(
+    "version,permission", [(1, False), (4, False), (True, False), (2, True), (3, True)]
+)
 def test_versioned_snapshot_rejects_unknown_or_permissive_policy(settings, version, permission):
     from vision_bill.service.execution_policy import current_snapshot
 
@@ -85,7 +88,7 @@ def test_versioned_snapshot_rejects_unknown_or_permissive_policy(settings, versi
         SubmissionService._fallback_permission(snapshot)
 
 
-@pytest.mark.parametrize("version", [None, 2])
+@pytest.mark.parametrize("version", [None, 2, 3])
 @pytest.mark.parametrize("change", ["enable", "disable", "endpoint"])
 def test_policy_holds_every_snapshot_version_on_operator_change(settings, version, change):
     from copy import deepcopy
@@ -94,6 +97,9 @@ def test_policy_holds_every_snapshot_version_on_operator_change(settings, versio
 
     settings.ocr = OcrSettings(enabled=change != "enable", service_url="http://old")
     snapshot = execution_policy.current_snapshot(settings)
+    if version != 3:
+        snapshot.pop("managed_binding_sha256", None)
+        snapshot["execution_policy_version"] = version
     if version is None:
         snapshot.pop("execution_policy_version")
     before = deepcopy(snapshot)
@@ -102,17 +108,31 @@ def test_policy_holds_every_snapshot_version_on_operator_change(settings, versio
     assert snapshot == before
 
 
-@pytest.mark.parametrize("permission,required,grant,held", [
-    (True, False, True, True), (False, False, True, False),
-    (True, True, True, False), (True, False, False, False),
-])
-def test_legacy_policy_holds_only_effective_image_fallback_grants(settings, permission, required, grant, held):
+@pytest.mark.parametrize(
+    "permission,required,grant,held",
+    [
+        (True, False, True, True),
+        (False, False, True, False),
+        (True, True, True, False),
+        (True, False, False, False),
+    ],
+)
+def test_legacy_policy_holds_only_effective_image_fallback_grants(
+    settings, permission, required, grant, held
+):
     from vision_bill.service import execution_policy
 
-    settings.ocr = OcrSettings(enabled=True, required=required, allow_vision_fallback=grant)
+    settings.ocr = OcrSettings(
+        enabled=True,
+        required=required,
+        allow_vision_fallback=grant,
+        manage_model_lifecycle=False,
+    )
     snapshot = {
-        "ocr": settings.ocr.model_dump(mode="json"), "temperature": 0.2,
-        "max_output_tokens": 8192, "allow_ocr_fallback": permission,
+        "ocr": settings.ocr.model_dump(mode="json"),
+        "temperature": 0.2,
+        "max_output_tokens": 8192,
+        "allow_ocr_fallback": permission,
     }
     reason = execution_policy.policy_hold_reason(snapshot, settings.ocr)
     assert reason == ("execution_policy_changed" if held else None)
@@ -126,7 +146,7 @@ def test_compatible_frozen_formatter_and_inactive_endpoint_are_retained(settings
     assert execution_policy.policy_hold_reason(snapshot, current) is None
 
 
-@pytest.mark.parametrize("version", [True, 1, 3, "2"])
+@pytest.mark.parametrize("version", [True, 1, 4, "2"])
 def test_policy_hold_parser_rejects_invalid_versions(settings, version):
     from vision_bill.service import execution_policy
 
@@ -134,3 +154,42 @@ def test_policy_hold_parser_rejects_invalid_versions(settings, version):
     snapshot["execution_policy_version"] = version
     with pytest.raises(ValueError, match="execution_snapshot_invalid"):
         execution_policy.policy_hold_reason(snapshot, settings.ocr)
+
+
+@pytest.mark.parametrize("version", [None, 2])
+def test_legacy_direct_remains_compatible_without_binding(settings, version):
+    from vision_bill.service.execution_policy import policy_hold_reason
+
+    snapshot = {
+        "ocr": settings.ocr.model_dump(mode="json"),
+        "temperature": 0.13,
+        "max_output_tokens": 1234,
+    }
+    if version is not None:
+        snapshot.update(execution_policy_version=version, allow_ocr_fallback=False)
+    assert policy_hold_reason(snapshot, settings.ocr) is None
+
+
+@pytest.mark.parametrize("version", [None, 2])
+def test_historical_managed_work_requires_explicit_adoption(settings, version):
+    from vision_bill.service.execution_policy import policy_hold_reason
+
+    settings.ocr = OcrSettings(enabled=True, manage_model_lifecycle=True)
+    snapshot = {
+        "ocr": settings.ocr.model_dump(mode="json"),
+        "temperature": 0.13,
+        "max_output_tokens": 1234,
+    }
+    if version is not None:
+        snapshot.update(execution_policy_version=version, allow_ocr_fallback=False)
+    assert policy_hold_reason(snapshot, settings.ocr) == "execution_policy_changed"
+
+
+@pytest.mark.parametrize("digest", ["", "A" * 64, "z" * 64, "a" * 63, False, 0])
+def test_invalid_binding_digest_is_rejected(settings, digest):
+    from vision_bill.service.execution_policy import current_snapshot, snapshot_ocr
+
+    snapshot = current_snapshot(settings)
+    snapshot["managed_binding_sha256"] = digest
+    with pytest.raises(ValueError, match="execution_snapshot_invalid"):
+        snapshot_ocr(snapshot)

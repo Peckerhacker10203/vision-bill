@@ -14,6 +14,7 @@ from ..model.benchmark import (
     ReferenceConfirmation,
     ReferencePreview,
 )
+from ..model.handoff import HandoffWait
 from ..model.workflow import AccessScope
 from ..security.dependencies import require_admin
 from ..security.models import User
@@ -44,6 +45,8 @@ async def create_benchmark_run(
     """Queue a benchmark run and return immediately with its durable run id."""
     try:
         run = await benchmark_service.create_run(request, scope=AccessScope(user_id=user.id, can_see_all=user.can_see_all))
+    except HandoffWait as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     except (ValueError, FileNotFoundError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     response.headers["Location"] = _location(run.id)
@@ -139,6 +142,8 @@ async def reevaluate_receipt(
             model_id=request.model_id,
             scope=AccessScope(user_id=user.id, can_see_all=user.can_see_all),
         )
+    except HandoffWait as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except FileNotFoundError as error:

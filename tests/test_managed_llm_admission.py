@@ -90,7 +90,9 @@ async def admission_context(settings, monkeypatch, tmp_path):
             model_lifecycle="llamacpp" if kind == "llamacpp" else "none",
         )
 
-    def build(kind="generic", *, ready=False, managed=True, enabled=True, attempts=0):
+    async def build(
+        kind="generic", *, ready=False, managed=True, enabled=True, attempts=0, adopt=True
+    ):
         nonlocal worker_ready
         worker_ready = ready
         settings.ocr = OcrSettings(
@@ -108,6 +110,12 @@ async def admission_context(settings, monkeypatch, tmp_path):
         )
         llm = provider(kind)
         receipts = ReceiptService(settings.images, settings.pg, llm)
+        if adopt and managed and enabled and llm.supports_model_release:
+            from test_handoff_binding import adopt as adopt_dedication
+
+            llm.resident_model_ids = AsyncMock(return_value=frozenset())
+            await adopt_dedication(llm.handoff, ("formatter",))
+            image.effective_options = receipts.current_execution_snapshot(settings)
 
         async def persist_wait(observed, reason):
             assert observed is image
@@ -160,7 +168,7 @@ async def test_incompatible_actual_llm_waits_without_claim_or_resource_side_effe
     attempts,
     identity,
 ):
-    ctx = admission_context(ready=ready, attempts=attempts)
+    ctx = await admission_context(ready=ready, attempts=attempts)
     if identity != "generic":
         if identity == "release-unsupported":
             ctx.llm.lifecycle_identity = "test:explicit-stable-identity"
@@ -183,11 +191,11 @@ async def test_incompatible_actual_llm_waits_without_claim_or_resource_side_effe
     ctx.service.process_claim.assert_not_awaited()
     ctx.receipts.extract_receipt.assert_not_awaited()
     assert ctx.image.attempt_count == attempts
-    assert ctx.image.status == "pending" and ctx.image.wait_reason == "provider_unavailable"
+    assert ctx.image.status == "pending" and ctx.image.wait_reason == "model_release_unsupported"
     assert ctx.image.generation == generation and ctx.image.effective_options == snapshot
     assert ctx.db.set_wait_reason.await_count == ctx.image.max_attempts + 1
     assert all(
-        call.args == (ctx.image, "provider_unavailable")
+        call.args == (ctx.image, "model_release_unsupported")
         for call in ctx.db.set_wait_reason.await_args_list
     )
     assert all(method == "GET" for method, _, _ in ctx.requests)
@@ -211,14 +219,15 @@ async def test_actual_managed_providers_are_admitted_without_loading_resources(
     kind,
     ready,
 ):
-    ctx = admission_context(kind, ready=ready)
+    ctx = await admission_context(kind, ready=ready)
     assert await ctx.receipts.get_available_models(capability="text")
     assert await ctx.service._readiness_reason(ctx.image) is None, ctx.requests
     assert await ctx.scheduler.process_pending() == []
     ctx.db.claim_next.assert_awaited_once()
     ctx.service.process_claim.assert_awaited_once()
     assert ctx.image.attempt_count == 1 and ctx.image.wait_reason is None
-    assert not ctx.coordination.exists()
+    assert ctx.llm.handoff.binding_path.exists()
+    assert not ctx.llm.handoff.journal.exists()
     assert {(method, path) for method, _, path in ctx.requests} <= {
         ("GET", "/v1/models"),
         ("GET", "/api/tags"),
@@ -230,7 +239,7 @@ async def test_actual_managed_providers_are_admitted_without_loading_resources(
 
 @pytest.mark.parametrize("enabled", [False, True], ids=["direct", "unmanaged-ocr"])
 async def test_generic_openai_without_managed_ocr_remains_eligible(admission_context, enabled):
-    ctx = admission_context(ready=True, managed=False, enabled=enabled)
+    ctx = await admission_context(ready=True, managed=False, enabled=enabled)
     assert await ctx.service._readiness_reason(ctx.image) is None, ctx.requests
     assert await ctx.scheduler.process_pending() == []
     ctx.db.claim_next.assert_awaited_once()
@@ -241,23 +250,34 @@ async def test_generic_openai_without_managed_ocr_remains_eligible(admission_con
 
 
 @pytest.mark.parametrize("kind", ["ollama", "llamacpp"])
-async def test_restoring_compatible_actual_provider_resumes_same_pending_generation(
+async def test_restoring_compatible_provider_requires_explicit_policy_adoption(
     admission_context,
     kind,
 ):
-    ctx = admission_context(attempts=2)
+    ctx = await admission_context(attempts=2)
     snapshot = deepcopy(ctx.image.effective_options)
     generation = ctx.image.generation
     for _ in range(2):
         assert await ctx.scheduler.process_pending() == []
     ctx.db.claim_next.assert_not_awaited()
     assert ctx.image.status == "pending" and ctx.image.attempt_count == 2
-    ctx.receipts._provider = ctx.provider(kind)
+    from test_handoff_binding import adopt
+
+    replacement = ctx.provider(kind)
+    replacement.resident_model_ids = AsyncMock(return_value=frozenset())
+    await adopt(replacement.handoff, ("formatter",))
+    ctx.receipts._provider = replacement
     assert await ctx.scheduler.process_pending() == []
-    ctx.db.claim_next.assert_awaited_once()
-    ctx.service.process_claim.assert_awaited_once()
-    assert ctx.image.attempt_count == 3 and ctx.image.wait_reason is None
-    claim = ctx.service.process_claim.call_args.args[0]
-    assert claim.image is ctx.image and claim.generation == generation
+    ctx.db.claim_next.assert_not_awaited()
+    ctx.service.process_claim.assert_not_awaited()
+    assert ctx.image.attempt_count == 2 and ctx.image.wait_reason == "execution_policy_changed"
     assert ctx.image.generation == generation and ctx.image.effective_options == snapshot
-    assert not ctx.coordination.exists()
+    assert not replacement.handoff.journal.exists()
+
+
+async def test_missing_dedication_is_a_readiness_hold(admission_context):
+    ctx = await admission_context("ollama", adopt=False)
+    assert await ctx.scheduler.process_pending() == []
+    ctx.db.claim_next.assert_not_awaited()
+    assert ctx.image.wait_reason == "model_handoff_binding_required"
+    assert not ctx.llm.handoff.journal.exists()

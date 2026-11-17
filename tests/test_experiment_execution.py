@@ -179,7 +179,7 @@ async def test_reevaluation_enforces_saved_run_deadline():
     service._run_digests = AsyncMock(return_value={"model": "original"})
     service._timeout = AsyncMock(return_value=0.01)
 
-    async def slow(*args):
+    async def slow(*args, **kwargs):
         await asyncio.Event().wait()
 
     service._run_experiment = slow
@@ -280,6 +280,7 @@ async def test_run_manifest_preserves_upload_policy_instead_of_forcing_configure
         _ocr_provider=sidecar(),
         _ocr_settings=OcrSettings(enabled=False),
         list_tags=AsyncMock(return_value=[]),
+        execution_handoff=lambda _: None,
     )
     rid = uuid4()
     service._select_receipts = AsyncMock(return_value=[rid])
@@ -322,6 +323,7 @@ async def test_ocr_benchmark_discovers_text_only_formatter_models(settings):
         _ocr_provider=sidecar(),
         _ocr_settings=OcrSettings(enabled=True, manage_model_lifecycle=False),
         list_tags=AsyncMock(return_value=[]),
+        execution_handoff=lambda _: None,
     )
     rid = uuid4()
     service._select_receipts = AsyncMock(return_value=[rid])

@@ -19,6 +19,7 @@ from ...config import PGSettings, WorkerSettings
 from ...model.db.image import ImageRow
 from ...model.db.receipt import ReceiptRow
 from ...model.extraction import DraftView, ExtractionDraft
+from ...model.handoff import HANDOFF_WAIT_REASONS
 from ...model.ocr import OcrPageMetadata, Sha256, SourceRef, WorkingImageMetadata
 from ...model.review import AmountPolicy, OriginalAvailability, SourceView
 from ...model.workflow import (
@@ -43,6 +44,10 @@ from ...service.execution_policy import EXECUTION_POLICY_VERSION, snapshot_ocr
 from ...service.receipt_review import evaluate_receipt, persistent_findings, receipt_from_draft
 from .deadline import connection
 from .receipt_db import OriginalChecker, ReceiptDB
+
+READINESS_WAIT_REASONS = HANDOFF_WAIT_REASONS | {
+    "provider_unavailable", "ocr_unavailable", "vision_model_unavailable", "formatter_model_unavailable",
+}
 
 
 def _json(value: Any) -> str:
@@ -533,6 +538,14 @@ class WorkflowDB:
         """Return only this claim's reserved attempt; retain earlier real attempts and intent."""
         if reason != "execution_policy_changed":
             raise ValueError("invalid_wait_reason")
+        return await self.hold_claim_for_readiness(claim, reason, deadline=deadline)
+
+    async def hold_claim_for_readiness(
+        self, claim: AnalysisClaim, reason: str, *, deadline: float | None = None,
+    ) -> CommitResult:
+        """Refund only the live claim whose pre-dispatch readiness was disproven."""
+        if reason not in READINESS_WAIT_REASONS:
+            raise ValueError("invalid_wait_reason")
         async with connection(self.pool, deadline=deadline, transaction=True) as conn:
             observed = await self._lock_claim(conn, claim)
             if observed is None or observed["receipt_id"] is not None or await conn.fetchval(
@@ -542,14 +555,14 @@ class WorkflowDB:
             row = await conn.fetchrow(
                 """UPDATE images SET status='pending',attempt_count=attempt_count-1,
                 claim_token=NULL,lease_expires_at=NULL,processing_at=NULL,retry_at=NULL,
-                wait_reason=$2 WHERE id=$1 RETURNING *""",
+                wait_reason=$2 WHERE id=$1 AND lease_expires_at>clock_timestamp() RETURNING *""",
                 claim.image.id, reason,
             )
-            return CommitResult(stale=False, submission=_status(row))
+            return CommitResult(stale=True) if row is None else CommitResult(stale=False, submission=_status(row))
 
     async def set_wait_reason(self, image: ImageRow, reason: str | None) -> bool:
         """A readiness observation cannot mutate a successor generation or claimed state."""
-        if reason not in {None, "provider_unavailable", "ocr_unavailable", "vision_model_unavailable", "formatter_model_unavailable", "execution_policy_changed"}:
+        if reason is not None and reason not in READINESS_WAIT_REASONS:
             raise ValueError("invalid_wait_reason")
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(

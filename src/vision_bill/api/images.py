@@ -13,7 +13,6 @@ from ..model.workflow import AccessScope, SubmissionCreate, SubmissionStatus
 from ..security.dependencies import get_current_user
 from ..security.models import User
 from ..service.analysis_scheduler import AnalysisScheduler
-from ..service.execution_policy import current_snapshot
 from ..service.image_service import ImageService, UnsupportedImageTypeError
 from ..service.receipt_service import ReceiptService
 from .helper.helper import get_analysis_scheduler, get_image_service, get_receipt_service
@@ -103,7 +102,7 @@ async def upload_image(
         source_manifest=manifest,
         requested_options=requested,
         request_fingerprint=fingerprint,
-        effective_options=current_snapshot(settings),
+        effective_options=receipt_service.current_execution_snapshot(settings),
         model_id=model_id if model_id is not None else settings.llm.model_name,
         bypass_review=(
             settings.images.bypass_review_default if bypass_review is None else bypass_review

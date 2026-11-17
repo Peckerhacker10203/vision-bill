@@ -14,7 +14,6 @@ from ..model.workflow import AccessScope, DraftFinalize, DraftPatch, RetryReques
 from ..security.dependencies import get_current_user
 from ..security.models import User
 from ..service.analysis_scheduler import AnalysisScheduler
-from ..service.execution_policy import current_snapshot
 from ..service.submission_service import SubmissionService
 from .helper.helper import get_analysis_scheduler
 
@@ -100,7 +99,7 @@ async def retry(
     try:
         status = await service.db.retry_submission(
             image_id, request, scope=scope,
-            replacement_snapshot=current_snapshot(service.settings) if request.policy == "current" else None,
+            replacement_snapshot=service.current_snapshot() if request.policy == "current" else None,
         )
     except ValueError:
         raise HTTPException(status_code=409, detail="Retry conflict") from None

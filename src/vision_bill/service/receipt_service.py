@@ -6,7 +6,7 @@ from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from time import monotonic
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 import asyncpg
@@ -14,10 +14,11 @@ import httpx
 from fastapi import UploadFile
 from openai import APITimeoutError
 
-from ..config import ImageSettings, OcrSettings, PGSettings, WorkerSettings
+from ..config import ImageSettings, OcrSettings, PGSettings, Settings, WorkerSettings
 from ..model.db.image import ImagePart, ImageRow
 from ..model.db.receipt import ReceiptRow, ReceiptWithDetails
 from ..model.extraction import InferenceEnvelope
+from ..model.handoff import HandoffStatus, HandoffWait
 from ..model.ocr import OcrCapabilities, OcrResponse, SourceRef
 from ..model.receipt import Receipt
 from ..model.search import ProductSearchResponse
@@ -42,6 +43,8 @@ from .image_service import ImageService
 if TYPE_CHECKING:
     from ..model.experiment import ExperimentOptions
     from .experiment_execution import ExperimentResult
+    from .extraction_pipeline import ExtractionPipeline
+    from .gpu_handoff import ModelHandoff
 
 logger = logging.getLogger(__name__)
 
@@ -434,11 +437,40 @@ class ReceiptService:
         return await self._db.list_tags() if self.db_ready else []
 
     async def ocr_capabilities(self, settings: OcrSettings) -> OcrCapabilities:
-        from ..provider.factory import get_ocr_provider
-        provider = get_ocr_provider(settings)
+        provider = self._extraction_pipeline(settings).ocr
         if provider is None:
             return OcrCapabilities(enabled=False, configured=False, reachable=False, ready=False)
         return await provider.get_capabilities()
+
+    def _extraction_pipeline(self, settings: OcrSettings | None = None) -> "ExtractionPipeline":
+        from ..provider.factory import get_ocr_provider
+        from .extraction_pipeline import ExtractionPipeline
+
+        if settings is None or (settings == self._ocr_settings and self._ocr_provider is not None):
+            return ExtractionPipeline(self._provider, self._ocr_provider, self._ocr_settings)
+        return ExtractionPipeline(self._provider, get_ocr_provider(settings), settings)
+
+    def execution_handoff(self, settings: OcrSettings) -> "ModelHandoff | None":
+        from .execution_policy import managed_ocr
+
+        selected = self._extraction_pipeline(settings).coordinator()
+        live = self._extraction_pipeline().coordinator() if self._ocr_provider is not None else selected
+        if (managed_ocr(settings) != (selected is not None)
+                or (selected is None) != (live is None)
+                or (live is not None and selected is not None and not selected.matches(live))):
+            raise HandoffWait(HandoffStatus(
+                state="configuration_required", reason_code="execution_policy_changed",
+            ))
+        return selected
+
+    def current_execution_snapshot(self, settings: Settings) -> dict[str, Any]:
+        from .execution_policy import current_snapshot
+
+        try:
+            handoff = self.execution_handoff(settings.ocr)
+        except (HandoffWait, ValueError, OSError):
+            handoff = None
+        return current_snapshot(settings, handoff=handoff)
 
     async def extract_receipt(
         self, model_id: str, paths: Sequence[Path], *, options: "ExperimentOptions",
@@ -446,16 +478,16 @@ class ReceiptService:
         checkpoint: Callable[[OcrResponse], Awaitable[None]] | None = None,
         resume_pages: Sequence[OcrResponse] = (), source_refs: Sequence[SourceRef] = (),
         ocr_settings: OcrSettings | None = None, max_output_tokens: int | None = None,
+        expected_binding_sha256: str | None = None, handoff_deadline: float | None = None,
     ) -> InferenceEnvelope:
         """Explicit per-attempt snapshots; never inject state into shared providers."""
-        from ..provider.factory import get_ocr_provider
-        from .extraction_pipeline import ExtractionPipeline
-        selected = ocr_settings if ocr_settings is not None else self._ocr_settings
-        ocr = get_ocr_provider(selected) if ocr_settings is not None else self._ocr_provider
-        return await ExtractionPipeline(self._provider, ocr, selected).extract(
+        if ocr_settings is not None:
+            self.execution_handoff(ocr_settings)
+        return await self._extraction_pipeline(ocr_settings).extract(
             model_id, paths, options=options, deadline=deadline, tags=tags,
             checkpoint=checkpoint, resume_pages=resume_pages, source_refs=source_refs,
-            max_output_tokens=max_output_tokens,
+            max_output_tokens=max_output_tokens, expected_binding_sha256=expected_binding_sha256,
+            handoff_deadline=handoff_deadline,
         )
 
     async def analyse_receipt_with_ocr(self, model_id: str, image_path: Path) -> Receipt:

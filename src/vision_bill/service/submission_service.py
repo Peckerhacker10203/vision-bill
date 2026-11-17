@@ -18,6 +18,7 @@ from ..model.db.image import ImageRow
 from ..model.db.receipt import ReceiptRow
 from ..model.experiment import ExperimentOptions
 from ..model.extraction import DraftView, ExtractionDraft, InferenceEnvelope
+from ..model.handoff import HandoffWait
 from ..model.ocr import OcrPageMetadata, OcrResponse, SourceRef, WorkingImage, WorkingImageMetadata
 from ..model.receipt import Receipt
 from ..model.review import OriginalAvailability
@@ -36,7 +37,7 @@ from ..model.workflow import (
 from ..provider.llm.base import ModelInfo
 from ..provider.llm.errors import AnalysisTimeoutError, UnreadableReceiptError
 from ..provider.ocr.base import compact_ocr_text
-from .execution_policy import current_snapshot, policy_hold_reason, snapshot_ocr
+from .execution_policy import current_snapshot, managed_ocr, policy_hold_reason, snapshot_ocr
 from .extraction_pipeline import (
     OcrRuntimeChangedError,
     OriginalSourceChangedError,
@@ -61,6 +62,10 @@ class PolicyHoldError(Exception):
     """The operator policy changed after readiness or while preparing dispatch."""
 
 
+class ReadinessHoldError(Exception):
+    """The explicitly selected legacy model disappeared before its initial binding."""
+
+
 class SubmissionService:
     def __init__(self, settings: Settings, receipts: ReceiptService, images: ImageService):
         self.settings = settings
@@ -69,12 +74,8 @@ class SubmissionService:
         self.db = receipts.workflow_db
         self.images = images
 
-    def legacy_snapshot(self) -> dict[str, Any]:
-        return {
-            "ocr": self.settings.ocr.model_dump(mode="json"),
-            "temperature": self.settings.llm.temperature,
-            "max_output_tokens": self.settings.llm.max_output_tokens,
-        }
+    def current_snapshot(self) -> dict[str, Any]:
+        return self.receipts.current_execution_snapshot(self.settings)
 
     @staticmethod
     def _fallback_permission(snapshot: dict[str, Any]) -> bool:
@@ -86,11 +87,8 @@ class SubmissionService:
     def _initial_model(models: list[ModelInfo], preferred: str, *, vision: bool) -> ModelInfo | None:
         """Resolve only an unfrozen legacy binding from affirmative discovery."""
         if vision:
-            return select_vision_model(models, preferred) or next(
-                (model for model in models if select_vision_model([model], model.id) is not None),
-                None,
-            )
-        return next((model for model in models if model.id == preferred), models[0] if models else None)
+            return select_vision_model(models, preferred)
+        return next((model for model in models if model.id == preferred), None)
 
     async def ready_for(self, image: ImageRow) -> bool:
         """Persist only safe reasons against the observed generation/status before a claim."""
@@ -99,12 +97,12 @@ class SubmissionService:
                 reason = await self._readiness_reason(image)
         except TimeoutError:
             reason = "provider_unavailable"
-        await self.db.set_wait_reason(image, reason)
-        return reason is None
+        observed = await self.db.set_wait_reason(image, reason)
+        return reason is None and observed
 
     async def _readiness_reason(self, image: ImageRow) -> str | None:
         """Readiness precedes claim, and therefore never spends the attempt budget."""
-        snapshot = image.effective_options or self.legacy_snapshot()
+        snapshot = image.effective_options or current_snapshot(self.settings)
         try:
             reason = policy_hold_reason(snapshot, self.settings.ocr)
             if reason:
@@ -115,30 +113,41 @@ class SubmissionService:
             return None
         try:
             from .gpu_handoff import managed_ocr_enabled
-            if ocr.enabled and ocr.manage_model_lifecycle and not managed_ocr_enabled():
-                return "ocr_unavailable"
-            if ocr.enabled and ocr.manage_model_lifecycle and not self.receipts.managed_ocr_compatible():
-                return "provider_unavailable"
+            selected = image.model_id or self.settings.llm.model_name
+            if managed_ocr(ocr):
+                if not managed_ocr_enabled():
+                    return "model_handoff_managed_ocr_required"
+                if not self.receipts.managed_ocr_compatible():
+                    return "model_release_unsupported"
+                handoff = self.receipts.execution_handoff(ocr)
+                assert handoff is not None
+                status = await handoff.inspect(
+                    model_id=selected, deadline=monotonic() + 1,
+                    expected_binding_sha256=(snapshot.get("managed_binding_sha256") or "")
+                    if image.effective_options else None,
+                )
+                if status.state != "ready":
+                    return status.reason_code
+            else:
+                self.receipts.execution_handoff(ocr)
             if not await self.receipts.check_connection():
                 return "provider_unavailable"
             capability = "vision"
-            selected = image.model_id or self.settings.llm.model_name
             if ocr.enabled:
                 capabilities = await self.receipts.ocr_capabilities(ocr)
+                if capabilities.reason_code == "ocr_mode_mismatch":
+                    return "ocr_mode_mismatch"
                 if not (
                     capabilities.ready or (ocr.manage_model_lifecycle and capabilities.can_load)
                 ):
                     return "ocr_unavailable"
                 capability = "text"
             models = await self.receipts.get_available_models(capability=capability)
-            if not image.effective_options:
-                model = self._initial_model(models, selected, vision=capability == "vision")
-                if model is not None:
-                    return None
-                return "vision_model_unavailable" if capability == "vision" else "formatter_model_unavailable"
-            if capability == "vision":
-                return None if select_vision_model(models, selected) is not None else "vision_model_unavailable"
-            return None if any(model.id == selected for model in models) else "formatter_model_unavailable"
+            if self._initial_model(models, selected, vision=capability == "vision") is not None:
+                return None
+            return "vision_model_unavailable" if capability == "vision" else "formatter_model_unavailable"
+        except HandoffWait as exc:
+            return str(exc)
         except (httpx.HTTPError, OSError, ValueError, KeyError):
             return "provider_unavailable"
 
@@ -191,8 +200,7 @@ class SubmissionService:
         try:
             # Reserve a small part of the same absolute budget for durable error
             # bookkeeping. Providers, callbacks and threads retain the original deadline.
-            reserve = min(5.0, self.worker.attempt_timeout_seconds * 0.05)
-            async with asyncio.timeout_at(db_deadline - reserve):
+            async with asyncio.timeout_at(db_deadline - self._outcome_reserve()):
                 outcome = await self._attempt(claim, deadline, owned, db_deadline=db_deadline)
                 check_deadline(deadline)
                 if asyncio.get_running_loop().time() >= db_deadline:
@@ -204,6 +212,8 @@ class SubmissionService:
             return await self.db.hold_claim_for_policy(
                 claim, "execution_policy_changed", deadline=db_deadline
             )
+        except (HandoffWait, ReadinessHoldError) as exc:
+            return await self.db.hold_claim_for_readiness(claim, str(exc), deadline=db_deadline)
         except (SourceIntegrityError, OriginalSourceChangedError):
             outcome = AttemptOutcome(kind="terminal", result_code="source_integrity_failed")
         except (TimeoutError, AnalysisTimeoutError):
@@ -221,6 +231,9 @@ class SubmissionService:
             raise TimeoutError("database_attempt_deadline")
         async with asyncio.timeout_at(db_deadline):
             return await self.db.finish_attempt(claim, outcome, deadline=db_deadline)
+
+    def _outcome_reserve(self) -> float:
+        return min(5.0, self.worker.attempt_timeout_seconds * 0.05)
 
     @staticmethod
     def _bindings(image: ImageRow) -> list[SourcePartBinding]:
@@ -241,7 +254,7 @@ class SubmissionService:
         *, db_deadline: float,
     ) -> AttemptOutcome:
         image = claim.image
-        snapshot = image.effective_options or current_snapshot(self.settings)
+        snapshot = image.effective_options or self.current_snapshot()
         if policy_hold_reason(snapshot, self.settings.ocr):
             raise PolicyHoldError
         if not image.effective_options or image.model_id is None:
@@ -252,11 +265,11 @@ class SubmissionService:
                 capability="text" if legacy_ocr.enabled else "vision"
             )
             preferred = image.model_id or self.settings.llm.model_name
-            if image.effective_options:
-                models = [model for model in models if model.id == preferred]
             selected = self._initial_model(models, preferred, vision=not legacy_ocr.enabled)
             if selected is None:
-                raise RuntimeError("model_unavailable")
+                raise ReadinessHoldError(
+                    "formatter_model_unavailable" if legacy_ocr.enabled else "vision_model_unavailable"
+                )
             saved = await self.db.ensure_execution_snapshot(
                 claim, model_id=selected.id, effective_options=snapshot, deadline=db_deadline
             )
@@ -311,6 +324,7 @@ class SubmissionService:
                 raise StaleClaimError
 
         tags = await self.receipts.list_tags(deadline=db_deadline)
+        expected_binding = (snapshot.get("managed_binding_sha256") or "") if managed_ocr(ocr) else None
         for retry in range(2):
             try:
                 if policy_hold_reason(snapshot, self.settings.ocr):
@@ -330,6 +344,8 @@ class SubmissionService:
                     source_refs=refs,
                     ocr_settings=ocr,
                     max_output_tokens=limit,
+                    expected_binding_sha256=expected_binding,
+                    handoff_deadline=deadline - self._outcome_reserve() if managed_ocr(ocr) else None,
                 )
                 break
             except OcrRuntimeChangedError:
@@ -339,6 +355,10 @@ class SubmissionService:
                 manifests.clear()
                 if retry:
                     raise
+            except HandoffWait as exc:
+                if retry:
+                    raise OcrRuntimeChangedError("ocr_runtime_changed") from exc
+                raise
         else:
             raise OcrRuntimeChangedError("ocr_runtime_changed")
         if envelope.provenance.ordered_source_sha256 != hashes:

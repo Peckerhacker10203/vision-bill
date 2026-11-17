@@ -263,18 +263,22 @@ async def test_migrated_legacy_first_resolution_persisted_once(db, settings, tmp
         receipts.list_tags = AsyncMock(return_value=[])
         service = SubmissionService(settings, receipts, ImageService(settings.images))
         claim = await w.claim_next()
-        snapshot = service.legacy_snapshot()
+        snapshot = {
+            "ocr": settings.ocr.model_dump(mode="json"),
+            "temperature": settings.llm.temperature,
+            "max_output_tokens": settings.llm.max_output_tokens,
+        }
         first = await w.ensure_execution_snapshot(
             claim, model_id="fixture", effective_options=snapshot
         )
         settings.llm.model_name = "changed"
         settings.llm.temperature = 0.99
         repeated = await w.ensure_execution_snapshot(
-            claim, model_id="changed", effective_options=service.legacy_snapshot()
+            claim, model_id="changed", effective_options=service.current_snapshot()
         )
         assert repeated.model_id == first.model_id == "fixture"
         assert repeated.effective_options == snapshot
-        result = await service.process_claim(claim)
+        result = await service.process_claim(claim.model_copy(update={"image": repeated}))
         assert result.receipt and result.submission.attempt_count == 1
         assert result.submission.id == image_id and path.exists()
         assert await w.claim_next() is None
@@ -482,22 +486,23 @@ async def test_deletion_preserves_shared_original_and_rejects_changed_durable_so
 
 
 @pytest.mark.parametrize('legacy', [True, False])
-@pytest.mark.parametrize('eligible', [True, False])
-async def test_scheduler_initial_legacy_model_resolution_is_frozen_once(workflow_db,settings,tmp_path,legacy,eligible):
+@pytest.mark.parametrize('discovery', ['selected', 'alternative', 'text-only'])
+async def test_scheduler_initial_legacy_model_resolution_is_frozen_once(workflow_db,settings,tmp_path,legacy,discovery):
     from vision_bill.service.analysis_scheduler import AnalysisScheduler
     from vision_bill.provider.llm.base import ModelInfo
     w,scope=workflow_db
     image,paths,llm,_,service=await setup(w,scope,settings,tmp_path,ocr=False)
-    settings.llm.model_name='missing-preferred'
+    preferred = 'fixture' if discovery == 'selected' else 'missing-preferred'
+    settings.llm.model_name=preferred
     settings.ocr=OcrSettings(enabled=False)
     async with w.pool.acquire() as conn:
-        await conn.execute("UPDATE images SET model_id='missing-preferred' WHERE id=$1",image.id)
+        await conn.execute("UPDATE images SET model_id=$2 WHERE id=$1",image.id, preferred)
         if legacy:
             await conn.execute("UPDATE images SET effective_options='{}', request_fingerprint=NULL WHERE id=$1",image.id)
     candidate=(await w.due_candidates())[0]
     frozen=dict(candidate.effective_options)
     service.receipts.check_connection=AsyncMock(return_value=True)
-    if not eligible:
+    if discovery == 'text-only':
         text=ModelInfo('text-only');text.capabilities=['completion']
         llm.get_available_models.return_value=[text]
     service.receipts.get_available_models=llm.get_available_models
@@ -505,16 +510,17 @@ async def test_scheduler_initial_legacy_model_resolution_is_frozen_once(workflow
     await scheduler.process_pending()
     async with w.pool.acquire() as conn:
         saved=await conn.fetchrow('SELECT * FROM images WHERE id=$1',image.id)
-    if legacy and eligible:
+    if discovery == 'selected':
         assert saved['attempt_count']==1 and saved['receipt_id'] is not None, (saved['status'],saved['result_code'],saved['model_id'])
         assert saved['model_id']=='fixture'
         snapshot=json.loads(saved['effective_options'])
-        assert snapshot==current_snapshot(settings) and snapshot['allow_ocr_fallback'] is False
+        assert snapshot == (current_snapshot(settings) if legacy else frozen)
+        assert snapshot['allow_ocr_fallback'] is False
         assert llm._client.chat.call_args.kwargs['model']=='fixture'
         assert await w.claim_next() is None
     else:
         assert saved['attempt_count']==0 and saved['receipt_id'] is None
-        assert saved['model_id']=='missing-preferred'
+        assert saved['model_id']==preferred
         assert json.loads(saved['effective_options'])==frozen
         assert saved['wait_reason']=='vision_model_unavailable'
         llm._client.chat.assert_not_awaited()

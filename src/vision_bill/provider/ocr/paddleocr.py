@@ -59,8 +59,13 @@ class PaddleOcrProvider(OcrProvider):
                     raise ValueError("ocr_contract_mismatch")
                 # Older v2 services omit mode; explicit ownership must match this client.
                 expected_mode = "managed" if self.managed_lifecycle else "standalone"
-                if "service_mode" in info and info["service_mode"] != expected_mode:
+                if "service_mode" in info and info["service_mode"] not in ("managed", "standalone"):
                     raise ValueError("ocr_contract_mismatch")
+                if info.get("service_mode", expected_mode) != expected_mode:
+                    return OcrCapabilities(
+                        enabled=True, configured=True, reachable=True, ready=False,
+                        reason_code="ocr_mode_mismatch",
+                    )
                 response = await client.get(f"{self.service_url}/ready")
                 if response.status_code not in (200, 503):
                     response.raise_for_status()
