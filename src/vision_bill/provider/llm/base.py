@@ -648,7 +648,7 @@ class LLMProvider(ABC):
             if row.tags is None:
                 missing.append(f"line_items.{index}.tags")
         result.classification_enrichment = ClassificationEnrichment(
-            state="pending", missing_fields=missing
+            state="pending" if missing else "completed", missing_fields=missing
         )
         return result
 
@@ -661,11 +661,15 @@ class LLMProvider(ABC):
     def _classification_prompt(result: InferenceEnvelope, tags: Sequence[str]) -> str:
         assert result.receipt is not None
         return (
-            "Classify these ordered receipt rows. Return JSON with category and line_items "
-            "(spending_category and tags only, same row count). Allowed tags: "
+            "Classify these ordered receipt rows. Fill only the requested label paths. "
+            "Return JSON with category only when requested. If any row labels are requested, "
+            "include line_items in the same count and order, using {} for fully labeled rows. "
+            "Allowed tags: "
             + json.dumps(list(tags))
             + "; categories: "
             + json.dumps(CATEGORY_DEFINITIONS)
+            + "; requested label paths: "
+            + json.dumps(result.classification_enrichment.missing_fields)
             + "; receipt: "
             + result.receipt.model_dump_json()
         )
@@ -684,8 +688,10 @@ class LLMProvider(ABC):
             payload = json.loads(content)
         except (ValueError, RecursionError):
             return result
-        rows = payload.get("line_items") if isinstance(payload, dict) else None
-        if (
+        if not isinstance(payload, dict):
+            return result
+        rows = payload.get("line_items", [])
+        if ("line_items" in payload or missing - {"category"}) and (
             not isinstance(rows, list)
             or len(rows) != len(result.receipt.line_items)
             or any(not isinstance(row, dict) for row in rows)
@@ -693,31 +699,34 @@ class LLMProvider(ABC):
             return result
 
         updated = result.receipt.model_dump()
-        incomplete = False
-        if payload.get("category") in get_args(Category):
+        if "category" in missing and payload.get("category") in get_args(Category):
             updated["category"] = payload["category"]
-            missing.discard("category")
-        else:
-            incomplete = True
-        for index, (row, additions) in enumerate(zip(updated["line_items"], rows, strict=True)):
+            missing.remove("category")
+        for index, additions in enumerate(rows):
+            row = updated["line_items"][index]
+            spending_path = f"line_items.{index}.spending_category"
             category = additions.get("spending_category")
-            if isinstance(category, str) and category in CATEGORY_CODE_SET and category != "unknown":
+            if (
+                spending_path in missing
+                and isinstance(category, str)
+                and category in CATEGORY_CODE_SET
+                and category != "unknown"
+            ):
                 row["spending_category"] = category
-                missing.discard(f"line_items.{index}.spending_category")
-            else:
-                incomplete = True
+                missing.remove(spending_path)
+            tags_path = f"line_items.{index}.tags"
+            if tags_path not in missing:
+                continue
             tags = additions.get("tags")
             if isinstance(tags, list) and all(isinstance(tag, str) for tag in tags):
                 normalized = LineItem._normalize_tags(tags)
                 if normalized or not tags:
                     row["tags"] = normalized
-                    missing.discard(f"line_items.{index}.tags")
-                    continue
-            incomplete = True
+                    missing.remove(tags_path)
         result.receipt = Receipt.model_validate(updated)
         result.classification_enrichment = ClassificationEnrichment(
-            state="unavailable" if incomplete else "completed",
-            reason_code="invalid_response" if incomplete else None,
+            state="unavailable" if missing else "completed",
+            reason_code="invalid_response" if missing else None,
             missing_fields=sorted(missing),
         )
         return result

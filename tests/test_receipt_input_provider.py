@@ -220,6 +220,77 @@ async def test_observation_stage_preserves_receipt_and_empty_tag_enrichment():
     assert observed.classification_enrichment.state == "pending"
 
 
+async def test_fully_observed_labels_complete_without_dispatch():
+    from test_experiment_scoring import receipt
+
+    values = receipt(("Milk",)).model_dump(mode="json")
+    values["category"] = "grocery"
+    values["line_items"][0].update(spending_category="milk", tags=[])
+    conflicting = {"category": "electronics", "line_items": [{"spending_category": "cheese", "tags": ["changed"]}]}
+    provider = OllamaProvider("http://local")
+    provider.send_message = AsyncMock(side_effect=[json.dumps(values), json.dumps(conflicting)])
+    result = await provider.extract_receipt_input(
+        "requested", ocr_input(), tags=[], deadline=time.monotonic() + 2
+    )
+    assert result.receipt.category == "grocery"
+    assert result.receipt.line_items[0].spending_category == "milk"
+    assert result.receipt.line_items[0].tags == []
+    assert result.classification_enrichment.model_dump() == {
+        "state": "completed", "reason_code": None, "missing_fields": [],
+    }
+    assert provider.send_message.await_count == 1
+    assert len(result.telemetry.calls) == 1
+
+
+@pytest.mark.parametrize("include_conflicts", [False, True])
+async def test_enrichment_fills_only_missing_labels_on_partly_observed_rows(include_conflicts):
+    from test_experiment_scoring import receipt
+
+    values = receipt().model_dump(mode="json")
+    values["category"] = "grocery"
+    values["line_items"][0].update(spending_category="milk", tags=[])
+    values["line_items"][1].update(spending_category="bread_bakery", tags=None)
+    labels = {"line_items": [{}, {"tags": ["bread"]}]}
+    if include_conflicts:
+        labels["category"] = "electronics"
+        labels["line_items"][0].update(spending_category="cheese", tags=["changed"])
+        labels["line_items"][1]["spending_category"] = "fish"
+    provider = OllamaProvider("http://local")
+    provider.send_message = AsyncMock(side_effect=[json.dumps(values), json.dumps(labels)])
+    result = await provider.extract_receipt_input(
+        "requested", ocr_input(), tags=[], deadline=time.monotonic() + 2
+    )
+    assert result.receipt.category == "grocery"
+    assert [(row.spending_category, row.tags) for row in result.receipt.line_items] == [
+        ("milk", []), ("bread_bakery", ["bread"]),
+    ]
+    assert [row.tags for row in result.draft.line_items] == [[], None]
+    assert result.classification_enrichment.model_dump() == {
+        "state": "completed", "reason_code": None, "missing_fields": [],
+    }
+    assert provider.send_message.await_count == 2
+
+
+async def test_enrichment_accepts_category_only_when_all_row_labels_are_observed():
+    from test_experiment_scoring import receipt
+
+    values = receipt(("Milk",)).model_dump(mode="json")
+    del values["category"]
+    values["line_items"][0].update(spending_category="milk", tags=["dairy"])
+    provider = OllamaProvider("http://local")
+    provider.send_message = AsyncMock(
+        side_effect=[json.dumps(values), '{"category":"grocery"}']
+    )
+    result = await provider.extract_receipt_input(
+        "requested", ocr_input(), tags=[], deadline=time.monotonic() + 2
+    )
+    assert result.receipt.category == "grocery"
+    assert result.receipt.line_items[0].spending_category == "milk"
+    assert result.receipt.line_items[0].tags == ["dairy"]
+    assert result.classification_enrichment.state == "completed"
+    assert result.classification_enrichment.missing_fields == []
+
+
 @pytest.mark.parametrize(
     "response",
     [
@@ -267,12 +338,15 @@ async def test_unknown_source_ref_cannot_survive_as_valid_draft():
 async def test_classification_is_separate_cannot_change_observations_and_is_in_telemetry():
     from test_experiment_scoring import receipt
 
+    values = receipt().model_dump(mode="json")
+    for row in values["line_items"]:
+        del row["tags"]
     provider = OllamaProvider("http://local")
     provider._client.chat = AsyncMock(
         side_effect=[
             ChatResponse(
                 model="extractor",
-                message={"role": "assistant", "content": receipt().model_dump_json()},
+                message={"role": "assistant", "content": json.dumps(values)},
             ),
             ChatResponse(
                 model="classifier",

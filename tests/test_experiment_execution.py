@@ -63,6 +63,7 @@ async def test_upload_execution_preserves_all_photo_paths_and_frozen_tags(settin
     available.capabilities = ["vision", "completion"]
     provider.get_available_models = AsyncMock(return_value=[available])
     payload = receipt(("Milk",)).model_dump(mode="json")
+    del payload["line_items"][0]["tags"]
     payload["line_items"][0]["source_image"] = 0
     payload["duplicate_candidates"] = []
     provider._client.chat = AsyncMock(
@@ -78,7 +79,7 @@ async def test_upload_execution_preserves_all_photo_paths_and_frozen_tags(settin
                     "content": json.dumps(
                         {
                             "category": "grocery",
-                            "line_items": [{"spending_category": "food", "tags": ["frozen_tag"]}],
+                            "line_items": [{"spending_category": "milk", "tags": ["frozen_tag"]}],
                         }
                     ),
                 }
@@ -96,6 +97,8 @@ async def test_upload_execution_preserves_all_photo_paths_and_frozen_tags(settin
     assert "frozen_tag" not in request["messages"][0]["content"]
     assert "frozen_tag" in calls[1].kwargs["messages"][0]["content"]
     assert result.receipt.line_items[0].tags == ["frozen_tag"]
+    assert result.receipt.category == "other"
+    assert result.metadata["classification_enrichment"]["state"] == "completed"
     assert request["options"]["temperature"] == 0
     assert provider._temperature == 0.7
     assert result.metadata["image_count"] == 2
