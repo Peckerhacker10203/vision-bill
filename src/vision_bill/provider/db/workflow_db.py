@@ -36,6 +36,7 @@ from ...model.workflow import (
     DraftFinalize,
     DraftPatch,
     EnqueueResult,
+    ObservationCheckpoint,
     OcrCheckpoint,
     PersistedSourcePart,
     PersistedWorkingView,
@@ -44,11 +45,17 @@ from ...model.workflow import (
     SubmissionCreate,
     SubmissionStatus,
 )
-from ...service.execution_policy import EXECUTION_POLICY_VERSION, snapshot_ocr
+from ...service.execution_policy import (
+    EXECUTION_POLICY_VERSION,
+    semantic_policy_sha256,
+    snapshot_ocr,
+)
+from ...service.observation_admission import admit_observations
 from ...service.receipt_review import evaluate_receipt, persistent_findings, receipt_from_draft
 from .deadline import connection
 from .receipt_db import OriginalChecker, ReceiptDB
 
+OBSERVATION_RECOVERY_WAIT = "observation_recovery_required"
 READINESS_WAIT_REASONS = HANDOFF_WAIT_REASONS | {
     "provider_unavailable", "vision_model_unavailable", "formatter_model_unavailable",
 }
@@ -65,6 +72,22 @@ def _decoded(value: Any) -> Any:
 
 def _status(row: Any) -> SubmissionStatus:
     return SubmissionStatus.model_validate(ImageRow.model_validate(dict(row)).model_dump())
+
+
+def _eligible_observations(row: Any) -> dict[str, Any] | None:
+    checkpoint = _decoded(row["observation_checkpoint"])
+    if isinstance(checkpoint, dict) and checkpoint.get("eligible_generation") == row["generation"]:
+        return checkpoint
+    return None
+
+
+def _observation_history(checkpoint: dict[str, Any], event: str) -> dict[str, Any]:
+    return {
+        "event": event,
+        "checkpoint_id": checkpoint["checkpoint_id"],
+        "producer_generation": checkpoint["producer_generation"],
+        "producer_attempt_number": checkpoint["producer_attempt_number"],
+    }
 
 
 class _ExpiredClaim(Exception):
@@ -174,6 +197,8 @@ class WorkflowDB:
         The caller hashes originals under its attempt deadline. Paths must equal
         the stored ordered originals; established identities cannot be changed.
         """
+        if claim.purpose != "inference":
+            return None
         async with connection(self.pool, deadline=deadline, transaction=True) as conn:
             row = await self._lock_claim(conn, claim)
             if row is None:
@@ -297,40 +322,59 @@ class WorkflowDB:
 
     @staticmethod
     async def _record_abandonment(conn: asyncpg.Connection, row: Any, *, exhausted: bool) -> None:
+        checkpoint = _eligible_observations(row)
         await conn.execute(
-            """INSERT INTO receipt_extractions(image_id,generation,attempt_number,outcome_kind,result_code)
-            VALUES($1,$2,$3,$4,'lease_expired')
+            """INSERT INTO receipt_extractions(image_id,generation,attempt_number,outcome_kind,
+            result_code,envelope,source_views)
+            VALUES($1,$2,$3,$4,'lease_expired',$5::jsonb,$6::jsonb)
             ON CONFLICT(image_id,generation,attempt_number) DO NOTHING""",
             row["id"], row["generation"], row["attempt_count"], "terminal" if exhausted else "retry",
+            _json(checkpoint["envelope"]) if checkpoint else None,
+            _json(checkpoint["persisted_views"]) if checkpoint else "[]",
         )
 
     async def reap_expired_claims(self, *, deadline: float | None = None) -> int:
-        """Seal expired attempts and release their claims before admitting work."""
+        """Release expired leases. Only inference creates abandonment history."""
         async with connection(self.pool, deadline=deadline, transaction=True) as conn:
             rows = await conn.fetch(
-                """SELECT id,generation,attempt_count,max_attempts FROM images
+                """SELECT id,generation,attempt_count,max_attempts,claim_purpose,
+                observation_checkpoint,wait_reason FROM images
                 WHERE status='processing' AND lease_expires_at<=clock_timestamp() AND receipt_id IS NULL
                 AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id)
                 ORDER BY id FOR UPDATE SKIP LOCKED"""
             )
             reaped = 0
             for row in rows:
-                exhausted = row["attempt_count"] >= row["max_attempts"]
-                result_code = "attempt_limit" if exhausted else "lease_expired"
-                delay = None if exhausted else self._worker.retry_delay(row["attempt_count"])
-                # Recheck expiry and receipt association after acquiring the image lock.
+                completion = row["claim_purpose"] == "completion"
+                checkpoint = _eligible_observations(row)
+                recovering = completion or checkpoint is not None
+                exhausted = not recovering and row["attempt_count"] >= row["max_attempts"]
+                result_code = None if completion else "attempt_limit" if exhausted else "lease_expired"
+                delay = None if recovering or exhausted else self._worker.retry_delay(row["attempt_count"])
+                reason = row["wait_reason"]
+                if recovering and reason != "execution_policy_changed":
+                    reason = OBSERVATION_RECOVERY_WAIT
+                history = []
+                if checkpoint is not None and not completion:
+                    history.append(_observation_history(checkpoint, "observation_checkpoint_abandoned"))
+                # Recheck expiry and the receipt association while holding the image lock.
                 changed = await conn.fetchval(
-                    """UPDATE images SET status=$2,result_code=$3,error=$3,
-                    claim_token=NULL,lease_expires_at=NULL,processing_at=NULL,
-                    retry_at=clock_timestamp()+make_interval(secs => $4)
+                    """UPDATE images SET status=$2,
+                    result_code=CASE WHEN $7 THEN result_code ELSE $3 END,
+                    error=CASE WHEN $7 THEN error ELSE $3 END,
+                    claim_token=NULL,claim_purpose=NULL,lease_expires_at=NULL,processing_at=NULL,
+                    retry_at=clock_timestamp()+make_interval(secs => $4),
+                    wait_reason=$5,legacy_events=legacy_events || $6::jsonb
                     WHERE id=$1 AND status='processing' AND lease_expires_at<=clock_timestamp()
                     AND receipt_id IS NULL
                     AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id)
                     RETURNING id""",
                     row["id"], "failed" if exhausted else "pending", result_code, delay,
+                    reason, _json(history), completion,
                 )
                 if changed is not None:
-                    await self._record_abandonment(conn, row, exhausted=exhausted)
+                    if not completion:
+                        await self._record_abandonment(conn, row, exhausted=exhausted)
                     reaped += 1
             return reaped
 
@@ -345,21 +389,24 @@ class WorkflowDB:
                     """SELECT * FROM images WHERE ($1::uuid IS NULL OR id=$1) AND receipt_id IS NULL AND
                     NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id) AND
                     status='pending' AND (retry_at IS NULL OR retry_at<=clock_timestamp())
+                    AND observation_checkpoint->>'eligible_generation' IS DISTINCT FROM generation::text
+                    AND wait_reason IS DISTINCT FROM $2
                     ORDER BY created_at,id FOR UPDATE SKIP LOCKED LIMIT 1""",
-                    image_id,
+                    image_id, OBSERVATION_RECOVERY_WAIT,
                 )
                 if row is None:
                     return None
                 if row["attempt_count"] >= row["max_attempts"]:
                     await conn.execute(
                         """UPDATE images SET status='failed', result_code='attempt_limit',
-                        claim_token=NULL,lease_expires_at=NULL,processing_at=NULL WHERE id=$1""",
+                        claim_token=NULL,claim_purpose=NULL,lease_expires_at=NULL,
+                        processing_at=NULL WHERE id=$1""",
                         row["id"],
                     )
                     continue
                 claimed = await conn.fetchrow(
                     """UPDATE images SET status='processing',
-                    processing_at=clock_timestamp(),claim_token=$2,
+                    processing_at=clock_timestamp(),claim_token=$2,claim_purpose='inference',
                     lease_expires_at=clock_timestamp()+$3::double precision*interval '1 second',
                     attempt_count=attempt_count+1,retry_at=NULL,wait_reason=NULL
                     WHERE id=$1 RETURNING *""",
@@ -373,6 +420,7 @@ class WorkflowDB:
                     attempt_number=claimed["attempt_count"],
                     claim_token=claimed["claim_token"],
                     lease_expires_at=claimed["lease_expires_at"],
+                    purpose=claimed["claim_purpose"],
                 )
 
     @staticmethod
@@ -388,9 +436,14 @@ class WorkflowDB:
             or row["generation"] != claim.generation
             or row["attempt_count"] != claim.attempt_number
             or row["claim_token"] != claim.claim_token
+            or row["claim_purpose"] != claim.purpose
             or not live
         ):
             return None
+        if claim.purpose == "completion":
+            checkpoint = _eligible_observations(row)
+            if checkpoint is None or str(claim.checkpoint_id) != checkpoint.get("checkpoint_id"):
+                return None
         return row
 
     @staticmethod
@@ -491,9 +544,14 @@ class WorkflowDB:
         image_id: UUID,
         parts: list[PersistedSourcePart],
         value: Any,
+        *,
+        checkpoint_view_ids: set[UUID] | None = None,
     ) -> None:
+        view_ids = set(_nested_view_ids(value))
+        if checkpoint_view_ids is not None and not view_ids <= checkpoint_view_ids:
+            raise ValueError("source reference does not match a checkpoint working view")
         await self._validate_refs(conn, image_id, parts, _nested_source_refs(value))
-        for view_id in set(_nested_view_ids(value)):
+        for view_id in view_ids:
             if not await conn.fetchval(
                 """SELECT EXISTS(SELECT 1 FROM extraction_working_views
                 WHERE view_id=$1 AND image_id=$2)""",
@@ -502,12 +560,119 @@ class WorkflowDB:
             ):
                 raise ValueError("source reference view does not match saved artifact")
 
+    async def get_observation_checkpoint(
+        self, claim: AnalysisClaim, *, deadline: float | None = None,
+    ) -> ObservationCheckpoint | None:
+        """Return complete observations only under the live, same-generation lease."""
+        async with connection(self.pool, deadline=deadline, transaction=True) as conn:
+            row = await self._lock_claim(conn, claim)
+            if row is None:
+                return None
+            checkpoint = _eligible_observations(row)
+            return ObservationCheckpoint.model_validate(checkpoint) if checkpoint else None
+
+    @staticmethod
+    async def _lock_unedited_submission(
+        conn: asyncpg.Connection, row: Any,
+    ) -> None:
+        # Keep the shared image → receipt → draft lock order.
+        existing = await conn.fetchrow(
+            "SELECT id FROM receipts WHERE image_id=$1 FOR UPDATE", row["id"]
+        )
+        draft = await conn.fetchrow(
+            "SELECT * FROM receipt_drafts WHERE image_id=$1 FOR UPDATE", row["id"]
+        )
+        if row["receipt_id"] is not None or existing is not None:
+            raise ValueError("a linked receipt must never be overwritten")
+        if draft is not None and (draft["human_edited"] or draft["finalized_receipt_id"] is not None):
+            raise ValueError("an edited or finalized draft must never be overwritten")
+
+    @staticmethod
+    def _validate_observation_binding(
+        row: Any, parts: list[PersistedSourcePart], checkpoint: ObservationCheckpoint,
+    ) -> None:
+        originals = ImageRow.model_validate(dict(row)).parts()
+        manifest = _decoded(row["source_manifest"])
+        if (
+            checkpoint.source_parts != parts
+            or [part.image_path for part in parts] != [part.image_path for part in originals]
+            or [(part.photo_index, part.source_sha256) for part in parts]
+            != [(item["photo_index"], item["source_sha256"]) for item in manifest]
+        ):
+            raise ValueError("observation checkpoint source manifest mismatch")
+        snapshot = _decoded(row["effective_options"])
+        expected_mode = "ocr" if snapshot_ocr(snapshot).enabled else "direct_vision"
+        identity = checkpoint.execution_identity
+        if (
+            row["model_id"] != checkpoint.model_id
+            or identity.semantic_policy_sha256 != semantic_policy_sha256(snapshot)
+            or checkpoint.envelope.provenance.used_pipeline != expected_mode
+        ):
+            raise ValueError("observation checkpoint execution policy mismatch")
+        admit_observations(checkpoint.envelope)
+
+    async def save_observation_checkpoint(
+        self, claim: AnalysisClaim, checkpoint: ObservationCheckpoint, *, deadline: float | None = None,
+    ) -> bool:
+        """Commit all-photo observations and their saved artifact references together."""
+        if claim.purpose != "inference":
+            return False
+        try:
+            async with connection(self.pool, deadline=deadline, transaction=True) as conn:
+                row = await self._lock_claim(conn, claim)
+                if row is None:
+                    return False
+                await self._lock_unedited_submission(conn, row)
+                # Revalidate nested objects even if the caller constructed a typed DTO.
+                checkpoint = ObservationCheckpoint.model_validate(checkpoint)
+                if (
+                    checkpoint.producer_generation != claim.generation
+                    or checkpoint.eligible_generation != claim.generation
+                    or checkpoint.producer_attempt_number != claim.attempt_number
+                ):
+                    raise ValueError("observation checkpoint producer claim mismatch")
+                parts = await self._parts(conn, row["id"])
+                self._validate_observation_binding(row, parts, checkpoint)
+                payload = checkpoint.model_dump(mode="json")
+                old = _decoded(row["observation_checkpoint"])
+                if old is not None and old["producer_generation"] == claim.generation:
+                    if old != payload:
+                        raise ValueError("immutable observation checkpoint conflict")
+                elif old is not None and (
+                    old["eligible_generation"] is not None or await conn.fetchval(
+                        "SELECT legacy_events @> $2::jsonb FROM images WHERE id=$1",
+                        row["id"], _json([{
+                            "event": "observation_checkpoint_retired",
+                            "checkpoint_id": str(checkpoint.checkpoint_id),
+                        }]),
+                    )
+                ):
+                    raise ValueError("immutable observation checkpoint conflict")
+
+                views = await self._save_views(conn, row["id"], parts, checkpoint.persisted_views)
+                await self._validate_metadata_refs(
+                    conn, row["id"], parts, payload["envelope"], checkpoint_view_ids=set(views),
+                )
+                if not await conn.fetchval(
+                    """UPDATE images SET observation_checkpoint=$2::jsonb WHERE id=$1
+                    AND status='processing' AND claim_purpose='inference'
+                    AND generation=$3 AND attempt_count=$4 AND claim_token=$5
+                    AND lease_expires_at>clock_timestamp() RETURNING id""",
+                    row["id"], _json(payload), claim.generation, claim.attempt_number, claim.claim_token,
+                ):
+                    raise _ExpiredClaim
+                return True
+        except _ExpiredClaim:
+            return False
+
     async def get_ocr_checkpoint(self, claim: AnalysisClaim, *, deadline: float | None = None) -> OcrCheckpoint | None:
         """Read internal metadata under a live fence, including saved-view paths.
 
         The application checks the actual OCR profile/runtime before reuse and
         loads saved artifacts through FileProvider. This never reconstructs PNGs.
         """
+        if claim.purpose != "inference":
+            return None
         async with connection(self.pool, deadline=deadline, transaction=True) as conn:
             row = await self._lock_claim(conn, claim)
             if row is None or row["ocr_checkpoint"] is None:
@@ -524,6 +689,8 @@ class WorkflowDB:
 
     async def clear_ocr_checkpoint(self, claim: AnalysisClaim, *, deadline: float | None = None) -> bool:
         """Invalidate only the cache pointer, retaining immutable views and history."""
+        if claim.purpose != "inference":
+            return False
         async with connection(self.pool, deadline=deadline, transaction=True) as conn:
             if await self._lock_claim(conn, claim) is None:
                 return False
@@ -539,6 +706,8 @@ class WorkflowDB:
         deadline: float | None = None,
     ) -> ImageRow | None:
         """Resolve an unbound snapshot/model once under the original claim fence."""
+        if claim.purpose != "inference":
+            return None
         async with connection(self.pool, deadline=deadline, transaction=True) as conn:
             row = await self._lock_claim(conn, claim)
             if row is None:
@@ -567,7 +736,7 @@ class WorkflowDB:
     async def hold_claim_for_policy(
         self, claim: AnalysisClaim, reason: str, *, deadline: float | None = None,
     ) -> CommitResult:
-        """Return only this claim's reserved attempt; retain earlier real attempts and intent."""
+        """Release the claim and refund only an inference reservation without observations."""
         if reason != "execution_policy_changed":
             raise ValueError("invalid_wait_reason")
         return await self.hold_claim_for_readiness(claim, reason, deadline=deadline)
@@ -584,13 +753,17 @@ class WorkflowDB:
                 "SELECT EXISTS(SELECT 1 FROM receipts WHERE image_id=$1)", claim.image.id
             ):
                 return CommitResult(stale=True)
+            refund = int(claim.purpose == "inference" and _eligible_observations(observed) is None)
             row = await conn.fetchrow(
-                """UPDATE images SET status='pending',attempt_count=attempt_count-1,
-                claim_token=NULL,lease_expires_at=NULL,processing_at=NULL,retry_at=NULL,
-                wait_reason=$2 WHERE id=$1 AND lease_expires_at>clock_timestamp() RETURNING *""",
-                claim.image.id, reason,
+                """UPDATE images SET status='pending',attempt_count=attempt_count-$3,
+                claim_token=NULL,claim_purpose=NULL,lease_expires_at=NULL,processing_at=NULL,retry_at=NULL,
+                wait_reason=$2 WHERE id=$1 AND lease_expires_at>clock_timestamp()
+                AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id) RETURNING *""",
+                claim.image.id, reason, refund,
             )
-            return CommitResult(stale=True) if row is None else CommitResult(stale=False, submission=_status(row))
+            if row is None:
+                return CommitResult(stale=True)
+            return CommitResult(stale=False, submission=_status(row))
 
     async def set_wait_reason(self, image: ImageRow, reason: str | None) -> bool:
         """A readiness observation cannot mutate a successor generation or claimed state."""
@@ -600,9 +773,10 @@ class WorkflowDB:
             row = await conn.fetchrow(
                 """UPDATE images SET wait_reason=$4 WHERE id=$1 AND generation=$2 AND status=$3
                 AND claim_token IS NOT DISTINCT FROM $5::uuid AND receipt_id IS NULL
-                AND status IN ('pending','processing')
+                AND claim_purpose IS NOT DISTINCT FROM $6
+                AND (status='pending' OR (status='processing' AND lease_expires_at>clock_timestamp()))
                 AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id) RETURNING id""",
-                image.id, image.generation, image.status, reason, image.claim_token,
+                image.id, image.generation, image.status, reason, image.claim_token, image.claim_purpose,
             )
         return row is not None
 
@@ -705,7 +879,9 @@ class WorkflowDB:
             rows = await conn.fetch("""SELECT * FROM images WHERE receipt_id IS NULL AND
                 NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id) AND
                 status='pending' AND (retry_at IS NULL OR retry_at<=clock_timestamp())
-                ORDER BY created_at,id""")
+                AND observation_checkpoint->>'eligible_generation' IS DISTINCT FROM generation::text
+                AND wait_reason IS DISTINCT FROM $1
+                ORDER BY created_at,id""", OBSERVATION_RECOVERY_WAIT)
         return [ImageRow.model_validate(dict(row)) for row in rows]
 
     async def next_wake_delay(
@@ -725,14 +901,20 @@ class WorkflowDB:
                     WHEN lease_expires_at<=sampled_at THEN sampled_at+interval '1 second'
                     ELSE lease_expires_at END-sampled_at))
                 FROM images CROSS JOIN wake_clock
-                WHERE status IN ('pending','processing') AND receipt_id IS NULL
+                WHERE receipt_id IS NULL
+                AND (status='processing' OR (
+                    status='pending' AND wait_reason IS DISTINCT FROM $2
+                    AND observation_checkpoint->>'eligible_generation' IS DISTINCT FROM generation::text
+                ))
                 AND id<>ALL($1::uuid[])
                 AND NOT EXISTS (SELECT 1 FROM receipts r WHERE r.image_id=images.id)""",
-                list(deferred_image_ids),
+                list(deferred_image_ids), OBSERVATION_RECOVERY_WAIT,
             )
         return min(maximum, max(0.0, float(delay))) if delay is not None else maximum
 
     async def save_ocr_checkpoint(self, claim: AnalysisClaim, checkpoint: OcrCheckpoint, *, deadline: float | None = None) -> bool:
+        if claim.purpose != "inference":
+            return False
         async with connection(self.pool, deadline=deadline, transaction=True) as conn:
             row = await self._lock_claim(conn, claim)
             if row is None:
@@ -768,6 +950,8 @@ class WorkflowDB:
             return True
 
     async def finish_attempt(self, claim: AnalysisClaim, outcome: AttemptOutcome, *, deadline: float | None = None) -> CommitResult:
+        if claim.purpose != "inference":
+            return CommitResult(stale=True)
         try:
             return await self._finish_attempt_transaction(claim, outcome, deadline=deadline)
         except _ExpiredClaim:
@@ -784,19 +968,7 @@ class WorkflowDB:
             row = await self._lock_claim(conn, claim)
             if row is None:
                 return CommitResult(stale=True)
-            # Lock and preserve human work, including an association added after claim.
-            existing = await conn.fetchrow(
-                "SELECT id FROM receipts WHERE image_id=$1 FOR UPDATE", row["id"]
-            )
-            draft = await conn.fetchrow(
-                "SELECT * FROM receipt_drafts WHERE image_id=$1 FOR UPDATE", row["id"]
-            )
-            if row["receipt_id"] is not None or existing is not None:
-                raise ValueError("a linked receipt must never be overwritten")
-            if draft is not None and (
-                draft["human_edited"] or draft["finalized_receipt_id"] is not None
-            ):
-                raise ValueError("an edited or finalized draft must never be overwritten")
+            await self._lock_unedited_submission(conn, row)
             parts = await self._parts(conn, row["id"])
             views = await self._save_views(conn, row["id"], parts, outcome.persisted_views)
             envelope = outcome.envelope
@@ -823,6 +995,14 @@ class WorkflowDB:
                 parts,
                 {"envelope": payload, "review": review_payload, "saved_views": saved_views},
             )
+            checkpoint = _eligible_observations(row)
+            failed = outcome.kind in {"retry", "terminal"}
+            history = []
+            if checkpoint is not None and failed:
+                history.append(_observation_history(checkpoint, "observation_checkpoint_attempt_failed"))
+                if payload is None:
+                    payload = checkpoint["envelope"]
+                    saved_views = checkpoint["persisted_views"]
             extraction_id = await conn.fetchval(
                 """INSERT INTO receipt_extractions(image_id,generation,
                 attempt_number,outcome_kind,result_code,envelope,review,source_views)
@@ -840,6 +1020,7 @@ class WorkflowDB:
             status = "failed"
             delay = None
             result_code = outcome.result_code
+            wait_reason = row["wait_reason"]
             if outcome.kind == "complete":
                 assert (
                     envelope is not None
@@ -918,6 +1099,10 @@ class WorkflowDB:
                     _json(payload["overlap_decisions"]),
                 )
                 status = "needs_review"
+            elif outcome.kind == "retry" and checkpoint is not None:
+                status = "pending"
+                if wait_reason != "execution_policy_changed":
+                    wait_reason = OBSERVATION_RECOVERY_WAIT
             elif outcome.kind == "retry" and row["attempt_count"] < row["max_attempts"]:
                 status = "pending"
                 if outcome.retry_delay_seconds is None:
@@ -930,12 +1115,17 @@ class WorkflowDB:
                 status = outcome.result_code
             updated = await conn.fetchrow(
                 """UPDATE images SET status=$2,receipt_id=$3,result_code=$4,
-                error=$4,claim_token=NULL,lease_expires_at=NULL,processing_at=NULL,
+                error=$4,claim_token=NULL,claim_purpose=NULL,lease_expires_at=NULL,processing_at=NULL,
+                wait_reason=$9,legacy_events=legacy_events || $10::jsonb,
+                observation_checkpoint=CASE WHEN $11 AND observation_checkpoint IS NOT NULL
+                    THEN jsonb_set(observation_checkpoint,'{eligible_generation}','null')
+                    ELSE observation_checkpoint END,
                 retry_at=CASE WHEN $5::double precision IS NULL THEN NULL ELSE
                     clock_timestamp()+$5::double precision*interval '1 second' END,
                 analyzed_at=CASE WHEN $2::varchar IN ('analyzed','needs_review') THEN clock_timestamp() ELSE analyzed_at END,
                 draft_available=$6 WHERE id=$1 AND lease_expires_at>clock_timestamp()
-                AND generation=$7 AND claim_token=$8 AND status='processing' RETURNING *""",
+                AND generation=$7 AND claim_token=$8 AND status='processing'
+                AND claim_purpose='inference' RETURNING *""",
                 row["id"],
                 status,
                 receipt.id if receipt else None,
@@ -944,6 +1134,9 @@ class WorkflowDB:
                 status == "needs_review",
                 claim.generation,
                 claim.claim_token,
+                wait_reason,
+                _json(history),
+                not failed,
             )
             if updated is None:
                 raise _ExpiredClaim
@@ -1020,15 +1213,23 @@ class WorkflowDB:
                 }]
                 snapshot = replacement_snapshot
                 model_id = _decoded(row["requested_options"]).get("model_id")
-                if expired_processing:
+                if expired_processing and row["claim_purpose"] != "completion":
                     # Preserve the real abandoned attempt exactly as normal lease recovery does.
                     await self._record_abandonment(
-                        conn, row, exhausted=row["attempt_count"] >= row["max_attempts"],
+                        conn, row, exhausted=_eligible_observations(row) is None
+                        and row["attempt_count"] >= row["max_attempts"],
                     )
+            checkpoint = _decoded(row["observation_checkpoint"])
+            if checkpoint is not None and checkpoint["producer_generation"] == row["generation"]:
+                retired = _observation_history(checkpoint, "observation_checkpoint_retired")
+                retired["checkpoint"] = checkpoint
+                history.append(retired)
             updated = await conn.fetchrow(
                 """UPDATE images SET generation=generation+1,attempt_count=0,
-                status='pending',retry_at=NULL,claim_token=NULL,lease_expires_at=NULL,processing_at=NULL,
+                status='pending',retry_at=NULL,claim_token=NULL,claim_purpose=NULL,
+                lease_expires_at=NULL,processing_at=NULL,
                 analyzed_at=NULL,error=NULL,result_code=NULL,wait_reason=NULL,ocr_checkpoint=NULL,
+                observation_checkpoint=jsonb_set(observation_checkpoint,'{eligible_generation}','null'),
                 effective_options=$2::jsonb,model_id=$3,legacy_events=legacy_events || $4::jsonb
                 WHERE id=$1 RETURNING *""",
                 image_id,

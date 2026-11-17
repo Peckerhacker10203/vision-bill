@@ -199,7 +199,7 @@ def complete(*, total="90071992547.91"):
 async def test_bootstrap_and_empty_downgrade(db):
     migrate(db)
     conn = await asyncpg.connect(db.pg_dsn)
-    assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0019"
+    assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0020"
     await conn.close()
     migrate(db, "0010", "downgrade")
     migrate(db)
@@ -213,11 +213,11 @@ async def test_retry_policy_migration_preserves_legacy_identity_and_refuses_loss
         image = await conn.fetchval("INSERT INTO images(status) VALUES('failed') RETURNING id")
         result = json.dumps({"id": str(image), "generation": 2})
         await conn.execute("INSERT INTO image_retry_requests(image_id,request_key,expected_generation,result) VALUES($1,'legacy',1,$2::jsonb)", image, result)
-        migrate(db)
+        migrate(db, "0019")
         assert json.loads(await conn.fetchval("SELECT request_options FROM image_retry_requests")) == {}
         assert json.loads(await conn.fetchval("SELECT result FROM image_retry_requests")) == json.loads(result)
         migrate(db, "0018", "downgrade")
-        migrate(db)
+        migrate(db, "0019")
         await conn.execute("UPDATE image_retry_requests SET request_options=$1::jsonb", json.dumps({"policy": "current"}))
         refused = migrate(db, "0018", "downgrade", check=False)
         assert refused.returncode != 0 and "adoption downgrade refused" in refused.stderr
@@ -493,7 +493,7 @@ async def test_finish_atomic_decimal_and_immutable_history(workflow_db, db):
         )
     assert migrate(db, "0010", "downgrade", check=False).returncode != 0
     async with w.pool.acquire() as conn:
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0019"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0020"
         assert await conn.fetchval("SELECT count(*) FROM receipt_review_revisions") == 1
 
 
@@ -794,7 +794,7 @@ async def test_upgrade_0010_preserves_precise_local_times_and_legacy_evidence(db
                 assert await conn.fetchval("SELECT image_path FROM images WHERE id=$1", image) == str(original)
         finally:
             await reader.destroy_db()
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0019"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0020"
     finally:
         await conn.close()
 
