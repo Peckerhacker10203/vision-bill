@@ -144,7 +144,7 @@ class BenchmarkService:
             available = {m.id: m for m in await self._provider.get_available_models(capability="all")}
             current = available.get(model_id)
             digest = (await self._run_digests(run)).get(model_id)
-            if current is None or (digest and current.digest and digest != current.digest):
+            if current is None or (digest and digest != current.digest):
                 raise ValueError("Selected model is unavailable or its digest changed; create a new run")
             budget = await self._timeout(run)
             async with asyncio.timeout(budget):

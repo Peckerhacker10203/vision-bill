@@ -265,8 +265,8 @@ def test_ocr_fingerprint_detects_endpoint_and_timeout_changes():
     assert ocr_fingerprint(None) is None
 
 
-@pytest.mark.parametrize("missing", [False, True])
-async def test_reevaluation_rejects_changed_or_missing_model(missing):
+@pytest.mark.parametrize("current_digest", ["replacement", None, "missing_model"])
+async def test_reevaluation_rejects_changed_or_missing_model(current_digest):
     from types import SimpleNamespace
     from uuid import uuid4
 
@@ -278,9 +278,9 @@ async def test_reevaluation_rejects_changed_or_missing_model(missing):
     service._db = SimpleNamespace(
         run=AsyncMock(return_value=run), manifest=AsyncMock(return_value={"options": {}})
     )
-    current = SimpleNamespace(id="model", digest="replacement")
+    current = SimpleNamespace(id="model", digest=current_digest)
     service._provider = SimpleNamespace(
-        get_available_models=AsyncMock(return_value=[] if missing else [current])
+        get_available_models=AsyncMock(return_value=[] if current_digest == "missing_model" else [current])
     )
     service._run_digests = AsyncMock(return_value={"model": "original"})
     service._run_experiment = AsyncMock()
