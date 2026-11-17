@@ -693,3 +693,16 @@ async def test_session_allows_metadata_slower_than_the_contended_lock_window(tmp
         deadline, model_id="own", lock_deadline=admission_deadline(deadline)
     ):
         assert handoff.journal.exists()
+
+
+def test_ollama_inference_identity_follows_effective_sdk_ports_without_rebinding_lifecycle():
+    from vision_bill.provider.llm.ollama import OllamaProvider
+
+    bare = OllamaProvider("localhost")
+    explicit = OllamaProvider("http://localhost:11434/")
+    standard = OllamaProvider("http://localhost")
+    assert str(bare._client._client.base_url) == "http://localhost:11434"
+    assert str(standard._client._client.base_url) == "http://localhost"
+    assert bare.inference_identity == explicit.inference_identity
+    assert bare.inference_identity != standard.inference_identity
+    assert bare.lifecycle_identity != explicit.lifecycle_identity

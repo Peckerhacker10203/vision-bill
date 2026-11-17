@@ -94,8 +94,7 @@ async def test_providers_send_ordered_photos_and_stop_on_unreadable(kind, tmp_pa
     for index, path in enumerate(paths):
         path.write_bytes(str(index).encode())
     if kind == "ollama":
-        with patch("vision_bill.provider.llm.ollama.AsyncClient"):
-            provider = OllamaProvider("http://localhost")
+        provider = OllamaProvider("http://localhost")
     else:
         with patch("vision_bill.provider.llm.openai.AsyncOpenAI"):
             provider = OpenAIProvider("http://localhost", "test")

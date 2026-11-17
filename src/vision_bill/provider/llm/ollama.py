@@ -55,7 +55,9 @@ class OllamaProvider(LLMProvider):
         self.supports_thinking_control = True
         self.supports_model_release = True
         self.lifecycle_identity = "ollama:" + hashlib.sha256(host.rstrip("/").encode()).hexdigest()
-        self.inference_identity = inference_endpoint_identity("ollama", host)
+        # The SDK resolves a bare hostname to port 11434, while an explicit
+        # http:// base without a port reaches the standard HTTP port.
+        self.inference_identity = inference_endpoint_identity("ollama", str(self._client._client.base_url))
         from ...service.gpu_handoff import configure_handoff
         configure_handoff(self)
 
