@@ -383,3 +383,21 @@ it('does not attach a late created collection to the next receipt', async () => 
 		expect.objectContaining({ collection_ids: [], expected_operation_revision: 7 })
 	]);
 });
+
+it('shows unavailable optional labels on a recovered receipt without blocking review', async () => {
+	vi.mocked(api.getReceipt).mockResolvedValue({
+		...detail(),
+		classification_enrichment: {
+			state: 'unavailable',
+			reason_code: 'recovered_without_classification',
+			missing_fields: ['category']
+		}
+	});
+	render(Page);
+	await screen.findByText(/some optional labels are unavailable/i);
+	await waitFor(() =>
+		expect((screen.getByRole('button', { name: 'Verify' }) as HTMLButtonElement).disabled).toBe(
+			false
+		)
+	);
+});

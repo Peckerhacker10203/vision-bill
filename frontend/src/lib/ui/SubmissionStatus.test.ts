@@ -412,3 +412,23 @@ it.each(['en', 'de'] as const)(
 		setLocale('en');
 	}
 );
+
+it('shows saved observations awaiting recovery at the inference limit', async () => {
+	setLocale('en');
+	vi.spyOn(api, 'getImage').mockResolvedValue(
+		status({
+			status: 'pending',
+			attempt_count: 3,
+			observations_available: true,
+			draft_available: true,
+			wait_reason: 'observation_recovery_required',
+			retry_at: null
+		}) as never
+	);
+	render(SubmissionStatus, { id: 'job' });
+	await screen.findByText('Attempt 3 of 3');
+	expect(screen.getByRole('status').textContent).toContain('Observations saved');
+	await screen.findByText(/finish after model recovery/i);
+	expect(screen.queryByRole('link', { name: 'Open receipt draft' })).toBeNull();
+	expect(screen.queryByRole('link', { name: 'Open and review receipt' })).toBeNull();
+});

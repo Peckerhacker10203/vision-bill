@@ -637,3 +637,36 @@ async def test_unconfirmed_cleanup_cannot_escape_as_refundable_wait(tmp_path):
             owner.require_model("not-adopted")
     assert not isinstance(caught.value, HandoffWait)
     assert str(caught.value.__cause__) == "cleanup uncertain"
+
+
+async def test_recovery_session_confirms_owned_cleanup_before_publication(tmp_path):
+    from vision_bill.service.gpu_handoff import HandoffOwner
+
+    events = []
+    llm = ResidentLlm(events)
+    ocr = Ocr(events)
+
+    async def release(model):
+        events.append(("unload", model))
+        llm.resident = frozenset()
+
+    async def unavailable_capabilities():
+        pytest.fail("Completion must not discover OCR capabilities")
+
+    llm.release_model = release
+    ocr.get_capabilities = unavailable_capabilities
+    handoff = ModelHandoff(tmp_path / "completion.lock", llm, ocr)
+    binding = await adopt(handoff)
+    producer = HandoffOwner(handoff, monotonic() + 1)
+    producer.models = ["own"]
+    producer.save()
+    llm.resident = frozenset({"own"})
+    events.clear()
+    async with handoff.recover_checkpoint(
+        monotonic() + 1, model_id="own", expected_binding_sha256=handoff.binding_sha256(binding),
+        before_dispatch=lambda: asyncio.sleep(0),
+    ):
+        events.append("publish")
+        saved = handoff.read_journal()
+        assert not saved.models and not saved.ocr_pending and not saved.unsettled
+    assert events == ["residency", "claim_park", ("unload", "own"), "residency", "publish"]

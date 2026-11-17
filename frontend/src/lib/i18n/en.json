@@ -6,6 +6,8 @@
 		"moveDown": "Move photo down",
 		"pending": "Waiting for receipt analysis",
 		"processing": "Reading your receipt photos…",
+		"savedObservations": "Observations saved",
+		"finishingSaved": "Finishing from saved observations…",
 		"analyzed": "Your receipt is ready",
 		"failed": "Receipt analysis failed",
 		"timed_out": "The LLM request timed out",
@@ -190,6 +192,7 @@
 		"loadError": "Could not load the queue."
 	},
 	"receipt": {
+		"optionalLabelsUnavailable": "Some optional labels are unavailable. You can add them when reviewing this receipt.",
 		"verified": "Verified",
 		"unverified": "Unverified",
 		"verify": "Verify",
@@ -525,6 +528,8 @@
 			"tax_information_conflict": "Tax is marked as explicitly zero, but the tax total is not zero."
 		},
 		"reasons": {
+			"observation_recovery_required": "The receipt will finish after model recovery using its saved observations.",
+			"observation_checkpoint_invalid": "The saved observations or their working images could not be validated.",
 			"provider_unavailable": "The model provider is unavailable. Waiting for it to become ready.",
 			"formatter_model_unavailable": "The selected text formatter model is unavailable. It must be available before OCR text can be formatted.",
 			"vision_model_unavailable": "No suitable selected vision model is available to read the photos.",

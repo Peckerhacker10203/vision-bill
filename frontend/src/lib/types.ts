@@ -132,6 +132,7 @@ export interface SubmissionStatus {
 	result_code: string | null;
 	wait_reason: string | null;
 	draft_available: boolean;
+	observations_available: boolean;
 	latest_extraction_id: string | null;
 	source_views: SourceView[];
 	bypass_review: boolean;

@@ -115,7 +115,7 @@ async def test_retry_due_during_long_second_job_rescans_without_provider_down_ho
     done = asyncio.Event()
     ready = {first.id: True, second.id: True}
 
-    async def candidates():
+    async def candidates(*, purpose=None):
         return [image for image in [first, second] if due.get(image.id, 999) <= clock[0]]
 
     async def claim_next(*, image_id, lease_seconds):
@@ -269,3 +269,24 @@ async def test_incompatible_ocr_mode_waits_before_claim_and_preserves_attempt_bu
         assert call.args == (image, "ocr_mode_mismatch")
     assert requests == [("GET", "/info")] * (image.max_attempts + 1)
     formatter.check_connection.assert_awaited()
+
+
+async def test_saved_observations_dispatch_only_completion(settings):
+    scheduler, db, service, image = context(settings)
+    image.observation_checkpoint = {"eligible_generation": image.generation}
+    db.due_candidates.side_effect = lambda *, purpose="inference": (
+        [image] if purpose in (None, "completion") else []
+    )
+    service.ready_for_completion = AsyncMock(return_value=True)
+    service.complete_checkpoint = AsyncMock(
+        return_value=CommitResult(
+            stale=False,
+            submission=SubmissionStatus(id=image.id, status="analyzed", attempt_count=3),
+        )
+    )
+    assert [result.status for result in await scheduler.process_pending()] == ["analyzed"]
+    db.claim_next.assert_awaited_once_with(
+        lease_seconds=900, image_id=image.id, purpose="completion"
+    )
+    service.ready_for.assert_not_awaited()
+    service.process_claim.assert_not_awaited()

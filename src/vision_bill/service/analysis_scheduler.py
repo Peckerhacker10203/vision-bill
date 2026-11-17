@@ -97,23 +97,34 @@ class AnalysisScheduler:
                 return []
             await self._db.reap_expired_claims()
             results = []
-            for image in await self._db.due_candidates():
+            for image in await self._db.due_candidates(purpose=None):
+                completion = image.observations_available
                 try:
                     async with asyncio.timeout(5):
-                        ready = await self._submissions.ready_for(image)
+                        ready = await (
+                            self._submissions.ready_for_completion(image) if completion
+                            else self._submissions.ready_for(image)
+                        )
                 except Exception:  # noqa: BLE001 - preclaim failure spends no attempt
                     ready = False
                 if not ready:
                     self._deferred_image_ids.add(image.id)
                     continue
-                claim = await self._db.claim_next(
-                    lease_seconds=self._settings.worker.claim_lease_seconds, image_id=image.id
-                )
+                lease = self._settings.worker.claim_lease_seconds
+                if completion:
+                    claim = await self._db.claim_next(
+                        lease_seconds=lease, image_id=image.id, purpose="completion"
+                    )
+                else:
+                    claim = await self._db.claim_next(lease_seconds=lease, image_id=image.id)
                 if claim is None:
                     # A competing claim/row lock must not create a zero-delay loop.
                     self._deferred_image_ids.add(image.id)
                     continue
-                result = await self._submissions.process_claim(claim)
+                result = await (
+                    self._submissions.complete_checkpoint(claim) if completion
+                    else self._submissions.process_claim(claim)
+                )
                 if result.submission is not None and result.submission.wait_reason:
                     self._deferred_image_ids.add(image.id)
                 if result.submission is not None and (

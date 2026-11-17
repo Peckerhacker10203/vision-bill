@@ -8,7 +8,12 @@ from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validat
 
 from .db.image import ClaimPurpose, ImagePart, ImageRow
 from .db.receipt import ReceiptRow
-from .extraction import InferenceEnvelope, PersistedInferenceEnvelope, assert_metadata_only
+from .extraction import (
+    ClassificationEnrichment,
+    InferenceEnvelope,
+    PersistedInferenceEnvelope,
+    assert_metadata_only,
+)
 from .ocr import OcrPageMetadata, OcrResponse, Sha256, SourceRef, WorkingImageMetadata
 from .review import FindingAcknowledgement, ReviewEvaluation, SourceView
 
@@ -267,6 +272,36 @@ class ObservationCheckpoint(BaseModel):
                 raise ValueError("checkpoint requires complete matching views for all OCR sources")
         elif provenance.used_pipeline != "direct_vision" or provenance.fallback_used or pages:
             raise ValueError("checkpoint pipeline mismatch")
+        return self
+
+    def recovered_envelope(self) -> PersistedInferenceEnvelope:
+        enrichment = self.envelope.classification_enrichment
+        if enrichment.state != "pending":
+            return self.envelope
+        return self.envelope.model_copy(update={
+            "classification_enrichment": ClassificationEnrichment(
+                state="unavailable", reason_code="recovered_without_classification",
+                missing_fields=enrichment.missing_fields,
+            ),
+        })
+
+
+class CheckpointCompletionOutcome(BaseModel):
+    """Final observation projection after a separate recovery reservation."""
+
+    model_config = ConfigDict(extra="forbid", revalidate_instances="always")
+    envelope: PersistedInferenceEnvelope
+    review: ReviewEvaluation
+    persisted_views: list[PersistedWorkingView]
+
+    @model_validator(mode="after")
+    def require_complete(self) -> "CheckpointCompletionOutcome":
+        if (
+            self.envelope.receipt is None or self.envelope.draft is None
+            or self.envelope.classification_enrichment.state == "pending"
+            or not self.review.can_finalize
+        ):
+            raise ValueError("checkpoint completion requires a finalizable receipt")
         return self
 
 

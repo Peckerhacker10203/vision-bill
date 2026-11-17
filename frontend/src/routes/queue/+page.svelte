@@ -150,7 +150,15 @@
 							{#if image.created_at}
 								{formatRelativeTime(image.created_at)} ·
 							{/if}
-							{#if image.status === 'pending'}
+							{#if image.observations_available && (image.status === 'pending' || image.status === 'processing')}
+								<span class="text-warning"
+									>{$t(
+										image.status === 'processing'
+											? 'submission.finishingSaved'
+											: 'submission.savedObservations'
+									)}</span
+								>
+							{:else if image.status === 'pending'}
 								<span class="text-warning">{$t('queue.pending')}</span>
 							{:else if image.status === 'failed'}
 								<span class="text-error">{$t('queue.failed')}</span>

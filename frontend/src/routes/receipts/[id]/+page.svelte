@@ -246,6 +246,9 @@
 		</div>
 
 		{#if reviewMessage}<p class="my-3 text-error" role="alert">{reviewMessage}</p>{/if}
+		{#if data.classification_enrichment?.state === 'unavailable'}
+			<p class="my-3 text-sm text-on-surface-variant">{$t('receipt.optionalLabelsUnavailable')}</p>
+		{/if}
 		{#if reviewMessage || needsReload}<button
 				type="button"
 				disabled={saving || verifying}

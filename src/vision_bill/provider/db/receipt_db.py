@@ -151,10 +151,13 @@ GET_RECEIPT_BY_IMAGE_ID_SQL = (
 # image_path without a second round-trip.
 GET_RECEIPT_WITH_IMAGE_SQL = """
     SELECT r.*, i.image_path, i.thumbnail_path,
-           e.envelope -> 'classification_enrichment' AS classification_enrichment
+           COALESCE(NULLIF(initial.snapshot -> 'classification_enrichment', 'null'::jsonb),
+                    e.envelope -> 'classification_enrichment') AS classification_enrichment
     FROM receipts r
     LEFT JOIN images i ON i.id = r.image_id
     LEFT JOIN receipt_extractions e ON e.id = r.extraction_id AND e.image_id = r.image_id
+    LEFT JOIN receipt_review_revisions initial ON initial.receipt_id = r.id
+        AND initial.operation_revision = 1 AND initial.event_kind = 'checkpoint_completed'
     WHERE r.id = $1
 """
 LIST_RECEIPTS_BASE_SQL = (

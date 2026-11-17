@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+from contextlib import AsyncExitStack
 from functools import partial
 from pathlib import Path
 from time import monotonic
@@ -19,12 +20,13 @@ from ..model.db.receipt import ReceiptRow
 from ..model.experiment import ExperimentOptions
 from ..model.extraction import (
     EXTRACTION_SCHEMA_VERSION,
+    SOURCE_PROJECTION_VERSION,
     DraftView,
     ExtractionDraft,
     InferenceEnvelope,
     pack_inference_metadata,
 )
-from ..model.handoff import HandoffWait
+from ..model.handoff import HandoffStatus, HandoffWait
 from ..model.ocr import OcrPageMetadata, OcrResponse, SourceRef, WorkingImage, WorkingImageMetadata
 from ..model.receipt import Receipt
 from ..model.review import OriginalAvailability
@@ -32,6 +34,7 @@ from ..model.workflow import (
     AccessScope,
     AnalysisClaim,
     AttemptOutcome,
+    CheckpointCompletionOutcome,
     CheckpointExecutionIdentity,
     CommitResult,
     DraftFinalize,
@@ -42,6 +45,7 @@ from ..model.workflow import (
     PersistedWorkingView,
     SourcePartBinding,
 )
+from ..provider.db.workflow_db import OBSERVATION_RECOVERY_WAIT
 from ..provider.llm.base import ModelInfo
 from ..provider.llm.errors import AnalysisTimeoutError, UnreadableReceiptError
 from ..provider.ocr.base import compact_ocr_text
@@ -58,6 +62,7 @@ from .extraction_pipeline import (
     OriginalSourceChangedError,
     select_vision_model,
 )
+from .gpu_handoff import ModelHandoff, managed_ocr_enabled
 from .image_service import ImageService
 from .observation_admission import admit_observations
 from .receipt_review import evaluate_receipt
@@ -80,6 +85,10 @@ class PolicyHoldError(Exception):
 
 class ReadinessHoldError(Exception):
     """The explicitly selected legacy model disappeared before its initial binding."""
+
+
+class CheckpointRecoveryError(Exception):
+    """Owned resource reconciliation has not been confirmed."""
 
 
 class SubmissionService:
@@ -116,6 +125,55 @@ class SubmissionService:
         observed = await self.db.set_wait_reason(image, reason)
         return reason is None and observed
 
+    def _completion_handoff(
+        self, image: ImageRow, checkpoint: ObservationCheckpoint,
+    ) -> ModelHandoff | None:
+        snapshot = image.effective_options
+        identity = checkpoint.execution_identity
+        if (
+            checkpoint.eligible_generation != image.generation
+            or checkpoint.producer_attempt_number != image.attempt_count
+            or checkpoint.model_id != image.model_id
+            or identity.semantic_policy_sha256 != semantic_policy_sha256(snapshot)
+        ):
+            raise ValueError("checkpoint producer or frozen policy mismatch")
+        if (
+            policy_hold_reason(snapshot, self.settings.ocr)
+            or identity.inference_identity != self.receipts.inference_identity
+            or identity.prompt_version != PROMPT_VERSION
+            or identity.extraction_schema_version != EXTRACTION_SCHEMA_VERSION
+            or identity.source_projection_version != SOURCE_PROJECTION_VERSION
+        ):
+            raise PolicyHoldError
+        ocr = snapshot_ocr(snapshot)
+        if managed_ocr(ocr) and not managed_ocr_enabled():
+            raise HandoffWait(HandoffStatus(
+                state="configuration_required", reason_code="model_handoff_managed_ocr_required",
+            ))
+        return self.receipts.execution_handoff(ocr)
+
+    async def ready_for_completion(self, image: ImageRow) -> bool:
+        """Check frozen policy and owned-resource recovery without model discovery."""
+        try:
+            checkpoint = ObservationCheckpoint.model_validate(image.observation_checkpoint)
+            handoff = self._completion_handoff(image, checkpoint)
+            reason = None
+            if handoff is not None:
+                status = await handoff.inspect(
+                    model_id=checkpoint.model_id, deadline=monotonic() + 1,
+                    expected_binding_sha256=image.effective_options.get("managed_binding_sha256") or "",
+                )
+                if status.state != "ready":
+                    reason = status.reason_code or OBSERVATION_RECOVERY_WAIT
+        except PolicyHoldError:
+            reason = "execution_policy_changed"
+        except HandoffWait as exc:
+            reason = exc.status.reason_code or OBSERVATION_RECOVERY_WAIT
+        except (ValueError, KeyError):
+            reason = "observation_checkpoint_invalid"
+        observed = await self.db.set_wait_reason(image, reason)
+        return reason is None and observed
+
     async def _readiness_reason(self, image: ImageRow) -> str | None:
         """Readiness precedes claim, and therefore never spends the attempt budget."""
         snapshot = image.effective_options or current_snapshot(self.settings)
@@ -128,7 +186,6 @@ class SubmissionService:
             # Claim malformed saved options to record a terminal safe diagnostic.
             return None
         try:
-            from .gpu_handoff import managed_ocr_enabled
             selected = image.model_id or self.settings.llm.model_name
             if managed_ocr(ocr):
                 if not managed_ocr_enabled():
@@ -168,6 +225,8 @@ class SubmissionService:
             return "provider_unavailable"
 
     async def process_claim(self, claim: AnalysisClaim) -> CommitResult:
+        if claim.purpose != "inference":
+            return CommitResult(stale=True)
         deadline = monotonic() + self.worker.attempt_timeout_seconds
         # Convert once: asyncio loop time need not share monotonic()'s epoch.
         loop = asyncio.get_running_loop()
@@ -208,6 +267,84 @@ class SubmissionService:
                             )
                 except Exception:  # noqa: BLE001 - a safe orphan is preferable to lost evidence
                     logger.warning("Working artifact cleanup deferred")
+
+    async def complete_checkpoint(self, claim: AnalysisClaim) -> CommitResult:
+        checkpoint_id = claim.checkpoint_id
+        if claim.purpose != "completion" or checkpoint_id is None:
+            return CommitResult(stale=True)
+        budget = self.worker.attempt_timeout_seconds
+        deadline = monotonic() + budget
+        db_deadline = asyncio.get_running_loop().time() + budget
+        try:
+            async with asyncio.timeout_at(db_deadline):
+                return await self._complete_checkpoint(claim, checkpoint_id, deadline, db_deadline)
+        except TimeoutError:
+            return CommitResult(stale=True)
+
+    async def _complete_checkpoint(
+        self, claim: AnalysisClaim, checkpoint_id: UUID, deadline: float, db_deadline: float,
+    ) -> CommitResult:
+        try:
+            async with asyncio.timeout_at(db_deadline - self._outcome_reserve()):
+                checkpoint = await self.db.get_observation_checkpoint(claim, deadline=db_deadline)
+                if checkpoint is None:
+                    return await self.db.get_checkpoint_completion_result(
+                        claim, checkpoint_id, deadline=db_deadline,
+                    )
+                handoff = self._completion_handoff(claim.image, checkpoint)
+                for view in checkpoint.persisted_views:
+                    try:
+                        await run_sync_before(
+                            deadline, self.images.read_working_image,
+                            claim.image.id, view.artifact_path, view.metadata,
+                        )
+                    except OSError as exc:
+                        raise ValueError("checkpoint working artifact unavailable") from exc
+                envelope = checkpoint.recovered_envelope()
+                originals = [OriginalAvailability(
+                    part_id=part.part_id, photo_index=part.photo_index,
+                    available=True, sha256_matches=True,
+                ) for part in checkpoint.source_parts]
+                outcome = CheckpointCompletionOutcome(
+                    envelope=envelope, persisted_views=checkpoint.persisted_views,
+                    review=evaluate_receipt(
+                        admit_observations(envelope), envelope.amount_policy, envelope.field_sources,
+                        envelope.overlap_decisions, originals, retained_findings=envelope.findings,
+                    ),
+                )
+
+                async def check_before_recovery() -> None:
+                    self._completion_handoff(claim.image, checkpoint)
+                    if await self.db.get_observation_checkpoint(claim, deadline=db_deadline) != checkpoint:
+                        raise StaleClaimError
+
+                async with AsyncExitStack() as recovery:
+                    if handoff is not None:
+                        try:
+                            await recovery.enter_async_context(handoff.recover_checkpoint(
+                                deadline, model_id=checkpoint.model_id,
+                                expected_binding_sha256=claim.image.effective_options.get("managed_binding_sha256") or "",
+                                before_dispatch=check_before_recovery,
+                            ))
+                        except HandoffWait:
+                            raise
+                        except (OSError, RuntimeError, httpx.HTTPError) as exc:
+                            raise CheckpointRecoveryError from exc
+                    self._completion_handoff(claim.image, checkpoint)
+                    return await self.db.finish_checkpoint_completion(
+                        claim, checkpoint_id, outcome, deadline=db_deadline,
+                    )
+        except StaleClaimError:
+            return CommitResult(stale=True)
+        except PolicyHoldError:
+            reason = "execution_policy_changed"
+        except HandoffWait as exc:
+            reason = exc.status.reason_code or OBSERVATION_RECOVERY_WAIT
+        except (CheckpointRecoveryError, TimeoutError):
+            reason = OBSERVATION_RECOVERY_WAIT
+        except (ValueError, KeyError) as exc:
+            reason = "source_integrity_failed" if str(exc) == "source_integrity_failed" else "observation_checkpoint_invalid"
+        return await self.db.defer_checkpoint_completion(claim, checkpoint_id, reason, deadline=db_deadline)
 
     async def _process_claim(
         self, claim: AnalysisClaim, deadline: float, owned: list[PersistedWorkingView],

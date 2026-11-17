@@ -132,7 +132,15 @@
 		<p role="status">{$t('common.loading')}</p>
 	{:else}
 		<p class="text-lg font-medium" role="status" aria-live="polite">
-			{$t(`submission.${job.data.status}`)}
+			{#if job.data.observations_available && !job.data.terminal}
+				{$t(
+					job.data.status === 'processing'
+						? 'submission.finishingSaved'
+						: 'submission.savedObservations'
+				)}
+			{:else}
+				{$t(`submission.${job.data.status}`)}
+			{/if}
 		</p>
 		<p class="mt-2 text-sm">
 			{$t('submission.attempt', {
@@ -167,7 +175,7 @@
 				href={resolve(`/receipts/${job.data.receipt_id}`)}>{$t('submission.openReceipt')}</a
 			>
 		{/if}
-		{#if job.data.draft_available}
+		{#if job.data.draft_available && !job.data.observations_available}
 			<a
 				class="mt-4 inline-block text-primary underline"
 				href={resolve(`/upload?job=${id}&draft=1`)}>{$t('submission.openDraft')}</a

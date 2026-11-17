@@ -6,6 +6,8 @@
 		"moveDown": "Foto nach unten verschieben",
 		"pending": "Warte auf Beleganalyse",
 		"processing": "Deine Belegfotos werden gelesen…",
+		"savedObservations": "Belegdaten gespeichert",
+		"finishingSaved": "Beleg wird aus gespeicherten Daten fertiggestellt…",
 		"analyzed": "Dein Beleg ist fertig",
 		"failed": "Beleganalyse fehlgeschlagen",
 		"timed_out": "Zeitüberschreitung bei der LLM-Anfrage",
@@ -190,6 +192,7 @@
 		"loadError": "Warteschlange konnte nicht geladen werden."
 	},
 	"receipt": {
+		"optionalLabelsUnavailable": "Einige optionale Kennzeichnungen fehlen. Du kannst sie bei der Prüfung des Belegs ergänzen.",
 		"verified": "Geprüft",
 		"unverified": "Nicht geprüft",
 		"verify": "Prüfen",
@@ -525,6 +528,8 @@
 			"tax_information_conflict": "Die Steuer ist ausdrücklich als null markiert, aber die Steuersumme ist nicht null."
 		},
 		"reasons": {
+			"observation_recovery_required": "Nach der Wiederherstellung des Modells wird der Beleg aus den gespeicherten Daten fertiggestellt.",
+			"observation_checkpoint_invalid": "Die gespeicherten Belegdaten oder ihre Arbeitsbilder konnten nicht geprüft werden.",
 			"provider_unavailable": "Der Modellanbieter ist nicht verfügbar. Es wird auf seine Bereitschaft gewartet.",
 			"formatter_model_unavailable": "Das gewählte Textformatierungsmodell ist nicht verfügbar. Es muss verfügbar sein, bevor OCR-Text formatiert werden kann.",
 			"vision_model_unavailable": "Kein geeignetes gewähltes Vision-Modell ist zum Lesen der Fotos verfügbar.",

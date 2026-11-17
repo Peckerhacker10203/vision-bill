@@ -392,10 +392,24 @@ class ModelHandoff:
             raise HandoffWait(HandoffStatus(state="configuration_required", reason_code="ocr_mode_mismatch"))
 
     @asynccontextmanager
+    async def recover_checkpoint(
+        self, deadline: float, *, model_id: str, expected_binding_sha256: str,
+        before_dispatch: Callable[[], Awaitable[None]],
+    ) -> AsyncIterator[None]:
+        """Confirm owned resources are parked and keep exclusion through publication."""
+        async with self.session(
+            deadline, model_id=model_id, lock_deadline=admission_deadline(deadline),
+            expected_binding_sha256=expected_binding_sha256, before_dispatch=before_dispatch,
+            _recovery_only=True,
+        ):
+            yield
+
+    @asynccontextmanager
     async def session(
         self, deadline: float, *, model_id: str | None = None, model_ids: Sequence[str] = (),
         lock_deadline: float | None = None, expected_binding_sha256: str | None = None,
         before_dispatch: Callable[[], Awaitable[None]] | None = None,
+        _recovery_only: bool = False,
     ) -> AsyncIterator[HandoffOwner]:
         # Exclusion owns its retry deadline. Activate cancellation only once we own the lock.
         selected = ((model_id,) if model_id is not None else ()) + tuple(model_ids)
@@ -403,7 +417,7 @@ class ModelHandoff:
             async with self._session(
                 deadline, selected=selected, lock_deadline=lock_deadline,
                 expected_binding_sha256=expected_binding_sha256, before_dispatch=before_dispatch,
-                timeout=timeout,
+                timeout=timeout, recovery_only=_recovery_only,
             ) as owner:
                 yield owner
             if monotonic() >= deadline:
@@ -413,7 +427,7 @@ class ModelHandoff:
     async def _session(
         self, deadline: float, *, selected: Sequence[str], lock_deadline: float | None,
         expected_binding_sha256: str | None, before_dispatch: Callable[[], Awaitable[None]] | None,
-        timeout: asyncio.Timeout,
+        timeout: asyncio.Timeout, recovery_only: bool,
     ) -> AsyncIterator[HandoffOwner]:
         expires_at = asyncio.get_running_loop().time() + (deadline - monotonic())
         if getattr(self.ocr, "managed_lifecycle", False) and not managed_ocr_enabled():
@@ -428,6 +442,8 @@ class ModelHandoff:
         resources = self.resources  # Validate explicit bindings before any resource calls.
         existing = current_owner()
         if existing is not None:
+            if recovery_only:
+                raise RuntimeError("model_handoff_busy")
             timeout.reschedule(expires_at)
             if not existing.coordinator.matches(self):
                 raise ValueError("model_handoff_identity_changed")
@@ -475,7 +491,7 @@ class ModelHandoff:
                     state="recovery_required", reason_code="model_handoff_recorded_model_not_adopted",
                 ))
             await self.require_residency(owner.models, admission_limit)
-            if lock_deadline is not None:
+            if lock_deadline is not None and not recovery_only:
                 await self.require_ocr_mode(admission_limit)
             # Read-only admission has its own earlier clock. Start the full
             # work timer before any durable attempt or external mutation.
@@ -495,6 +511,10 @@ class ModelHandoff:
                     owner.save()
                 except HandoffWait as exc:
                     raise _handoff_error(exc.status, admission=False) from exc
+                if recovery_only:
+                    await self.require_residency([], deadline)
+                    yield owner
+                    return
                 try:
                     yield owner
                 except BaseException as body_error:
