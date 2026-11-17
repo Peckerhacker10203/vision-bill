@@ -1,9 +1,11 @@
 import json
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, computed_field, field_validator
+
+ClaimPurpose = Literal["inference", "completion"]
 
 
 class ImagePart(BaseModel):
@@ -59,6 +61,19 @@ class ImageRow(BaseModel):
     # Internal fencing/lease fields. Public responses use SubmissionStatus.
     claim_token: UUID | None = Field(default=None, repr=False, exclude=True)
     lease_expires_at: datetime | None = Field(default=None, repr=False, exclude=True)
+    claim_purpose: ClaimPurpose | None = Field(default=None, repr=False, exclude=True)
+    observation_checkpoint: dict[str, Any] | None = Field(default=None, repr=False, exclude=True)
+
+    @field_validator("observation_checkpoint", mode="before")
+    @classmethod
+    def decode_observation_checkpoint(cls, value: object) -> object:
+        return json.loads(value) if isinstance(value, str) else value
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def observations_available(self) -> bool:
+        checkpoint = self.observation_checkpoint
+        return checkpoint is not None and checkpoint.get("eligible_generation") == self.generation
 
     @field_validator("additional_images", mode="before")
     @classmethod

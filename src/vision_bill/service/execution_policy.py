@@ -1,5 +1,7 @@
 """The server-selected policy frozen for newly accepted receipt submissions."""
 
+import hashlib
+import json
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -10,6 +12,12 @@ if TYPE_CHECKING:
     from .gpu_handoff import ModelHandoff
 
 EXECUTION_POLICY_VERSION = 3
+
+
+def semantic_policy_sha256(snapshot: dict[str, Any]) -> str:
+    """Bind the frozen options exactly without copying settings into the checkpoint."""
+    canonical = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def snapshot_ocr(snapshot: dict[str, Any]) -> OcrSettings:
