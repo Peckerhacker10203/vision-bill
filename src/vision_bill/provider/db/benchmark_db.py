@@ -25,7 +25,6 @@ from ...model.workflow import AccessScope
 from .deadline import connection
 from .receipt_db import ReceiptDB
 
-
 # A restricted actor may read a whole run only while every frozen receipt is
 # still theirs. Result payloads can retain evidence after a receipt is deleted.
 _RUN_SCOPE = """(
