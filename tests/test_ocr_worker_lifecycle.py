@@ -423,9 +423,11 @@ def _real_partial_reply_worker(args, failure_mode):
         elif failure_mode == "oversized_notification":
             out_channel.socket.send(b"x" * 5000)
         elif failure_mode == "oversized_artifact":
+            from ocr_contract.limits import MAX_OCR_RESPONSE_BYTES
+
             result_path = args[-1] / (uuid4().hex + ".json")
             with result_path.open("wb") as output:
-                output.truncate(64 * 1024 * 1024 + 1)
+                output.truncate(MAX_OCR_RESPONSE_BYTES + 1)
             out_channel.put(
                 {
                     "kind": "result",
@@ -861,3 +863,20 @@ def test_poll_and_infer_share_one_failed_replacement_when_recovery_is_delayed(tm
         owner.join(1)
         for thread in recovery_threads:
             thread.join(1)
+
+
+def test_result_artifact_write_and_read_reject_metadata_over_the_wire_cap(tmp_path, monkeypatch):
+    from ocr_contract import limits
+    from ocr_service.worker import publish_result, read_result
+
+    result = response(request(tmp_path))
+    result.telemetry = {"model_observations": "€" * 200}
+    artifact = tmp_path / (uuid4().hex + ".json")
+    artifact.write_bytes(result.model_dump_json().encode("utf-8"))
+    monkeypatch.setattr(limits, "MAX_RESPONSE_METADATA_BYTES", 500)
+
+    with pytest.raises(ValueError, match="ocr_response_metadata_too_large"):
+        publish_result(result, tmp_path)
+    assert list(tmp_path.glob("*.json")) == [artifact]
+    with pytest.raises(ValueError, match="ocr_response_metadata_too_large"):
+        read_result(tmp_path, artifact.name)

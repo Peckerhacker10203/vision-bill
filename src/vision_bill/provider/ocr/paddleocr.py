@@ -1,8 +1,6 @@
 """Local v2 OCR transport. Original bytes and identities cross this boundary unchanged."""
 
 import asyncio
-import base64
-import binascii
 import hashlib
 from io import BytesIO
 from pathlib import Path
@@ -11,11 +9,13 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
+from ocr_contract import limits
+from ocr_contract.document_image import decode_working_png, validate_working_png
 from PIL import Image
 
 from ...helper.deadline import check_deadline, run_sync_before
 from ...model.ocr import OcrCapabilities, OcrResponse, WorkerReadiness
-from .base import OcrProvider, compact_ocr_text
+from .base import OcrProvider
 
 
 class PaddleOcrProvider(OcrProvider):
@@ -133,8 +133,10 @@ class PaddleOcrProvider(OcrProvider):
             raise ValueError("ocr_managed_session_required")
         async with asyncio.timeout(max(0, deadline - monotonic())):
             async with httpx.AsyncClient(timeout=remaining, trust_env=False) as client:
-                response = await client.post(
+                async with client.stream(
+                    "POST",
                     f"{self.service_url}/ocr",
+                    headers={"Accept-Encoding": "identity"},
                     files={"image": (image.name, raw, media_type)},
                     data={
                         "request_id": str(request_id),
@@ -143,13 +145,20 @@ class PaddleOcrProvider(OcrProvider):
                         "timeout_ms": str(max(1, min(600000, int(remaining * 1000)))),
                         "owner_token": owner.token if owner is not None else "",
                     },
-                )
-                response.raise_for_status()
+                ) as response:
+                    response.raise_for_status()
+                    limits.check_ocr_response_headers(
+                        response.headers.get("Content-Length"),
+                        response.headers.get("Content-Encoding", ""),
+                    )
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        limits.append_ocr_response_chunk(body, chunk)
         check_deadline(deadline)
         return await run_sync_before(
             deadline,
             self._validated_response,
-            response.content,
+            body,
             request_id,
             photo_index,
             source_sha256,
@@ -157,9 +166,17 @@ class PaddleOcrProvider(OcrProvider):
         )
 
     @staticmethod
+    def _read_original(image: Path) -> bytes:
+        with image.open("rb") as source:
+            raw = source.read(limits.APP_SOURCE_MAX_BYTES + 1)
+        if len(raw) > limits.APP_SOURCE_MAX_BYTES:
+            raise ValueError("ocr_source_too_large")
+        return raw
+
+    @staticmethod
     def _source_payload(image: Path, source_sha256: str) -> tuple[bytes, str]:
         """Pure original-byte/MIME preparation; no caller objects are mutated."""
-        raw = image.read_bytes()
+        raw = PaddleOcrProvider._read_original(image)
         if hashlib.sha256(raw).hexdigest() != source_sha256:
             raise ValueError("ocr_source_hash_mismatch")
         from pillow_heif.as_plugin import register_heif_opener
@@ -179,14 +196,14 @@ class PaddleOcrProvider(OcrProvider):
 
     @staticmethod
     def _validated_response(
-        content: bytes,
+        content: bytes | bytearray,
         request_id: object,
         photo_index: int,
         source_sha256: str,
         expected_profile_id: str | None,
     ) -> OcrResponse:
         """Decode/validate PNG and typed page in an isolated synchronous worker."""
-        page = OcrResponse.model_validate_json(content)
+        page = OcrResponse.parse_wire(content)
         if (
             page.request_id != request_id
             or page.photo_index != photo_index
@@ -194,20 +211,10 @@ class PaddleOcrProvider(OcrProvider):
             or (expected_profile_id is not None and page.profile_id != expected_profile_id)
         ):
             raise ValueError("ocr_identity_mismatch")
-        compact_ocr_text({"text": page.text})
+        view = page.working_image
         try:
-            png = base64.b64decode(page.working_image.png_base64, validate=True)
-            with Image.open(BytesIO(png)) as working:
-                if (
-                    working.format != "PNG"
-                    or working.size != (page.working_image.width, page.working_image.height)
-                    or getattr(working, "n_frames", 1) != 1
-                ):
-                    raise ValueError("ocr_invalid_working_image")
-                working.verify()
-            if hashlib.sha256(png).hexdigest() != page.working_image.sha256:
-                raise ValueError("ocr_invalid_working_image")
-        except (OSError, binascii.Error, SyntaxError) as exc:
+            validate_working_png(decode_working_png(view.png_base64), view)
+        except ValueError as exc:
             raise ValueError("ocr_invalid_working_image") from exc
         return page
 
@@ -215,7 +222,7 @@ class PaddleOcrProvider(OcrProvider):
         """Compatibility API; live sidecars still require a validated v2 response."""
         deadline = monotonic() + self.timeout
         digest = await run_sync_before(
-            deadline, lambda: hashlib.sha256(image.read_bytes()).hexdigest()
+            deadline, lambda: hashlib.sha256(self._read_original(image)).hexdigest()
         )
         if not self.managed_lifecycle:
             page = await self.extract_page(image, photo_index=0, source_sha256=digest, deadline=deadline)

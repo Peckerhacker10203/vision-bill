@@ -178,3 +178,25 @@ runpy.run_module("ocr_service.client", run_name="__main__")
         json.loads(completed.stdout)["source_sha256"]
         == hashlib.sha256(original.read_bytes()).hexdigest()
     )
+
+
+@pytest.mark.parametrize("declared_length", [True, False])
+def test_standalone_ocr_client_stops_at_oversized_body(monkeypatch, declared_length):
+    from ocr_contract import limits
+
+    class OversizedBody(httpx.SyncByteStream):
+        def __iter__(self):
+            assert not declared_length, "oversized Content-Length must be rejected before reading"
+            yield b"01234567"
+            yield b"8"
+            pytest.fail("client read another chunk after crossing the response cap")
+
+    monkeypatch.setattr(limits, "MAX_OCR_RESPONSE_BYTES", 8)
+    headers = {"Content-Length": "9"} if declared_length else {}
+    with (
+        httpx.Client(transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, headers=headers, stream=OversizedBody())
+        )) as transport,
+        pytest.raises(ValueError, match="ocr_response_too_large"),
+    ):
+        module().recognize(b"source", media_type="image/png", url="http://ocr", client=transport)

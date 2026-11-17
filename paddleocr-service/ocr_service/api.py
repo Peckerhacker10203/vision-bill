@@ -1,8 +1,6 @@
 """Original-image HTTP ingress, validated working PNGs, and worker lifecycle."""
 
 import asyncio
-import base64
-import binascii
 import hashlib
 import os
 import tempfile
@@ -16,16 +14,16 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from ocr_contract import OcrResponse
+from ocr_contract.document_image import decode_working_png, validate_working_png
+from ocr_contract.limits import MAX_IMAGE_PIXELS, NATIVE_SOURCE_MAX_BYTES, check_ocr_response_size
 from PIL import Image
 from pydantic import BaseModel, Field
 
 from .profile import RuntimeSettings, load_profile
 from .worker import OcrRequest, OcrWorkerError, OcrWorkerManager
 
-MAX_UPLOAD_BYTES = 25 * 1024 * 1024
-MAX_IMAGE_PIXELS = 40_000_000
 SOURCE_FORMATS = {
     "image/jpeg": "JPEG",
     "image/png": "PNG",
@@ -53,20 +51,6 @@ def configured_worker() -> OcrWorkerManager:
     )
 
 
-def validate_png(raw: bytes, *, limit: int) -> None:
-    if len(raw) > limit:
-        raise HTTPException(413, "ocr_payload_too_large")
-    try:
-        with Image.open(BytesIO(raw)) as decoded:
-            if decoded.format != "PNG" or decoded.width * decoded.height > MAX_IMAGE_PIXELS:
-                raise ValueError("Invalid PNG dimensions or format")
-            if getattr(decoded, "n_frames", 1) != 1:
-                raise ValueError("Only deliberate single-frame PNG inputs are accepted")
-            decoded.verify()
-    except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
-        raise HTTPException(415, "ocr_invalid_png") from None
-
-
 def validate_source(raw: bytes, media_type: str | None, *, limit: int) -> None:
     if len(raw) > limit:
         raise HTTPException(413, "ocr_payload_too_large")
@@ -92,18 +76,10 @@ def validate_source(raw: bytes, media_type: str | None, *, limit: int) -> None:
 
 def validate_result(result: OcrResponse) -> None:
     try:
-        raw = base64.b64decode(result.working_image.png_base64, validate=True)
-    except (ValueError, binascii.Error):
-        raise HTTPException(502, "ocr_invalid_result") from None
-    try:
-        validate_png(raw, limit=MAX_UPLOAD_BYTES)
+        result.check_wire_bounds()
         view = result.working_image
-        with Image.open(BytesIO(raw)) as decoded:
-            if decoded.size != (view.width, view.height):
-                raise ValueError("Result dimensions differ")
-        if hashlib.sha256(raw).hexdigest() != view.sha256:
-            raise ValueError("Result hash differs")
-    except (HTTPException, ValueError):
+        validate_working_png(decode_working_png(view.png_base64), view)
+    except ValueError:
         raise HTTPException(502, "ocr_invalid_result") from None
 
 
@@ -111,7 +87,7 @@ def create_app(
     *,
     mode: str = "managed",
     worker_factory: Callable[[], OcrWorkerManager] = configured_worker,
-    max_upload_bytes: int = MAX_UPLOAD_BYTES,
+    max_upload_bytes: int = NATIVE_SOURCE_MAX_BYTES,
 ) -> FastAPI:
     if mode not in ("managed", "standalone"):
         raise ValueError("OCR service mode must be managed or standalone")
@@ -188,7 +164,7 @@ def create_app(
         deadline: float,
         owner_token: str | None,
         cancel_event: threading.Event,
-    ) -> OcrResponse:
+    ) -> Response:
         if mode == "standalone" and owner_token is not None:
             raise HTTPException(403, "ocr_standalone_lifecycle_owned")
         if worker is None:
@@ -214,7 +190,11 @@ def create_app(
             else:
                 result = worker.infer(request, deadline_monotonic=deadline, owner=owner_token)
             validate_result(result)
-            return result
+            # The exact same compact UTF-8 Pydantic serializer defines the
+            # wire metadata allowance and emits the successful HTTP body.
+            payload = result.model_dump_json().encode("utf-8")
+            check_ocr_response_size(len(payload))
+            return Response(payload, media_type="application/json")
         except OcrWorkerError as exc:
             cleanup_safe = exc.cleanup_safe
             raise HTTPException(exc.status_code, exc.code) from None
@@ -231,7 +211,7 @@ def create_app(
         source_sha256: Annotated[str, Form(pattern=r"^[0-9a-f]{64}$")],
         timeout_ms: Annotated[int, Form(gt=0, le=600000)],
         owner_token: Annotated[str | None, Form()] = None,
-    ) -> OcrResponse:
+    ) -> Response:
         deadline = time.monotonic() + timeout_ms / 1000
         cancel_event = threading.Event()
         task = asyncio.create_task(

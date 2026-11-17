@@ -12,7 +12,8 @@ from typing import Any
 from uuid import uuid4
 
 from ocr_contract import WorkingImage
-from ocr_contract.document_image import NORMALIZER_VERSION, document_rgb
+from ocr_contract.document_image import NORMALIZER_VERSION, document_rgb, encode_working_png
+from ocr_contract.limits import NATIVE_SOURCE_MAX_BYTES, check_working_image_dimensions
 from PIL import Image, ImageOps
 
 
@@ -25,7 +26,10 @@ class NormalizedSource:
 
 @contextmanager
 def normalize_source(source: Path, source_sha256: str) -> Iterator[NormalizedSource]:
-    uploaded_bytes = source.read_bytes()
+    with source.open("rb") as stream:
+        uploaded_bytes = stream.read(NATIVE_SOURCE_MAX_BYTES + 1)
+    if len(uploaded_bytes) > NATIVE_SOURCE_MAX_BYTES:
+        raise ValueError("OCR source exceeds the native upload limit")
     actual_sha256 = hashlib.sha256(uploaded_bytes).hexdigest()
     if actual_sha256 != source_sha256:
         raise ValueError("Uploaded source hash differs from the supplied identity")
@@ -36,6 +40,7 @@ def normalize_source(source: Path, source_sha256: str) -> Iterator[NormalizedSou
     with TemporaryDirectory(prefix="vision-bill-ocr-") as temporary:
         derived_path = Path(temporary, "input.png")
         with Image.open(BytesIO(uploaded_bytes)) as decoded:
+            check_working_image_dimensions(*decoded.size)
             frame_count = getattr(decoded, "n_frames", 1)
             decoded.seek(0)
             transform = {
@@ -66,10 +71,10 @@ def working_image(preprocessor: Any, transforms: list[dict[str, Any]]) -> Workin
     angle = preprocessor.get("angle")
     if angle not in {0, 90, 180, 270}:
         raise ValueError("Enabled document orientation requires a recognized rotation angle")
-    rgb = Image.fromarray(np.ascontiguousarray(output[..., ::-1]))
-    encoded = BytesIO()
-    rgb.save(encoded, format="PNG")
-    png_bytes = encoded.getvalue()
+    height, width, _ = output.shape
+    check_working_image_dimensions(width, height)
+    with Image.fromarray(np.ascontiguousarray(output[..., ::-1])) as rgb:
+        png_bytes = encode_working_png(rgb)
     preprocessing_transform = {
         "operation": "doc_preprocessor",
         "angle": int(angle),
@@ -80,8 +85,8 @@ def working_image(preprocessor: Any, transforms: list[dict[str, Any]]) -> Workin
     }
     return WorkingImage(
         view_id=uuid4(),
-        width=rgb.width,
-        height=rgb.height,
+        width=width,
+        height=height,
         sha256=hashlib.sha256(png_bytes).hexdigest(),
         png_base64=base64.b64encode(png_bytes).decode("ascii"),
         transforms=transforms + [preprocessing_transform],

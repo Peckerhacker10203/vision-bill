@@ -325,7 +325,7 @@ def test_original_ingress_preserves_raw_identity_and_real_normalization(source_f
                 result.working_image.sha256 = hashlib.sha256(derived).hexdigest()
                 result.working_image.width, result.working_image.height = size
                 result.working_image.transforms = normalized.transforms
-                result.telemetry = {"findings": normalized.findings}
+                result.telemetry = {"findings": normalized.findings, "note": "grüße \n"}
                 return result
 
     with TestClient(create_app(worker_factory=NormalizingWorker)) as client:
@@ -333,6 +333,11 @@ def test_original_ingress_preserves_raw_identity_and_real_normalization(source_f
             "/ocr", files={"image": ("original", raw, media_type)}, data=fields(raw)
         )
     assert result.status_code == 200, result.text
+    from ocr_contract import OcrResponse
+
+    typed = OcrResponse.parse_wire(result.content)
+    assert result.content == typed.model_dump_json().encode("utf-8")
+    assert b"gr\xc3\xbc\xc3\x9fe" in result.content
     page = result.json()
     assert seen == [raw]
     assert page["source_sha256"] == hashlib.sha256(raw).hexdigest()
@@ -367,3 +372,42 @@ def test_ingress_rejects_unsupported_actual_format_and_forged_hash():
         result = client.post("/ocr", files={"image": ("original", raw, "image/jpeg")}, data=data)
         assert result.status_code == 422
         assert not context.requests
+
+
+@pytest.mark.parametrize("delta", [-1, 0, 1])
+def test_native_api_caps_canonical_utf8_metadata_without_counting_png(tmp_path, monkeypatch, delta):
+    from fastapi import HTTPException
+    from ocr_contract import limits
+    from ocr_service.api import validate_result
+    from test_ocr_worker_lifecycle import request, response
+
+    result = response(request(tmp_path))
+    result.telemetry = {"label": "grüße \\ ＼n"}  # Multibyte and escaped wire characters.
+    empty_png_wire = result.model_copy(
+        update={"working_image": result.working_image.model_copy(update={"png_base64": ""})}
+    ).model_dump_json().encode()
+    monkeypatch.setattr(limits, "MAX_RESPONSE_METADATA_BYTES", len(empty_png_wire) - delta)
+    if delta <= 0:
+        validate_result(result)
+    else:
+        with pytest.raises(HTTPException) as error:
+            validate_result(result)
+        assert error.value.status_code == 502
+        assert error.value.detail == "ocr_invalid_result"
+
+
+@pytest.mark.parametrize("size", [200_000, 200_001])
+def test_native_api_retains_compact_ocr_text_cap(tmp_path, size):
+    from fastapi import HTTPException
+    from ocr_service.api import validate_result
+    from test_ocr_worker_lifecycle import request, response
+
+    result = response(request(tmp_path))
+    result.text = "  " + "é" * size + "  "
+    if size == 200_000:
+        validate_result(result)
+    else:
+        with pytest.raises(HTTPException) as error:
+            validate_result(result)
+        assert error.value.status_code == 502
+        assert error.value.detail == "ocr_invalid_result"

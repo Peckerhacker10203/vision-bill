@@ -207,19 +207,21 @@ async def test_original_byte_preparation_is_bounded_before_http(monkeypatch, tmp
 
     path = image_file(tmp_path)
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    original = Path.read_bytes
+    original = Path.open
     gate, entered, finished = threading.Event(), threading.Event(), threading.Event()
 
-    def read(selected):
+    def read(selected, *args, **kwargs):
+        if selected != path:
+            return original(selected, *args, **kwargs)
         entered.set()
         gate.wait(0.5)
         try:
-            return original(selected)
+            return original(selected, *args, **kwargs)
         finally:
             finished.set()
 
     calls = http_client(monkeypatch, lambda request: httpx.Response(500))
-    monkeypatch.setattr(Path, "read_bytes", read)
+    monkeypatch.setattr(Path, "open", read)
     timer = threading.Timer(0.5, gate.set)
     timer.start()
     began = time.monotonic()
@@ -363,3 +365,23 @@ async def test_managed_extract_text_checks_selected_model_before_native_effects(
     provider.extract_page.assert_not_awaited()
     assert handoff.journal.read_bytes() == before
     assert json.loads(handoff.journal.read_bytes())["generation"] == 7
+
+
+async def test_app_ocr_provider_stops_at_oversized_chunked_body(monkeypatch, tmp_path):
+    from ocr_contract import limits
+
+    class OversizedBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"01234567"
+            yield b"8"
+            pytest.fail("provider read another chunk after crossing the response cap")
+
+    monkeypatch.setattr(limits, "MAX_OCR_RESPONSE_BYTES", 8)
+    path = image_file(tmp_path)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    http_client(monkeypatch, lambda _: httpx.Response(200, stream=OversizedBody()))
+    provider = PaddleOcrProvider("http://local", managed_lifecycle=False)
+    with pytest.raises(ValueError, match="ocr_response_too_large"):
+        await provider.extract_page(
+            path, photo_index=0, source_sha256=digest, deadline=time.monotonic() + 2
+        )

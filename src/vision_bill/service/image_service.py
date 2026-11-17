@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import logging
 import os
 import shutil
@@ -9,12 +8,13 @@ import stat
 import tempfile
 import uuid
 from hashlib import sha256
-from io import BytesIO
 from pathlib import Path
 from uuid import UUID
 
 import magic
 import pillow_heif
+from ocr_contract import limits
+from ocr_contract.document_image import decode_working_png, validate_working_png
 from PIL import Image, ImageOps
 
 from ..config import ImageSettings
@@ -265,22 +265,6 @@ class ImageService:
             raise ValueError("invalid_working_artifact_path")
         return target
 
-    @staticmethod
-    def _validate_working_png(raw: bytes, metadata: WorkingImageMetadata) -> None:
-        if len(raw) > 64 * 1024 * 1024 or sha256(raw).hexdigest() != metadata.sha256:
-            raise ValueError("invalid_working_artifact_hash")
-        try:
-            with Image.open(BytesIO(raw)) as decoded:
-                if (
-                    decoded.format != "PNG"
-                    or decoded.size != (metadata.width, metadata.height)
-                    or getattr(decoded, "n_frames", 1) != 1
-                ):
-                    raise ValueError("invalid_working_artifact_dimensions")
-                decoded.load()
-        except (OSError, SyntaxError) as exc:
-            raise ValueError("invalid_working_artifact_png") from exc
-
     def read_working_image(
         self,
         image_id: UUID,
@@ -293,10 +277,12 @@ class ImageService:
         fd = os.open(expected, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
         with os.fdopen(fd, "rb") as handle:
             info = os.fstat(handle.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024 * 1024:
+            if not stat.S_ISREG(info.st_mode) or info.st_size > limits.MAX_WORKING_PNG_BYTES:
                 raise ValueError("invalid_working_artifact_type")
-            raw = handle.read(64 * 1024 * 1024 + 1)
-        self._validate_working_png(raw, metadata)
+            raw = handle.read(info.st_size + 1)
+            if len(raw) != info.st_size:
+                raise ValueError("invalid_working_artifact_size")
+        validate_working_png(raw, metadata, load=True)
         return raw
 
     async def save_working_image(
@@ -309,13 +295,15 @@ class ImageService:
         """Isolated immutable publication; cancelled writers clean only their own file."""
         from time import monotonic
 
-        metadata = WorkingImageMetadata.model_validate(working.model_dump())
+        metadata = WorkingImageMetadata.model_validate(
+            working.model_dump(exclude={"png_base64"})
+        )
         encoded = working.png_base64
 
         def save() -> tuple[Path, bool]:
             target = self._working_path(image_id, metadata.view_id)
-            raw = base64.b64decode(encoded, validate=True)
-            self._validate_working_png(raw, metadata)
+            raw = decode_working_png(encoded)
+            validate_working_png(raw, metadata, load=True)
             check_deadline(deadline)
             target.parent.mkdir(parents=True, exist_ok=True)
             created = False

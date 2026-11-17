@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
+from ocr_contract.limits import APP_SOURCE_MAX_BYTES
 
 from ..config import settings
 from ..model.db.image import ImagePart, ImageRow
@@ -61,8 +62,8 @@ async def upload_image(
     # Before enqueue begins these paths cannot be referenced by a DB transaction.
     try:
         for index, upload in enumerate(receipt):
-            content = await upload.read(20 * 1024 * 1024 + 1)
-            if len(content) > 20 * 1024 * 1024:
+            content = await upload.read(APP_SOURCE_MAX_BYTES + 1)
+            if len(content) > APP_SOURCE_MAX_BYTES:
                 raise HTTPException(status_code=413, detail="Each photo must be at most 20 MB")
             try:
                 info = image_service.validate_and_inspect(content)

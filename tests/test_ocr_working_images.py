@@ -132,3 +132,98 @@ def test_transparent_document_preserves_black_ink_on_white_background(tmp_path, 
         assert [rgb.getpixel((x, 0)) for x in range(2)] == [(0, 0, 0), (255, 255, 255)]
     assert transforms[0]["alpha_background"] == "#ffffff"
     assert source.read_bytes() == original
+
+
+async def test_accepted_seeded_12mp_jpeg_round_trips_full_resolution_working_png(
+    settings, tmp_path
+):
+    import time
+    from uuid import uuid4
+
+    import numpy as np
+    from ocr_contract import OcrResponse, WorkingImageMetadata
+    from ocr_service.api import validate_result, validate_source
+    from ocr_service.images import working_image
+    from ocr_service.worker import publish_result, read_result
+
+    from vision_bill.provider.ocr.paddleocr import PaddleOcrProvider
+    from vision_bill.service.image_service import ImageService
+
+    pixels = np.random.default_rng(1729).integers(
+        0, 256, size=(3000, 4000, 3), dtype=np.uint8
+    )
+    encoded = BytesIO()
+    Image.fromarray(pixels).save(encoded, format="JPEG", quality=90)
+    source = encoded.getvalue()
+    assert len(source) < 20 * 1024 * 1024
+    validate_source(source, "image/jpeg", limit=25 * 1024 * 1024)
+
+    # The decoded JPEG stands in for the preprocessor's BGR output.
+    with Image.open(BytesIO(source)) as decoded:
+        expected_pixels = np.asarray(decoded.convert("RGB"))
+    view = working_image({"output_img": expected_pixels[:, :, ::-1], "angle": 0}, [])
+    png = base64.b64decode(view.png_base64)
+    assert len(png) > 25 * 1024 * 1024
+    print(f"source={len(source)} bytes, working PNG={len(png)} bytes")
+    assert (view.width, view.height) == (4000, 3000)
+    with Image.open(BytesIO(png)) as decoded:
+        np.testing.assert_array_equal(np.asarray(decoded), expected_pixels)
+    result = OcrResponse(
+        request_id=uuid4(),
+        photo_index=0,
+        source_sha256=hashlib.sha256(source).hexdigest(),
+        text="SHOP",
+        blocks=[],
+        profile_id="fixed-profile",
+        runtime_fingerprint="cpu-test",
+        working_image=view,
+    )
+    validate_result(result)
+
+    payload = result.model_dump_json().encode()
+    print(f"wire={len(payload)} bytes")
+    page = PaddleOcrProvider._validated_response(
+        payload, result.request_id, 0, result.source_sha256, result.profile_id
+    )
+    assert read_result(tmp_path, publish_result(result, tmp_path)) == page
+    service = ImageService(settings.images)
+    image_id = uuid4()
+    path = await service.save_working_image(image_id, page.working_image, deadline=time.monotonic() + 10)
+    metadata = WorkingImageMetadata.model_validate(page.working_image.model_dump())
+    assert service.read_working_image(image_id, str(path), metadata) == png
+
+
+@pytest.mark.parametrize("size", [(1, 25_000), (401, 331)])
+def test_bounded_rgb_encoder_writes_only_standard_chunks_and_rgb8_scanlines(size):
+    import random
+    import struct
+    import zlib
+
+    from ocr_contract.document_image import encode_working_png
+    from ocr_contract.limits import working_png_bound
+
+    width, height = size
+    pixels = random.Random(1729).randbytes(3 * width * height)
+    image = Image.frombytes("RGB", size, pixels)
+    image.info.update({"icc_profile": b"untrusted profile", "transparency": (0, 0, 0)})
+    png = encode_working_png(image)
+    assert len(png) <= working_png_bound(width * height)
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+
+    chunks = []
+    offset = 8
+    while offset < len(png):
+        length, name = struct.unpack_from(">I4s", png, offset)
+        chunks.append((name, png[offset + 8 : offset + 8 + length]))
+        offset += 12 + length
+    assert offset == len(png)
+    assert chunks[0] == (b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    assert chunks[-1] == (b"IEND", b"")
+    idat = [payload for name, payload in chunks[1:-1] if name == b"IDAT"]
+    assert len(idat) == len(chunks) - 2
+    assert len(idat) >= 2
+    assert all(len(chunk) == 65_536 for chunk in idat[:-1])
+    assert len(zlib.decompress(b"".join(idat))) == (3 * width + 1) * height
+    with Image.open(BytesIO(png)) as decoded:
+        assert decoded.size == size
+        assert decoded.tobytes() == pixels

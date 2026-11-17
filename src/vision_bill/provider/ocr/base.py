@@ -2,6 +2,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+from ocr_contract.limits import MAX_OCR_TEXT_CHARS
+
 from ...model.ocr import OcrCapabilities, OcrResponse
 
 
@@ -27,7 +29,7 @@ def compact_ocr_text(result: dict[str, Any]) -> str:
     text = "\n".join(candidates).strip()
     if not text:
         raise ValueError("OCR returned no recognized text; layout boxes are not transcription")
-    if len(text) > 200_000:
+    if len(text) > MAX_OCR_TEXT_CHARS:
         raise ValueError("Recognized text exceeds the input limit")
     return text
 

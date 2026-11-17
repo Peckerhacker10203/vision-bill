@@ -5,6 +5,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from . import limits
+
 CONTRACT_VERSION: Literal[2] = 2
 
 __all__ = [
@@ -89,6 +91,38 @@ class OcrPageMetadata(BaseModel):
 class OcrResponse(OcrPageMetadata):
     model_config = ConfigDict(extra="forbid")
     working_image: WorkingImage
+
+    def check_wire_bounds(self) -> None:
+        """Bound the transcription and evidence without rewriting either."""
+        view = self.working_image
+        limits.check_working_image_dimensions(view.width, view.height)
+        limits.check_working_png_base64(view.png_base64)
+        text = self.text.strip()
+        if not text or len(text) > limits.MAX_OCR_TEXT_CHARS:
+            raise ValueError("ocr_invalid_recognized_text")
+        # Measure the complete canonical object with only the PNG string's
+        # contents removed. This cap covers block text and geometry, telemetry,
+        # transforms and every other field, including UTF-8 JSON escaping.
+        metadata = self.model_copy(
+            update={"working_image": view.model_copy(update={"png_base64": ""})}
+        ).model_dump_json().encode("utf-8")
+        if len(metadata) > limits.MAX_RESPONSE_METADATA_BYTES:
+            raise ValueError("ocr_response_metadata_too_large")
+        if any(
+            not (0 <= x <= view.width and 0 <= y <= view.height)
+            for block in self.blocks
+            for x, y in block.bbox
+        ):
+            raise ValueError("ocr_invalid_block_geometry")
+
+    @classmethod
+    def parse_wire(cls, payload: bytes | bytearray) -> "OcrResponse":
+        limits.check_ocr_response_size(len(payload))
+        # Unknown nested wire fields would otherwise disappear before the
+        # canonical measurement. Persisted metadata keeps its own validation.
+        result = cls.model_validate_json(payload, extra="forbid")
+        result.check_wire_bounds()
+        return result
 
 
 class OcrCapabilities(BaseModel):

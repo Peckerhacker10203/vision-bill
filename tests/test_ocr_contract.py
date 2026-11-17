@@ -8,6 +8,8 @@ import textwrap
 import zipfile
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 SERVICE = ROOT / "paddleocr-service"
 
@@ -67,6 +69,7 @@ def test_app_wheel_installs_neutral_contract(tmp_path):
     with zipfile.ZipFile(wheel) as archive:
         assert "ocr_contract/__init__.py" in archive.namelist()
         assert "ocr_contract/document_image.py" in archive.namelist()
+        assert "ocr_contract/limits.py" in archive.namelist()
         archive.extractall(tmp_path / "installed")
     result = subprocess.run(
         [sys.executable, "-I", "-c", textwrap.dedent("""
@@ -81,3 +84,35 @@ def test_app_wheel_installs_neutral_contract(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["module"].startswith("ocr_contract")
+
+
+@pytest.mark.parametrize(("raw_size", "wire_size"), [(0, 0), (1, 4), (3, 4), (4, 8), (6, 8), (7, 12)])
+def test_base64_wire_bound_includes_padding(raw_size, wire_size):
+    from ocr_contract.limits import base64_bound
+
+    assert base64_bound(raw_size) == wire_size
+
+
+def test_working_png_bound_accounts_for_one_filter_per_row_at_maximum_height():
+    from ocr_contract.limits import MAX_IMAGE_PIXELS, MAX_WORKING_PNG_BYTES, working_png_bound
+
+    assert MAX_IMAGE_PIXELS == 40_000_000
+    # RGB plus one per-row filter byte: a 1 × 40,000,000 image needs 160,000,000
+    # scanline bytes, 182,500,011 bounded zlib bytes and 2,785 IDAT chunks.
+    assert working_png_bound(40_000_000) == MAX_WORKING_PNG_BYTES == 182_533_476
+
+
+@pytest.mark.parametrize(
+    ("encoded", "valid"),
+    [("YWJj", True), ("YWJjZA==", True), ("YWJjZGU=", False), ("YWJjZGVmZw==", False)],
+)
+def test_working_png_decode_checks_encoded_and_decoded_bounds(monkeypatch, encoded, valid):
+    from ocr_contract import limits
+    from ocr_contract.document_image import decode_working_png
+
+    monkeypatch.setattr(limits, "MAX_WORKING_PNG_BYTES", 4)
+    if valid:
+        assert decode_working_png(encoded) in (b"abc", b"abcd")
+    else:
+        with pytest.raises(ValueError, match="ocr_working_png_too_large"):
+            decode_working_png(encoded)

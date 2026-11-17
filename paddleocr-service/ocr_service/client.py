@@ -10,7 +10,8 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import httpx
-from ocr_contract import OcrResponse
+from ocr_contract import OcrResponse, limits
+from ocr_contract.document_image import decode_working_png, validate_working_png
 
 
 def recognize(
@@ -31,31 +32,42 @@ def recognize(
         raise ValueError("OCR timeout must be at least one millisecond")
     if photo_index < 0:
         raise ValueError("OCR photo index must be nonnegative")
+    if len(source) > limits.NATIVE_SOURCE_MAX_BYTES:
+        raise ValueError("ocr_source_too_large")
     identity = request_id or uuid4()
     digest = hashlib.sha256(source).hexdigest()
     # A small transport margin permits the service to confirm native cleanup.
     timeout = timeout_seconds + 10
     transport = nullcontext(client) if client is not None else httpx.Client(timeout=timeout)
-    with transport as http:
-        response = http.post(
-            url.rstrip("/") + "/ocr",
-            files={"image": ("original", source, media_type)},
-            data={
-                "request_id": str(identity),
-                "photo_index": str(photo_index),
-                "source_sha256": digest,
-                "timeout_ms": str(timeout_ms),
-            },
-            timeout=timeout,
-        )
+    with transport as http, http.stream(
+        "POST",
+        url.rstrip("/") + "/ocr",
+        headers={"Accept-Encoding": "identity"},
+        files={"image": ("original", source, media_type)},
+        data={
+            "request_id": str(identity),
+            "photo_index": str(photo_index),
+            "source_sha256": digest,
+            "timeout_ms": str(timeout_ms),
+        },
+        timeout=timeout,
+    ) as response:
         response.raise_for_status()
-        result = OcrResponse.model_validate_json(response.content)
+        limits.check_ocr_response_headers(
+            response.headers.get("Content-Length"), response.headers.get("Content-Encoding", "")
+        )
+        body = bytearray()
+        for chunk in response.iter_bytes():
+            limits.append_ocr_response_chunk(body, chunk)
+    result = OcrResponse.parse_wire(body)
     if (
         result.request_id != identity
         or result.photo_index != photo_index
         or result.source_sha256 != digest
     ):
         raise ValueError("OCR response identity differs from the submitted source")
+    view = result.working_image
+    validate_working_png(decode_working_png(view.png_base64), view)
     return result
 
 
@@ -70,8 +82,10 @@ def main() -> int:
     if media_type is None:
         parser.error("cannot determine source media type; pass --media-type")
     try:
+        with args.source.open("rb") as source:
+            raw = source.read(limits.NATIVE_SOURCE_MAX_BYTES + 1)
         result = recognize(
-            args.source.read_bytes(),
+            raw,
             media_type=media_type,
             url=args.url,
             timeout_seconds=args.timeout_seconds,

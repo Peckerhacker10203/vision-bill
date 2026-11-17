@@ -16,11 +16,11 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from ocr_contract import OcrResponse, WorkerReadiness
+from ocr_contract.limits import MAX_OCR_RESPONSE_BYTES, check_ocr_response_size
 
 from .profile import RuntimeSettings, load_profile
 
 MAX_CONTROL_BYTES = 4096
-MAX_RESULT_BYTES = 64 * 1024 * 1024
 
 
 class ControlChannel:
@@ -61,9 +61,9 @@ class ControlChannel:
 
 
 def publish_result(result: OcrResponse, directory: Path) -> str:
-    payload = result.model_dump_json().encode()
-    if len(payload) > MAX_RESULT_BYTES:
-        raise ValueError("Result artifact exceeds its fixed bound")
+    result.check_wire_bounds()
+    payload = result.model_dump_json().encode("utf-8")
+    check_ocr_response_size(len(payload))
     destination = directory / (uuid4().hex + ".json")
     with tempfile.NamedTemporaryFile(dir=directory, suffix=".part", delete=False) as temporary:
         temporary.write(payload)
@@ -80,13 +80,13 @@ def read_result(directory: Path, name: Any) -> OcrResponse:
     descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     with os.fdopen(descriptor, "rb") as artifact:
         info = os.fstat(artifact.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_RESULT_BYTES:
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_OCR_RESPONSE_BYTES:
             raise ValueError("Invalid result artifact type or size")
-        payload = artifact.read(MAX_RESULT_BYTES + 1)
-        if len(payload) > MAX_RESULT_BYTES:
-            raise ValueError("Result artifact exceeds its fixed bound")
+        payload = artifact.read(info.st_size + 1)
+        if len(payload) != info.st_size:
+            raise ValueError("Result artifact size changed while reading")
     path.unlink()
-    return OcrResponse.model_validate_json(payload)
+    return OcrResponse.parse_wire(payload)
 
 
 @dataclass(frozen=True)
