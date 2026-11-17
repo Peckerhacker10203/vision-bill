@@ -35,6 +35,15 @@ def _handoff_error(status: HandoffStatus, *, admission: bool) -> RuntimeError:
     return HandoffWait(status) if admission else RuntimeError(status.reason_code or status.state)
 
 
+def _unique_json_members(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    members: dict[str, object] = {}
+    for key, value in pairs:
+        if key in members:
+            raise ValueError("model_handoff_duplicate_member")
+        members[key] = value
+    return members
+
+
 class HandoffJournal(BaseModel):
     """No legacy endpoint key: old coordinators must fail before dispatch."""
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -244,7 +253,7 @@ class ModelHandoff:
         if not self.journal.exists():
             return None
         try:
-            state = json.loads(self.journal.read_text())
+            state = json.loads(self.journal.read_text(), object_pairs_hook=_unique_json_members)
         except (ValueError, UnicodeError):
             raise ValueError("model_handoff_invalid_journal: preserve journal and recover managed resources") from None
         if isinstance(state, dict) and "version" not in state:
@@ -264,7 +273,8 @@ class ModelHandoff:
 
     def read_binding(self) -> HandoffBinding:
         try:
-            binding = HandoffBinding.model_validate_json(self.binding_path.read_bytes())
+            data = json.loads(self.binding_path.read_text(encoding="utf-8"), object_pairs_hook=_unique_json_members)
+            binding = HandoffBinding.model_validate(data)
         except FileNotFoundError:
             raise HandoffWait(HandoffStatus(
                 state="configuration_required", reason_code="model_handoff_binding_required",
@@ -291,7 +301,11 @@ class ModelHandoff:
             raise _handoff_error(HandoffStatus(
                 state="recovery_required", reason_code="model_handoff_residency_unknown",
             ), admission=admission) from None
-        if resident.difference(recorded):
+        allowed = set(recorded)
+        residency_ids_for = getattr(self.provider, "residency_ids_for", None)
+        if residency_ids_for is not None:
+            allowed.update(resident_id for model in recorded for resident_id in residency_ids_for(model))
+        if resident.difference(allowed):
             raise _handoff_error(HandoffStatus(
                 state="recovery_required", reason_code="model_handoff_foreign_residency",
             ), admission=admission)
@@ -320,14 +334,18 @@ class ModelHandoff:
 
     @asynccontextmanager
     async def session(self, deadline: float, *, model_id: str | None = None) -> AsyncIterator[HandoffOwner]:
-        async with asyncio.timeout(max(0, deadline - monotonic())):
-            async with self._session(deadline, model_id=model_id) as owner:
+        # Exclusion owns its retry deadline. Activate cancellation only once we own the lock.
+        async with asyncio.timeout(None) as timeout:
+            async with self._session(deadline, model_id=model_id, timeout=timeout) as owner:
                 yield owner
             if monotonic() >= deadline:
                 raise TimeoutError("model_handoff_deadline")
 
     @asynccontextmanager
-    async def _session(self, deadline: float, *, model_id: str | None) -> AsyncIterator[HandoffOwner]:
+    async def _session(
+        self, deadline: float, *, model_id: str | None, timeout: asyncio.Timeout,
+    ) -> AsyncIterator[HandoffOwner]:
+        expires_at = asyncio.get_running_loop().time() + (deadline - monotonic())
         if getattr(self.ocr, "managed_lifecycle", False) and not managed_ocr_enabled():
             raise ValueError(
                 "managed_ocr_requires_production_ocr: enable OCR__ENABLED and "
@@ -336,6 +354,7 @@ class ModelHandoff:
         resources = self.resources  # Validate explicit bindings before any resource calls.
         existing = current_owner()
         if existing is not None:
+            timeout.reschedule(expires_at)
             if (existing.coordinator.path != self.path
                     or existing.coordinator.resources != resources):
                 raise ValueError("model_handoff_identity_changed")
@@ -348,6 +367,7 @@ class ModelHandoff:
         token = None
         owner = HandoffOwner(self, deadline)
         async with self.exclusion(deadline):
+            timeout.reschedule(expires_at)
             if self.resources != resources:
                 raise ValueError("model_handoff_identity_changed")
             saved = self.read_journal()
@@ -376,12 +396,17 @@ class ModelHandoff:
                 owner.save()
                 try:
                     yield owner
-                except BaseException:
-                    # Cleanup cannot replace the original inference/body failure.
+                except BaseException as body_error:
+                    # Preserve ordinary body failures. A wait must account for cleanup dispatch.
+                    cause = body_error
                     try:
                         await self._cleanup(owner, deadline)
-                    except BaseException:  # noqa: BLE001, S110 - retain the original error and durable unresolved journal.
-                        pass
+                    except BaseException as cleanup_error:
+                        if isinstance(body_error, HandoffWait) and isinstance(cleanup_error, asyncio.CancelledError):
+                            raise
+                        cause = cleanup_error
+                    if isinstance(body_error, HandoffWait) and owner.model_work_started:
+                        raise _handoff_error(body_error.status, admission=False) from cause
                     raise
                 else:
                     await self._cleanup(owner, deadline)

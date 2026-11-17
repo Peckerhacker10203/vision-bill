@@ -334,6 +334,7 @@ async def test_failed_cleanup_is_retried_before_successor_load(tmp_path):
 
 @pytest.mark.asyncio
 async def test_independent_coordinators_wait_and_cancellation_leaves_cleanup(tmp_path):
+    from vision_bill.model.handoff import HandoffWait
     from vision_bill.service.gpu_handoff import ModelHandoff
     events = []
     llm, ocr = Llm(events), Ocr(events)
@@ -347,9 +348,10 @@ async def test_independent_coordinators_wait_and_cancellation_leaves_cleanup(tmp
             await asyncio.Event().wait()
     task = asyncio.create_task(first())
     await entered.wait()
-    with pytest.raises(TimeoutError):
+    with pytest.raises(HandoffWait) as caught:
         async with two.session(monotonic() + .03):
             pytest.fail("overlapped")
+    assert caught.value.status.reason_code == "model_handoff_busy"
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task

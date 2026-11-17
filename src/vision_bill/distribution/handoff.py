@@ -51,11 +51,11 @@ async def adopt_binding(
 
 
 async def _run(args: argparse.Namespace) -> int:
-    from ..config import settings
-    from ..provider.factory import get_llm_provider, get_ocr_provider
-
     provider = None
     try:
+        from ..config import settings
+        from ..provider.factory import get_llm_provider, get_ocr_provider
+
         provider = get_llm_provider(settings.llm)
         ocr = get_ocr_provider(settings.ocr)
         if ocr is None or not ocr.managed_lifecycle:

@@ -75,10 +75,15 @@ class OllamaProvider(LLMProvider):
 
     async def _release_model(self, model_id: str, deadline: float) -> None:
         await self._client.generate(model=model_id, keep_alive=0)
-        canonical = model_id if ":" in model_id.rsplit("/", 1)[-1] else model_id + ":latest"
         running = await self.resident_model_ids(deadline=deadline)
-        if any(model in (model_id, canonical) for model in running):
+        if not running.isdisjoint(self.residency_ids_for(model_id)):
             raise RuntimeError("model_release_unconfirmed")
+
+    def residency_ids_for(self, model_id: str) -> tuple[str, ...]:
+        """Ollama reports untagged requests with the implicit latest tag."""
+        if ":" in model_id.rsplit("/", 1)[-1]:
+            return (model_id,)
+        return (model_id, model_id + ":latest")
 
     async def resident_model_ids(self, *, deadline: float) -> frozenset[str]:
         async with asyncio.timeout(max(0, deadline - monotonic())):

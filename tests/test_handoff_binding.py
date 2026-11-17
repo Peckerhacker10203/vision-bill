@@ -1,11 +1,20 @@
 """External dedication and residency barriers, with owned software doubles only."""
+import asyncio
+import fcntl
 import json
 import stat
+import subprocess
+import sys
 from time import monotonic
 
+import httpx
 import pytest
+import pytest_asyncio
+from ollama import AsyncClient
 from test_gpu_handoff import Llm, Ocr
 
+from vision_bill.model.handoff import HandoffWait
+from vision_bill.provider.llm.ollama import OllamaProvider
 from vision_bill.service.gpu_handoff import ModelHandoff
 
 
@@ -66,16 +75,15 @@ async def test_adoption_persists_exact_secret_free_binding_and_inspection_is_rea
 
 @pytest.mark.asyncio
 async def test_model_outside_explicit_binding_is_held_before_tracking_or_dispatch(tmp_path):
-    from vision_bill.model.handoff import HandoffWait
     events = []
     handoff = ModelHandoff(tmp_path / "handoff.lock", ResidentLlm(events), Ocr(events))
     await adopt(handoff)
-    async with handoff.session(monotonic() + 1) as owner:
-        with pytest.raises(HandoffWait) as caught:
+    with pytest.raises(HandoffWait) as caught:
+        async with handoff.session(monotonic() + 1) as owner:
             await owner.llm_phase("other")
-        assert caught.value.status.state == "configuration_required"
-        assert owner.models == []
-    assert ("unload", "other") not in events
+    assert caught.value.status.state == "configuration_required"
+    assert owner.models == []
+    assert all(not isinstance(event, tuple) for event in events)
 
 
 @pytest.mark.asyncio
@@ -417,3 +425,199 @@ async def test_residency_failure_after_ocr_load_is_not_an_admission_wait(tmp_pat
         assert handoff.journal.read_bytes() == before
         assert events.count("load_ocr") == 1
         assert all(not isinstance(event, tuple) for event in events)
+
+
+@pytest_asyncio.fixture
+async def ollama_client():
+    provider = OllamaProvider("http://ollama.local")
+    await provider._client._client.aclose()
+
+    def use_transport(handler):
+        provider._client = AsyncClient(host="http://ollama.local", transport=httpx.MockTransport(handler))
+        return provider
+
+    yield use_transport
+    await provider._client._client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lost_reply,ordinary_error", [(False, False), (True, False), (True, True)])
+async def test_session_classifies_body_failure_after_cleanup_dispatch(tmp_path, ollama_client, lost_reply, ordinary_error):
+    entered, finish = asyncio.Event(), asyncio.Event()
+    unloads = []
+
+    async def handler(request):
+        if request.url.path == "/api/ps":
+            return httpx.Response(200, json={"models": []})
+        assert request.url.path == "/api/generate"
+        unloads.append(json.loads(request.content))
+        entered.set()
+        await finish.wait()
+        if lost_reply:
+            raise httpx.ReadError("lost cleanup reply")
+        return httpx.Response(200, json={})
+
+    handoff = ModelHandoff(tmp_path / "handoff.lock", ollama_client(handler), Ocr([]))
+    await adopt(handoff)
+    original = ValueError("original body failure")
+
+    async def run_session():
+        async with handoff.session(monotonic() + 2, model_id="own") as owner:
+            owner.track("own")
+            if ordinary_error:
+                raise original
+            owner.track("unadopted")
+
+    task = asyncio.create_task(run_session())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        pending = handoff.journal.read_bytes()
+        assert json.loads(pending)["unsettled"] is True
+        assert (await handoff.inspect(model_id="own", deadline=monotonic() + 1)).state == "busy"
+        assert handoff.journal.read_bytes() == pending
+    finally:
+        finish.set()
+        with pytest.raises(ValueError if ordinary_error else RuntimeError) as caught:
+            await task
+
+    assert [(call["model"], call["keep_alive"]) for call in unloads] == [("own", 0)]
+    saved = json.loads(handoff.journal.read_bytes())
+    assert saved["unsettled"] is lost_reply
+    assert saved["models"] == (["own"] if lost_reply else [])
+    status = await handoff.inspect(model_id="own", deadline=monotonic() + 1)
+    assert status.state == ("recovery_required" if lost_reply else "ready")
+    if ordinary_error:
+        assert caught.value is original
+    else:
+        assert not isinstance(caught.value, HandoffWait)
+        assert str(caught.value) == "model_handoff_model_not_adopted"
+        assert isinstance(caught.value.__cause__, httpx.ReadError if lost_reply else HandoffWait)
+
+
+@pytest.mark.parametrize("setting", ["LLM__API_KEY", "AUTH__SECRET_KEY"])
+def test_cli_invalid_settings_subprocess_does_not_disclose_credentials(tmp_path, setting):
+    marker = "vb-test-key-49"
+    result = subprocess.run(
+        [sys.executable, "-m", "vision_bill.distribution.handoff", "status", "--model-id", "own"],
+        cwd=tmp_path, env={setting: marker, "VISION_BILL_CONFIG_PATH": str(tmp_path / "absent.yaml")},
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert marker not in result.stdout + result.stderr
+    assert result.returncode == 1
+    assert json.loads(result.stdout) == {"state": "recovery_required", "reason_code": "model_handoff_setup_failed"}
+    assert result.stderr == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("artifact,nested", [("journal", False), ("binding", False), ("journal", True), ("binding", True)])
+async def test_duplicate_handoff_members_fence_all_readers_and_preserve_bytes(tmp_path, artifact, nested):
+    events = []
+    handoff = ModelHandoff(tmp_path / "handoff.lock", ResidentLlm(events), Ocr(events))
+    await adopt(handoff)
+    async with handoff.session(monotonic() + 1, model_id="own"):
+        pass
+    events.clear()
+    path = handoff.journal if artifact == "journal" else handoff.binding_path
+    members = path.read_bytes()
+    if nested:
+        ambiguous = members.replace(b'"llm"', b'"l\\u006cm":"other", "llm"', 1)
+    elif artifact == "journal":
+        ambiguous = members.replace(b'"unsettled"', b'"unsettled":true, "unsettled"', 1)
+    else:
+        ambiguous = members.replace(b'"dedicated_coordinated_requests"',
+                                    b'"dedicated_coordinated_requests":false, "dedicated_coordinated_requests"', 1)
+    assert ambiguous != members
+    path.write_bytes(ambiguous)
+    before = [p.read_bytes() for p in (handoff.journal, handoff.binding_path)]
+
+    assert (await handoff.inspect(model_id="own", deadline=monotonic() + 1)).state == "recovery_required"
+    with pytest.raises((ValueError, HandoffWait)):
+        async with handoff.session(monotonic() + 1, model_id="own"):
+            pytest.fail("ambiguous handoff authorized session entry")
+    with pytest.raises((ValueError, HandoffWait)):
+        await adopt(handoff, models=("another",))
+    assert events == []
+    assert [p.read_bytes() for p in (handoff.journal, handoff.binding_path)] == before
+
+
+@pytest.mark.asyncio
+async def test_session_lock_deadline_is_typed_busy(tmp_path):
+    events = []
+    handoff = ModelHandoff(tmp_path / "handoff.lock", ResidentLlm(events), Ocr(events))
+    await adopt(handoff)
+    events.clear()
+    with handoff.path.open("r+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(HandoffWait) as caught:
+            async with handoff.session(monotonic() + .03, model_id="own"):
+                pytest.fail("busy lock authorized session entry")
+    assert caught.value.status.state == "busy"
+    assert events == []
+    assert not handoff.journal.exists()
+
+
+@pytest.mark.asyncio
+async def test_session_lock_preserves_external_cancellation(tmp_path):
+    events = []
+    handoff = ModelHandoff(tmp_path / "handoff.lock", ResidentLlm(events), Ocr(events))
+    await adopt(handoff)
+    events.clear()
+
+    async def acquire():
+        async with handoff.session(monotonic() + 5, model_id="own"):
+            pytest.fail("busy lock authorized session entry")
+
+    with handoff.path.open("r+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        waiter = asyncio.create_task(acquire())
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+    assert events == []
+    assert not handoff.journal.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resident_tag", ["latest", "foreign"])
+async def test_ollama_restart_recovers_only_recorded_implicit_latest(tmp_path, ollama_client, resident_tag):
+    selected = "registry.local:5000/team/own"
+    resident, unloads = [], []
+
+    def handler(request):
+        if request.url.path == "/api/ps":
+            return httpx.Response(200, json={"models": [{"model": model} for model in resident]})
+        assert request.url.path == "/api/generate"
+        unloads.append(json.loads(request.content)["model"])
+        resident.clear()
+        return httpx.Response(200, json={})
+
+    events = []
+    provider = ollama_client(handler)
+    handoff = ModelHandoff(tmp_path / "handoff.lock", provider, Ocr(events))
+    await adopt(handoff, models=(selected,))
+    handoff.journal.write_text(json.dumps({
+        "version": 2, "coordinator": "vision-bill-model-handoff-v2",
+        "resources": handoff.resources.model_dump(), "models": [selected],
+        "generation": 8, "unsettled": False, "ocr_pending": False,
+    }))
+    resident.append(f"{selected}:{resident_tag}")
+    before = handoff.journal.read_bytes()
+    assert (await handoff.inspect(model_id=selected + ":latest", deadline=monotonic() + 1)).state == "configuration_required"
+    status = await handoff.inspect(model_id=selected, deadline=monotonic() + 1)
+    assert handoff.journal.read_bytes() == before
+    assert unloads == events == []
+    if resident_tag == "latest":
+        assert status.state == "ready"
+        async with handoff.session(monotonic() + 1, model_id=selected) as owner:
+            await owner.ocr_phase()
+        assert unloads == [selected]
+        assert "load_ocr" in events
+        assert json.loads(handoff.journal.read_bytes())["models"] == []
+    else:
+        assert status.reason_code == "model_handoff_foreign_residency"
+        with pytest.raises(HandoffWait):
+            async with handoff.session(monotonic() + 1, model_id=selected):
+                pytest.fail("foreign resident authorized session entry")
+        assert handoff.journal.read_bytes() == before
+        assert unloads == events == []
