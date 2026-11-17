@@ -469,6 +469,7 @@
 		"saveAndVerify": "Speichern & prüfen",
 		"merchantRequired": "Händler ist erforderlich.",
 		"dateRequired": "Ein gültiges Datum ist erforderlich.",
+		"invalidCurrency": "Gib einen Währungscode aus drei Buchstaben ein.",
 		"invalidAmount": "Betrag muss eine nicht negative Zahl sein.",
 		"invalidNumber": "Betrag muss eine gültige Zahl sein.",
 		"invalidQuantity": "Menge muss größer als null sein.",

@@ -25,7 +25,9 @@
 
 	let id = $derived(page.url.pathname.split('/').pop() ?? '');
 	const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-	let verifyOpen = $state(false);
+	type ReviewVersion = Pick<ReceiptRow, 'operation_revision' | 'review_revision'>;
+	let reviewTarget = $state<ReviewVersion | null>(null);
+	let renderedVersion = $state<(ReviewVersion & { id: string }) | null>(null);
 	let previewing = $state(false);
 	let humanPreview = $state<ReviewPreview | null>(null);
 	let humanAcknowledgements = $state<ReviewRequest['acknowledgements']>([]);
@@ -52,7 +54,7 @@
 		acknowledgementReset = 0;
 		saving = false;
 		verifying = false;
-		verifyOpen = false;
+		reviewTarget = null;
 		previewing = false;
 		humanPreview = null;
 		humanAcknowledgements = [];
@@ -96,7 +98,35 @@
 			data.receipt.status === 'verified' &&
 			data.receipt.verification_source !== 'human'
 	);
-	let reviewBlocked = $derived(editorDirty || saving || verifying || needsReload || childPending);
+	let editorStale = $derived(
+		renderedVersion !== null &&
+			(renderedVersion.id !== id || !sameVersion(renderedVersion, data?.receipt))
+	);
+	let reviewBlocked = $derived(
+		renderedVersion === null ||
+			editorStale ||
+			editorDirty ||
+			saving ||
+			verifying ||
+			needsReload ||
+			childPending
+	);
+	function sameVersion(left: ReviewVersion, right: ReviewVersion | null | undefined) {
+		return (
+			left.operation_revision === right?.operation_revision &&
+			left.review_revision === right.review_revision
+		);
+	}
+	function matchesReview(version: ReviewVersion) {
+		return (
+			renderedVersion?.id === id &&
+			sameVersion(version, data?.receipt) &&
+			sameVersion(version, renderedVersion)
+		);
+	}
+	$effect(() => {
+		if (reviewTarget && !matchesReview(reviewTarget)) closeReview();
+	});
 
 	function findingsReady(findings: ReviewFinding[], comments: ReviewRequest['acknowledgements']) {
 		return findings.every(
@@ -110,10 +140,7 @@
 	let humanReviewReady = $derived(
 		!!humanPreview && findingsReady(humanPreview.findings, humanAcknowledgements)
 	);
-	function reviewBody(
-		receipt: Pick<ReceiptRow, 'operation_revision' | 'review_revision'>,
-		comments = acknowledgements
-	) {
+	function reviewBody(receipt: ReviewVersion, comments = acknowledgements) {
 		return {
 			expected_operation_revision: receipt.operation_revision,
 			expected_review_revision: receipt.review_revision,
@@ -146,7 +173,7 @@
 		}
 	}
 	async function save(write: ReceiptWrite, verify: boolean) {
-		if (saving || needsReload || childPending) return;
+		if (saving || needsReload || editorStale || childPending) return;
 		const requestId = id;
 		const view = activeView;
 		if (!isCurrentView(view)) return;
@@ -195,12 +222,18 @@
 		return save(write, true);
 	}
 	function closeReview() {
-		verifyOpen = false;
+		reviewTarget = null;
 		humanPreview = null;
 		humanAcknowledgements = [];
 	}
+	function openVerify() {
+		if (canVerify && reviewReady && !reviewBlocked && renderedVersion) {
+			reviewTarget = { ...renderedVersion };
+		}
+	}
 	async function openHumanReview() {
-		if (!canReviewAsHuman || previewing || reviewBlocked) return;
+		if (!canReviewAsHuman || previewing || reviewBlocked || !renderedVersion) return;
+		const version = { ...renderedVersion };
 		const requestId = id;
 		const view = activeView;
 		if (!isCurrentView(view)) return;
@@ -209,13 +242,13 @@
 		try {
 			const preview = await api.previewHumanReview(requestId);
 			if (!isCurrentView(view)) return;
-			if (!matchesReview(preview)) {
+			if (!sameVersion(version, preview) || !matchesReview(version)) {
 				reviewMessage = translate('review.conflict');
 				return;
 			}
 			if (!reviewBlocked) {
 				humanPreview = preview;
-				verifyOpen = true;
+				reviewTarget = version;
 			}
 		} catch (error) {
 			if (!isCurrentView(view)) return;
@@ -227,26 +260,19 @@
 			if (isCurrentView(view)) previewing = false;
 		}
 	}
-	function matchesReview(preview: ReviewPreview) {
-		return (
-			data?.receipt.operation_revision === preview.operation_revision &&
-			data.receipt.review_revision === preview.review_revision
-		);
-	}
 	async function doVerify() {
 		const requestId = id;
 		const view = activeView;
-		if (!isCurrentView(view) || !data || reviewBlocked) return;
+		const version = reviewTarget;
+		if (!isCurrentView(view) || !version || reviewBlocked) return;
 		const preview = humanPreview;
-		if (preview && !matchesReview(preview)) {
+		if (!matchesReview(version)) {
 			closeReview();
 			reviewMessage = translate('review.conflict');
 			return;
 		}
 		if (preview ? !humanReviewReady : !canVerify || !reviewReady) return;
-		const request = reviewBody(preview ?? data.receipt, [
-			...(preview ? humanAcknowledgements : acknowledgements)
-		]);
+		const request = reviewBody(version, [...(preview ? humanAcknowledgements : acknowledgements)]);
 		verifying = true;
 		try {
 			await api.verifyReceipt(requestId, request);
@@ -309,7 +335,7 @@
 					type="button"
 					class="flex items-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-on-primary hover:opacity-90 disabled:opacity-50"
 					disabled={reviewBlocked || previewing || (canVerify && !reviewReady)}
-					onclick={canReviewAsHuman ? openHumanReview : () => (verifyOpen = true)}
+					onclick={canReviewAsHuman ? openHumanReview : openVerify}
 				>
 					<Icon icon="check" />
 					{$t(canReviewAsHuman ? 'receipt.humanReview' : 'receipt.verify')}
@@ -328,7 +354,7 @@
 		{#if enrichment?.state === 'unavailable' || (enrichment?.state === 'skipped' && enrichment.reason_code === 'classification_budget_exhausted' && enrichment.missing_fields.length > 0)}
 			<p class="my-3 text-sm text-on-surface-variant">{$t('receipt.optionalLabelsUnavailable')}</p>
 		{/if}
-		{#if reviewMessage || needsReload}<button
+		{#if reviewMessage || needsReload || editorStale}<button
 				type="button"
 				disabled={saving || verifying}
 				onclick={discardReload}
@@ -337,7 +363,7 @@
 		<ReviewFindings
 			findings={data.receipt.findings}
 			revision={`${id}:${data.receipt.review_revision}:${acknowledgementReset}`}
-			editable={canVerify && !editorDirty && !saving && !needsReload}
+			editable={canVerify && !reviewBlocked}
 			onChange={(value) => (acknowledgements = value)}
 			onSource={(sources) => (selectedSources = sources)}
 		/>
@@ -366,10 +392,11 @@
 					lineItems={data.line_items}
 					taxes={data.taxes}
 					collectionIds={data.collection_ids}
-					busy={saving || verifying || needsReload}
+					busy={saving || verifying || needsReload || editorStale}
 					onSave={saveOnly}
 					onSaveAndVerify={canVerify ? saveAndVerify : undefined}
 					onDirtyChange={(dirty) => (editorDirty = dirty)}
+					onSnapshotChange={(version) => (renderedVersion = version)}
 					onSource={(sources) => (selectedSources = sources)}
 					onPendingChange={(pending) => (childPending = pending)}
 				/>
@@ -378,7 +405,7 @@
 	</section>
 
 	<ConfirmDialog
-		open={verifyOpen}
+		open={reviewTarget !== null && matchesReview(reviewTarget)}
 		title={$t(humanPreview ? 'receipt.humanReviewTitle' : 'receipt.verifyTitle')}
 		body={$t(humanPreview ? 'receipt.humanReviewBody' : 'receipt.verifyBody')}
 		confirmLabel={$t(humanPreview ? 'receipt.humanReview' : 'receipt.verify')}

@@ -470,3 +470,34 @@ describe.each(['Save', 'Save & verify'])('%s time precision', (action) => {
 		expect((screen.getByLabelText('Time') as HTMLInputElement).value).toBe(displayed);
 	});
 });
+
+it.each(['re-currency', 're-discount_total', 're-tax_total'])(
+	'requires an explicit completed receipt value in %s before either save action',
+	async (inputId) => {
+		const onSave = vi.fn();
+		const onSaveAndVerify = vi.fn();
+		const { container } = render(ReceiptEditor, {
+			receipt: { ...receipt, discount_total: '2', tax_total: '1' },
+			lineItems: [line()],
+			taxes: [],
+			onSave,
+			onSaveAndVerify
+		});
+		await fireEvent.input(container.querySelector(`#${inputId}`)!, { target: { value: '' } });
+		await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+		await fireEvent.click(screen.getByRole('button', { name: 'Save & verify' }));
+		expect(onSave).not.toHaveBeenCalled();
+		expect(onSaveAndVerify).not.toHaveBeenCalled();
+		await fireEvent.input(container.querySelector(`#${inputId}`)!, {
+			target: { value: inputId === 're-currency' ? 'chf' : '0' }
+		});
+		await fireEvent.click(screen.getByRole('button', { name: 'Save & verify' }));
+		expect(onSaveAndVerify).toHaveBeenCalledOnce();
+		expect(onSaveAndVerify.mock.calls[0][0]).toMatchObject({
+			currency: inputId === 're-currency' ? 'CHF' : 'EUR',
+			discount_total: inputId === 're-discount_total' ? '0' : '2',
+			tax_total: inputId === 're-tax_total' ? '0' : '1',
+			tip: null
+		});
+	}
+);

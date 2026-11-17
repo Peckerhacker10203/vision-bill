@@ -469,6 +469,7 @@
 		"saveAndVerify": "Save & verify",
 		"merchantRequired": "Merchant is required.",
 		"dateRequired": "A valid date is required.",
+		"invalidCurrency": "Enter a three-letter currency code.",
 		"invalidAmount": "Amount must be a non-negative number.",
 		"invalidNumber": "Amount must be a valid number.",
 		"invalidQuantity": "Quantity must be greater than zero.",

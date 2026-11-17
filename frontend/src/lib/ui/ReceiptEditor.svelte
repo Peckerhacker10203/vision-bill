@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { createQuery } from '@tanstack/svelte-query';
 	import { sessionViewGuard } from '$lib/session-view';
@@ -111,12 +112,12 @@
 			receipt_number: receipt.receipt_number ?? '',
 			date: receipt.date,
 			time: receipt.time?.replace(/^(\d{2}:\d{2}):00(?:\.0+)?$/, '$1') ?? '',
-			currency: receipt.currency || 'USD',
+			currency: receipt.currency,
 			category: receipt.category,
 			payment_method: receipt.payment_method,
 			subtotal: String(receipt.subtotal),
-			discount_total: String(receipt.discount_total),
-			tax_total: String(receipt.tax_total),
+			discount_total: String(receipt.discount_total ?? ''),
+			tax_total: String(receipt.tax_total ?? ''),
 			tip: receipt.tip === null ? '' : String(receipt.tip),
 			total: String(receipt.total),
 			lines: lineItems.map((line) => ({
@@ -154,6 +155,7 @@
 		onSave,
 		onSaveAndVerify,
 		onDirtyChange,
+		onSnapshotChange,
 		onSource,
 		onPendingChange
 	}: {
@@ -174,6 +176,10 @@
 		onSaveAndVerify?: (write: ReceiptWrite) => void;
 		/** Notified with the current dirty state after (re)initialisation. */
 		onDirtyChange?: (dirty: boolean) => void;
+		/** Revisions of the server data currently shown in this editor. */
+		onSnapshotChange?: (
+			snapshot: Pick<ReceiptRow, 'id' | 'operation_revision' | 'review_revision'>
+		) => void;
 		onSource?: (sources: SourceRef[]) => void;
 		onPendingChange?: (pending: boolean) => void;
 	} = $props();
@@ -188,6 +194,9 @@
 	let snapshot = $state<EditorForm>(initialForm());
 	let initializedReceiptId: string | undefined;
 	let initializedRevision = -1;
+	let rendered = $state<Pick<ReceiptRow, 'id' | 'operation_revision' | 'review_revision'> | null>(
+		null
+	);
 	let initializedSavedRevision = 0;
 	let merchantVersion = 0;
 	const pendingTags = new SvelteSet<EditorLine>();
@@ -231,16 +240,33 @@
 	);
 
 	$effect(() => {
-		if (receipt.id !== initializedReceiptId || revision !== initializedRevision) {
+		const receiptId = receipt.id;
+		const operationRevision = receipt.operation_revision;
+		const reviewRevision = receipt.review_revision;
+		const reload = receiptId !== initializedReceiptId || revision !== initializedRevision;
+		const incomingRevision = revision;
+		untrack(() => {
+			const changed =
+				operationRevision !== rendered?.operation_revision ||
+				reviewRevision !== rendered?.review_revision;
+			if (!reload && (!changed || dirty || childPending)) return;
 			pendingTags.clear();
 			pendingCollections.clear();
 			merchantVersion++;
-			initializedReceiptId = receipt.id;
-			initializedRevision = revision;
+			initializedReceiptId = receiptId;
+			initializedRevision = incomingRevision;
 			const fresh = initialForm();
 			form = fresh;
 			snapshot = fresh;
-		}
+			rendered = {
+				id: receiptId,
+				operation_revision: operationRevision,
+				review_revision: reviewRevision
+			};
+		});
+	});
+	$effect(() => {
+		if (rendered) onSnapshotChange?.(rendered);
 	});
 	$effect(() => {
 		if (savedRevision !== initializedSavedRevision) {
@@ -255,7 +281,7 @@
 	});
 
 	const REQUIRED_AMOUNTS = ['subtotal', 'total'] as const;
-	const OPTIONAL_AMOUNTS = ['discount_total', 'tax_total', 'tip'] as const;
+	const NON_NEGATIVE_AMOUNTS = ['discount_total', 'tax_total'] as const;
 
 	let errors = $derived.by(() => {
 		const set = new SvelteSet<string>();
@@ -270,11 +296,15 @@
 				set.add('editor.invalidNumber');
 			}
 		}
-		for (const key of OPTIONAL_AMOUNTS) {
-			if (form[key].trim() !== '' && !isPlainDecimal(form[key])) {
+		if (!/^[a-z]{3}$/i.test(form.currency.trim())) {
+			set.add('editor.invalidCurrency');
+		}
+		for (const key of NON_NEGATIVE_AMOUNTS) {
+			if (!isPlainDecimal(form[key])) {
 				set.add('editor.invalidAmount');
 			}
 		}
+		if (form.tip.trim() !== '' && !isPlainDecimal(form.tip)) set.add('editor.invalidAmount');
 		const confidence = Number(form.confidence);
 		if (
 			form.confidence.trim() === '' ||
@@ -322,7 +352,7 @@
 			receipt_number: form.receipt_number.trim() || null,
 			date: form.date,
 			time: form.time.trim() || null,
-			currency: form.currency.trim().toUpperCase() || 'USD',
+			currency: form.currency.trim().toUpperCase(),
 			category: form.category as Category,
 			line_items: form.lines.map((line) => ({
 				...(line.id ? { id: line.id } : {}),
@@ -340,8 +370,8 @@
 				amount: tax.amount.trim()
 			})),
 			subtotal: form.subtotal.trim(),
-			discount_total: form.discount_total.trim() || '0',
-			tax_total: form.tax_total.trim() || '0',
+			discount_total: form.discount_total.trim(),
+			tax_total: form.tax_total.trim(),
 			tip: form.tip.trim() === '' ? null : form.tip.trim(),
 			total: form.total.trim(),
 			payment_method: form.payment_method as PaymentMethod,
@@ -906,7 +936,7 @@
 						class="rounded-lg border border-outline-variant px-4 py-2.5 text-sm font-medium text-on-surface hover:bg-surface-container-high disabled:opacity-50"
 						disabled={busy || childPending || !valid}
 						onclick={() => {
-							if (!childPending) onSave(buildWrite());
+							if (!busy && !childPending && valid) onSave(buildWrite());
 						}}
 					>
 						{$t('common.save')}
@@ -918,7 +948,7 @@
 						class="flex items-center justify-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-on-primary hover:opacity-90 disabled:opacity-50"
 						disabled={busy || childPending || !valid}
 						onclick={() => {
-							if (!childPending) onSaveAndVerify(buildWrite());
+							if (!busy && !childPending && valid) onSaveAndVerify(buildWrite());
 						}}
 					>
 						<Icon icon="check" />

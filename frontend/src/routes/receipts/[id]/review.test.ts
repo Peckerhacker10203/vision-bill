@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { api, ApiError } from '$lib/api/client';
 import { queryClient } from '$lib/query/client';
+import { queryKeys } from '$lib/query/keys';
 import type { ReceiptRow, ReceiptWithDetails, ReviewPreview } from '$lib/types';
 import Page from './+page.svelte';
 import { page } from '$app/state';
@@ -541,4 +542,72 @@ it('drops a human-review preview from a different receipt view', async () => {
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	expect(screen.queryByRole('dialog', { name: 'Review receipt as human?' })).toBeNull();
 	expect(screen.queryByRole('alert')).toBeNull();
+});
+
+it.each([row, verifiedByBypass])(
+	'binds confirmation to the rendered $status receipt and closes it on revision change',
+	async (cached) => {
+		const next = {
+			...cached,
+			operation_revision: 8,
+			review_revision: 4,
+			merchant_name: 'A revised receipt',
+			currency: 'CHF',
+			total: '10'
+		};
+		const refreshed = deferred<ReceiptWithDetails>();
+		queryClient.setQueryData(queryKeys.receipt(row.id), detail(cached), {
+			updatedAt: Date.now() - 60_000
+		});
+		vi.mocked(api.getReceipt).mockReturnValue(refreshed.promise);
+		vi.spyOn(api, 'previewHumanReview')
+			.mockResolvedValueOnce(previewResponse)
+			.mockResolvedValue({ operation_revision: 8, review_revision: 4, findings: [] });
+		const verify = vi.spyOn(api, 'verifyReceipt').mockResolvedValue(next);
+		const label = cached.verified ? /review as human/i : 'Verify';
+		render(Page);
+		expect(await screen.findByDisplayValue('Shop')).not.toBeNull();
+		await fireEvent.click(screen.getByRole('button', { name: label }));
+		expect(await screen.findByRole('dialog')).not.toBeNull();
+		refreshed.resolve(detail(next));
+		await screen.findByDisplayValue('A revised receipt');
+		expect(screen.queryByRole('dialog')).toBeNull();
+		expect(verify).not.toHaveBeenCalled();
+		await fireEvent.click(screen.getByRole('button', { name: label }));
+		await fireEvent.click(
+			within(await screen.findByRole('dialog')).getByRole('button', { name: label })
+		);
+		await waitFor(() =>
+			expect(verify).toHaveBeenCalledWith(row.id, {
+				expected_operation_revision: 8,
+				expected_review_revision: 4,
+				acknowledgements: []
+			})
+		);
+	}
+);
+
+it('preserves dirty values but blocks saving or verifying a stale editor until explicitly reloaded', async () => {
+	const next = { ...row, operation_revision: 8, review_revision: 4, merchant_name: 'New source' };
+	const update = vi.spyOn(api, 'updateReceipt');
+	render(Page);
+	const merchant = await screen.findByLabelText('Merchant');
+	await fireEvent.input(merchant, { target: { value: 'Unsaved edit' } });
+	queryClient.setQueryData(queryKeys.receipt(row.id), detail(next));
+	const discard = await screen.findByRole('button', {
+		name: 'Discard edits and load current version'
+	});
+	expect((merchant as HTMLInputElement).value).toBe('Unsaved edit');
+	expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(true);
+	expect(
+		(screen.getByRole('button', { name: 'Save & verify' }) as HTMLButtonElement).disabled
+	).toBe(true);
+	expect((screen.getByRole('button', { name: 'Verify' }) as HTMLButtonElement).disabled).toBe(true);
+	expect(update).not.toHaveBeenCalled();
+	vi.mocked(api.getReceipt).mockResolvedValue(detail(next));
+	await fireEvent.click(discard);
+	await screen.findByDisplayValue('New source');
+	expect((screen.getByRole('button', { name: 'Verify' }) as HTMLButtonElement).disabled).toBe(
+		false
+	);
 });
