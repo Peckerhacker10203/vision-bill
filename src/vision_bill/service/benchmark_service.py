@@ -36,6 +36,7 @@ from .benchmark_scoring import PROMPT_VERSION, dataset_fingerprint, score_receip
 from .experiment_execution import (
     ExperimentFailure,
     ExperimentResult,
+    PostObservationFailure,
     effective_policy,
     image_digest,
     ocr_fingerprint,
@@ -274,6 +275,8 @@ class BenchmarkService:
 
     @staticmethod
     def _retryable(exc: BaseException) -> bool:
+        if isinstance(exc, PostObservationFailure):
+            return False
         # ExperimentFailure deliberately preserves its cause. A wrapped ValueError
         # is not automatically permanent or retryable. OCR page failures include
         # both transport and blank/invalid pages; conservatively bound them to three.

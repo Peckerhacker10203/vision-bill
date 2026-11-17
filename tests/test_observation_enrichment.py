@@ -514,3 +514,69 @@ async def test_openai_classifier_distinguishes_empty_choices_from_ambiguous_tran
             assert events == ["formatter", "observations", "classifier"]
             journal = llm.handoff.read_journal()
             assert journal.unsettled and journal.models == ["own"]
+
+
+@pytest.mark.parametrize("failure_at", ["formatter", "classifier"])
+async def test_benchmark_worker_retry_only_before_admitted_observations(
+    settings, tmp_path, failure_at,
+):
+    llm = observation_provider()
+    failed = httpx.ReadTimeout("response status unknown")
+    llm._client.chat.side_effect = (
+        [failed] if failure_at == "formatter" else [llm._client.chat.return_value, failed]
+    )
+    receipts = ReceiptService(settings.images, settings.pg, llm)
+    worker = object.__new__(BenchmarkService)
+    worker._provider, worker._settings = llm, settings.worker
+    path = tmp_path / "photo.png"
+    Image.new("RGB", (4, 5)).save(path)
+    options = ExperimentOptions(pipeline="direct_vision")
+    receipt_id = uuid4()
+    manifest = {
+        "options": options.model_dump(mode="json"),
+        "inputs": [{
+            "receipt_id": str(receipt_id),
+            "expected": receipt().model_dump(mode="json"),
+            "reference": {},
+        }],
+    }
+    task = {
+        "run_id": uuid4(), "receipt_id": receipt_id, "model_id": "fixture", "attempts": 0,
+        "inference_started": False, "inference_attempt_count": 0,
+    }
+    worker._db = SimpleNamespace(
+        run=AsyncMock(return_value=SimpleNamespace(model_ids=["fixture"])),
+        manifest=AsyncMock(return_value=manifest),
+        begin_attempt=AsyncMock(return_value={
+            "inference_started": True, "inference_attempt_count": 1,
+        }),
+        finish_task=AsyncMock(), retry_task=AsyncMock(),
+    )
+    worker._run_digests = AsyncMock(return_value={})
+    worker._timeout = AsyncMock(return_value=600)
+
+    async def execute(task, _manifest, deadline, *, inference_deadline, managed_model_ids):
+        assert managed_model_ids == ["fixture"]
+        await worker._begin(task, deadline)
+        await execute_submission(
+            receipts, "fixture", [path], options, [], deadline=inference_deadline
+        )
+
+    worker._execute_experiment = execute
+    await worker._execute(task)
+    worker._db.begin_attempt.assert_awaited_once()
+    if failure_at == "formatter":
+        assert llm._client.chat.await_count == 1
+        worker._db.retry_task.assert_awaited_once()
+        worker._db.finish_task.assert_not_awaited()
+    else:
+        assert llm._client.chat.await_count == 2
+        worker._db.retry_task.assert_not_awaited()
+        worker._db.finish_task.assert_awaited_once()
+        failure = worker._db.finish_task.await_args.kwargs
+        assert failure["success"] is False
+        result = failure["result"]
+        assert result["full_receipt_correct"] is False
+        assert result["metadata"]["draft"]["total"] == "4.00"
+        assert result["metadata"]["classification_enrichment"]["state"] == "pending"
+        assert result["metadata"]["inference_attempt_count"] == 1

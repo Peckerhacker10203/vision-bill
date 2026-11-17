@@ -48,6 +48,10 @@ class ExperimentFailure(ValueError):
         self.metadata = metadata
 
 
+class PostObservationFailure(ExperimentFailure):
+    """Keep admitted evidence as a failed case without repeating inference."""
+
+
 def ocr_fingerprint(provider: Any) -> str | None:
     """Identify the published OCR extension's client without exposing its URL.
 
@@ -128,11 +132,14 @@ async def execute_submission(
         if provider.experiment_options
         else options.model_dump(mode="json"),
     }
+    observations_recorded = False
+
     async def remember_observations(envelope: InferenceEnvelope) -> None:
-        # This experiment metadata survives an ordinary call failure in this process.
+        nonlocal observations_recorded
         metadata.update(await run_sync_before(
             work_deadline, lambda: observation_metadata(pack_inference_metadata(envelope)),
         ))
+        observations_recorded = True
 
     try:
         async with asyncio.timeout(max(0, work_deadline - monotonic())):
@@ -150,13 +157,14 @@ async def execute_submission(
                 code = persisted.findings[-1].code if persisted.findings else "receipt_incomplete"
                 raise ValueError(code)
             receipt = await run_sync_before(work_deadline, admit_observations, persisted)
-    except HandoffWait:
-        raise
     except Exception as exc:
+        if isinstance(exc, HandoffWait) and not observations_recorded:
+            raise
         metadata.setdefault("calls", provider.experiment_trace or [])
         metadata["elapsed_ms"] = (perf_counter() - started) * 1000
         code = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
-        raise ExperimentFailure(code, metadata) from exc
+        failure = PostObservationFailure if observations_recorded else ExperimentFailure
+        raise failure(code, metadata) from exc
     metadata["llm_ms"] = sum(call.get("elapsed_ms", 0) for call in metadata["calls"])
     elapsed = (perf_counter() - started) * 1000
     metadata["elapsed_ms"] = elapsed
