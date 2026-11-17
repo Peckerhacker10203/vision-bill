@@ -31,26 +31,7 @@ postgres, db, workflow_db = shared.postgres, shared.db, shared.workflow_db
 pytestmark = pytest.mark.e2e
 
 
-async def test_awaited_producer_checkpoint_resumes_after_uncertain_managed_classification(
-    workflow_db,
-    settings,
-    tmp_path,
-    monkeypatch,
-):
-    w, scope = workflow_db
-    llm = observation_provider()
-    enable_managed_ocr(monkeypatch)
-    settings.ocr = OcrSettings(enabled=True, coordination_path=tmp_path / "owned-handoff.lock")
-    native = sidecar()
-    native.managed_lifecycle = True
-    native.claim, native.park, native.load = AsyncMock(), AsyncMock(), AsyncMock()
-    receipts = ReceiptService(settings.images, settings.pg, llm, native, settings.ocr)
-    receipts._workflow_db = w
-    receipts.list_tags = AsyncMock(return_value=[])
-    submission = SubmissionService(settings, receipts, ImageService(settings.images))
-    handoff = receipts.execution_handoff(settings.ocr)
-    await adopt(handoff, ("fixture",))
-
+async def prepare_last_attempt(w, scope, receipts, settings, tmp_path):
     paths = [tmp_path / f"original-{i}.png" for i in range(2)]
     for i, path in enumerate(paths):
         Image.new("RGB", (8, 8), (i, 0, 0)).save(path)
@@ -83,6 +64,30 @@ async def test_awaited_producer_checkpoint_resumes_after_uncertain_managed_class
         )
     claim = await w.claim_next(image_id=image.id)
     assert claim is not None and claim.attempt_number == 3
+    return image, claim
+
+
+async def test_awaited_producer_checkpoint_resumes_after_uncertain_managed_classification(
+    workflow_db,
+    settings,
+    tmp_path,
+    monkeypatch,
+):
+    w, scope = workflow_db
+    llm = observation_provider()
+    enable_managed_ocr(monkeypatch)
+    settings.ocr = OcrSettings(enabled=True, coordination_path=tmp_path / "owned-handoff.lock")
+    native = sidecar()
+    native.managed_lifecycle = True
+    native.claim, native.park, native.load = AsyncMock(), AsyncMock(), AsyncMock()
+    receipts = ReceiptService(settings.images, settings.pg, llm, native, settings.ocr)
+    receipts._workflow_db = w
+    receipts.list_tags = AsyncMock(return_value=[])
+    submission = SubmissionService(settings, receipts, ImageService(settings.images))
+    handoff = receipts.execution_handoff(settings.ocr)
+    await adopt(handoff, ("fixture",))
+
+    image, claim = await prepare_last_attempt(w, scope, receipts, settings, tmp_path)
 
     resident = False
     formatted = llm._client.chat.return_value
@@ -175,3 +180,103 @@ async def test_awaited_producer_checkpoint_resumes_after_uncertain_managed_class
         ] == [str(checkpoint_id)]
     final = await w.get_submission(image.id, scope=scope)
     assert final.attempt_count == 3 and final.generation == 1 and not final.observations_available
+
+
+@pytest.mark.parametrize(
+    "uncertain", [True, False], ids=["unknown-settlement", "response-returned"]
+)
+async def test_unmanaged_producer_durably_fences_dispatch_and_recovers_once(
+    workflow_db,
+    settings,
+    tmp_path,
+    uncertain,
+):
+    from test_observation_enrichment import chat_reply
+
+    w, scope = workflow_db
+    llm = observation_provider()
+    settings.ocr = OcrSettings(enabled=False, manage_model_lifecycle=False)
+    receipts = ReceiptService(settings.images, settings.pg, llm, ocr_settings=settings.ocr)
+    receipts._workflow_db = w
+    receipts.list_tags = AsyncMock(return_value=[])
+    submission = SubmissionService(settings, receipts, ImageService(settings.images))
+    image, claim = await prepare_last_attempt(w, scope, receipts, settings, tmp_path)
+    formatted = llm._client.chat.return_value
+    checkpoint_ids = []
+
+    async def chat(**request):
+        (message,) = request["messages"]
+        if not message["content"].startswith("Classify these ordered"):
+            assert len(message["images"]) == 2
+            return formatted
+        assert "images" not in message
+        checkpoint = await w.get_observation_checkpoint(claim)
+        assert checkpoint is not None and len(checkpoint.persisted_views) == 2
+        assert checkpoint.envelope.receipt.total == Decimal("4.00")
+        checkpoint_ids.append(checkpoint.checkpoint_id)
+        status = await w.unmanaged_classification_status(
+            image.id, inference_identity=llm.inference_identity
+        )
+        assert status == {
+            "state": "busy",
+            "image_id": str(image.id),
+            "checkpoint_id": str(checkpoint.checkpoint_id),
+            "generation": 1,
+        }
+        if uncertain:
+            raise TimeoutError("classification_request_unsettled")
+        return chat_reply('{"category":"grocery","line_items":[{}]}')
+
+    llm._client.chat.side_effect = chat
+    produced = await submission.process_claim(claim)
+    assert produced.submission.attempt_count == 3
+    (checkpoint_id,) = checkpoint_ids
+    scheduler = AnalysisScheduler(settings, llm, receipts, None, submission_service=submission)
+    counts = (
+        llm._client.chat.await_count,
+        llm.get_available_models.await_count,
+        receipts.list_tags.await_count,
+    )
+    assert counts[0] == 2
+    if uncertain:
+        assert (
+            produced.submission.status == "pending"
+            and produced.submission.result_code == "timed_out"
+        )
+        assert await scheduler.process_pending(scope=scope) == []
+        held = await w.get_submission(image.id, scope=scope)
+        assert held.wait_reason == "model_request_unsettled" and held.receipt_id is None
+        assert await w.reconcile_unmanaged_classification(
+            image.id,
+            checkpoint_id,
+            expected_generation=1,
+            inference_identity=llm.inference_identity,
+            request_settled=True,
+        )
+        assert [item.status for item in await scheduler.process_pending(scope=scope)] == [
+            "analyzed"
+        ]
+    else:
+        assert produced.submission.status == "analyzed"
+    assert await scheduler.process_pending(scope=scope) == []
+    assert counts == (
+        llm._client.chat.await_count,
+        llm.get_available_models.await_count,
+        receipts.list_tags.await_count,
+    )
+    final = await w.get_submission(image.id, scope=scope)
+    assert final.attempt_count == 3 and final.generation == 1 and not final.observations_available
+    async with w.pool.acquire() as conn:
+        saved = await conn.fetchrow("SELECT total FROM receipts WHERE image_id=$1", image.id)
+        assert saved["total"] == Decimal("4.00")
+        history = json.loads(
+            await conn.fetchval("SELECT legacy_events FROM images WHERE id=$1", image.id)
+        )
+    assert [
+        event["settlement"]
+        for event in history
+        if event["event"] == "unmanaged_classification_settled"
+    ] == ["operator_attested" if uncertain else "provider_returned"]
+    assert [
+        event["checkpoint_id"] for event in history if event["event"] == "checkpoint_completed"
+    ] == ([str(checkpoint_id)] if uncertain else [])
