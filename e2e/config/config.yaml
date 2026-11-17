@@ -6,8 +6,8 @@
 # test_settings_sources_and_env_conflict asserts that temperature is NOT
 # environment-controlled while provider/host/model_name are.
 #
-# e2e/run.py copies this seed into its private owned config directory. The
-# settings test rewrites that private copy, not this tracked seed or operator
-# configuration. Let the runner clean up its own stack/config after the run.
+# e2e/run.py makes a private copy for the Compose initializer to read. The
+# app and settings tests use the initialized config in their stack's named
+# volume, which the runner removes during stack cleanup.
 llm:
   temperature: 0.0
