@@ -17,6 +17,8 @@ from typing import Any
 
 import yaml
 
+from vision_bill.provider.llm import OPENAI_CREDENTIALLESS_API_KEY
+
 
 class BootstrapError(ValueError):
     """Unsafe or incomplete persistent installation state."""
@@ -84,15 +86,28 @@ def config_lock(config_dir: Path) -> Iterator[None]:
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
-    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:
-        self.flatten_mapping(node)
-        result: dict[Any, Any] = {}
-        for key_node, value_node in node.value:
-            key = self.construct_object(key_node, deep=deep)
-            if key in result:
-                raise BootstrapError("Persistent YAML has conflicting duplicate keys")
-            result[key] = self.construct_object(value_node, deep=deep)
-        return result
+    def __init__(self, stream: str):
+        super().__init__(stream)
+        self._checked_mappings: set[yaml.MappingNode] = set()
+
+    def flatten_mapping(self, node: yaml.MappingNode) -> None:
+        # PyYAML flattens shared merge sources in place. Check each mapping
+        # before its first flatten, while only explicitly declared keys are present.
+        if node not in self._checked_mappings:
+            self._checked_mappings.add(node)
+            merge_key = object()
+            keys: set[Any] = set()
+            for key_node, _ in node.value:
+                if key_node.tag == "tag:yaml.org,2002:merge":
+                    key = merge_key
+                elif key_node.tag == "tag:yaml.org,2002:value":
+                    key = self.construct_scalar(key_node)
+                else:
+                    key = self.construct_object(key_node)
+                if key in keys:
+                    raise BootstrapError("Persistent YAML has conflicting duplicate keys")
+                keys.add(key)
+        super().flatten_mapping(node)
 
 
 def read_mapping(path: Path) -> dict[str, Any]:
@@ -120,6 +135,8 @@ def read_config(path: Path) -> dict[str, Any]:
         ):
             raise BootstrapError("Persistent configuration is incomplete")
     llm = data["llm"]
+    if not all(llm[name].strip() for name in ("host", "model_name")):
+        raise BootstrapError("Persistent LLM host and model_name must be nonblank")
     if llm.get("provider", "ollama") not in ("ollama", "openai"):
         raise BootstrapError("Unsupported LLM provider; select ollama or openai in llm.provider")
     if not isinstance(llm.get("api_key"), str) or not isinstance(
@@ -142,7 +159,9 @@ def _fresh_llm_settings(environment: Mapping[str, str]) -> dict[str, Any]:
     provider = environment["LLM__PROVIDER"]
     if provider not in ("ollama", "openai"):
         raise BootstrapError("Unsupported LLM__PROVIDER; select ollama or openai")
-    api_key = environment.get("LLM__API_KEY", "none" if provider == "openai" else "")
+    api_key = environment.get(
+        "LLM__API_KEY", OPENAI_CREDENTIALLESS_API_KEY if provider == "openai" else ""
+    )
     if provider == "openai" and not api_key.strip():
         raise BootstrapError(
             "LLM__API_KEY must be nonblank for OpenAI; use none for a credentialless endpoint"

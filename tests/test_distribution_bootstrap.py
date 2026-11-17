@@ -347,3 +347,64 @@ def test_unsupported_restored_provider_has_actionable_diagnostic(tmp_path):
     assert result.returncode != 0
     assert "ollama or openai" in result.stderr
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("field", ["host", "model_name"])
+def test_restored_whitespace_identity_cannot_publish_companions(tmp_path, field):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    content = (
+        "llm: {host: 'http://external', api_key: '', model_name: 'selected', temperature: 0}\n"
+        "pg: {user: 'runtime-login', password: 'db-secret'}\n"
+        "auth: {secret_key: 'auth-secret'}\n"
+    )
+    saved = yaml.safe_load(content)
+    saved["llm"][field] = " \t "
+    saved_bytes = yaml.safe_dump(saved).encode()
+    path = config_dir / "config.yaml"
+    path.write_bytes(saved_bytes)
+
+    result = initialize(tmp_path, runtime_environment={})
+
+    assert result.returncode != 0
+    assert not (config_dir / ".bootstrap-complete.yaml").exists()
+    assert not (tmp_path / "pg-secret/password").exists()
+    assert path.read_bytes() == saved_bytes
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_restore_yaml_merge_uses_explicit_override_and_rejects_literal_duplicates(
+    tmp_path, duplicate
+):
+    from vision_bill.distribution.bootstrap import read_config
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    content = (
+        "llm:\n"
+        "  <<: [{<<: &profile {host: 'http://first', model_name: inherited"
+        + (", model_name: duplicate" if duplicate else "")
+        + "}}, {host: 'http://second', model_name: other}]\n"
+        "  model_name: selected\n"
+        "  api_key: ''\n"
+        "  temperature: 0\n"
+        "alternate: {<<: *profile, model_name: alternate}\n"
+        "pg: {user: 'runtime-login', password: 'db-secret'}\n"
+        "auth: {secret_key: 'auth-secret'}\n"
+    )
+    path = config_dir / "config.yaml"
+    path.write_text(content)
+
+    result = initialize(tmp_path, runtime_environment={})
+
+    assert path.read_text() == content
+    if duplicate:
+        assert result.returncode != 0
+        assert "duplicate keys" in result.stderr
+        assert not (config_dir / ".bootstrap-complete.yaml").exists()
+    else:
+        assert result.returncode == 0, result.stderr
+        assert (config_dir / ".bootstrap-complete.yaml").exists()
+        llm = read_config(path)["llm"]
+        assert llm["host"] == "http://first"
+        assert llm["model_name"] == "selected"

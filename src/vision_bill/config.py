@@ -20,6 +20,8 @@ from pydantic import (
 )
 from pydantic_settings import (
     BaseSettings,
+    DotEnvSettingsSource,
+    EnvSettingsSource,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
     YamlConfigSettingsSource,
@@ -250,39 +252,21 @@ def _read_yaml_config(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _dotenv_names(path: Path) -> set[str]:
-    """Return setting names present in a dotenv file without reading values."""
-    if not path.is_file():
-        return set()
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return set()
-
-    names: set[str] = set()
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        name = stripped.removeprefix("export ").split("=", 1)[0].strip()
-        if name in EDITABLE_ENV_KEYS.values():
-            names.add(name)
-    return names
-
-
 def editable_setting_sources() -> dict[str, str]:
     """Return the source of each setting shown in the admin UI."""
-    environment_names = set(os.environ)
-    environment_names.update(_dotenv_names(Path(".env")))
-    environment_names.update(_dotenv_names(Path(".env.local")))
+    environment = EnvSettingsSource(Settings)()
+    dotenv = DotEnvSettingsSource(Settings)()
     config_data = _read_yaml_config(get_config_path())
     sources: dict[str, str] = {}
 
-    for field_name, environment_name in EDITABLE_ENV_KEYS.items():
-        if environment_name in environment_names:
+    for field_name in EDITABLE_ENV_KEYS:
+        section, key = field_name.split(".", 1)
+        if any(
+            isinstance(data, dict) and key in data
+            for data in (environment.get(section), dotenv.get(section))
+        ):
             sources[field_name] = "environment"
             continue
-        section, key = field_name.split(".", 1)
         section_data = config_data.get(section)
         sources[field_name] = (
             "config" if isinstance(section_data, dict) and key in section_data else "default"
@@ -292,10 +276,18 @@ def editable_setting_sources() -> dict[str, str]:
 
 def write_config_file(config: Settings, *, changed_paths: frozenset[str] | None = None) -> None:
     """Merge a save under the bootstrap lock without discarding private metadata."""
+    _publish_config_file(get_config_path(), config, changed_paths=changed_paths)
+
+
+def _publish_config_file(
+    path: Path,
+    config: Settings,
+    *,
+    changed_paths: frozenset[str] | None = None,
+    create_only: bool = False,
+) -> bool:
     from .distribution.bootstrap import BootstrapError, config_lock, read_config, write_private
 
-    path = get_config_path()
-    resolved = config.model_dump(mode="json", exclude={"pg": {"database_url", "pg_dsn"}})
     if changed_paths is not None and not changed_paths <= EDITABLE_ENV_KEYS.keys():
         raise BootstrapError("Only editable setting paths may be selectively saved")
 
@@ -315,6 +307,8 @@ def write_config_file(config: Settings, *, changed_paths: frozenset[str] | None 
         if pending.exists() or pending.is_symlink():
             raise BootstrapError("Interrupted installation requires explicit recovery")
         existing = path.exists() or path.is_symlink()
+        if create_only and existing:
+            return False
         if not existing and any(
             marker.exists() or marker.is_symlink()
             for marker in (
@@ -323,6 +317,7 @@ def write_config_file(config: Settings, *, changed_paths: frozenset[str] | None 
             )
         ):
             raise BootstrapError("Incomplete installation requires explicit recovery")
+        resolved = config.model_dump(mode="json", exclude={"pg": {"database_url", "pg_dsn"}})
         data = read_config(path) if existing else resolved
         if existing:
             # Validate the persisted document itself, independent of environment overrides.
@@ -341,6 +336,7 @@ def write_config_file(config: Settings, *, changed_paths: frozenset[str] | None 
                         )
                     section_data[key] = resolved[section][key]
         write_private(path, yaml.safe_dump(data, sort_keys=False), replace=existing)
+        return True
 
 
 def initialize_config_file(config: Settings) -> None:
@@ -349,8 +345,8 @@ def initialize_config_file(config: Settings) -> None:
     if path.exists():
         return
     try:
-        write_config_file(config)
-        logger.info("Created initial YAML config at %s", path)
+        if _publish_config_file(path, config, create_only=True):
+            logger.info("Created initial YAML config at %s", path)
     except OSError as exc:
         # Unit tests and read-only deployments may intentionally omit the
         # config volume; the application can still run from environment values.

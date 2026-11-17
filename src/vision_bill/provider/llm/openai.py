@@ -19,6 +19,7 @@ from ...provider.llm.base import (
     ModelInfo,
     inference_endpoint_identity,
 )
+from . import OPENAI_CREDENTIALLESS_API_KEY
 from .experiment import chat_telemetry
 from .llamacpp import LlamaCppLifecycle
 
@@ -88,6 +89,8 @@ class OpenAIProvider(LLMProvider):
     ):
         if model_lifecycle not in ("none", "llamacpp"):
             raise ValueError("Unsupported OpenAI-compatible model lifecycle")
+        # The SDK needs a nonempty key even for a credentialless endpoint.
+        api_key = api_key or OPENAI_CREDENTIALLESS_API_KEY
         self._lifecycle = LlamaCppLifecycle(host, api_key) if model_lifecycle == "llamacpp" else None
         self.supports_model_release = self._lifecycle is not None
         self.lifecycle_identity = self._lifecycle.identity if self._lifecycle else "unsupported"

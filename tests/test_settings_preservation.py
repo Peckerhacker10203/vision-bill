@@ -175,3 +175,112 @@ def test_invalid_save_diagnostics_do_not_log_secret_lines(saved_settings, caplog
     response = client.put("/system/settings", json=payload(settings, model_name="changed"))
     assert response.status_code == 503
     assert "malformed-secret-value" not in caplog.text + response.text
+
+
+@pytest.mark.parametrize(
+    ("saved_key", "runtime_key", "expected_key"),
+    [("", None, "none"), ("saved-key", None, "saved-key"), ("", "runtime-key", "runtime-key")],
+)
+async def test_ollama_to_openai_update_constructs_fresh_provider(
+    saved_settings, monkeypatch, saved_key, runtime_key, expected_key
+):
+    from vision_bill.provider.factory import get_llm_provider
+
+    path, original, _, client = saved_settings
+    original["llm"].update(api_key=saved_key, model_lifecycle="llamacpp")
+    path.write_text(yaml.safe_dump(original))
+    monkeypatch.setitem(config.Settings.model_config, "yaml_file", str(path))
+    monkeypatch.delenv("LLM__API_KEY", raising=False)
+    if runtime_key is not None:
+        monkeypatch.setenv("LLM__API_KEY", runtime_key)
+    before_restart = config.Settings()
+    monkeypatch.setattr(system, "settings", before_restart)
+
+    response = client.put(
+        "/system/settings",
+        json=payload(before_restart, provider="openai", host="http://router.example/v1"),
+    )
+    assert response.status_code == 200
+    original["llm"].update(provider="openai", host="http://router.example/v1")
+    assert yaml.safe_load(path.read_text()) == original
+    after_restart = config.Settings()
+    provider = get_llm_provider(after_restart.llm)
+    try:
+        assert provider._client.api_key == expected_key
+        async with provider._lifecycle._client() as lifecycle:
+            assert lifecycle.headers["Authorization"] == f"Bearer {expected_key}"
+    finally:
+        await provider._client.close()
+
+
+@pytest.mark.parametrize("source", ["lowercase env", "JSON env", "JSON dotenv", "dotenv local"])
+def test_actual_settings_sources_lock_overrides(saved_settings, monkeypatch, source):
+    path, _, _, client = saved_settings
+    monkeypatch.setitem(config.Settings.model_config, "yaml_file", str(path))
+    if source == "lowercase env":
+        monkeypatch.setenv("llm__host", "http://effective.example")
+    elif source == "JSON env":
+        monkeypatch.setenv("LLM", '{"HOST":"http://effective.example"}')
+    elif source == "JSON dotenv":
+        (path.parent / ".env").write_text('llm=\'{"HOST":"http://effective.example"}\'\n')
+    else:
+        (path.parent / ".env").write_text("LLM__HOST=http://overridden.example\n")
+        (path.parent / ".env.local").write_text("export llm__host=http://effective.example\n")
+    settings = config.Settings()
+    monkeypatch.setattr(system, "settings", settings)
+    before = path.read_bytes()
+
+    response = client.get("/system/settings")
+    assert response.status_code == 200
+    assert response.json()["llm"]["host"] == "http://effective.example"
+    assert response.json()["sources"]["llm.host"] == "environment"
+    assert response.json()["sources"]["llm.model_name"] == "config"
+    blocked = client.put("/system/settings", json=payload(settings, host="http://other"))
+    assert blocked.status_code == 409
+    assert path.read_bytes() == before
+
+
+def test_settings_save_accepts_yaml_merge_with_explicit_override(saved_settings):
+    path, original, settings, client = saved_settings
+    inherited = {**original.pop("llm"), "model_name": "inherited"}
+    path.write_text(
+        yaml.safe_dump(original)
+        + "llm_profile: &profile\n"
+        + "".join(f"  {line}\n" for line in yaml.safe_dump(inherited).splitlines())
+        + f"llm:\n  <<: *profile\n  model_name: {settings.llm.model_name!r}\n"
+    )
+    expected = yaml.safe_load(path.read_text())
+    expected["llm"]["model_name"] = "new-selection"
+
+    response = client.put("/system/settings", json=payload(settings, model_name="new-selection"))
+
+    assert response.status_code == 200
+    assert yaml.safe_load(path.read_text()) == expected
+
+
+def test_first_start_does_not_overwrite_locked_winner(saved_settings, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from vision_bill.distribution import bootstrap
+
+    path, original, settings, _ = saved_settings
+    path.unlink()
+    real_lock = bootstrap.config_lock
+    at_lock = Event()
+
+    def observe_lock(directory):
+        at_lock.set()
+        return real_lock(directory)
+
+    monkeypatch.setattr(bootstrap, "config_lock", observe_lock)
+    winner = yaml.safe_dump(original)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with real_lock(path.parent):
+            loser = pool.submit(config.initialize_config_file, settings)
+            assert at_lock.wait(timeout=2)
+            bootstrap.write_private(path, winner)
+        loser.result(timeout=2)
+
+    preserved = path.read_text() == winner
+    assert preserved
