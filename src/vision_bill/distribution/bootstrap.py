@@ -124,6 +124,12 @@ def read_mapping(path: Path) -> dict[str, Any]:
 def read_config(path: Path) -> dict[str, Any]:
     """Read existing credentials without importing config's settings singleton."""
     data = read_mapping(path)
+    validate_config_data(data)
+    return data
+
+
+def validate_config_data(data: dict[str, Any]) -> None:
+    """Require the complete identity and credential fields of an installation."""
     for section, names in {
         "llm": ("host", "model_name"),
         "pg": ("user", "password"),
@@ -149,7 +155,6 @@ def read_config(path: Path) -> dict[str, Any]:
         username and (not isinstance(username, str) or not isinstance(password, str))
     ):
         raise BootstrapError("Persistent bootstrap credentials are incomplete")
-    return data
 
 
 def _fresh_llm_settings(environment: Mapping[str, str]) -> dict[str, Any]:

@@ -24,6 +24,7 @@ from pydantic_settings import (
     EnvSettingsSource,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
+    SettingsError,
     YamlConfigSettingsSource,
 )
 
@@ -233,6 +234,7 @@ class Settings(BaseSettings):
         env_nested_delimiter="__",
         yaml_file=str(get_config_path()),
         extra="ignore",
+        hide_input_in_errors=True,
     )
 
     api: ApiSettings = ApiSettings()
@@ -313,7 +315,13 @@ def _publish_config_file(
     changed_paths: frozenset[str] | None = None,
     create_only: bool = False,
 ) -> bool:
-    from .distribution.bootstrap import BootstrapError, config_lock, read_config, write_private
+    from .distribution.bootstrap import (
+        BootstrapError,
+        config_lock,
+        read_mapping,
+        validate_config_data,
+        write_private,
+    )
 
     if changed_paths is not None and not changed_paths <= EDITABLE_ENV_KEYS.keys():
         raise BootstrapError("Only editable setting paths may be selectively saved")
@@ -336,25 +344,37 @@ def _publish_config_file(
         existing = path.exists() or path.is_symlink()
         if create_only and existing:
             return False
-        if not existing and any(
+        prepared = any(
             marker.exists() or marker.is_symlink()
             for marker in (
                 path.parent / ".bootstrap-complete.yaml",
                 path.parent / "initial-admin.yaml",
             )
-        ):
+        )
+        if not existing and prepared:
             raise BootstrapError("Incomplete installation requires explicit recovery")
         resolved = config.model_dump(mode="json", exclude={"pg": {"database_url", "pg_dsn"}})
-        data = read_config(path) if existing else resolved
+        data = read_mapping(path) if existing else resolved
         if existing:
-            # Validate persisted fields, including credentials hidden by environment overrides.
+            # Source deployments can keep credentials and other required fields in
+            # the environment. Fill missing validation inputs only, without copying
+            # them into the saved document or masking an invalid persisted value.
+            validation = data if prepared else {
+                section: (
+                    {**values, **data[section]}
+                    if isinstance(data.get(section), dict)
+                    else data.get(section, values)
+                )
+                for section, values in resolved.items()
+            }
+            validate_config_data(validation)
             for section, model_field in Settings.model_fields.items():
                 if section not in data:
                     continue
                 if section == "ocr":
                     validate_saved_ocr_config(data[section], effective_enabled=config.ocr.enabled)
                 else:
-                    TypeAdapter(model_field.annotation).validate_python(data[section])
+                    TypeAdapter(model_field.annotation).validate_python(validation[section])
             if changed_paths is None:
                 merge(data, resolved)
             else:
@@ -400,5 +420,12 @@ def runtime_restart_required(config: Settings) -> bool:
 
 # Required fields (llm, pg and auth) are populated from YAML, dotenv files, or
 # environment variables. The first start writes the resolved values to YAML.
-settings = Settings()  # type: ignore[call-arg]
+try:
+    settings = Settings()  # type: ignore[call-arg]
+except SettingsError as exc:
+    # The source diagnostic names the field and source. Its parser cause may
+    # include the raw configuration, including sibling secrets.
+    raise RuntimeError(str(exc)) from None
+except (OSError, yaml.YAMLError):
+    raise RuntimeError("Could not read application YAML config") from None
 initialize_config_file(settings)

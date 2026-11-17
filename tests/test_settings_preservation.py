@@ -316,3 +316,38 @@ def test_settings_save_preserves_partial_ocr_with_canonical_runtime_endpoint(
         assert yaml.safe_load(path.read_text()) == original
     else:
         assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("persisted", "prepared", "status"),
+    [
+        ({"temperature": 0.3, "metadata": {"retain": True}}, False, 200),
+        ({"temperature": 0.3, "host": ["invalid"]}, False, 503),
+        ({"temperature": 0.3, "api_key": 42}, False, 503),
+        ({"temperature": 0.3}, True, 503),
+    ],
+)
+def test_edits_sparse_runtime_config_without_saving_environment_credentials(
+    saved_settings, monkeypatch, persisted, prepared, status
+):
+    path, _, settings, client = saved_settings
+    original = {"llm": persisted, "extension": {"keep": "private metadata"}}
+    path.write_text(yaml.safe_dump(original))
+    before = path.read_bytes()
+    for field in ("provider", "host", "model_name", "api_key"):
+        monkeypatch.setenv(f"LLM__{field.upper()}", str(settings.llm.model_dump(mode="json")[field]))
+    monkeypatch.setenv("PG__PASSWORD", settings.pg.password)
+    monkeypatch.setenv("AUTH__SECRET_KEY", settings.auth.secret_key)
+    if prepared:
+        (path.parent / ".bootstrap-complete.yaml").write_text("existing: true")
+
+    response = client.put("/system/settings", json=payload(settings, temperature=0.61))
+
+    assert response.status_code == status
+    if status == 200:
+        original["llm"]["temperature"] = 0.61
+        assert yaml.safe_load(path.read_text()) == original
+        assert response.json()["sources"]["llm.host"] == "environment"
+        assert response.json()["sources"]["llm.temperature"] == "config"
+    else:
+        assert path.read_bytes() == before
