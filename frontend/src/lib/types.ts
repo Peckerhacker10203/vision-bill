@@ -566,6 +566,22 @@ export interface BenchmarkRun {
 	experiment?: Record<string, unknown> | null;
 }
 
+export interface BenchmarkSummary {
+	model_id: string;
+	model_digest: string | null;
+	completed: number;
+	succeeded: number;
+	failed: number;
+	average_score: number | null;
+	all_case_average_score: number | null;
+	full_receipt_correct_rate: number | null;
+	average_confidence: number | null;
+	average_attempts: number | null;
+	average_latency_ms: number | null;
+	council_candidates: number;
+	council_findings: number;
+}
+
 export interface BenchmarkStatus {
 	run: BenchmarkRun;
 	queued: number;
@@ -573,14 +589,5 @@ export interface BenchmarkStatus {
 	retrying: number;
 	waiting_for_model: number;
 	terminal: number;
-	summaries: {
-		model_id: string;
-		model_digest: string | null;
-		succeeded: number;
-		failed: number;
-		average_score: number | null;
-		average_confidence: number | null;
-		average_latency_ms: number | null;
-		council_findings: number;
-	}[];
+	summaries: BenchmarkSummary[];
 }

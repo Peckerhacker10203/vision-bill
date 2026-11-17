@@ -1,3 +1,5 @@
+import type { ClassificationEnrichment } from '$lib/types';
+
 export type ExperimentSettings = {
 	pipeline: 'upload' | 'direct_vision' | 'ocr';
 	temperature: number | undefined;
@@ -22,7 +24,7 @@ export function experimentRequest(settings: ExperimentSettings) {
 	};
 }
 
-export type IndividualResult = {
+type IndividualResultBase = {
 	model_id: string;
 	receipt_id: string;
 	success: boolean;
@@ -30,7 +32,30 @@ export type IndividualResult = {
 	scores?: Record<string, number | null>;
 	rows?: { missing: number; extra: number; matched: number };
 	differences?: { path: string; expected: unknown; actual: unknown; equivalent: boolean }[];
-	metadata?: Record<string, unknown>;
+	metadata?: Record<string, unknown> & {
+		classification_enrichment?: ClassificationEnrichment;
+	};
 	expected?: unknown;
 	actual?: unknown;
 };
+
+export type IndividualResult = IndividualResultBase &
+	(
+		| { version?: '3' }
+		| {
+				version: '4';
+				legacy_detail_version: '3';
+				scored_fields: string[];
+				extraction_failed: boolean;
+				full_receipt_correct: boolean;
+				item_tp: number;
+				item_fp: number;
+				item_fn: number;
+				item_matches: [number, number][];
+				precision: number;
+				recall: number;
+				exact_item_count: boolean;
+				exact_item_order: boolean;
+				exact_amounts: boolean;
+		  }
+	);

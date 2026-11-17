@@ -7,6 +7,7 @@
 	import { captureSessionActor, isCurrentSessionActor } from '$lib/session-lifetime';
 	import type { BenchmarkRun, BenchmarkStatus } from '$lib/types';
 	import BenchmarkResultDetails from '$lib/ui/BenchmarkResultDetails.svelte';
+	import { t } from '$lib/i18n';
 	import type { IndividualResult } from '$lib/benchmark-experiments';
 
 	const actor = captureSessionActor();
@@ -174,30 +175,57 @@
 			</div>
 			<div class="mt-6 overflow-x-auto rounded-xl border border-outline-variant">
 				<table class="w-full text-left text-sm">
-					<thead class="bg-surface-container text-xs text-on-surface-variant"
-						><tr
-							><th class="p-3">Model</th><th class="p-3">Correctness</th><th class="p-3"
-								>Confidence</th
-							><th class="p-3">Latency</th><th class="p-3">Success / failed</th><th class="p-3"
-								>Council</th
-							></tr
-						></thead
-					><tbody
-						>{#each result.summaries as summary (summary.model_id)}<tr
-								class="border-t border-outline-variant"
-								><td class="p-3 font-medium"
-									>{summary.model_id}<br /><span class="text-xs text-on-surface-variant"
-										>{summary.model_digest ?? '—'}</span
-									></td
-								><td class="p-3"
-									>{fmt(summary.average_score === null ? null : summary.average_score * 100)}%</td
-								><td class="p-3">{fmt(summary.average_confidence)}%</td><td class="p-3"
-									>{fmt(summary.average_latency_ms, 0)} ms</td
-								><td class="p-3">{summary.succeeded} / {summary.failed}</td><td class="p-3"
-									>{summary.council_findings} findings</td
-								></tr
-							>{/each}</tbody
-					>
+					<thead class="bg-surface-container text-xs text-on-surface-variant">
+						<tr>
+							<th scope="col" class="p-3">{$t('benchmarkResults.model')}</th>
+							<th scope="col" class="p-3">{$t('benchmarkResults.fullyCorrectReceipts')}</th>
+							<th scope="col" class="p-3">{$t('benchmarkResults.allCaseScore')}</th>
+							<th scope="col" class="p-3">{$t('benchmarkResults.successOnlyScore')}</th>
+							<th scope="col" class="p-3">{$t('benchmarkResults.confidence')}</th>
+							<th scope="col" class="p-3">{$t('benchmarkResults.latency')}</th>
+							<th scope="col" class="p-3">{$t('benchmarkResults.successFailed')}</th>
+							<th scope="col" class="p-3">{$t('benchmarkResults.council')}</th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each result.summaries as summary (summary.model_id)}
+							<tr class="border-t border-outline-variant">
+								<td class="p-3 font-medium">
+									{summary.model_id}<br />
+									<span class="text-xs text-on-surface-variant">{summary.model_digest ?? '—'}</span>
+								</td>
+								<td class="p-3">
+									{@render rate(
+										summary.full_receipt_correct_rate,
+										summary.completed,
+										'completedCases'
+									)}
+								</td>
+								<td class="p-3">
+									{@render rate(
+										summary.all_case_average_score,
+										summary.completed,
+										'completedCases'
+									)}
+								</td>
+								<td class="p-3">
+									{@render rate(summary.average_score, summary.succeeded, 'successfulCases')}
+								</td>
+								<td class="p-3">
+									{summary.average_confidence == null ? '—' : `${fmt(summary.average_confidence)}%`}
+								</td>
+								<td class="p-3">
+									{summary.average_latency_ms == null
+										? '—'
+										: `${fmt(summary.average_latency_ms, 0)} ms`}
+								</td>
+								<td class="p-3">{summary.succeeded} / {summary.failed}</td>
+								<td class="p-3">
+									{$t('benchmarkResults.findings', { values: { count: summary.council_findings } })}
+								</td>
+							</tr>
+						{/each}
+					</tbody>
 				</table>
 			</div>
 			{#if result.run.experiment}
@@ -223,3 +251,18 @@
 		{/if}
 	{/if}
 </section>
+
+{#snippet rate(
+	value: number | null,
+	count: number,
+	denominator: 'completedCases' | 'successfulCases'
+)}
+	{#if value == null}
+		{$t('benchmarkResults.unavailable')}
+	{:else}
+		{(value * 100).toFixed(2)}%
+		<span class="block text-xs text-on-surface-variant">
+			{$t(`benchmarkResults.${denominator}`, { values: { count } })}
+		</span>
+	{/if}
+{/snippet}
