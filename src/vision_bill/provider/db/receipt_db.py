@@ -778,6 +778,22 @@ class ReceiptDB:
         )
 
     @staticmethod
+    async def _visible_collection_ids(
+        conn: asyncpg.Connection, receipt_id: UUID, user_id: UUID | None, can_see_all: bool,
+    ) -> list[UUID]:
+        if can_see_all or user_id is None:
+            rows = await conn.fetch(LIST_COLLECTION_IDS_FOR_RECEIPT_SQL, receipt_id)
+        else:
+            rows = await conn.fetch(
+                "SELECT rc.collection_id FROM receipt_collections rc "
+                "JOIN collections c ON c.id=rc.collection_id "
+                "WHERE rc.receipt_id=$1 AND c.user_id=$2",
+                receipt_id,
+                user_id,
+            )
+        return [row["collection_id"] for row in rows]
+
+    @staticmethod
     async def _set_collections(
         conn: asyncpg.Connection,
         receipt_id: UUID,
@@ -794,7 +810,15 @@ class ReceiptDB:
         )
         if {row["id"] for row in rows} != targets:
             raise ValueError("collection_not_found")
-        await conn.execute("DELETE FROM receipt_collections WHERE receipt_id=$1", receipt_id)
+        if can_see_all or user_id is None:
+            await conn.execute("DELETE FROM receipt_collections WHERE receipt_id=$1", receipt_id)
+        else:
+            await conn.execute(
+                "DELETE FROM receipt_collections rc USING collections c "
+                "WHERE rc.receipt_id=$1 AND rc.collection_id=c.id AND c.user_id=$2",
+                receipt_id,
+                user_id,
+            )
         for target in sorted(targets):
             await conn.execute(
                 "INSERT INTO receipt_collections(receipt_id,collection_id) VALUES($1,$2)",
@@ -1349,12 +1373,11 @@ class ReceiptDB:
                 return None
             li_rows = await conn.fetch(LIST_LINE_ITEMS_SQL, receipt_id)
             tax_rows = await conn.fetch(LIST_TAXES_SQL, receipt_id)
-            coll_rows = await conn.fetch(LIST_COLLECTION_IDS_FOR_RECEIPT_SQL, receipt_id)
+            collection_ids = await self._visible_collection_ids(conn, receipt_id, user_id, can_see_all)
 
         d = dict(row)
         image_path: str | None = d.get("image_path")
         receipt = self._receipt_row_from_record(row)
-        collection_ids = [r["collection_id"] for r in coll_rows]
         raw_enrichment = d.get("classification_enrichment")
         if isinstance(raw_enrichment, str):
             raw_enrichment = json.loads(raw_enrichment)

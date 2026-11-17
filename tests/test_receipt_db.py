@@ -827,3 +827,22 @@ async def test_explicit_unknown_removes_both_confirmed_aliases(db: ReceiptDB) ->
     assert inserted.args[9:11] == ("unknown", "user")
     deletes = [c for c in conn.execute.call_args_list if c.args[0] == DELETE_CATEGORY_ALIAS_SQL]
     assert {c.args[3] for c in deletes} == {"h-milch 1,5%", "milk"}
+
+
+@pytest.mark.asyncio
+async def test_details_and_replacement_only_access_visible_collection_links(db: ReceiptDB) -> None:
+    owner, target = OTHER_RECEIPT_ID, IMAGE_ID
+    conn = AsyncMock()
+    conn.fetchrow = AsyncMock(return_value=_receipt_row())
+    db._pool = _make_pool(conn)
+    conn.fetch.side_effect = [[], [], [{"collection_id": target}], [{"id": target}]]
+    detail = await db.get_receipt_with_details(RECEIPT_ID, user_id=owner)
+    assert detail is not None and detail.collection_ids == [target]
+    read_sql, *read_args = conn.fetch.await_args.args
+    assert "JOIN collections" in read_sql and "c.user_id" in read_sql
+    assert read_args == [RECEIPT_ID, owner]
+
+    await db._set_collections(conn, RECEIPT_ID, [target], owner, False)
+    delete_sql, *delete_args = conn.execute.await_args_list[0].args
+    assert "USING collections" in delete_sql and "c.user_id" in delete_sql
+    assert delete_args == [RECEIPT_ID, owner]

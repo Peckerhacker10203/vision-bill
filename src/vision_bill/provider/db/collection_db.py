@@ -336,10 +336,9 @@ class CollectionDB:
             await conn.execute(MEMBERSHIP_LOCK_SQL)
             if await ReceiptDB._lock_review_receipt(conn, receipt_id, user_id, can_see_all) is None:
                 raise ValueError("receipt_not_found")
-            current = {
-                row["collection_id"]
-                for row in await conn.fetch(LIST_COLLECTION_IDS_FOR_RECEIPT_SQL, receipt_id)
-            }
+            current = set(await ReceiptDB._visible_collection_ids(
+                conn, receipt_id, user_id, can_see_all
+            ))
             if current == set(collection_ids):
                 return
             await ReceiptDB._set_collections(conn, receipt_id, collection_ids, user_id, can_see_all)

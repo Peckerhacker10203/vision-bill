@@ -1187,3 +1187,55 @@ async def test_bypass_rereview_requires_cas_and_rechecks_known_original(workflow
     assert await w._receipts.get_statistics(user_id=scope.user_id) == stats
     async with w.pool.acquire() as conn:
         assert await conn.fetchval("SELECT count(*) FROM receipt_review_revisions") == 1
+
+
+async def test_receipt_editor_replaces_only_visible_memberships(workflow_db, tmp_path):
+    from vision_bill.provider.db.collection_db import CollectionDB
+
+    w, scope = workflow_db
+    row, body, _ = await seed(w, scope, tmp_path)
+    collections = CollectionDB(w.pool)
+    async with w.pool.acquire() as conn:
+        other_owner = await conn.fetchval(
+            "INSERT INTO users(username,hashed_password) VALUES($1,'fixture') RETURNING id",
+            str(uuid4()),
+        )
+
+    owner = scope.user_id
+    own = await collections.create(owner, "Own", None, None, None)
+    replacement = await collections.create(owner, "Replacement", None, None, None)
+    foreign = await collections.create(other_owner, "Foreign", None, None, None)
+    await collections.assign(own.id, row.id, user_id=owner)
+    await collections.assign(foreign.id, row.id, user_id=other_owner, can_see_all=True)
+
+    async def detail(actor=owner, see_all=False):
+        return await w._receipts.get_receipt_with_details(row.id, user_id=actor, can_see_all=see_all)
+
+    displayed = await detail()
+    assert displayed.collection_ids == [own.id]
+    assert set((await detail(other_owner, True)).collection_ids) == {own.id, foreign.id}
+
+    body.merchant_name = "An ordinary correction"
+    body.expected_operation_revision = displayed.receipt.operation_revision
+    body.collection_ids = list(displayed.collection_ids)
+    saved = await w._receipts.update_receipt(row.id, body, user_id=owner)
+    assert saved.merchant_name == body.merchant_name
+    assert set((await detail(other_owner, True)).collection_ids) == {own.id, foreign.id}
+
+    body.expected_operation_revision = saved.operation_revision
+    body.collection_ids = [replacement.id]
+    await w._receipts.update_receipt(row.id, body, user_id=owner)
+    assert (await detail()).collection_ids == [replacement.id]
+    full = await detail(other_owner, True)
+    assert set(full.collection_ids) == {replacement.id, foreign.id}
+
+    # The collection provider's shared bulk operation also leaves hidden links alone.
+    await collections.set_receipt_collections(row.id, [], user_id=owner)
+    assert (await detail()).collection_ids == []
+    full = await detail(other_owner, True)
+    assert full.collection_ids == [foreign.id]
+
+    body.expected_operation_revision = full.receipt.operation_revision
+    body.collection_ids = [own.id]
+    await w._receipts.update_receipt(row.id, body, user_id=other_owner, can_see_all=True)
+    assert (await detail(other_owner, True)).collection_ids == [own.id]
