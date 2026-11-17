@@ -30,6 +30,13 @@ def _expected_actor(request: Request) -> UUID | None:
     return next(iter(actors), None)
 
 
+def validate_expected_actor(request: Request, user_id: UUID | None) -> None:
+    """Check browser actor intent against any authenticated cookie actor."""
+    expected = _expected_actor(request)
+    if expected is not None and user_id is not None and expected != user_id:
+        raise HTTPException(status_code=409, detail="session_actor_changed")
+
+
 async def get_current_user(request: Request) -> User:
     """Resolve the authenticated user from the session cookie.
 
@@ -61,9 +68,7 @@ async def get_current_user(request: Request) -> User:
     if user is None:
         raise _UNAUTHENTICATED
 
-    expected = _expected_actor(request)
-    if expected is not None and expected != user.id:
-        raise HTTPException(status_code=409, detail="session_actor_changed")
+    validate_expected_actor(request, user.id)
 
     user.can_see_all = user.is_admin and settings.auth.admin_can_see_all
     return user

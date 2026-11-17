@@ -7,6 +7,7 @@ import { queryClient } from '$lib/query/client';
 import { snackbar } from '$lib/ui/snackbar.svelte';
 import {
 	advanceSessionGeneration,
+	captureSessionActor,
 	currentSessionGeneration,
 	requireSessionGeneration,
 	session,
@@ -48,12 +49,16 @@ async function changeCookie<T>(generation: number, operation: () => Promise<T>):
 	pendingCookieWrites++;
 	try {
 		return await authRequest(generation, async () => {
-			try {
-				return await operation();
-			} finally {
-				// An obsolete local response can still carry an applied Set-Cookie.
-				channel?.postMessage('cookie-may-have-changed');
-			}
+			const write = async () => {
+				requireSessionGeneration(generation);
+				try {
+					return await operation();
+				} finally {
+					// An obsolete local response can still carry an applied Set-Cookie.
+					channel?.postMessage('cookie-may-have-changed');
+				}
+			};
+			return navigator.locks ? navigator.locks.request('vision-bill-auth-cookie', write) : write();
 		});
 	} finally {
 		pendingCookieWrites--;
@@ -96,11 +101,20 @@ export async function signUp(username: string, password: string): Promise<User> 
 A failing logout endpoint (e.g. offline) must not block sign-out: the local
 session is cleared regardless and the caller redirects to the login page. */
 export async function signOut(): Promise<void> {
+	const actor = captureSessionActor();
 	const generation = beginSession();
+	if (!actor) return;
 	try {
-		await changeCookie(generation, () => api.logout());
-	} catch {
-		// Ignore: clearing the local session is what actually signs the user out.
+		await changeCookie(generation, () => api.logout(actor.userId));
+	} catch (error) {
+		if (
+			generation === currentSessionGeneration() &&
+			error instanceof ApiError &&
+			error.status === 409 &&
+			error.detail === 'session_actor_changed'
+		) {
+			await initSession();
+		}
 	}
 }
 

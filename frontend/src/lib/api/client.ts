@@ -345,8 +345,11 @@ export const api = {
 	},
 
 	/** POST /auth/logout clears the session cookie. */
-	logout(): Promise<void> {
-		return request<void>('/auth/logout', { method: 'POST' });
+	logout(expectedUserId: string): Promise<void> {
+		return request<void>('/auth/logout', {
+			method: 'POST',
+			headers: { 'X-Vision-Bill-Expected-User': expectedUserId }
+		});
 	},
 
 	listImages(filters: ImageListFilters = {}): Promise<ImageRow[]> {

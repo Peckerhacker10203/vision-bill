@@ -318,3 +318,33 @@ def test_invalid_or_stale_media_actor_is_rejected_before_image_lookup(
     if status == 409:
         assert response.json() == {"detail": "session_actor_changed"}
     lookup.assert_not_awaited()
+
+
+def test_stale_browser_logout_cannot_clear_the_successor_cookie(
+    auth_context: AuthContext, settings: Settings
+) -> None:
+    successor = UUID("00000000-0000-4000-8000-000000000002")
+    token = create_token(successor, settings.auth.session_max_age_seconds, settings.auth.secret_key)
+    auth_context.client.cookies.set(settings.auth.session_cookie_name, token)
+    response = auth_context.client.post(
+        f"{AUTH_URL}/logout", headers={"X-Vision-Bill-Expected-User": str(USER_ID)}
+    )
+    assert response.status_code == 409
+    assert response.json() == {"detail": "session_actor_changed"}
+    assert "set-cookie" not in response.headers
+    assert auth_context.client.cookies.get(settings.auth.session_cookie_name) == token
+
+
+@pytest.mark.parametrize("max_age", [300, -300])
+def test_expected_actor_logout_clears_matching_or_expired_cookie(
+    auth_context: AuthContext, settings: Settings, max_age: int
+) -> None:
+    token = create_token(USER_ID, max_age, settings.auth.secret_key)
+    auth_context.client.cookies.set(
+        settings.auth.session_cookie_name, token, domain="testserver.local", path="/"
+    )
+    response = auth_context.client.post(
+        f"{AUTH_URL}/logout", headers={"X-Vision-Bill-Expected-User": str(USER_ID)}
+    )
+    assert response.status_code == 200
+    assert settings.auth.session_cookie_name not in auth_context.client.cookies

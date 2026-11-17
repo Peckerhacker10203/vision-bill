@@ -115,6 +115,7 @@ it('protected 401 disposes cached private data before redirect', async () => {
 it.each(['login', 'signup', 'logout'] as const)(
 	'orders the %s cookie write before successor login',
 	async (kind) => {
+		session.set(alice);
 		let serverPrincipal: string | null = 'alice';
 		const firstResponse = deferred<Response>();
 		const calls: string[] = [];
@@ -217,5 +218,22 @@ it('ignores a delayed actor mismatch body once a successor signs in', async () =
 	late.resolve({ detail: 'session_actor_changed' });
 	expect((await old).name).toBe('AbortError');
 	expect(me).not.toHaveBeenCalled();
+	expect(get(session)).toEqual(bob);
+});
+
+it('binds logout to the rendered actor and revalidates without clearing a successor session', async () => {
+	vi.spyOn(api, 'login').mockResolvedValue(alice);
+	await signIn('alice', 'x');
+	const sent = vi.fn((url: string) =>
+		Promise.resolve(
+			url.endsWith('/logout') ? response({ detail: 'session_actor_changed' }, 409) : response(bob)
+		)
+	);
+	vi.stubGlobal('fetch', sent);
+	await signOut();
+	expect(
+		new Headers(vi.mocked(fetch).mock.calls[0][1]?.headers).get('X-Vision-Bill-Expected-User')
+	).toBe(alice.id);
+	expect(sent.mock.calls.map(([url]) => url.split('/').at(-1))).toEqual(['logout', 'me']);
 	expect(get(session)).toEqual(bob);
 });
