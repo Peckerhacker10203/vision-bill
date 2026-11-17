@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -338,6 +339,86 @@ async def test_delete_unlink_failure_retains_owner_scoped_retry_manifest(workflo
     assert not any(path.exists() for path in paths)
     async with w.pool.acquire() as conn:
         assert await conn.fetchval('SELECT count(*) FROM resource_deletions')==0
+
+
+@pytest.mark.parametrize("failure", ["open", "fsync"])
+async def test_owned_deletion_sync_failure_retains_manifest_until_durable_retry(
+    workflow_db, settings, tmp_path, monkeypatch, failure
+):
+    w, scope = workflow_db
+    image, originals, _, _, service = await setup(w, scope, settings, tmp_path)
+    result = await service.process_claim(await w.claim_next())
+    assert result.receipt is not None
+    thumbnails = [service.images.generate_thumbnail(path) for path in originals]
+    assert all(path is not None for path in thumbnails)
+    async with w.pool.acquire() as conn:
+        working = [
+            Path(row["artifact_path"]) for row in await conn.fetch(
+                "SELECT artifact_path FROM extraction_working_views WHERE image_id=$1", image.id
+            )
+        ]
+    assert working
+    owned = [*originals, *thumbnails, *working]
+    parents = {path.parent for path in owned}
+    assert len(parents) == 3
+    foreign = tmp_path / "foreign" / "foreign.png"
+    foreign.parent.mkdir()
+    foreign.write_bytes(b"foreign")
+
+    events = []
+    real_fsync = os.fsync
+    real_open = os.open
+    real_execute = asyncpg.Connection.execute
+
+    def fail_directory_open(path, flags, *args, **kwargs):
+        if flags & os.O_DIRECTORY and Path(path) in parents:
+            raise OSError("directory open failed")
+        return real_open(path, flags, *args, **kwargs)
+
+    def fail_fsync(_fd):
+        raise OSError("directory fsync failed")
+
+    def record_fsync(fd):
+        assert not any(path.exists() for path in owned)
+        real_fsync(fd)
+        events.append(("fsync_parent", os.fstat(fd).st_ino))
+
+    async def execute(conn, query, *args, **kwargs):
+        if query.startswith("DELETE FROM resource_deletions"):
+            events.append(("delete_cleanup_manifest", None))
+        return await real_execute(conn, query, *args, **kwargs)
+
+    async def delete():
+        return await service.receipts.delete_resource(
+            result.receipt.id, receipt=True, scope=scope, images=service.images
+        )
+
+    monkeypatch.setattr(asyncpg.Connection, "execute", execute)
+    with monkeypatch.context() as failing:
+        if failure == "open":
+            failing.setattr(os, "open", fail_directory_open)
+        else:
+            failing.setattr(os, "fsync", fail_fsync)
+        with pytest.raises(OSError, match=f"directory {failure} failed"):
+            await delete()
+
+    assert events == []
+    assert not any(path.exists() for path in owned)
+    assert foreign.read_bytes() == b"foreign"
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM resource_deletions") == 1
+        assert await conn.fetchval("SELECT count(*) FROM images") == 0
+        assert await conn.fetchval("SELECT count(*) FROM receipts") == 0
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    assert await delete()
+    assert sorted(events[:-1]) == sorted(
+        ("fsync_parent", path.stat().st_ino) for path in parents
+    )
+    assert events[-1] == ("delete_cleanup_manifest", None)
+    assert foreign.read_bytes() == b"foreign"
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM resource_deletions") == 0
 
 
 async def test_provider_wait_visible_and_stale_probe_cannot_touch_claim(workflow_db,settings,tmp_path):

@@ -1,3 +1,4 @@
+import os
 from collections.abc import Generator
 from io import BytesIO
 from pathlib import Path
@@ -240,19 +241,38 @@ def test_store_original_keeps_actual_bytes_hash_order_and_immutable_path(image_s
     assert list(target.parent.iterdir()) == [target]
 
 
-def test_deleted_original_retry_removes_owned_thumbnail_after_original_is_missing(image_service, tmp_path):
+def test_deleted_original_retry_syncs_distinct_existing_parents(image_service, tmp_path, monkeypatch):
     from vision_bill.model.db.image import ImagePart
     from vision_bill.model.workflow import DeletedResource
-    original = tmp_path / 'original.png'
-    original.write_bytes(b'original')
-    thumbnail = image_service._thumb_for(original)
+
+    monkeypatch.chdir(tmp_path)
+    originals = [Path("originals/original.png"), tmp_path / "originals/second.png"]
+    originals[0].parent.mkdir()
+    for original in originals:
+        original.write_bytes(b"original")
+    thumbnail = image_service._thumb_for(originals[0])
     thumbnail.parent.mkdir()
-    thumbnail.write_bytes(b'thumbnail')
-    deleted = DeletedResource(parts=[ImagePart(image_path=str(original), thumbnail_path=str(thumbnail))])
+    thumbnail.write_bytes(b"thumbnail")
+    absent = tmp_path / "absent" / "original.png"
+    deleted = DeletedResource(parts=[
+        ImagePart(image_path=str(original)) for original in [*originals, absent]
+    ])
     image_service.validate_deleted_files(deleted, initial=True)
-    original.unlink()  # The first attempt removed it before an unlink failure.
+    originals[0].unlink()  # The first attempt removed it before an unlink failure.
+    synced = []
+    real_fsync = os.fsync
+
+    def track_fsync(fd):
+        synced.append(os.fstat(fd).st_ino)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", track_fsync)
     image_service.remove_deleted_files(deleted)
-    assert not thumbnail.exists()
+
+    assert not any(path.exists() for path in [*originals, thumbnail, absent])
+    assert sorted(synced) == sorted([
+        originals[0].parent.stat().st_ino, thumbnail.parent.stat().st_ino
+    ])
 
 
 @pytest.mark.parametrize('mode', ['RGBA', 'LA', 'P'])

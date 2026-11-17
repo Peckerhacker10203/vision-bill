@@ -7,6 +7,7 @@ import shutil
 import stat
 import tempfile
 import uuid
+from collections.abc import Sequence
 from hashlib import sha256
 from pathlib import Path
 from uuid import UUID
@@ -385,13 +386,30 @@ class ImageService:
     def remove_deleted_files(self, deleted: DeletedResource) -> None:
         """Only a confirmed committed deletion authorizes unlink; failures retain metadata."""
         self.validate_deleted_files(deleted)
+        paths = []
         for view in deleted.working_views:
             assert deleted.image_id is not None
             self.remove_unreferenced_working_image(deleted.image_id, view.artifact_path, view.metadata)
-        for part in deleted.parts:
-            Path(part.image_path).unlink(missing_ok=True)
-        for name in deleted.thumbnail_sha256:
-            Path(name).unlink(missing_ok=True)
+            paths.append(Path(view.artifact_path))
+        for name in [*(part.image_path for part in deleted.parts), *deleted.thumbnail_sha256]:
+            path = Path(name)
+            path.unlink(missing_ok=True)
+            paths.append(path)
+        self._sync_deleted_parents(paths)
+
+    @staticmethod
+    def _sync_deleted_parents(paths: Sequence[Path]) -> None:
+        # A prior attempt may have unlinked these files before syncing the directory entries.
+        for parent in dict.fromkeys(path.absolute().parent for path in paths):
+            try:
+                parent.lstat()
+            except FileNotFoundError:
+                continue
+            fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
 
     def remove_unreferenced_working_image(
         self,
