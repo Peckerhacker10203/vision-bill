@@ -31,7 +31,9 @@ def test_experiment_provider_settings_do_not_mutate_live_provider():
 
 
 async def test_standalone_qualifies_with_production_llamacpp_binding(settings, tmp_path, monkeypatch):
+    import tempfile
     from argparse import Namespace
+    from pathlib import Path
     from time import monotonic
 
     from scripts import standalone_benchmark as script
@@ -63,7 +65,20 @@ async def test_standalone_qualifies_with_production_llamacpp_binding(settings, t
     monkeypatch.setenv("LLM__HOST", llm_settings.host)
     monkeypatch.setenv("LLM__MODEL_NAME", llm_settings.model_name)
     monkeypatch.setenv("OCR__SERVICE_URL", ocr_settings.service_url)
-    monkeypatch.setattr(script, "ImageSettings", lambda: settings.images)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    real_mkdir = Path.mkdir
+    image_dirs = set()
+
+    def host_mkdir(path, *args, **kwargs):
+        if path.is_relative_to("/app"):
+            raise PermissionError(f"Host CLI cannot write to {path}")
+        real_mkdir(path, *args, **kwargs)
+        if path.is_relative_to(scratch):
+            image_dirs.add(path)
+
+    monkeypatch.setattr(Path, "mkdir", host_mkdir)
 
     monkeypatch.setattr(OpenAIProvider, "get_available_models", AsyncMock(
         return_value=[ModelInfo("selected"), ModelInfo("unadopted")],
@@ -93,6 +108,12 @@ async def test_standalone_qualifies_with_production_llamacpp_binding(settings, t
         identity = await script.execution_identity(
             cli_llm, cli_ocr, settings.pg, cli_ocr_settings, cli_settings.model_name, qualify=True,
         )
+        assert image_dirs and not list(scratch.iterdir())
+        with pytest.raises(ValueError, match="formatter_model_unavailable"):
+            await script.execution_identity(
+                cli_llm, cli_ocr, settings.pg, cli_ocr_settings, "missing-model", qualify=True,
+            )
+        assert list(scratch.iterdir()) == []
     finally:
         await application_llm._client.close()
         await cli_llm._client.close()

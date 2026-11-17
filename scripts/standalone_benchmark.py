@@ -33,6 +33,7 @@ from datetime import UTC, datetime
 from datetime import time as Time
 from hashlib import sha256
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 from uuid import UUID
 
@@ -343,8 +344,6 @@ async def execute_photos(
     *,
     ocr_settings: OcrSettings | None = None,
 ) -> ExperimentResult:
-    from tempfile import TemporaryDirectory
-
     from vision_bill.model.experiment import ExperimentOptions, ExtractionPipeline
     from vision_bill.service.receipt_service import ReceiptService
 
@@ -372,23 +371,32 @@ async def execution_identity(
     from vision_bill.service.experiment_execution import pipeline_identity
     from vision_bill.service.receipt_service import ReceiptService
 
-    service = ReceiptService(ImageSettings(), pg, provider, ocr_provider=ocr, ocr_settings=settings)
-    options = ExperimentOptions(pipeline=ExtractionPipeline.OCR, include_classification=False)
-    model = next(
-        (m for m in await provider.get_available_models(capability="text") if m.id == model_id),
-        None,
-    )
-    if model is None:
-        raise ValueError("formatter_model_unavailable")
-    return {
-        "pipeline": await pipeline_identity(service, options, qualify=qualify, managed_model_ids=[model_id]),
-        "provider": type(provider).__name__,
-        "endpoint_fingerprint": endpoint_fingerprint(provider),
-        "requested_model": {"id": model.id, "digest": model.digest},
-        "validation_schema_sha256": sha256(
-            json.dumps(Receipt.model_json_schema(), sort_keys=True).encode()
-        ).hexdigest(),
-    }
+    with TemporaryDirectory(prefix="vision-bill-benchmark-") as directory:
+        service = ReceiptService(
+            ImageSettings(save_dir=directory, tmp_dir=directory),
+            pg,
+            provider,
+            ocr_provider=ocr,
+            ocr_settings=settings,
+        )
+        options = ExperimentOptions(pipeline=ExtractionPipeline.OCR, include_classification=False)
+        model = next(
+            (m for m in await provider.get_available_models(capability="text") if m.id == model_id),
+            None,
+        )
+        if model is None:
+            raise ValueError("formatter_model_unavailable")
+        return {
+            "pipeline": await pipeline_identity(
+                service, options, qualify=qualify, managed_model_ids=[model_id],
+            ),
+            "provider": type(provider).__name__,
+            "endpoint_fingerprint": endpoint_fingerprint(provider),
+            "requested_model": {"id": model.id, "digest": model.digest},
+            "validation_schema_sha256": sha256(
+                json.dumps(Receipt.model_json_schema(), sort_keys=True).encode()
+            ).hexdigest(),
+        }
 
 
 async def run_benchmark(args: argparse.Namespace) -> BenchmarkSummary:
