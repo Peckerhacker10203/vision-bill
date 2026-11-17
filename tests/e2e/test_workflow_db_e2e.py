@@ -433,7 +433,7 @@ async def test_policy_adoption_rechecks_extended_lease_under_row_lock(workflow_d
     image = await enqueue(w, scope)
     claim = await w.claim_next()
     assert await w.set_wait_reason(claim.image, "execution_policy_changed")
-    async with w.pool.acquire() as conn:
+    async with w.pool.acquire() as conn, w.pool.acquire() as observer:
         await conn.execute("UPDATE images SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", image.id)
         async with conn.transaction():
             await conn.fetchrow("SELECT id FROM images WHERE id=$1 FOR UPDATE", image.id)
@@ -441,9 +441,13 @@ async def test_policy_adoption_rechecks_extended_lease_under_row_lock(workflow_d
                 image.id, RetryRequest(expected_generation=1, request_key="race", policy="current"),
                 scope=scope, replacement_snapshot=current_snapshot(settings),
             ))
-            # Wait for PostgreSQL to observe the blocked retry, avoiding a timing-only race test.
+            # Observe the exact blocker from a separate session without a cached activity snapshot.
             for _ in range(100):
-                if await conn.fetchval("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE 'SELECT * FROM images WHERE id=%')"):
+                if await observer.fetchval(
+                    """SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                    WHERE datname=current_database() AND $1=ANY(pg_blocking_pids(pid)))""",
+                    conn.get_server_pid(),
+                ):
                     break
                 await asyncio.sleep(0.01)
             else:
