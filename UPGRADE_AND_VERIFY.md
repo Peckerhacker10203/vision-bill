@@ -1,16 +1,12 @@
 # Unreleased package: upgrade and verification
 
 This guide covers durable receipt processing, strict optional OCR, managed OCR/LLM
-handoff and independent prepared deployments. The verification table records the
-final software baseline with explicit component carry boundaries. See
-[backend setup, ownership and changes](OPENAI_COMPATIBLE.md). This is an operator
-procedure, not an executed deployment. The original PR14 optional OCR integration
-has been stabilized here;
-PR15's splitting experiments and historical results remain separate evidence.
-Those source imports are not described as remotely merged PRs. The colleague
-attachment supplied settings only; no colleague project logic was imported. The
-user separately enabled document orientation/unwarping and raised the per-region
-maximum to 2,000,000 pixels.
+handoff and prepared deployments with an external LLM. The verification table records
+the software baseline and component carry boundaries. See
+[backend setup, ownership and changes](OPENAI_COMPATIBLE.md). The original PR14 optional
+OCR integration informed this package. PR15's splitting experiments and
+historical results remain separate evidence. The native profile uses document
+orientation, unwarping and a 2,000,000-pixel per-region maximum.
 
 ## Resulting processing order
 
@@ -25,9 +21,11 @@ maximum to 2,000,000 pixels.
    complete receipt output require all ordered photos.
    Managed OCR first confirms release of owned LLMs and later confirms native OCR
    worker exit before any LLM formatting request.
-4. Format nullable printed observations with the configured LLM. Reconcile only
-   verified adjacent boundary overlaps; apply classification as enrichment after
-   extraction. Preserve missing data, repeated purchases and original descriptions.
+4. Format nullable printed observations with the selected LLM. Reconcile only
+   verified adjacent overlaps. Save complete observations before optional
+   classification, preserving original descriptions and printed amounts. When
+   labels cannot be obtained after safe settlement, keep the observations and show
+   the classification state. An uncertain request holds work for reconciliation.
 5. Save an immutable extraction and editable draft/receipt, evaluate source,
    overlap and financial checks, then require human correction/acknowledgement as
    necessary. Clean bypass can verify, but cannot qualify benchmark Gold.
@@ -47,6 +45,21 @@ identity seams, isolated build inputs and truthful script/comparator behavior.
 These are correctness changes, not measured OCR accuracy or speed improvements.
 
 ## Backup and upgrade order
+
+For a prepared upgrade, keep the old Compose project name and volume mounts.
+Use a schema-v2 bundle for the new installation. Changing the extraction directory
+does not require new volumes. Copy the private runtime file or use a private
+empty `runtime.env` if the saved configuration already specifies the intended
+endpoint. The app reuses credentials, settings, receipts and uploads on these
+volumes. The retired LLM model volume is separate and stays operator-managed.
+
+If a saved configuration points to a removed bundled Ollama hostname, the app
+retains that selection. Pending work waits until you deliberately configure a
+reachable endpoint and installed model or restore the old reachable service.
+Reconcile owned work on the old endpoint before changing identities, then adopt
+the current endpoint and policy for eligible unfinished jobs as needed.
+See [prepared cutover](distribution/README.md#stop-cut-over-and-recover) and
+[managed endpoint setup](OPENAI_COMPATIBLE.md#adopt-the-managed-pair).
 
 Keep the existing app image/source identity, configuration, auth secret/pepper,
 PostgreSQL roles and ownership, original uploads (including legacy temporary
@@ -127,7 +140,7 @@ Run from a prepared checkout/environment on a network that reaches the intended
 DB. Clear conflicting process/dotenv settings and use a private
 `VISION_BILL_CONFIG_PATH` as appropriate: process env > dotenv > YAML precedence
 still applies. No DSN/password needs to appear in public commands or shell history.
-The resulting head is **0019**. Before starting uvicorn with runtime credentials,
+The resulting head is **0020**. Before starting uvicorn with runtime credentials,
 complete owner migration and grants. The current image still executes Alembic at
 startup using the runtime `PG__*` identity; it can only check an already-current
 schema, not apply pending owner DDL. Future upgrades must repeat the owner step.
@@ -135,16 +148,17 @@ Do not temporarily leave the app serving as the owner to simplify migration.
 
 ### Fresh and legacy mapping
 
-Fresh installations apply 0001 through 0019. Existing supported 0010 installations
-apply additive workflow/review/reference/claim/deletion migrations 0011–0019.
+Fresh installations apply 0001 through 0020. Existing supported 0010 installations
+apply additive workflow, review, reference, claim, deletion and observation
+checkpoint migrations 0011–0020.
 Migration 0011 preserves linked receipts, verified flags, amounts and historical
 paths and marks their submissions analyzed; they are not re-OCRed. Receipt-free
 legacy failed/processing images become pending with attempt_count 0/max_attempts
 3, retaining prior status/error/processing history in `legacy_events`. Historical
 benchmark attempt counts that cannot be known are not invented by migration 0017.
 0014 retains exact Decimal/NUMERIC values; 0018 supplies durable owned deletion
-cleanup; 0019 retains retry policy choice for replay-safe explicit policy adoption.
-Earlier existing migrations remain in the chain.
+cleanup. Migration 0019 keeps retry policy choice for replay-safe explicit adoption.
+Migration 0020 adds durable observation checkpoints for completion-only recovery.
 
 After head/grants, start only the compatible new application. Verify login and
 owner/admin scope, polling of a new synthetic upload, a preserved old receipt and
@@ -179,6 +193,34 @@ are not. Cleanup metadata remains until all owned cleanup succeeds. This is not 
 general background sweeper. Active or still-referenced resources return conflicts;
 benchmark references can prevent receipt deletion. Do not manually remove arbitrary
 paths or assume every failed HTTP response means the DB deletion rolled back.
+
+### Recover from a complete observation checkpoint
+
+When the saved complete observation matches the source and execution state, a
+completion-only retry can publish the reviewed receipt after ownership is
+reconciled. This uses the existing generation and inference-attempt count.
+It makes no new OCR, formatter or classification request. A failed optional
+classification leaves usable observations and records the label outcome. A
+request whose delivery or settlement is uncertain keeps the checkpoint on hold.
+
+For an unmanaged classification hold, inspect and reconcile the exact submitted
+image using the configured endpoint identity. In a prepared bundle use the
+`app` service. Source Compose uses `vision_bill`.
+
+```bash
+image_id=your-image-uuid
+docker compose exec app python -m vision_bill.distribution.handoff \
+  reconcile-classification --image-id "$image_id"
+# After independently confirming the previous request has settled:
+docker compose exec app python -m vision_bill.distribution.handoff \
+  reconcile-classification --image-id "$image_id" \
+  --expected-generation "$generation" --checkpoint-id "$checkpoint_id" \
+  --request-settled
+```
+
+Use the exact generation and checkpoint ID from the status result. If a managed
+owner has an outstanding request, use the original endpoint and coordination
+storage for recovery. See [native ownership](paddleocr-service/README.md#internal-model-ownership).
 
 ## Review and financial contract
 
@@ -215,6 +257,11 @@ invalidate findings/revisions and require fresh human review. Bypass can auto-ve
 only with no current findings and identified originals; it is not human verification
 or Gold qualification. Verify updates DB/history and preserves file paths.
 
+The browser sends `X-Vision-Bill-Expected-User` on protected requests and
+`vb_expected_user` on private media links. A different authenticated account
+returns `409 session_actor_changed` before the affected operation. Intent
+checks complement normal session and owner authorization.
+
 ## Benchmarks and reproducibility
 
 Admin reference preview/qualification lives at
@@ -238,9 +285,9 @@ Changed model digests wait rather than silently drifting.
 Observed masks prevent absent reference observations from being treated as truth.
 
 V4 reports full-receipt correctness, occurrence-aware ordered item precision/recall,
-exact item count/order, exact amounts/taxes and failed-case denominators. Keep the
-separately named historical success-only average and v3 weighted score meaning;
-neither is a perfect-receipt rate. Frozen Gold is not a population accuracy claim.
+exact item count/order, exact amounts/taxes and failed-case denominators. The full-receipt correct rate and all-case average count completed failures in
+the denominator. The historical success-only average and v3 weighted score
+remain separate measures. Frozen Gold is not a population accuracy claim.
 The [standalone CLI](scripts/README.md) requires an explicit owner `--user-id` and
 uses a consistent read-only snapshot; it cannot benchmark all owners by omission.
 Historical CPU transcripts use a separate explicit adapter contract, never fake
@@ -248,28 +295,23 @@ native qualification/geometry. See the [harness guide](scripts/ocr_harness/READM
 
 ## Verification evidence
 
-The final code baseline is `0cae9678e4304257b2c5c46633b199d2cc8d7b4c`.
-Results below are local software evidence, not suites rerun for this prose change.
-Counts are per run and are not summed across repeated executions.
+The reviewed runtime source is `2ab3efe6a7ee765c0c2b61f89c4426e822eb397b`.
+These are local software results. Public CI for the published commit is separate.
+Repeated executions of the same case are not added to the counts below.
 
 | Gate | Observed result and exact boundary |
 | --- | --- |
-| Python/static | Fresh at `0cae967`: 1437 passed; 11 host PID1 skips; 346 deselected. Ruff clean; mypy 128 files. |
-| Prepared app | Fresh rebuilt/attested `0cae967` image passed the original generated-bundle installation smoke without an API-key override: initialization, schema 0019, real admin login, ordinary registration, private secret mounts and repeat-init preservation. Explicit CPU provider stub/local images were used. |
-| Backend E2E | Full 354 passed at `6f1d55f`; carried to `0cae967` only through an exact init-only change proof. |
-| Browser E2E | Full 98 passed at `6f1d55f` against its attested fresh image; same init-only carry to `0cae967`. |
-| Frontend | 31 Vitest files / 215 tests, Svelte 0 errors/warnings, lint/format, E2E types and production build at `b11755f`; exact unchanged-component carry through both later fixes. |
-| Release/distribution | 14 release tests, 19 distribution tests, three Compose configurations and 42 actual container PID1 tests at `b11755f`; exact unchanged-component carry through later fixes. The PID1 gate covers the 11 host skips. |
+| Python/static | 1,750 passing tests, 17 host PID1 skips and 416 deselections at `41995d4`. Ruff and mypy passed. Backend source is unchanged through `2ab3efe`. |
+| Frontend | 258 passing tests in 33 files at `2ab3efe`, with static checks and production build passing. |
+| Browser E2E | Full `41995d4` run passed 102 of 103 cases. The upload replay fix at `2ab3efe` passed the previously failing case and all 28 scoped cases on the rebuilt image. |
+| Backend E2E | 51 API cases, 45 OCR policy cases, two build-context cases and eight discovery cases passed across the verified runs at `41995d4`. The OCR suite reran the 15 cases affected by a local port collision. |
+| PostgreSQL | 317 of 318 cases passed at the same backend baseline, `bbbc06b`. The last case passed with a corrected test observer at `c60f993`, alongside controlled reproduction and repeat checks. |
+| Release/distribution | 14 release tests, 27 distribution tests, three Compose configurations and 69 CPU container PID1 checks passed at `41995d4`, with those components unchanged through `2ab3efe`. |
+| Prepared app | The exact `2ab3efe` image passed fresh and restored schema 0020 installs with a credentialless or authenticated OpenAI-compatible test endpoint. The renamed bundle reused the project and volumes, retained credentials, settings and a synthetic receipt, and accepted ordinary registration. |
 
-The final image attested 114 tracked runtime files and 83 static files. The
-prepared smoke validates the software bootstrap graph, not public immutable pulls
-or real model inference. The initial empty-key failure and workaround run are
-retained failure/history, not final installation success; the reviewed initializer
-fix passed the original no-override smoke. All unique owned E2E/smoke resources
-were removed. Backend/browser counts are explicitly carried, not claimed as fresh
-runs at `0cae967`. Public CI for the eventual published commit is separate; inspect
-the actual conclusions in
-[current branch CI](https://github.com/Peckerhacker10203/vision-bill/actions?query=branch%3Acodex%2Fvision-bill-update-package).
+Local application tests used synthetic receipts and CPU service doubles. See
+[current branch CI](https://github.com/Peckerhacker10203/vision-bill/actions?query=branch%3Acodex%2Fvision-bill-update-package)
+for the published commit's conclusions.
 
 Actual official CUDA wheel-lock resolution, CUDA/ROCm native compilation, physical
 GPU inference/qualification, current historical CPU image installation/inference,

@@ -1,9 +1,29 @@
 # OpenAI-compatible LLM backends
 
 Vision Bill can send text and image requests to an OpenAI-compatible API, including
-llama.cpp. Keep the endpoint local for local receipt processing. Ollama remains the
-default. OpenAI compatibility covers inference; model loading and unloading need
-an additional backend-specific contract.
+llama.cpp. Keep the endpoint local for local receipt processing. Every app
+installation uses an operator-selected endpoint and model. OpenAI compatibility
+covers inference. Model loading and unloading need a separate backend contract.
+
+## Connect an inference endpoint
+
+For a prepared bundle, set the following in private `runtime.env` using literal
+values and mode 0600. Use private `.env` for source Compose. Replace the example
+endpoint and model with your own. The provider key can be omitted on fresh
+credentialless prepared installs or set to `none`. Supply the real key when the
+server requires authentication.
+
+```dotenv
+LLM__PROVIDER=openai
+LLM__HOST=http://host.docker.internal:8083/v1
+LLM__MODEL_NAME=your-installed-model-id
+LLM__API_KEY=none
+```
+
+The URL must be reachable from the app container. Direct vision requires a model
+that supports image input. A generic server can leave lifecycle set to `none`.
+Use the configuration and explicit adoption below when pairing a compatible
+dedicated router with managed OCR. See the [installation guide](distribution/README.md).
 
 ## Configure a dedicated llama.cpp router
 
@@ -33,8 +53,7 @@ OCR__MANAGE_MODEL_LIFECYCLE=true
 
 The LLM URL must reach your deliberately deployed router. Set the OCR endpoint to
 your actual managed service; an independent OCR-only bundle must use
-`OCR_SERVICE_MODE=managed` when paired with VisionBill. Combined bundles fix it
-to managed. See [prepared installation](distribution/README.md). The example uses the
+`OCR_SERVICE_MODE=managed` when paired with VisionBill. `app-ocr-cuda` and `app-ocr-rocm` set it to managed. See [prepared installation](distribution/README.md). The example uses the
 Docker host gateway; a host process can use `http://127.0.0.1:8083/v1`. A host router must
 listen on an interface reachable from the app container and remain on a trusted
 private network. `none` is a placeholder for a router without authentication;
@@ -51,10 +70,34 @@ metadata, `LLM__VISION_MODEL_IDS=["receipt-vision"]` can declare known image sup
 it never overrides explicit contrary metadata. Output/context limits still apply;
 this setting does not give a text model vision support.
 
-The normal output cap remains 8192 tokens. The fixed native OCR 4096-token cap,
-2,000,000-pixel region limit, orientation/unwarping and CUDA/ROCm profile are
-unchanged. The lifecycle API is independent of the GPU backend selected when
+The normal formatter output cap is 8192 tokens. Native PaddleOCR-VL 1.6 uses
+4096 output tokens, a 2,000,000-pixel region limit, document orientation and
+unwarping. The lifecycle API is independent of the GPU backend selected when
 deploying llama.cpp.
+
+## Adopt the managed pair
+
+Drain participating work before adoption. Start the dedicated router with all
+models unloaded, all startup loading disabled and access limited to coordinated
+Vision Bill model-loading requests. Start the configured managed OCR and app
+using the original shared coordinator path. From a prepared app bundle, use:
+
+```bash
+model_id=your-installed-model-id
+docker compose exec app python -m vision_bill.distribution.handoff adopt \
+  --model-id "$model_id" --dedicated-coordinated-requests \
+  --external-eager-loading-disabled
+docker compose exec app python -m vision_bill.distribution.handoff status \
+  --model-id "$model_id"
+```
+
+Use the `vision_bill` service name for source Compose. Add one `--model-id` for
+each deliberately authorized ID when setting up the binding. Keep the exact
+configured lock path, or pass that same path with `--handoff-lock`. Adoption
+checks for clean owned state and supported idle residency evidence. A busy lock,
+unknown residency, unaccounted models, damaged state or a changed binding holds
+work before inference. The attestations describe the endpoint that the operator
+actually set up.
 
 ## Sequential GPU handoff
 
@@ -108,14 +151,14 @@ Ollama uses its own lifecycle and ignores a retained OpenAI-only lifecycle optio
 Drain and stop all owners before changing provider, endpoint or lifecycle mode.
 Reconcile outstanding requests and owned models on the **old endpoint** first;
 the existing journal binds its endpoint identity. Only after confirmed release,
-with all owners stopped, archive/reset the old handoff journal as described in
-recovery. Keep the lockfile inode intact, change configuration and restart. Lifecycle configuration requires a restart.
+with all owners stopped, archive the reconciled handoff journal and binding
+according to the recovery procedure. Keep the lockfile inode intact. Restart
+with the intended configuration and explicitly adopt the new pair.
 
-Build/install and ordinary API startup do not run unsolicited comparisons or
-historical colleague/Gemma benchmarks. Persisted explicit pending work can resume
-under readiness/policy guards. Prepared native first setup separately runs full
-required qualification; model provisioning uses pull/tags data checks only. After
-installation, test your own uploads through the web UI. Software CI uses CPU
-doubles; these contracts do not certify a real llama.cpp deployment or CUDA/ROCm hardware.
+Prepare the model on your endpoint before connecting Vision Bill. Benchmarks are
+explicit requests, and persisted pending work can resume under readiness and
+policy guards. Native qualification runs through explicit maintenance. Software
+verification uses CPU doubles. Real endpoint and accelerator qualification
+require separate evidence.
 The context-budget diagnostic remains Ollama-only; the app and standalone
 benchmark use the configured provider.

@@ -1,17 +1,18 @@
 # Release procedures
 
-For the five verified prebuilt installation variants and their input producer,
-physical qualification and assets-last publication gates, use the
-[distribution guide](distribution/README.md). The source/gates now exist, but no
-actual qualified native images or prepared bundles were published here. The older
-app-image workflow below remains separate; it cannot qualify or publish a native
-installation bundle.
+For schema-v2 prebuilt installation variants, input staging, physical
+qualification and assets-last publication, use the
+[distribution guide](distribution/README.md). The variants are `app`, `ocr-cuda`,
+`ocr-rocm`, `app-ocr-cuda` and `app-ocr-rocm`. App installations use an external
+LLM endpoint and an explicit installed model. This update verifies the software
+gates locally. Public distribution and physical accelerator qualification require
+a separate release run. The app-image workflow below publishes the app image.
 
 ## Unreleased package
 
 Durable 202 uploads/retries, source-preserving review/checks2, exact money, explicit
-Gold/v4 diagnostics, strict optional OCR, independent native OCR candidates and prepared distribution gates and account/view
-isolation are integrated in this local package. Historical split/CPU results retain
+Gold/v4 diagnostics, strict optional OCR, independent native OCR candidates and external-only LLM distribution are integrated in this package. The update also
+includes account and view isolation and completion-only receipt recovery. Historical split/CPU results retain
 their original meaning. See [upgrade prerequisites and accepted evidence](UPGRADE_AND_VERIFY.md).
 No version/tag/release or deployment has been authorized by this documentation
 update. In particular, publishing the app image does not qualify CUDA/ROCm OCR.
