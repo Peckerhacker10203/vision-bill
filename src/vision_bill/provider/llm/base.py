@@ -29,6 +29,7 @@ from ...model.extraction import (
     SOURCE_PROJECTION_VERSION,
     ClassificationEnrichment,
     DerivedInputView,
+    EnrichmentReason,
     ExtractionDraft,
     InferenceEnvelope,
     InferenceTelemetry,
@@ -40,6 +41,7 @@ from ...model.ocr import SourceRef, WorkingImage
 from ...model.receipt import Category, LineItem, Receipt
 from ...model.receipt_extraction import DuplicateCandidate, MultiImageReceipt, validate_overlap
 from ...model.review import AmountPolicy, ReviewFinding
+from ...service.gpu_handoff import current_owner
 from ...service.observation_admission import admit_observations
 from ...service.receipt_review import observation_values
 from .errors import UnreadableReceiptError
@@ -289,11 +291,10 @@ class LLMProvider(ABC):
             self.handoff.session(deadline, model_id=model_id) if self.handoff is not None else nullcontext()
         ):
             result = await self.extract_observations(model_id, input, tags=tags, deadline=deadline)
-            if result.classification_enrichment.state == "pending":
-                result = await self.enrich_observations(model_id, result, tags, work_deadline=deadline)
-            check_deadline(deadline)
-            result.telemetry.elapsed_ms = (perf_counter() - started) * 1000
-            return result
+            result = await self.enrich_observations(model_id, result, tags, work_deadline=deadline)
+        check_deadline(deadline)
+        result.telemetry.elapsed_ms = (perf_counter() - started) * 1000
+        return result
 
     async def extract_observations(
         self, model_id: str, input: ReceiptInput, *, tags: Sequence[str], deadline: float
@@ -659,7 +660,7 @@ class LLMProvider(ABC):
 
     @staticmethod
     def _classification_prompt(result: InferenceEnvelope, tags: Sequence[str]) -> str:
-        assert result.receipt is not None
+        receipt = admit_observations(result)
         return (
             "Classify these ordered receipt rows. Fill only the requested label paths. "
             "Return JSON with category only when requested. If any row labels are requested, "
@@ -671,7 +672,7 @@ class LLMProvider(ABC):
             + "; requested label paths: "
             + json.dumps(result.classification_enrichment.missing_fields)
             + "; receipt: "
-            + result.receipt.model_dump_json()
+            + receipt.model_dump_json()
         )
 
     @staticmethod
@@ -735,28 +736,71 @@ class LLMProvider(ABC):
         self, model_id: str, result: InferenceEnvelope, tags: Sequence[str], *, work_deadline: float
     ) -> InferenceEnvelope:
         """Classify admitted observations with text under the caller's model owner."""
+        owner = current_owner()
+        if owner is not None:
+            work_deadline = min(work_deadline, owner.deadline)
+        check_deadline(work_deadline)
         if result.classification_enrichment.state != "pending":
             return result
+        now = monotonic()
+        # The lifecycle owner retains its full work deadline for remote settlement
+        # and verified release after the optional classifier budget expires.
+        class_deadline = min(now + 30, work_deadline - 60)
+        reason: EnrichmentReason = "classification_budget_exhausted"
+        if class_deadline <= now:
+            return result.model_copy(update={
+                "classification_enrichment": ClassificationEnrichment(
+                    state="skipped", reason_code=reason,
+                    missing_fields=result.classification_enrichment.missing_fields,
+                )
+            })
         started = perf_counter()
-        await run_sync_before(work_deadline, admit_observations, result)
         probe = copy(self)
         probe.experiment_trace = []
-        prompt = await run_sync_before(work_deadline, probe._classification_prompt, result, tuple(tags))
-        async with asyncio.timeout(max(0, work_deadline - monotonic())):
-            content = await probe.send_message(model_id, [{"role": "user", "content": prompt}])
+        request_sequence = owner.request_sequence if owner is not None else 0
+        entered_send = False
+        call: dict[str, Any] | None = None
+        parsed: InferenceEnvelope | None = None
+        timeout = asyncio.timeout(max(0, class_deadline - monotonic()))
+        try:
+            async with timeout:
+                prompt = await asyncio.to_thread(probe._classification_prompt, result, tuple(tags))
+                if monotonic() < class_deadline:
+                    entered_send = True
+                    content = await probe.send_message(model_id, [{"role": "user", "content": prompt}])
+                    call = dict(probe.experiment_trace[-1]) if probe.experiment_trace else {}
+                    call.update(
+                        stage="classification",
+                        requested_model=model_id,
+                        raw_response=content[:200000],
+                        response_truncated=len(content) > 200000,
+                    )
+                    parsed = await asyncio.to_thread(probe._parse_classification, content, result)
+        except TimeoutError:
+            if not timeout.expired():
+                raise
         check_deadline(work_deadline)
-        call = dict(probe.experiment_trace[-1]) if probe.experiment_trace else {}
-        call.update(
-            stage="classification",
-            requested_model=model_id,
-            raw_response=content[:200000],
-            response_truncated=len(content) > 200000,
-        )
-        result = await run_sync_before(work_deadline, probe._parse_classification, content, result)
-        result.telemetry.calls.append(call)
-        if isinstance(call.get("elapsed_ms"), (float, int)):
-            result.telemetry.stage_ms["classification"] = call["elapsed_ms"]
+        if parsed is not None and monotonic() < class_deadline:
+            result = parsed
+        else:
+            # Settlement must belong to this classifier, not the prior formatter.
+            settled = (
+                owner is not None and owner.request_sequence == request_sequence + 1
+                and owner.dispatch_disposition == "settled" and not owner.unsettled
+            )
+            if entered_send and call is None and not settled:
+                raise TimeoutError("classification_request_unsettled")
+            result = result.model_copy(deep=True)
+            result.classification_enrichment = ClassificationEnrichment(
+                state="unavailable", reason_code=reason,
+                missing_fields=result.classification_enrichment.missing_fields,
+            )
+        if call is not None:
+            result.telemetry.calls.append(call)
+            if isinstance(call.get("elapsed_ms"), (float, int)):
+                result.telemetry.stage_ms["classification"] = call["elapsed_ms"]
         result.telemetry.elapsed_ms += (perf_counter() - started) * 1000
+        check_deadline(work_deadline)
         return result
 
     def _ocr_result_to_text(self, ocr_result: dict[str, Any]) -> str:

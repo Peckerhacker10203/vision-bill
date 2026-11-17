@@ -21,7 +21,6 @@ class UploadWire(WireConnection):
             raise ValueError("original wire failure")
         if self.phase == "release":
             await self.pause(.08)
-        return None
 
     async def fetch(self, sql, *args, **kwargs):
         return []
@@ -104,7 +103,7 @@ async def test_each_acquisition_uses_absolute_deadline(settings, tmp_path, opera
         pool.terminate()
 
 
-async def test_offset_clocks_keep_original_provider_and_one_db_deadline(settings, tmp_path, monkeypatch):
+async def test_offset_clocks_keep_distinct_work_and_final_db_deadlines(settings, tmp_path, monkeypatch):
     import vision_bill.helper.deadline as deadlines
     import vision_bill.service.submission_service as submissions
 
@@ -114,12 +113,14 @@ async def test_offset_clocks_keep_original_provider_and_one_db_deadline(settings
     started = asyncio.get_running_loop().time()
     receipts.extract_receipt.side_effect = TimeoutError()
     await service.process_claim(claim)
-    assert receipts.extract_receipt.call_args.kwargs["deadline"] == 700.0
+    assert receipts.extract_receipt.call_args.kwargs["deadline"] == 695.0
     values = [method.call_args.kwargs["deadline"] for method in
-              (db.bind_source_parts, db.get_ocr_checkpoint, receipts.list_tags, db.finish_attempt)]
+              (db.bind_source_parts, db.get_ocr_checkpoint, receipts.list_tags)]
     assert len(set(values)) == 1
-    assert started + 599 < values[0] <= asyncio.get_running_loop().time() + 600
-    assert values[0] != 700
+    final_deadline = db.finish_attempt.call_args.kwargs["deadline"]
+    assert started + 599 < final_deadline <= asyncio.get_running_loop().time() + 600
+    assert final_deadline - values[0] == 5.0
+    assert values[0] != 695.0
 
 
 async def test_queued_removal_checks_deadline_immediately_before_unlink(settings, tmp_path, monkeypatch):

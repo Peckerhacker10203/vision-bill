@@ -8,7 +8,7 @@ from functools import partial
 from pathlib import Path
 from time import monotonic
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 
@@ -17,7 +17,13 @@ from ..helper.deadline import check_deadline, run_sync_before
 from ..model.db.image import ImageRow
 from ..model.db.receipt import ReceiptRow
 from ..model.experiment import ExperimentOptions
-from ..model.extraction import DraftView, ExtractionDraft, InferenceEnvelope
+from ..model.extraction import (
+    EXTRACTION_SCHEMA_VERSION,
+    DraftView,
+    ExtractionDraft,
+    InferenceEnvelope,
+    pack_inference_metadata,
+)
 from ..model.handoff import HandoffWait
 from ..model.ocr import OcrPageMetadata, OcrResponse, SourceRef, WorkingImage, WorkingImageMetadata
 from ..model.receipt import Receipt
@@ -26,9 +32,11 @@ from ..model.workflow import (
     AccessScope,
     AnalysisClaim,
     AttemptOutcome,
+    CheckpointExecutionIdentity,
     CommitResult,
     DraftFinalize,
     DraftPatch,
+    ObservationCheckpoint,
     OcrCheckpoint,
     PersistedSourcePart,
     PersistedWorkingView,
@@ -37,7 +45,14 @@ from ..model.workflow import (
 from ..provider.llm.base import ModelInfo
 from ..provider.llm.errors import AnalysisTimeoutError, UnreadableReceiptError
 from ..provider.ocr.base import compact_ocr_text
-from .execution_policy import current_snapshot, managed_ocr, policy_hold_reason, snapshot_ocr
+from .benchmark_scoring import PROMPT_VERSION
+from .execution_policy import (
+    current_snapshot,
+    managed_ocr,
+    policy_hold_reason,
+    semantic_policy_sha256,
+    snapshot_ocr,
+)
 from .extraction_pipeline import (
     OcrRuntimeChangedError,
     OriginalSourceChangedError,
@@ -199,14 +214,19 @@ class SubmissionService:
         *, db_deadline: float,
     ) -> CommitResult:
         try:
-            # Reserve a small part of the same absolute budget for durable error
-            # bookkeeping. Providers, callbacks and threads retain the original deadline.
-            async with asyncio.timeout_at(db_deadline - self._outcome_reserve()):
-                outcome = await self._attempt(claim, deadline, owned, db_deadline=db_deadline)
-                check_deadline(deadline)
-                if asyncio.get_running_loop().time() >= db_deadline:
-                    raise TimeoutError("database_attempt_deadline")
-                return await self.db.finish_attempt(claim, outcome, deadline=db_deadline)
+            # Keep the durable final write inside its own reserve on both clocks.
+            reserve = self._outcome_reserve()
+            work_deadline = deadline - reserve
+            work_db_deadline = db_deadline - reserve
+            async with asyncio.timeout_at(work_db_deadline):
+                outcome = await self._attempt(
+                    claim, work_deadline, owned, db_deadline=work_db_deadline,
+                )
+                check_deadline(work_deadline)
+            check_deadline(deadline)
+            if asyncio.get_running_loop().time() >= db_deadline:
+                raise TimeoutError("database_attempt_deadline")
+            return await self.db.finish_attempt(claim, outcome, deadline=db_deadline)
         except StaleClaimError:
             return CommitResult(stale=True)
         except PolicyHoldError:
@@ -324,6 +344,46 @@ class SubmissionService:
             if not await self.db.save_ocr_checkpoint(claim, checkpoint, deadline=db_deadline):
                 raise StaleClaimError
 
+        async def save_direct_views(envelope: InferenceEnvelope) -> None:
+            for view in envelope.input_views:
+                manifest = await self._save_view(
+                    image.id, view.photo_index, view.source_sha256, view.working_image, parts, deadline
+                )
+                owned.append(manifest)
+                manifests.append(manifest)
+
+        async def save_observations(envelope: InferenceEnvelope) -> None:
+            if envelope.provenance.ordered_source_sha256 != hashes:
+                raise SourceIntegrityError
+            await save_direct_views(envelope)
+            if await run_sync_before(deadline, self._bindings, image) != bindings:
+                raise SourceIntegrityError
+            provenance = envelope.provenance
+            checkpoint = await run_sync_before(
+                deadline,
+                lambda: ObservationCheckpoint(
+                    checkpoint_id=uuid4(),
+                    producer_generation=claim.generation,
+                    producer_attempt_number=claim.attempt_number,
+                    eligible_generation=claim.generation,
+                    source_parts=parts,
+                    model_id=provenance.model_id,
+                    execution_identity=CheckpointExecutionIdentity(
+                        inference_identity=self.receipts.inference_identity,
+                        semantic_policy_sha256=semantic_policy_sha256(snapshot),
+                        model_id=provenance.model_id,
+                        model_digest=provenance.model_digest,
+                        prompt_version=PROMPT_VERSION,
+                        extraction_schema_version=EXTRACTION_SCHEMA_VERSION,
+                        source_projection_version=envelope.source_projection_version,
+                    ),
+                    envelope=pack_inference_metadata(envelope),
+                    persisted_views=manifests,
+                ),
+            )
+            if not await self.db.save_observation_checkpoint(claim, checkpoint, deadline=db_deadline):
+                raise StaleClaimError
+
         tags = await self.receipts.list_tags(deadline=db_deadline)
         expected_binding = (snapshot.get("managed_binding_sha256") or "") if managed_ocr(ocr) else None
         for retry in range(2):
@@ -341,12 +401,13 @@ class SubmissionService:
                     deadline=deadline,
                     tags=tags,
                     checkpoint=save_page,
+                    observation_checkpoint=save_observations,
                     resume_pages=list(pages),
                     source_refs=refs,
                     ocr_settings=ocr,
                     max_output_tokens=limit,
                     expected_binding_sha256=expected_binding,
-                    handoff_deadline=deadline - self._outcome_reserve() if managed_ocr(ocr) else None,
+                    handoff_deadline=deadline if managed_ocr(ocr) else None,
                 )
                 break
             except OcrRuntimeChangedError:
@@ -364,16 +425,15 @@ class SubmissionService:
             raise OcrRuntimeChangedError("ocr_runtime_changed")
         if envelope.provenance.ordered_source_sha256 != hashes:
             raise SourceIntegrityError
-        for view in envelope.input_views:
-            manifest = await self._save_view(
-                image.id, view.photo_index, view.source_sha256, view.working_image, parts, deadline
-            )
-            owned.append(manifest)
-            manifests.append(manifest)
+        if not manifests:
+            # An incomplete Direct draft can still publish views with its partial outcome.
+            await save_direct_views(envelope)
         # Check originals again before accepting any receipt; preserve bytes and paths.
         if await run_sync_before(deadline, self._bindings, image) != bindings:
             raise SourceIntegrityError
-        return self._outcome(
+        return await run_sync_before(
+            deadline,
+            self._outcome,
             envelope,
             manifests,
             [

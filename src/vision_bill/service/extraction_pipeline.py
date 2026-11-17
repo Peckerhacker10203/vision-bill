@@ -24,6 +24,7 @@ from ..model.review import ReviewFinding
 from ..provider.llm.base import LLMProvider, ModelInfo
 from ..provider.ocr.base import OcrProvider, compact_ocr_text
 from .gpu_handoff import ModelHandoff, admission_deadline, current_owner
+from .observation_admission import admit_observations
 
 
 def select_vision_model(models: Sequence[ModelInfo], requested_id: str) -> ModelInfo | None:
@@ -80,12 +81,17 @@ class ExtractionPipeline:
         deadline: float,
         tags: Sequence[str],
         checkpoint: Callable[[OcrResponse], Awaitable[None]] | None = None,
+        observation_checkpoint: Callable[[InferenceEnvelope], Awaitable[None]] | None = None,
         resume_pages: Sequence[OcrResponse] = (),
         source_refs: Sequence[SourceRef] = (),
         max_output_tokens: int | None = None,
         expected_binding_sha256: str | None = None,
         handoff_deadline: float | None = None,
     ) -> InferenceEnvelope:
+        owner = current_owner()
+        if owner is not None:
+            deadline = min(deadline, owner.deadline)
+        started = perf_counter()
         handoff = self.coordinator()
         async with asyncio.timeout(max(0, deadline - monotonic())), (
             handoff.session(
@@ -102,11 +108,13 @@ class ExtractionPipeline:
                 deadline=deadline,
                 tags=tuple(tags),
                 checkpoint=checkpoint,
+                observation_checkpoint=observation_checkpoint,
                 resume_pages=tuple(p.model_copy(deep=True) for p in resume_pages),
                 source_refs=tuple(r.model_copy(deep=True) for r in source_refs),
                 max_output_tokens=max_output_tokens,
             )
         check_deadline(deadline)
+        result.telemetry.elapsed_ms = (perf_counter() - started) * 1000
         return result
 
     async def _extract(
@@ -118,6 +126,7 @@ class ExtractionPipeline:
         deadline: float,
         tags: Sequence[str],
         checkpoint: Callable[[OcrResponse], Awaitable[None]] | None,
+        observation_checkpoint: Callable[[InferenceEnvelope], Awaitable[None]] | None,
         resume_pages: Sequence[OcrResponse],
         source_refs: Sequence[SourceRef],
         max_output_tokens: int | None,
@@ -257,7 +266,7 @@ class ExtractionPipeline:
                     if model is None:
                         return self._failed(result, "formatter_model_unavailable", started)
                     result.provenance.model_digest = model.digest
-                    formatted = await provider.extract_receipt_input(
+                    formatted = await provider.extract_observations(
                         model_id,
                         ReceiptInput(
                             mode="ocr",
@@ -272,7 +281,9 @@ class ExtractionPipeline:
                         deadline=deadline,
                     )
                     formatted.telemetry.context_window_tokens = model.context_window_tokens
-                    return self._finish(formatted, result, started)
+                    return await self._finish(
+                        provider, formatted, result, started, tags, deadline, observation_checkpoint,
+                    )
                 result.provenance.fallback_reason = reason
                 return self._failed(result, reason, started)
             # Only discovered Vision models may receive originals/normalized image derivatives.
@@ -281,7 +292,7 @@ class ExtractionPipeline:
             if model is None:
                 return self._failed(result, "vision_model_unavailable", started)
             vision_id = model.id
-            formatted = await provider.extract_receipt_input(
+            formatted = await provider.extract_observations(
                 vision_id,
                 ReceiptInput(
                     mode="direct_vision", image_paths=[str(p) for p in paths], source_refs=refs
@@ -294,7 +305,9 @@ class ExtractionPipeline:
             result.provenance.model_id = vision_id
             result.provenance.model_digest = model.digest
             formatted.telemetry.context_window_tokens = model.context_window_tokens
-            return self._finish(formatted, result, started)
+            return await self._finish(
+                provider, formatted, result, started, tags, deadline, observation_checkpoint,
+            )
 
     @staticmethod
     def _failed(result: InferenceEnvelope, code: str, started: float) -> InferenceEnvelope:
@@ -311,8 +324,14 @@ class ExtractionPipeline:
         return result
 
     @staticmethod
-    def _finish(
-        formatted: InferenceEnvelope, original: InferenceEnvelope, started: float
+    async def _finish(
+        provider: LLMProvider,
+        formatted: InferenceEnvelope,
+        original: InferenceEnvelope,
+        started: float,
+        tags: Sequence[str],
+        deadline: float,
+        observation_checkpoint: Callable[[InferenceEnvelope], Awaitable[None]] | None,
     ) -> InferenceEnvelope:
         original.provenance.used_pipeline = formatted.provenance.used_pipeline
         formatted.provenance = original.provenance
@@ -321,4 +340,11 @@ class ExtractionPipeline:
         formatted.telemetry.stage_ms.update(original.telemetry.stage_ms)
         formatted.telemetry.ocr_max_new_tokens = original.telemetry.ocr_max_new_tokens
         formatted.telemetry.elapsed_ms = (perf_counter() - started) * 1000
-        return formatted
+        if formatted.receipt is None:
+            return formatted
+        await run_sync_before(deadline, admit_observations, formatted)
+        if observation_checkpoint is not None:
+            await observation_checkpoint(formatted)
+        return await provider.enrich_observations(
+            formatted.provenance.model_id, formatted, tags, work_deadline=deadline,
+        )

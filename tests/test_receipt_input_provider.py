@@ -204,7 +204,7 @@ async def test_observation_stage_preserves_receipt_and_empty_tag_enrichment():
     labels = {"category": "grocery", "line_items": [{"spending_category": "milk", "tags": []}]}
     provider = OllamaProvider("http://local")
     provider.send_message = AsyncMock(side_effect=[json.dumps(values), json.dumps(labels)])
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + 90
     observed = await provider.extract_observations("requested", ocr_input(), tags=[], deadline=deadline)
     assert provider.send_message.await_count == 1
     assert observed.classification_enrichment.state == "pending"
@@ -258,7 +258,7 @@ async def test_enrichment_fills_only_missing_labels_on_partly_observed_rows(incl
     provider = OllamaProvider("http://local")
     provider.send_message = AsyncMock(side_effect=[json.dumps(values), json.dumps(labels)])
     result = await provider.extract_receipt_input(
-        "requested", ocr_input(), tags=[], deadline=time.monotonic() + 2
+        "requested", ocr_input(), tags=[], deadline=time.monotonic() + 90
     )
     assert result.receipt.category == "grocery"
     assert [(row.spending_category, row.tags) for row in result.receipt.line_items] == [
@@ -282,7 +282,7 @@ async def test_enrichment_accepts_category_only_when_all_row_labels_are_observed
         side_effect=[json.dumps(values), '{"category":"grocery"}']
     )
     result = await provider.extract_receipt_input(
-        "requested", ocr_input(), tags=[], deadline=time.monotonic() + 2
+        "requested", ocr_input(), tags=[], deadline=time.monotonic() + 90
     )
     assert result.receipt.category == "grocery"
     assert result.receipt.line_items[0].spending_category == "milk"
@@ -309,7 +309,7 @@ async def test_bad_classification_is_unavailable_without_erasing_labels_or_creat
     provider = OllamaProvider("http://local")
     provider.send_message = AsyncMock(side_effect=[json.dumps(values), response])
     result = await provider.extract_receipt_input(
-        "requested", ocr_input(), tags=[], deadline=time.monotonic() + 2
+        "requested", ocr_input(), tags=[], deadline=time.monotonic() + 90
     )
     assert result.receipt.line_items[0].spending_category == "milk"
     assert result.receipt.line_items[0].tags == ["observed"]
@@ -371,7 +371,7 @@ async def test_classification_is_separate_cannot_change_observations_and_is_in_t
         ]
     )
     result = await provider.extract_receipt_input(
-        "requested", ocr_input(), tags=["food"], deadline=time.monotonic() + 2
+        "requested", ocr_input(), tags=["food"], deadline=time.monotonic() + 90
     )
     assert result.receipt.total == receipt().total
     assert [r.description for r in result.receipt.line_items] == [
@@ -672,10 +672,19 @@ async def test_blocked_parsing_cannot_return_late_success_or_mutate_input(monkey
     timer.start()
     began = time.monotonic()
     try:
-        with pytest.raises(TimeoutError):
-            await provider.extract_receipt_input(
-                "requested", inp, tags=["food"], deadline=began + 0.08
+        if stage == "classification":
+            result = await provider.extract_receipt_input(
+                "requested", inp, tags=["food"], deadline=began + 60.15
             )
+            assert result.receipt.total == receipt().total
+            assert all(row.tags == [] for row in result.receipt.line_items)
+            assert result.classification_enrichment.state == "unavailable"
+            assert result.classification_enrichment.reason_code == "classification_budget_exhausted"
+        else:
+            with pytest.raises(TimeoutError):
+                await provider.extract_receipt_input(
+                    "requested", inp, tags=["food"], deadline=began + 0.08
+                )
         assert entered.is_set()
         assert time.monotonic() - began < 0.3
     finally:
@@ -973,6 +982,7 @@ async def test_prompt_compliant_observations_admit_complete_without_raw_classifi
     classification, overlap
 ):
     from test_multi_image_extraction import extraction, item
+
     from vision_bill.model.experiment import ExperimentOptions
     from vision_bill.model.review import OriginalAvailability
     from vision_bill.service.submission_service import SubmissionService
@@ -1028,7 +1038,7 @@ async def test_prompt_compliant_observations_admit_complete_without_raw_classifi
         ]
     )
     result = await provider.extract_receipt_input(
-        "requested", inp, tags=[], deadline=time.monotonic() + 2
+        "requested", inp, tags=[], deadline=time.monotonic() + 90
     )
     outcome = SubmissionService._outcome(
         result,

@@ -255,7 +255,7 @@ async def test_controlled_clock_exhausts_original_600_seconds_before_commit(
     monkeypatch.setattr(deadlines, "monotonic", lambda: clock[0])
 
     async def expired(*args, **kwargs):
-        assert kwargs["deadline"] == 700.0
+        assert kwargs["deadline"] == 695.0
         clock[0] = 700.01
         raise TimeoutError()
 

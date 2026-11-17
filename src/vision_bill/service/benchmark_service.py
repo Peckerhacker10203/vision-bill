@@ -492,7 +492,7 @@ class BenchmarkService:
 
         async def infer() -> Any:
             return await self._receipts.analyse_submission_with_metadata(
-                model_id, paths, options, list(manifest["tags"]),
+                model_id, paths, options, list(manifest["tags"]), deadline=inference_deadline,
             )
 
         if handoff is None:

@@ -509,7 +509,7 @@ async def test_budget_exhausted_after_all_ocr_during_late_call(photos, late_stag
     began = time.monotonic()
     # Include real hashing/parsing and executor scheduling before the late call.
     # The assertions below still require both OCR checkpoints and late-stage entry.
-    deadline = began + 1
+    deadline = began + (61 if late_stage == "enrichment" else 1)
     with pytest.raises(TimeoutError):
         await pipeline(llm, ocr).extract(
             "fixture",
@@ -523,7 +523,7 @@ async def test_budget_exhausted_after_all_ocr_during_late_call(photos, late_stag
         )
     assert checkpoint.await_count == 2
     assert entered.is_set() and llm._client.chat.await_count == 2
-    assert time.monotonic() < deadline + 0.35
+    assert time.monotonic() < began + 1.35
 
 
 async def test_ollama_serializes_exact_prepared_png_after_temporary_cleanup(
@@ -669,7 +669,7 @@ async def test_saved_formatter_controls_repair_and_enrichment_without_shared_mut
         options=ExperimentOptions(
             pipeline=intent, temperature=0.13, include_classification=True
         ),
-        deadline=time.monotonic() + 2,
+        deadline=time.monotonic() + 90,
         tags=["food"],
         max_output_tokens=1234,
     )

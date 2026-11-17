@@ -418,6 +418,10 @@ class ReceiptService:
         """Return True if the LLM backend is reachable, False otherwise."""
         return await self._provider.check_connection()
 
+    @property
+    def inference_identity(self) -> str:
+        return self._provider.inference_identity
+
     def managed_ocr_compatible(self) -> bool:
         """Check the actual LLM's handoff contract without resource side effects."""
         from .gpu_handoff import handoff_resource_identity
@@ -476,6 +480,7 @@ class ReceiptService:
         self, model_id: str, paths: Sequence[Path], *, options: "ExperimentOptions",
         deadline: float, tags: Sequence[str],
         checkpoint: Callable[[OcrResponse], Awaitable[None]] | None = None,
+        observation_checkpoint: Callable[[InferenceEnvelope], Awaitable[None]] | None = None,
         resume_pages: Sequence[OcrResponse] = (), source_refs: Sequence[SourceRef] = (),
         ocr_settings: OcrSettings | None = None, max_output_tokens: int | None = None,
         expected_binding_sha256: str | None = None, handoff_deadline: float | None = None,
@@ -486,6 +491,7 @@ class ReceiptService:
         return await self._extraction_pipeline(ocr_settings).extract(
             model_id, paths, options=options, deadline=deadline, tags=tags,
             checkpoint=checkpoint, resume_pages=resume_pages, source_refs=source_refs,
+            observation_checkpoint=observation_checkpoint,
             max_output_tokens=max_output_tokens, expected_binding_sha256=expected_binding_sha256,
             handoff_deadline=handoff_deadline,
         )
@@ -565,8 +571,9 @@ class ReceiptService:
         return results
 
     async def analyse_submission_with_metadata(
-        self, model_id: str, paths: list[Path], options: "ExperimentOptions", tags: list[str]
+        self, model_id: str, paths: list[Path], options: "ExperimentOptions", tags: list[str],
+        *, deadline: float | None = None,
     ) -> "ExperimentResult":
         """Run an isolated experiment through normal upload extraction paths."""
         from .experiment_execution import execute_submission
-        return await execute_submission(self, model_id, paths, options, tags)
+        return await execute_submission(self, model_id, paths, options, tags, deadline=deadline)

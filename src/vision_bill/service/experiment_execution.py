@@ -16,8 +16,13 @@ from time import monotonic, perf_counter
 from typing import TYPE_CHECKING, Any
 
 from ..config import OcrSettings
+from ..helper.deadline import run_sync_before
 from ..model.experiment import ExperimentOptions, ExtractionPipeline
-from ..model.extraction import pack_inference_metadata
+from ..model.extraction import (
+    InferenceEnvelope,
+    PersistedInferenceEnvelope,
+    pack_inference_metadata,
+)
 from ..model.handoff import HandoffStatus, HandoffWait
 from ..model.receipt import Receipt
 from .execution_policy import EXECUTION_POLICY_VERSION
@@ -100,6 +105,8 @@ async def execute_submission(
     paths: list[Path],
     options: ExperimentOptions,
     tags: list[str],
+    *,
+    deadline: float | None = None,
 ) -> ExperimentResult:
     if not paths or any(not path.is_file() for path in paths):
         raise FileNotFoundError("Receipt image or additional photo is unavailable")
@@ -109,6 +116,8 @@ async def execute_submission(
     provider = service._provider.for_experiment(effective_options)
     probe._provider = provider
     probe._experiment_tags = list(tags)
+    provider_deadline = monotonic() + provider.analysis_timeout_seconds
+    work_deadline = provider_deadline if deadline is None else min(deadline, provider_deadline)
     metadata: dict[str, Any] = {
         "requested_pipeline": options.pipeline.value,
         "requested_options": options.model_dump(mode="json"),
@@ -119,39 +128,28 @@ async def execute_submission(
         if provider.experiment_options
         else options.model_dump(mode="json"),
     }
+    async def remember_observations(envelope: InferenceEnvelope) -> None:
+        # This experiment metadata survives an ordinary call failure in this process.
+        metadata.update(await run_sync_before(
+            work_deadline, lambda: observation_metadata(pack_inference_metadata(envelope)),
+        ))
+
     try:
-        async with asyncio.timeout(provider.analysis_timeout_seconds):
+        async with asyncio.timeout(max(0, work_deadline - monotonic())):
             envelope = await probe.extract_receipt(
                 model_id,
                 paths,
                 options=effective_options,
-                deadline=monotonic() + provider.analysis_timeout_seconds,
+                deadline=work_deadline,
                 tags=tags,
+                observation_checkpoint=remember_observations,
             )
-            persisted = pack_inference_metadata(envelope)
-            metadata.update(persisted.provenance.model_dump(mode="json"))
-            metadata["calls"] = persisted.telemetry.calls
-            metadata["telemetry"] = persisted.telemetry.model_dump(mode="json")
-            metadata["source_projection_version"] = persisted.source_projection_version
-            metadata["draft"] = persisted.draft.model_dump(mode="json") if persisted.draft else None
-            metadata["raw_field_sources"] = {
-                key: [ref.model_dump(mode="json") for ref in refs]
-                for key, refs in persisted.raw_field_sources.items()
-            }
-            metadata["field_sources"] = {
-                key: [ref.model_dump(mode="json") for ref in refs]
-                for key, refs in persisted.field_sources.items()
-            }
-            metadata["overlap_decisions"] = persisted.overlap_decisions
-            metadata["findings"] = [f.model_dump(mode="json") for f in persisted.findings]
-            metadata["ocr_pages"] = [page.model_dump(mode="json") for page in persisted.ocr_pages]
-            metadata["classification_enrichment"] = persisted.classification_enrichment.model_dump(
-                mode="json"
-            )
+            persisted = await run_sync_before(work_deadline, pack_inference_metadata, envelope)
+            metadata.update(await run_sync_before(work_deadline, observation_metadata, persisted))
             if persisted.draft is None and persisted.receipt is None:
                 code = persisted.findings[-1].code if persisted.findings else "receipt_incomplete"
                 raise ValueError(code)
-            receipt = admit_observations(persisted)
+            receipt = await run_sync_before(work_deadline, admit_observations, persisted)
     except HandoffWait:
         raise
     except Exception as exc:
@@ -163,6 +161,15 @@ async def execute_submission(
     elapsed = (perf_counter() - started) * 1000
     metadata["elapsed_ms"] = elapsed
     return ExperimentResult(receipt, len(metadata["calls"]) or 1, elapsed, metadata)
+
+
+def observation_metadata(persisted: PersistedInferenceEnvelope) -> dict[str, Any]:
+    evidence = persisted.model_dump(mode="json", exclude={"provenance", "receipt", "amount_policy"})
+    return {
+        **persisted.provenance.model_dump(mode="json"),
+        **evidence,
+        "calls": evidence["telemetry"]["calls"],
+    }
 
 
 async def pipeline_identity(

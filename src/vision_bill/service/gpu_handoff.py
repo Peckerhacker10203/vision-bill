@@ -104,6 +104,7 @@ class HandoffOwner:
         self.generation = 1
         self.unsettled = False
         self.dispatch_disposition: DispatchDisposition = "not_dispatched"
+        self.request_sequence = 0
         self.model_work_started = False
         self.ocr_loaded = False
         self.ocr_phase_closed = False
@@ -186,20 +187,21 @@ class HandoffOwner:
 
     async def model_call(self, call: Coroutine[Any, Any, Any]) -> Any:
         self.model_work_started = True
+        self.request_sequence += 1
         self.dispatch_disposition = "unknown"
         self.unsettled = True
         self.save()
         task = asyncio.create_task(call)
         try:
             result = await asyncio.shield(task)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancelled:
             try:
                 async with asyncio.timeout(min(30, max(0, self.deadline - monotonic()))):
                     await asyncio.shield(task)
-            except (Exception, asyncio.CancelledError):
-                # Never let a detached call mutate a successor's journal.
+            except (Exception, asyncio.CancelledError):  # noqa: BLE001 - settlement is unproven
+                # Preserve the initiating cancellation and keep the fence for any late response.
                 task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
-                raise
+                raise cancelled from None
             self.unsettled = False
             self.dispatch_disposition = "settled"
             self.save()
