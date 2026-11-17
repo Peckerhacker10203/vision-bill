@@ -114,6 +114,11 @@ def inspect_device_identity(accelerator: Literal["cuda", "rocm"], gpu_index: int
         ):
             raise ValueError("Malformed device UUID or PCI bus identity")
         if accelerator == "rocm":
+            # The pinned ROCr UUID suffix is sixteen ASCII hex digits. When the
+            # hardware ID is unavailable, HIP instead returns XX padded with zeros.
+            hip_uuid = bytes.fromhex(result["uuid"])
+            if not re.fullmatch(rb"[0-9a-fA-F]{16}", hip_uuid) or hip_uuid == b"0" * 16:
+                raise ValueError("Unavailable or malformed HIP UUID")
             if not isinstance(result["gfx_target"], str) or not re.fullmatch(
                 r"gfx[0-9a-f]+", result["gfx_target"]
             ):

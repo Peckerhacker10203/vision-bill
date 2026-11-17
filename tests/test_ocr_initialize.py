@@ -2,9 +2,11 @@
 
 import json
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -141,6 +143,52 @@ def test_success_publishes_verified_settings_then_cached_start_never_spawns_or_r
             == result
         )
     assert before == {path: path.lstat().st_mtime_ns for path in before}
+
+
+@pytest.mark.usefixtures("native_pid1")
+@pytest.mark.parametrize("published", [False, True], ids=["pre-swap", "post-swap"])
+def test_interrupted_publication_preserves_selected_installation(
+    tmp_path, release, monkeypatch, published
+):
+    from ocr_service import initialize as module
+    from ocr_service.supervision import ManagedInterrupted
+
+    monkeypatch.setenv("OCR_INSTALLATION_LOCK_PATH", str(tmp_path / "installation.lock"))
+    external_qualifier(monkeypatch)
+    previous = initialize_release(tmp_path, release)
+    state = tmp_path / "state"
+    selected = state / "selected"
+    original_replace = Path.replace
+
+    def interrupt_replace(path, target):
+        if target != selected:
+            return original_replace(path, target)
+        if published:
+            original_replace(path, target)
+        signal.raise_signal(signal.SIGTERM)
+
+    with monkeypatch.context() as publication:
+        publication.setattr(Path, "replace", interrupt_replace)
+        with pytest.raises(ManagedInterrupted) as interrupted:
+            initialize_release(tmp_path, release, force=True)
+    assert interrupted.value.signum == signal.SIGTERM
+    assert previous.is_dir()
+    retained = selected.resolve()
+    assert (retained != previous) is published
+    assert set(previous.parent.iterdir()) == {previous, retained}
+    assert list(state.glob(".selected-*")) == []
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Retry should reuse the verified installation")
+
+    monkeypatch.setattr(module, "owned_qualification_process", forbidden)
+    monkeypatch.setattr(module, "provision_bundle", forbidden)
+    bundle, _, config = release
+    assert (
+        module.check_installation(bundle, state, config, "sha256:" + sha(config.read_bytes()))
+        == retained
+    )
+    assert initialize_release(tmp_path, release) == retained
 
 
 @pytest.mark.usefixtures("native_pid1")
@@ -337,7 +385,6 @@ def test_app_lock_blocks_maintenance(tmp_path, release, monkeypatch):
 def test_metadata_probe_uses_driver_only(tmp_path, monkeypatch, accelerator):
     import builtins
     import ctypes
-    from types import SimpleNamespace
 
     from ocr_service import device_inventory
 
@@ -351,6 +398,7 @@ def test_metadata_probe_uses_driver_only(tmp_path, monkeypatch, accelerator):
     expected = {**DEVICE, "accelerator": accelerator}
     if accelerator == "rocm":
         expected = {key: value for key, value in expected.items() if key != "compute_capability"}
+        expected["uuid"] = b"0123456789abcdef".hex()
         expected["gfx_target"] = "gfx1030"
 
         def run(command, **kwargs):
@@ -395,6 +443,24 @@ def test_metadata_probe_uses_driver_only(tmp_path, monkeypatch, accelerator):
         monkeypatch.setattr(device_inventory.ctypes, "CDLL", lambda name: driver)
         expected["uuid"] = "000102030405060708090a0b0c0d0e0f"
     assert device_inventory.inspect_device_identity(accelerator, 0) == expected
+
+
+@pytest.mark.parametrize(
+    "uuid", [b"XX" + b"\0" * 14, b"0" * 16], ids=["gpu-xx-sentinel", "zero-id"]
+)
+def test_rocm_metadata_rejects_unavailable_uuid(monkeypatch, uuid):
+    from ocr_service import device_inventory
+
+    metadata = {key: value for key, value in DEVICE.items() if key != "compute_capability"}
+    metadata.update(accelerator="rocm", gfx_target="gfx1030", uuid=uuid.hex())
+    monkeypatch.setattr(
+        device_inventory.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(stdout=json.dumps(metadata)),
+    )
+    with pytest.raises(device_inventory.DeviceIdentityUnavailable) as error:
+        device_inventory.inspect_device_identity("rocm", 0)
+    assert error.value.reason_code == "native_device_identity_unavailable"
 
 
 @pytest.mark.parametrize("accelerator", ["cuda", "rocm"])

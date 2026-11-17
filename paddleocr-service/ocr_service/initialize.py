@@ -221,6 +221,8 @@ def initialize(
         assets = provision_bundle(bundle, state)
         (state / "installations").mkdir(exist_ok=True, mode=0o700)
         root = state / "installations" / uuid4().hex
+        selected = state / "selected"
+        target = root.relative_to(state)
         root.mkdir(parents=True, mode=0o700)
         try:
             runtime = {
@@ -286,13 +288,16 @@ def initialize(
             )
             temporary = state / (".selected-" + uuid4().hex)
             try:
-                temporary.symlink_to(root.relative_to(state), target_is_directory=True)
-                temporary.replace(state / "selected")
+                temporary.symlink_to(target, target_is_directory=True)
+                temporary.replace(selected)
             finally:
                 temporary.unlink(missing_ok=True)
             return root
         except BaseException:
-            shutil.rmtree(root)
+            # A signal can raise after the atomic replacement succeeds. Read the
+            # pointer under the exclusive lock before deleting any candidate.
+            if not selected.is_symlink() or selected.readlink() != target:
+                shutil.rmtree(root)
             raise
 
 
