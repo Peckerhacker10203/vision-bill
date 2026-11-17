@@ -271,7 +271,7 @@ def validate_managed_ocr() -> None:
         from pydantic_settings import EnvSettingsSource
 
         # Deliberately after initialization: config imports eagerly resolve settings.
-        from vision_bill.config import OcrSettings, Settings, get_config_path, settings
+        from vision_bill.config import Settings, get_config_path, settings
 
         saved_ocr = read_config(get_config_path()).get("ocr", {})
         runtime_ocr = EnvSettingsSource(Settings)().get("ocr", {})
@@ -298,10 +298,7 @@ def validate_managed_ocr() -> None:
                     and TypeAdapter(bool).validate_python(explicit[name]) != expected
                 ):
                     raise ValueError("conflicting explicit managed policy")
-        saved = OcrSettings.model_validate(saved_ocr)
         effective = settings.ocr
-        if saved.enabled and saved.service_url != "http://ocr:8082":
-            raise ValueError("conflicting saved topology")
         if (
             not effective.enabled
             or effective.service_url != "http://ocr:8082"

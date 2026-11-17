@@ -284,3 +284,30 @@ def test_first_start_does_not_overwrite_locked_winner(saved_settings, monkeypatc
 
     preserved = path.read_text() == winner
     assert preserved
+
+
+@pytest.mark.parametrize(
+    ("saved_ocr", "status"),
+    [({"required": True}, 200), ({"required": True, "enabled": "invalid-boolean"}, 503)],
+)
+def test_settings_save_preserves_partial_ocr_with_canonical_runtime_endpoint(
+    saved_settings, monkeypatch, saved_ocr, status
+):
+    path, original, _, client = saved_settings
+    original["ocr"] = saved_ocr
+    path.write_text(yaml.safe_dump(original))
+    monkeypatch.setitem(config.Settings.model_config, "yaml_file", str(path))
+    monkeypatch.setenv("OCR__ENDPOINT", "http://ocr:8082")
+    active = config.Settings()
+    monkeypatch.setattr(system, "settings", active)
+    assert active.ocr.required and active.ocr.enabled
+    before = path.read_bytes()
+
+    response = client.put("/system/settings", json=payload(active, model_name="new-selection"))
+
+    assert response.status_code == status
+    if status == 200:
+        original["llm"]["model_name"] = "new-selection"
+        assert yaml.safe_load(path.read_text()) == original
+    else:
+        assert path.read_bytes() == before

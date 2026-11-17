@@ -12,6 +12,18 @@ import yaml
     "saved,runtime,expected",
     [
         ({}, {"OCR__ENDPOINT": "http://ocr:8082"}, 0),
+        pytest.param(
+            {"required": True},
+            {"OCR__ENDPOINT": "http://ocr:8082"},
+            0,
+            id="canonical-runtime-endpoint-completes-partial-saved-ocr",
+        ),
+        pytest.param(
+            {"enabled": True},
+            {"OCR__ENDPOINT": "http://ocr:8082"},
+            0,
+            id="canonical-runtime-endpoint-supplies-missing-saved-service-url",
+        ),
         ({"endpoint": "http://ocr:8082"}, {}, 0),
         ({"enabled": True, "service_url": "http://ocr:8082"}, {}, 0),
         ({}, {}, 1),
@@ -161,6 +173,9 @@ def test_managed_initialization_reuses_valid_restored_config_without_seeds(tmp_p
         command, env=env, cwd=tmp_path, capture_output=True, text=True, check=False
     )
     assert first.returncode == 0, first.stderr
+    saved = yaml.safe_load(config_path.read_text())
+    saved["ocr"] = {"required": True}
+    config_path.write_text(yaml.safe_dump(saved))
     before = config_path.read_bytes()
     for name in ("LLM__PROVIDER", "LLM__HOST", "LLM__MODEL_NAME"):
         env.pop(name)

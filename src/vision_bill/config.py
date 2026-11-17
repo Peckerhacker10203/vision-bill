@@ -320,10 +320,21 @@ def _publish_config_file(
         resolved = config.model_dump(mode="json", exclude={"pg": {"database_url", "pg_dsn"}})
         data = read_config(path) if existing else resolved
         if existing:
-            # Validate the persisted document itself, independent of environment overrides.
+            # Validate persisted fields, including credentials hidden by environment overrides.
             for section, model_field in Settings.model_fields.items():
-                if section in data:
-                    TypeAdapter(model_field.annotation).validate_python(data[section])
+                if section not in data:
+                    continue
+                section_data = data[section]
+                if (
+                    section == "ocr"
+                    and isinstance(section_data, dict)
+                    and config.ocr.enabled
+                    and "enabled" not in section_data
+                    and "endpoint" not in section_data
+                ):
+                    # Check partial OCR with its effective enabled state without saving it.
+                    section_data = {**section_data, "enabled": True}
+                TypeAdapter(model_field.annotation).validate_python(section_data)
             if changed_paths is None:
                 merge(data, resolved)
             else:

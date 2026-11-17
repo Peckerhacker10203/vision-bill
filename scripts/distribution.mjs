@@ -233,9 +233,11 @@ function runtimeExample(managed) {
 # LLM__PROVIDER=ollama
 # LLM__HOST=http://host.docker.internal:11434
 # LLM__MODEL_NAME=your-explicit-model
-# Optional: LLM__API_KEY=literal-key
-# Optional: LLM__TEMPERATURE=0
-# Optional OpenAI owned-router control: LLM__MODEL_LIFECYCLE=llamacpp
+# Optional API key and temperature.
+# LLM__API_KEY=literal-key
+# LLM__TEMPERATURE=0
+# Optional lifecycle control for a dedicated OpenAI-compatible llama.cpp router.
+# LLM__MODEL_LIFECYCLE=llamacpp
 ${managed ? "OCR__ENDPOINT=http://ocr:8082\nOCR__TIMEOUT_SECONDS=600\nOCR__ALLOW_VISION_FALLBACK=false\n" : "# Optional OCR__ENDPOINT: omit to preserve YAML; set blank only to explicitly disable.\n"}`;
 }
 

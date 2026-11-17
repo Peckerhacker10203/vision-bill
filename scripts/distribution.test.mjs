@@ -1167,6 +1167,46 @@ test("canonical_runtime_env_reaches_init_and_app", (t) => {
     }
   }
 });
+test("uncommenting_optional_runtime_assignments_reaches_init_and_app", (t) => {
+  const root = temp(t);
+  const { manifest, bytes } = externalFixture();
+  seed(root, bytes);
+  const directory = join(root, "bundle");
+  writeBundle(manifest, "app", directory, root);
+  const environment = readFileSync(
+    join(directory, "runtime.env.example"),
+    "utf8",
+  ).replace(/^# .*LLM__(?:API_KEY|TEMPERATURE|MODEL_LIFECYCLE)=.*$/gm, (line) =>
+    line.slice(2),
+  );
+  writeFileSync(join(directory, "runtime.env"), environment, { mode: 0o600 });
+  const result = spawnSync(
+    "docker",
+    [
+      "compose",
+      "-f",
+      join(directory, "compose.yaml"),
+      "config",
+      "--format",
+      "json",
+    ],
+    {
+      encoding: "utf8",
+      env: { ...process.env, COMPOSE_PROJECT_NAME: "vb-optional-env-example" },
+    },
+  );
+  assert.equal(
+    result.status,
+    0,
+    "Compose could not resolve the uncommented example assignments",
+  );
+  const { services } = JSON.parse(result.stdout);
+  for (const name of ["app", "config-init"]) {
+    assert.ok(services[name].environment.LLM__API_KEY === "literal-key");
+    assert.equal(services[name].environment.LLM__TEMPERATURE, "0");
+    assert.equal(services[name].environment.LLM__MODEL_LIFECYCLE, "llamacpp");
+  }
+});
 test("missing_optional_ocr_does_not_override_yaml", (t) => {
   const { effective } = resolveExternal(t, "app", temp(t));
   assert.equal(effective.services.app.environment.OCR__ENDPOINT, undefined);
