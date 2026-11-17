@@ -13,6 +13,7 @@ import sys
 import time
 from decimal import Decimal
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 import asyncpg
@@ -106,16 +107,17 @@ def migrate(settings, revision="head", direction="upgrade", check=True):
         "PG__PORT": str(settings.port),
         "PG__DB": settings.db,
         "AUTH__SECRET_KEY": secrets.token_hex(32),
-        "VISION_BILL_CONFIG_PATH": "/tmp/vb-task7-no-config",
     }
-    return subprocess.run(
-        [sys.executable, "-m", "alembic", direction, revision],
-        cwd=ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        check=check,
-    )
+    with TemporaryDirectory(prefix="vision-bill-migration-") as directory:
+        env["VISION_BILL_CONFIG_PATH"] = str(Path(directory) / "config.yaml")
+        return subprocess.run(
+            [sys.executable, "-m", "alembic", direction, revision],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
 
 
 @pytest.fixture
