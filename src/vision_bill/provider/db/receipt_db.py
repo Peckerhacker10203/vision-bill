@@ -1184,7 +1184,7 @@ class ReceiptDB:
             args.append(collection_id)
             where.append(
                 "EXISTS (SELECT 1 FROM receipt_collections rc "
-                f"WHERE rc.receipt_id = receipts.id AND rc.collection_id = ${len(args)})"
+                f"WHERE rc.receipt_id = r.id AND rc.collection_id = ${len(args)})"
             )
 
         sql = LIST_RECEIPTS_BASE_SQL

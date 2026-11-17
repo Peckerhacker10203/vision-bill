@@ -1,4 +1,7 @@
-"""Receipt CRUD + verify over live HTTP (uses the first registered fixture)."""
+"""Receipt CRUD over live HTTP and collection filtering on isolated PostgreSQL."""
+
+from decimal import Decimal
+from uuid import uuid4
 
 import pytest
 
@@ -9,8 +12,12 @@ from e2e.helpers import (
     register_user,
     wait_until,
 )
+from tests.e2e import test_workflow_db_e2e as pg_fixtures
+from vision_bill.model.workflow import AccessScope
+from vision_bill.provider.db.receipt_db import ReceiptDB
 
 pytestmark = pytest.mark.e2e
+db, postgres = pg_fixtures.db, pg_fixtures.postgres
 
 
 def _make_receipt(client) -> str:
@@ -51,3 +58,67 @@ def test_receipt_crud(http_factory) -> None:
     assert delete.json() == {"deleted": receipt_id}
     assert client.get(f"{API}/receipts/{receipt_id}").status_code == 404
     assert client.delete(f"{API}/receipts/{receipt_id}").status_code == 404
+
+
+async def test_receipt_collection_filter_respects_membership_and_owner(db) -> None:
+    pg_fixtures.migrate(db)
+    receipts = ReceiptDB(db)
+    await receipts.init_db()
+    try:
+        owner, foreign, admin = uuid4(), uuid4(), uuid4()
+        owned_collection, foreign_collection, empty_collection = uuid4(), uuid4(), uuid4()
+        selected_receipt, unassigned_receipt, foreign_receipt = uuid4(), uuid4(), uuid4()
+        async with receipts.pool.acquire() as conn:
+            await conn.executemany(
+                "INSERT INTO users(id, username, hashed_password, is_admin) "
+                "VALUES($1, $2, 'fixture', $3)",
+                [(owner, "owner", False), (foreign, "foreign", False), (admin, "admin", True)],
+            )
+            await conn.executemany(
+                "INSERT INTO collections(id, user_id, name) VALUES($1, $2, $3)",
+                [
+                    (owned_collection, owner, "Owned"),
+                    (foreign_collection, foreign, "Foreign"),
+                    (empty_collection, owner, "Empty"),
+                ],
+            )
+            await conn.executemany(
+                "INSERT INTO receipts(id, user_id, merchant_name, date, total, currency, "
+                "status, verified) VALUES($1, $2, 'Fixture', CURRENT_DATE, $3, "
+                "'USD', 'verified', TRUE)",
+                [
+                    (selected_receipt, owner, Decimal("3.25")),
+                    (unassigned_receipt, owner, Decimal("9.50")),
+                    (foreign_receipt, foreign, Decimal("7.10")),
+                ],
+            )
+            await conn.executemany(
+                "INSERT INTO receipt_collections(receipt_id, collection_id) VALUES($1, $2)",
+                [(selected_receipt, owned_collection), (foreign_receipt, foreign_collection)],
+            )
+
+        owner_scope = AccessScope(user_id=owner)
+        admin_scope = AccessScope(user_id=admin, can_see_all=True)
+        for scope, collection_id, expected_ids in (
+            (owner_scope, owned_collection, [selected_receipt]),
+            (owner_scope, foreign_collection, []),
+            (owner_scope, empty_collection, []),
+            (admin_scope, owned_collection, [selected_receipt]),
+            (admin_scope, foreign_collection, [foreign_receipt]),
+            (admin_scope, empty_collection, []),
+        ):
+            rows = await receipts.list_receipts(
+                collection_id=collection_id,
+                status=["verified"],
+                user_id=scope.user_id,
+                can_see_all=scope.can_see_all,
+            )
+            assert [row.id for row in rows] == expected_ids
+
+        statistics = await receipts.get_statistics(user_id=owner, collection_id=owned_collection)
+        assert statistics.verified_receipt_count == 1
+        assert [(row.currency, row.total) for row in statistics.currencies] == [
+            ("USD", Decimal("3.25"))
+        ]
+    finally:
+        await receipts.destroy_db()
