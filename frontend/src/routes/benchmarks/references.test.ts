@@ -38,8 +38,10 @@ it('requires unchecked explicit consent and sends the preview revision/hash exac
 	);
 	render(Page);
 	await screen.findByText('model');
+	expect(screen.queryByLabelText(/council/i)).toBeNull();
+	expect(screen.getByLabelText('Request timeout (seconds)')).toBeTruthy();
 	await fireEvent.input(screen.getByLabelText('Explicit receipt IDs'), {
-		target: { value: 'receipt' }
+		target: { value: 'receipt, receipt' }
 	});
 	await fireEvent.click(screen.getByRole('button', { name: 'Preview human references' }));
 	const consent = await screen.findByLabelText(
@@ -52,6 +54,10 @@ it('requires unchecked explicit consent and sends the preview revision/hash exac
 	await fireEvent.click(screen.getByRole('button', { name: 'Confirm and start' }));
 	await waitFor(() => expect(calls.filter((c) => c.init?.method === 'POST')).toHaveLength(2));
 	const writes = calls.filter((c) => c.init?.method === 'POST');
+	expect(
+		calls.filter((call) => call.url.endsWith('/references/receipt') && call.init?.method !== 'POST')
+	).toHaveLength(1);
+	expect(JSON.parse(writes[1].init!.body as string).receipt_ids).toEqual(['receipt']);
 	expect(writes[0].url).toBe('/api/v1/benchmarks/references/receipt');
 	expect(JSON.parse(writes[0].init!.body as string)).toEqual({
 		expected_review_revision: 7,

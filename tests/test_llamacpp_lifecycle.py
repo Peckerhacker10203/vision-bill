@@ -119,6 +119,12 @@ async def test_router_release_waits_for_exact_owned_model_exit(monkeypatch, init
     ]
 
 
+@pytest.mark.parametrize("path", ["//", "/v1//", "/proxy/v1///"])
+def test_router_rejects_ambiguous_trailing_slashes(path):
+    with pytest.raises(ValueError, match="unambiguous"):
+        OpenAIProvider(f"http://llama.local{path}", "test-key", model_lifecycle="llamacpp")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("host,path", [
     ("http://llama.local", "/models"),

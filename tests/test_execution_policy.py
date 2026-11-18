@@ -3,7 +3,7 @@
 import pytest
 
 from vision_bill.config import OcrSettings
-from vision_bill.service.submission_service import SubmissionService
+from vision_bill.service.execution_policy import snapshot_ocr
 
 
 @pytest.mark.parametrize(
@@ -72,7 +72,7 @@ def test_new_snapshot_disables_effective_fallback_and_is_accepted(settings):
     assert snapshot["allow_ocr_fallback"] is False
     assert snapshot["ocr"]["allow_vision_fallback"] is False
     assert snapshot["ocr"]["vision_fallback_model_id"] is None
-    assert SubmissionService._fallback_permission(snapshot) is False
+    assert snapshot_ocr(snapshot).allow_vision_fallback is False
     assert settings.ocr.allow_vision_fallback  # building the snapshot never mutates live settings
 
 
@@ -85,7 +85,7 @@ def test_versioned_snapshot_rejects_unknown_or_permissive_policy(settings, versi
     snapshot = current_snapshot(settings)
     snapshot.update(execution_policy_version=version, allow_ocr_fallback=permission)
     with pytest.raises(ValueError, match="execution_snapshot_invalid"):
-        SubmissionService._fallback_permission(snapshot)
+        snapshot_ocr(snapshot)
 
 
 @pytest.mark.parametrize("version", [None, 2, 3])

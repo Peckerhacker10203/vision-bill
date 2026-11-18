@@ -62,12 +62,17 @@ conditional native requirements and comment-only evidence are rejected. The Make
 targets provide the pinned packaging parser in an isolated uv tool environment.
 
 `make ocr-build-rocm` builds the full TheRock SDK and Paddle from the approved
-source pins. The recipe initializes TheRock's recursive Git submodules at their
+source pins. Fresh Git clones request `--filter=blob:none` for TheRock, Paddle
+and their recursive submodules. Git retains commit history and tags, downloads
+file contents for the checked-out revisions, and can fetch historical blobs on
+demand. The recipe initializes TheRock's recursive Git submodules at their
 recorded pins before applying upstream patches. It checks the source inventory
 before building `patchelf` and reports the path and pin of a missing checkout.
 Provision substantial disk/RAM/CPU capacity first; this is a large
 native compilation, not an ordinary sidecar dependency install. `OCR_BUILD_JOBS`
-controls compiler parallelism and concurrent Git submodule fetches. Model weights
+sets the job limit for each CMake build (including TheRock subprojects) and
+concurrent Git submodule fetches. TheRock can run multiple subprojects at once,
+so their combined compiler count can exceed this setting. Model weights
 are provisioned separately for qualification. The versioned patch replaces both
 legacy HIP target lists, uses the flat SDK and same-pin legacy FindHIP helpers,
 requires MIOpen, and stops the forced download of FlashAttention. FP32 runs with

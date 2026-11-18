@@ -365,10 +365,6 @@ class ReceiptService:
             model_id=model_id,
         )
 
-    async def claim_image_for_analysis(self, image_id: UUID) -> ImageRow | None:
-        """Claim a queued image before an in-request analysis starts."""
-        return await self._image_db.claim_for_analysis(image_id)
-
     async def get_image_by_id(
         self, image_id: UUID, user_id: UUID | None = None, can_see_all: bool = False
     ) -> ImageRow | None:
@@ -396,18 +392,6 @@ class ReceiptService:
 
     async def mark_image_failed(self, image_id: UUID, error: str) -> None:
         await self._image_db.mark_failed(image_id, error)
-
-    async def mark_image_terminal(self, image_id: UUID, status: str, error: str) -> None:
-        await self._image_db.mark_terminal(image_id, status, error)
-
-    async def move_additional_images(self, image: ImageRow, receipt_id: UUID) -> None:
-        for part in image.additional_images:
-            path, thumb = self._image_service.store_perm_image(Path(part.image_path), receipt_id)
-            if path is not None:
-                part.image_path = str(path)
-            if thumb is not None:
-                part.thumbnail_path = str(thumb)
-            await self._image_db.update_additional_images(image.id, image.additional_images)
 
     async def update_image_path(self, image_id: UUID, image_path: str) -> None:
         await self._image_db.update_image_path(image_id, image_path)

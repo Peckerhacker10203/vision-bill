@@ -173,13 +173,14 @@ def create_app(
         validate_source(raw, image.content_type, limit=max_upload_bytes)
         if hashlib.sha256(raw).hexdigest() != source_sha256:
             raise HTTPException(422, "ocr_source_hash_mismatch")
-        with tempfile.NamedTemporaryFile(
-            prefix="vision-bill-upload-", suffix=".source", delete=False
-        ) as f:
-            f.write(raw)
-            path = Path(f.name)
+        path: Path | None = None
         cleanup_safe = True
         try:
+            with tempfile.NamedTemporaryFile(
+                prefix="vision-bill-upload-", suffix=".source", delete=False
+            ) as source:
+                path = Path(source.name)
+                source.write(raw)
             request = OcrRequest(request_id, path, photo_index, source_sha256)
             if mode == "standalone":
                 result = worker.infer_standalone(
@@ -195,7 +196,7 @@ def create_app(
             cleanup_safe = exc.cleanup_safe
             raise HTTPException(exc.status_code, exc.code) from None
         finally:
-            if cleanup_safe:
+            if cleanup_safe and path is not None:
                 path.unlink(missing_ok=True)
 
     @app.post("/ocr", response_model=OcrResponse)

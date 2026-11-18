@@ -191,9 +191,6 @@ class BenchmarkService:
         r = details.receipt
         return Receipt.model_validate({"confidence": r.confidence, "merchant_name": r.merchant_name, "merchant_address": r.merchant_address, "receipt_number": r.receipt_number, "date": r.date, "time": r.time, "currency": r.currency, "category": r.category, "line_items": [LineItem.model_validate(x.model_dump()) for x in details.line_items], "taxes": [TaxLine.model_validate(x.model_dump()) for x in details.taxes], "subtotal": r.subtotal, "discount_total": r.discount_total, "tax_total": r.tax_total, "tip": r.tip, "total": r.total, "payment_method": r.payment_method}), details.image_path
 
-    async def _expected_receipt(self, receipt_id: UUID) -> Receipt:
-        return (await self._expected_receipt_and_path(receipt_id))[0]
-
     async def _work(self) -> None:
         while not self._stopping.is_set():
             try:

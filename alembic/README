@@ -1,4 +1,5 @@
-Hand-written raw-SQL PostgreSQL migrations; current head: 0018.
+Hand-written SQL migrations for PostgreSQL. Run `uv run alembic heads` to see
+the latest revision in this checkout.
 
 Run `uv run alembic upgrade head` with the genuine schema owner PG__* settings.
 Alembic/entrypoint does not consume MIGRATION_DATABASE_URL; that variable belongs

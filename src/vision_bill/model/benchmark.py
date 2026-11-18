@@ -40,6 +40,11 @@ class BenchmarkCreate(BaseModel):
     council_relative_threshold: Decimal | None = Field(default=None, ge=0)
     apply_council_flags: bool = False
 
+    @field_validator("receipt_ids")
+    @classmethod
+    def unique_receipt_selection(cls, receipt_ids: list[UUID] | None) -> list[UUID] | None:
+        return list(dict.fromkeys(receipt_ids)) if receipt_ids is not None else None
+
     @field_validator("model_ids")
     @classmethod
     def explicit_model_selection(cls, model_ids: list[str]) -> list[str]:

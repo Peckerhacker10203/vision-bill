@@ -8,6 +8,7 @@ from fastapi import FastAPI
 
 from vision_bill.api.benchmarks import router
 from vision_bill.api.helper.helper import get_benchmark_service
+from vision_bill.model.benchmark import BenchmarkCreate
 from vision_bill.security.dependencies import get_current_user
 from vision_bill.security.models import User
 
@@ -51,3 +52,9 @@ async def test_create_rejects_ineligible_selection_as_unprocessable(message):
     assert response.status_code == 422 and response.json()['detail'] == message
     assert len(service.create_run.call_args.args[0].receipt_ids) == 2
     assert service.create_run.call_args.kwargs['scope'].user_id == user.id
+
+
+def test_benchmark_selection_deduplicates_receipts_in_first_seen_order():
+    first, second = uuid4(), uuid4()
+    request = BenchmarkCreate(model_ids=["m"], receipt_ids=[second, first, second])
+    assert request.receipt_ids == [second, first]

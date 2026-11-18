@@ -15,7 +15,6 @@ dependencies = [
     "pillow-heif>=0.16.0",
     "pydantic-settings>=2.14.2",
     "pyyaml>=6.0",
-    "pytest>=9.1.1",
     "python-magic>=0.4.27",
     "python-multipart>=0.0.32",
     "sqlalchemy[asyncio]>=2.0.52",
@@ -26,7 +25,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
+    "pytest>=9.1.1",
     "pytest-asyncio>=0.24",
     "httpx>=0.27",
     "httpx2>=2.0.0",

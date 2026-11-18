@@ -6,12 +6,7 @@
 	import { api } from '$lib/api/client';
 	import { session } from '$lib/auth';
 	import { captureSessionActor, isCurrentSessionActor } from '$lib/session-lifetime';
-	import type {
-		BenchmarkCouncilPolicy,
-		BenchmarkCreate,
-		BenchmarkReferencePreview,
-		ModelInfo
-	} from '$lib/types';
+	import type { BenchmarkCreate, BenchmarkReferencePreview, ModelInfo } from '$lib/types';
 	import BenchmarkExperimentControls from '$lib/ui/BenchmarkExperimentControls.svelte';
 	import { defaultExperiment, experimentRequest } from '$lib/benchmark-experiments';
 
@@ -32,6 +27,13 @@
 			qualify = false;
 		}
 	});
+	function selectedReceiptIds(value: string) {
+		const ids = value
+			.split(',')
+			.map((id) => id.trim().toLowerCase())
+			.filter(Boolean);
+		return [...new Set(ids)];
+	}
 	async function previewReferences() {
 		if (!actor || !current() || previewing) return;
 		previewing = true;
@@ -40,10 +42,7 @@
 		error = '';
 		const selection = receiptIds;
 		try {
-			const ids = selection
-				.split(',')
-				.map((id) => id.trim())
-				.filter(Boolean);
+			const ids = selectedReceiptIds(selection);
 			if (!ids.length)
 				throw new Error(
 					'Enter explicit receipt IDs to qualify new references. Filters use existing qualified references.'
@@ -95,10 +94,6 @@
 		maxConfidence = $state<number | undefined>(),
 		limit = $state<number | undefined>(),
 		timeout = $state(600),
-		policy = $state<BenchmarkCouncilPolicy>('all'),
-		absolute = $state<number | undefined>(),
-		relative = $state<number | undefined>(),
-		applyFlags = $state(false),
 		confirm = $state(false),
 		creating = $state(false),
 		error = $state('');
@@ -133,23 +128,18 @@
 		if (!actor || !current() || creating) return;
 		creating = true;
 		error = '';
-		const ids = receiptIds
-			.split(',')
-			.map((id) => id.trim())
-			.filter(Boolean);
+		const ids = selectedReceiptIds(receiptIds);
 		const body: BenchmarkCreate = {
 			model_ids: selected,
 			experiment: experimentRequest(experiment),
 			request_timeout_seconds: timeout,
-			council_policy: policy,
-			apply_council_flags: applyFlags
+			council_policy: 'all',
+			apply_council_flags: false
 		};
 		if (ids.length) body.receipt_ids = ids;
 		if (category) body.category = category;
 		if (maxConfidence !== undefined) body.max_source_confidence = maxConfidence;
 		if (limit !== undefined) body.limit = limit;
-		if (absolute !== undefined) body.council_absolute_threshold = absolute;
-		if (relative !== undefined) body.council_relative_threshold = relative;
 		try {
 			if (qualify) {
 				if (!references.length || receiptIds !== referenceSelection)
@@ -280,44 +270,17 @@
 			thinkingControl={capabilities.thinking_control}
 		/>
 		<fieldset class="rounded-xl border border-outline-variant p-4">
-			<legend class="px-1 font-medium">Execution and council</legend>
-			<div class="grid gap-3 sm:grid-cols-2">
-				<label class="text-sm"
-					>Request timeout (seconds)<input
-						class="mt-1 block w-full rounded-lg border border-outline-variant p-2"
-						type="number"
-						min="1"
-						bind:value={timeout}
-					/></label
-				><label class="text-sm"
-					>Council policy<select
-						class="mt-1 block w-full rounded-lg border border-outline-variant p-2"
-						bind:value={policy}
-						><option value="all">All differences (€0.01)</option><option value="material"
-							>Material (€1 and 2%)</option
-						><option value="custom">Custom threshold</option></select
-					></label
-				><label class="text-sm"
-					>Custom absolute €<input
-						class="mt-1 block w-full rounded-lg border border-outline-variant p-2"
-						type="number"
-						min="0"
-						step="0.01"
-						bind:value={absolute}
-					/></label
-				><label class="text-sm"
-					>Custom relative<input
-						class="mt-1 block w-full rounded-lg border border-outline-variant p-2"
-						type="number"
-						min="0"
-						step="0.001"
-						bind:value={relative}
-					/></label
-				>
-			</div>
-			<label class="mt-3 inline-flex items-center gap-2 text-sm"
-				><input type="checkbox" bind:checked={applyFlags} /> Apply council flags</label
-			>
+			<legend class="px-1 font-medium">Execution</legend>
+			<label class="text-sm"
+				>Request timeout (seconds)
+				<input
+					class="mt-1 block w-full rounded-lg border border-outline-variant p-2"
+					type="number"
+					min="1"
+					max="600"
+					bind:value={timeout}
+				/>
+			</label>
 		</fieldset>
 		<p class="rounded-lg bg-error-container p-3 text-sm text-on-error-container">
 			<strong>Before creating:</strong> this can take a long time, consume substantial energy, and make

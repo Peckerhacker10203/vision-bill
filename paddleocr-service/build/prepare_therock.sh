@@ -8,7 +8,7 @@ RECIPE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # TheRock's fetch only initializes selected top-level sources. Populate all
 # recorded pins first so an update cannot reset an upstream-patched checkout.
-git -C "$SOURCE" submodule update --init --recursive --checkout --jobs "$JOBS"
+git -C "$SOURCE" submodule update --init --recursive --filter=blob:none --checkout --jobs "$JOBS"
 (
   cd "$SOURCE"
   python build_tools/fetch_sources.py --no-remote --apply-patches

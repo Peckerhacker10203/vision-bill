@@ -100,12 +100,6 @@ class SubmissionService:
         return self.receipts.current_execution_snapshot(self.settings)
 
     @staticmethod
-    def _fallback_permission(snapshot: dict[str, Any]) -> bool:
-        snapshot_ocr(snapshot)
-        # Legacy intent stays in the saved request, never in effective execution.
-        return False
-
-    @staticmethod
     def _initial_model(models: list[ModelInfo], preferred: str, *, vision: bool) -> ModelInfo | None:
         """Resolve only an unfrozen legacy binding from affirmative discovery."""
         if vision:
@@ -427,13 +421,10 @@ class SubmissionService:
                 raise StaleClaimError
             image = saved
         snapshot = image.effective_options
-        permission = self._fallback_permission(snapshot)
         if not image.model_id:
             raise ValueError("execution_snapshot_invalid")
-        ocr = OcrSettings.model_validate(snapshot["ocr"])
-        options = ExperimentOptions(
-            temperature=snapshot["temperature"], allow_ocr_fallback=permission
-        )
+        ocr = snapshot_ocr(snapshot)
+        options = ExperimentOptions(temperature=snapshot["temperature"], allow_ocr_fallback=False)
         limit = snapshot["max_output_tokens"]
         if type(limit) is not int or limit <= 0:
             raise ValueError("execution_snapshot_invalid")

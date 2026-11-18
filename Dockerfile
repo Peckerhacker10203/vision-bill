@@ -22,26 +22,24 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends libmagic1 && rm -rf /var/lib/apt/lists/*
+
 # Copy dependency files first for better layer caching
 COPY pyproject.toml uv.lock ./
 
 # Install dependencies into a project-local venv, based only on the lockfile
 # (no source yet, so this layer is cached until deps actually change)
-RUN uv sync --frozen --no-install-project
+RUN uv sync --no-cache --frozen --no-install-project
 
 # Now copy the source (plus the alembic migration tooling the app relies on)
 COPY ./src ./src
 COPY ./paddleocr-service/ocr_contract ./paddleocr-service/ocr_contract
+
+# The editable install reads the SPA from the source tree at runtime.
+RUN uv sync --no-cache --frozen
+
 COPY alembic.ini ./
 COPY ./alembic ./alembic
-
-# Bake the built SPA into the package's static dir (served by FastAPI at /).
-COPY --from=frontend /build/frontend/out/. ./src/vision_bill/static/
-
-RUN apt-get update && apt-get install -y --no-install-recommends libmagic1 && rm -rf /var/lib/apt/lists/*
-
-# Install the project itself (editable, matches the lockfile)
-RUN uv sync --frozen
 
 # Make sure the venv's binaries are used
 ENV PATH="/app/.venv/bin:$PATH"
@@ -54,7 +52,9 @@ EXPOSE 8080
 # the migration here keeps the image self-sufficient: `docker run` on a fresh
 # DB works, and new migrations apply on upgrade. docker-compose's
 # `depends_on: db: service_healthy` gate keeps this safe when orchestrated.
-COPY docker-entrypoint.sh /docker-entrypoint.sh
-RUN chmod +x /docker-entrypoint.sh
+COPY --chmod=755 docker-entrypoint.sh /docker-entrypoint.sh
+
+# Join the independent frontend and Python builds after both have finished.
+COPY --from=frontend /build/frontend/out/. ./src/vision_bill/static/
 ENTRYPOINT ["/docker-entrypoint.sh"]
 CMD ["uvicorn", "src.vision_bill.main:app", "--host", "0.0.0.0", "--port", "8080"]

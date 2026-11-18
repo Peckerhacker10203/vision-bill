@@ -6,16 +6,21 @@ SOURCE_ROOT="${SOURCE_ROOT:-/opt/native-src}"
 SDK="${SDK:-/opt/rocm}"
 RECIPE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 EVIDENCE=/opt/ocr/build-evidence
-mkdir -p "$SOURCE_ROOT" "$EVIDENCE" /opt/ocr/bin /opt/wheels
 THEROCK_SRC="$SOURCE_ROOT/TheRock"
 THEROCK_BUILD="$SOURCE_ROOT/therock-build"
 PADDLE_SRC="$SOURCE_ROOT/Paddle"
 # Fresh sources/caches only: a previous native build is not a reproducible input.
-test ! -e "$THEROCK_SRC" && test ! -e "$PADDLE_SRC" && test ! -e "$THEROCK_BUILD"
+for path in "$THEROCK_SRC" "$PADDLE_SRC" "$THEROCK_BUILD"; do
+  if [[ -e "$path" || -L "$path" ]]; then
+    echo "Native build path already exists: $path" >&2
+    exit 1
+  fi
+done
+mkdir -p "$SOURCE_ROOT" "$EVIDENCE" /opt/ocr/bin /opt/wheels
 TARGETS="$(python "$RECIPE/../ocr_service/targets.py" --targets "${AMDGPU_TARGETS:-}" --output "$EVIDENCE/targets.json")"
 export VISION_BILL_AMDGPU_TARGETS="$TARGETS"
 
-git clone --no-checkout https://github.com/ROCm/TheRock.git "$THEROCK_SRC"
+git clone --filter=blob:none --no-checkout https://github.com/ROCm/TheRock.git "$THEROCK_SRC"
 git -C "$THEROCK_SRC" checkout --detach b324869fb3116353ac7eec5e6926aa3d452ac987
 git -C "$THEROCK_SRC" ls-files --stage > "$EVIDENCE/therock-original-gitlinks.txt"
 bash "$RECIPE/prepare_therock.sh" "$THEROCK_SRC" "$EVIDENCE/therock-sources.json" "$BUILD_JOBS"
@@ -29,7 +34,8 @@ cmake -S "$THEROCK_SRC" -B "$THEROCK_BUILD" -GNinja \
   -DTHEROCK_AMDGPU_FAMILIES= "-DTHEROCK_AMDGPU_TARGETS=$TARGETS" \
   -DTHEROCK_DIST_AMDGPU_FAMILIES= "-DTHEROCK_DIST_AMDGPU_TARGETS=$TARGETS" \
   -DTHEROCK_AMDGPU_DIST_BUNDLE_NAME=vision-bill-candidate-v1 -DBUILD_TESTING=OFF
-cmake --build "$THEROCK_BUILD" --target dist-rocm --parallel "$BUILD_JOBS"
+# TheRock launches separate cmake --build processes for its subprojects.
+CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS" cmake --build "$THEROCK_BUILD" --target dist-rocm
 cmake --install "$THEROCK_BUILD" --component rocm --prefix "$SDK"
 cp "$THEROCK_BUILD/CMakeCache.txt" "$EVIDENCE/therock-CMakeCache.txt"
 # Legacy FindHIP + Linux linker helper from the SAME patched source pin.
@@ -49,9 +55,9 @@ for helper in "$SDK/bin/hipcc" "$SDK/bin/hipconfig" "$SDK/bin/hipcc_cmake_linker
   sha256sum "$helper" >> "$EVIDENCE/hip-helpers.sha256"
 done
 
-git clone --no-checkout https://github.com/PaddlePaddle/Paddle.git "$PADDLE_SRC"
+git clone --filter=blob:none --no-checkout https://github.com/PaddlePaddle/Paddle.git "$PADDLE_SRC"
 git -C "$PADDLE_SRC" checkout --detach 7688495538f4d6c1893f084dd238a402e8f68ab6
-git -C "$PADDLE_SRC" submodule update --init --recursive --jobs "$BUILD_JOBS"
+git -C "$PADDLE_SRC" submodule update --init --recursive --filter=blob:none --jobs "$BUILD_JOBS"
 (
   cd "$PADDLE_SRC"
   git apply --check "$RECIPE/hip-rdna2-v1.patch"

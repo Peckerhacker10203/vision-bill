@@ -65,11 +65,12 @@ make script-create-benchmark ARGS="--model installed-local-model --receipt-id 12
 
 Supply at least one explicit `--model` and use each exact model ID once. Repeat
 `--receipt-id` to select individual references or omit it to use current eligible
-Gold in the caller's scope. Other flags include `--category`,
-`--max-source-confidence`, `--limit`,
-`--request-timeout-seconds` (default 300, at most 600), `--council-policy` and explicit
-council thresholds/flags. This CLI does not expose every experiment UI/API setting;
-consult `--help` and `BenchmarkCreate` before assuming a pipeline flag exists.
+Gold in the caller's scope. Use `--category`, `--max-source-confidence` and `--limit` to filter
+the dataset. Set the per-request timeout with `--request-timeout-seconds`
+(default 300, maximum 600). The CLI still accepts council policy, thresholds and
+flags as legacy run metadata. They have no effect on scoring, model execution or
+receipt flags. See `--help` for supported CLI options and `BenchmarkCreate` for
+the full API contract.
 
 ## Standalone benchmark (no API)
 

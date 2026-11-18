@@ -11,7 +11,7 @@ import httpx
 class LlamaCppLifecycle:
     def __init__(self, host: str, api_key: str):
         parts = urlsplit(host)
-        path = parts.path.rstrip("/")
+        path = parts.path
         if (
             parts.scheme not in ("http", "https")
             or not parts.hostname
@@ -27,7 +27,7 @@ class LlamaCppLifecycle:
             raise ValueError("llamacpp lifecycle requires an unambiguous local router URL")
         # Validate the port before any request or journal identity is created.
         _ = parts.port
-        path = path.removesuffix("/v1")
+        path = path.removesuffix("/").removesuffix("/v1")
         self._base_url = urlunsplit((parts.scheme, parts.netloc, path + "/", "", ""))
         self._api_key = api_key
         self.identity = "llamacpp:" + hashlib.sha256(self._base_url.encode()).hexdigest()

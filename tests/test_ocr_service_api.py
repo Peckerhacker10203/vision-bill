@@ -421,3 +421,30 @@ def test_native_result_rejects_crc_correct_invalid_deflate(tmp_path):
     with pytest.raises(HTTPException) as error:
         validate_result(with_invalid_deflate(response(request(tmp_path))))
     assert error.value.status_code == 502
+
+
+def test_failed_source_write_removes_partial_private_upload(tmp_path, monkeypatch):
+    from ocr_service import api
+
+    original = api.tempfile.NamedTemporaryFile
+    context = FakeContext()
+    worker = manager(context)
+
+    def partial_write(**kwargs):
+        source = original(dir=tmp_path, **kwargs)
+        write = source.write
+
+        def fail(raw):
+            write(raw[:5])
+            raise OSError("no space left")
+
+        source.write = fail
+        return source
+
+    monkeypatch.setattr(api.tempfile, "NamedTemporaryFile", partial_write)
+    raw = png()
+    with TestClient(api.create_app(worker_factory=lambda: worker)) as client:
+        with pytest.raises(OSError, match="no space left"):
+            client.post("/ocr", files={"image": ("x.png", raw, "image/png")}, data=fields(raw))
+    assert not list(tmp_path.iterdir())
+    assert not context.requests

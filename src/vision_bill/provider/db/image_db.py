@@ -232,23 +232,6 @@ class ImageDB:
         async with self.pool.acquire() as conn:
             await conn.execute(UPDATE_IMAGE_PATH_SQL, image_id, image_path)
 
-    async def mark_terminal(self, image_id: UUID, status: str, error: str) -> None:
-        if status not in ("timed_out", "unreadable"):
-            raise ValueError("Unsupported terminal analysis status")
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE images SET status = $2, error = $3, processing_at = NULL WHERE id = $1 "
-                "AND request_fingerprint IS NULL AND claim_token IS NULL AND attempt_count = 0",
-                image_id, status, error,
-            )
-
-    async def update_additional_images(self, image_id: UUID, parts: list[ImagePart]) -> None:
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE images SET additional_images = $2::jsonb WHERE id = $1",
-                image_id, json.dumps([part.model_dump() for part in parts]),
-            )
-
     async def update_image_thumbnail_path(self, image_id: UUID, thumbnail_path: str) -> None:
         """Update the stored thumbnail path for an image row."""
         async with self.pool.acquire() as conn:

@@ -7,6 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,8 +27,6 @@ def test_separate_digest_pinned_native_images_and_cuda_lock():
     cuda = (SERVICE / "requirements.cuda.lock").read_text()
     assert "paddlepaddle_gpu-3.3.1" in cuda and "cu126" in cuda
     if "UNRESOLVED" in cuda:
-        import pytest
-
         with pytest.raises(ValueError, match="unresolved"):
             load_build_module("resolve_cuda").validate_lock(SERVICE / "requirements.cuda.lock")
     else:
@@ -44,6 +43,7 @@ def test_rocm_exact_pins_full_sdk_targets_and_no_spoofing():
     assert lock["sources"]["therock"] == "b324869fb3116353ac7eec5e6926aa3d452ac987"
     assert lock["rdna2_targets"] == ["gfx1030", "gfx1031", "gfx1032", "gfx1034"]
     assert "THEROCK_ENABLE_ALL=ON" in script and "--target dist-rocm" in script
+    assert 'CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS" cmake --build "$THEROCK_BUILD"' in script
     assert "HSA_OVERRIDE_GFX_VERSION" not in script
     assert "WITH_FLASHATTN=OFF" in script
     assert "git apply --check" in script
@@ -51,6 +51,20 @@ def test_rocm_exact_pins_full_sdk_targets_and_no_spoofing():
     assert "+  list(APPEND HIP_HCC_FLAGS --offload-arch=${target})" in patch
     assert "+  list(APPEND HIP_CLANG_FLAGS --offload-arch=${target})" in patch
     assert "WITH_ROCM AND WITH_FLASHATTN" in patch
+
+
+@pytest.mark.parametrize("existing", ["TheRock", "Paddle", "therock-build"])
+def test_rocm_rejects_existing_source_before_starting_build(tmp_path, existing):
+    (tmp_path / existing).mkdir()
+    result = subprocess.run(
+        ["bash", SERVICE / "build/build_rocm.sh"],
+        env={**os.environ, "SOURCE_ROOT": str(tmp_path), "AMDGPU_TARGETS": "invalid"},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert f"Native build path already exists: {tmp_path / existing}" in result.stderr
 
 
 def test_therock_preparation_inventories_gitlinks_omitted_by_upstream_fetch(tmp_path):
@@ -67,6 +81,7 @@ def test_therock_preparation_inventories_gitlinks_omitted_by_upstream_fetch(tmp_
         path = tmp_path / name
         path.mkdir()
         git(path, "init", "--quiet")
+        git(path, "config", "uploadpack.allowFilter", "true")
         git(path, "commit", "--quiet", "--allow-empty", "-m", f"Pin {name}")
         return path
 
@@ -74,10 +89,10 @@ def test_therock_preparation_inventories_gitlinks_omitted_by_upstream_fetch(tmp_
     libraries = repo("libraries")
     docs = repo("docs")
     upstream = repo("upstream")
-    git(libraries, "submodule", "add", "--quiet", str(nested), "projects/miopen/fin")
+    git(libraries, "submodule", "add", "--quiet", nested.as_uri(), "projects/miopen/fin")
     git(libraries, "commit", "--quiet", "-am", "Pin nested source")
-    git(upstream, "submodule", "add", "--quiet", str(libraries), "rocm-libraries")
-    git(upstream, "submodule", "add", "--quiet", str(docs), "rocm-docs")
+    git(upstream, "submodule", "add", "--quiet", libraries.as_uri(), "rocm-libraries")
+    git(upstream, "submodule", "add", "--quiet", docs.as_uri(), "rocm-docs")
 
     # Model TheRock's pinned top-level fetch and patches without network or a compiler.
     fetch_sources = upstream / "build_tools/fetch_sources.py"
@@ -114,6 +129,8 @@ def test_therock_preparation_inventories_gitlinks_omitted_by_upstream_fetch(tmp_
         ["bash", SERVICE / "build/prepare_therock.sh", new, output, "4"], env=env, check=True
     )
 
+    for path in ("rocm-docs", "rocm-libraries", "rocm-libraries/projects/miopen/fin"):
+        assert git(new / path, "config", "--get", "remote.origin.partialclonefilter") == "blob:none"
     report = json.loads(output.read_text())
     assert report["checkouts"]["rocm-docs"]["head"] == git(docs, "rev-parse", "HEAD")
     assert report["checkouts"]["rocm-libraries/projects/miopen/fin"]["head"] == git(nested, "rev-parse", "HEAD")
