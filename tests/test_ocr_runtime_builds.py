@@ -1,7 +1,10 @@
 """Static recipe checks do not assert a working GPU binary."""
 
 import json
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import yaml
@@ -48,6 +51,75 @@ def test_rocm_exact_pins_full_sdk_targets_and_no_spoofing():
     assert "+  list(APPEND HIP_HCC_FLAGS --offload-arch=${target})" in patch
     assert "+  list(APPEND HIP_CLANG_FLAGS --offload-arch=${target})" in patch
     assert "WITH_ROCM AND WITH_FLASHATTN" in patch
+
+
+def test_therock_preparation_inventories_gitlinks_omitted_by_upstream_fetch(tmp_path):
+    env = {**os.environ, "GIT_ALLOW_PROTOCOL": "file"}
+
+    def git(repo, *args):
+        return subprocess.check_output(
+            ["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.com", *args],
+            env=env,
+            text=True,
+        ).strip()
+
+    def repo(name):
+        path = tmp_path / name
+        path.mkdir()
+        git(path, "init", "--quiet")
+        git(path, "commit", "--quiet", "--allow-empty", "-m", f"Pin {name}")
+        return path
+
+    nested = repo("fin")
+    libraries = repo("libraries")
+    docs = repo("docs")
+    upstream = repo("upstream")
+    git(libraries, "submodule", "add", "--quiet", str(nested), "projects/miopen/fin")
+    git(libraries, "commit", "--quiet", "-am", "Pin nested source")
+    git(upstream, "submodule", "add", "--quiet", str(libraries), "rocm-libraries")
+    git(upstream, "submodule", "add", "--quiet", str(docs), "rocm-docs")
+
+    # Model TheRock's pinned top-level fetch and patches without network or a compiler.
+    fetch_sources = upstream / "build_tools/fetch_sources.py"
+    fetch_sources.parent.mkdir()
+    fetch_sources.write_text(
+        "import subprocess\n"
+        "from pathlib import Path\n"
+        "subprocess.run(['git', 'submodule', 'update', '--init', '--', 'rocm-libraries'], check=True)\n"
+        "subprocess.run(['git', '-C', 'rocm-libraries', '-c', 'user.name=Test', '-c', "
+        "'user.email=test@example.com', 'commit', '--quiet', '--allow-empty', '-m', 'Patch'], check=True)\n"
+        "Path('.rocm-libraries.smrev').write_text('patched checkout\\n')\n"
+    )
+    git(upstream, "add", "build_tools")
+    git(upstream, "commit", "--quiet", "-m", "Pin TheRock inputs")
+    for checkout in ("old-checkout", "new-checkout"):
+        git(tmp_path, "clone", "--quiet", str(upstream), checkout)
+
+    old = tmp_path / "old-checkout"
+    output = tmp_path / "sources.json"
+    subprocess.run([sys.executable, "build_tools/fetch_sources.py"], cwd=old, env=env, check=True)
+    original_inventory = subprocess.run(
+        [sys.executable, SERVICE / "build/source_inventory.py", old, output],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert original_inventory.returncode != 0
+    missing_gitlink = git(docs, "rev-parse", "HEAD") + " rocm-docs"
+    assert f"Uninitialized recursive source gitlink: {missing_gitlink}" in original_inventory.stderr
+    assert not output.exists()
+
+    new = tmp_path / "new-checkout"
+    subprocess.run(
+        ["bash", SERVICE / "build/prepare_therock.sh", new, output, "4"], env=env, check=True
+    )
+
+    report = json.loads(output.read_text())
+    assert report["checkouts"]["rocm-docs"]["head"] == git(docs, "rev-parse", "HEAD")
+    assert report["checkouts"]["rocm-libraries/projects/miopen/fin"]["head"] == git(nested, "rev-parse", "HEAD")
+    assert report["checkouts"]["rocm-libraries"]["head"] != git(libraries, "rev-parse", "HEAD")
+    assert report["checkouts"]["rocm-libraries"]["head"] == git(new / "rocm-libraries", "rev-parse", "HEAD")
+    assert ".rocm-libraries.smrev" in report["patches_and_smrev"]
 
 
 def test_sidecar_independent_context_cache_and_internal_readiness():

@@ -264,6 +264,7 @@ paddleocr-service/.wheelhouse/
 !paddleocr-service/build/
 paddleocr-service/build/*
 !paddleocr-service/build/build_rocm.sh
+!paddleocr-service/build/prepare_therock.sh
 !paddleocr-service/build/hip-rdna2-v1.patch
 !paddleocr-service/build/hip-device-info.cpp
 !paddleocr-service/build/source_inventory.py

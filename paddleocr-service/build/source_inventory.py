@@ -17,7 +17,7 @@ def record(root: Path, output: Path) -> None:
     status = git(root, "submodule", "status", "--recursive")
     for row in status.splitlines():
         if row.startswith("-"):
-            raise ValueError("Uninitialized recursive source gitlink")
+            raise ValueError(f"Uninitialized recursive source gitlink: {row[1:]}")
         paths.append(root / row[1:].split()[1])
     checkouts = {}
     for path in paths:

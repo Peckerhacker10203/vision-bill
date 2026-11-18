@@ -18,12 +18,11 @@ export VISION_BILL_AMDGPU_TARGETS="$TARGETS"
 git clone --no-checkout https://github.com/ROCm/TheRock.git "$THEROCK_SRC"
 git -C "$THEROCK_SRC" checkout --detach b324869fb3116353ac7eec5e6926aa3d452ac987
 git -C "$THEROCK_SRC" ls-files --stage > "$EVIDENCE/therock-original-gitlinks.txt"
+bash "$RECIPE/prepare_therock.sh" "$THEROCK_SRC" "$EVIDENCE/therock-sources.json" "$BUILD_JOBS"
 (
   cd "$THEROCK_SRC"
-  python build_tools/fetch_sources.py --no-remote --apply-patches
   INSTALL_PREFIX=/usr/local bash dockerfiles/install_pinned_patchelf.sh
 )
-python "$RECIPE/source_inventory.py" "$THEROCK_SRC" "$EVIDENCE/therock-sources.json"
 # All SDK components retained, including host APIs for upstream-excluded Lt targets.
 cmake -S "$THEROCK_SRC" -B "$THEROCK_BUILD" -GNinja \
   -DCMAKE_BUILD_TYPE=Release -DTHEROCK_ENABLE_ALL=ON \
@@ -52,7 +51,7 @@ done
 
 git clone --no-checkout https://github.com/PaddlePaddle/Paddle.git "$PADDLE_SRC"
 git -C "$PADDLE_SRC" checkout --detach 7688495538f4d6c1893f084dd238a402e8f68ab6
-git -C "$PADDLE_SRC" submodule update --init --recursive
+git -C "$PADDLE_SRC" submodule update --init --recursive --jobs "$BUILD_JOBS"
 (
   cd "$PADDLE_SRC"
   git apply --check "$RECIPE/hip-rdna2-v1.patch"
