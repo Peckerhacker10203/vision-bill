@@ -53,11 +53,18 @@ LLM__API_KEY=none
 Use the endpoint's actual model ID and reachable URL. Supply the real key for an
 authenticated endpoint. Fresh credentialless OpenAI installs can omit the key or
 use `none`. Ollama ignores it. On restored installations, a private empty runtime
-file takes its values from the saved configuration.
+file takes its values from the saved configuration. Admin Settings can adopt
+changed safe formatter fields from environment defaults through an explicit save.
+Provider and endpoint changes require an app restart; model and temperature
+changes apply live. Credentials stay in operator configuration.
 
 For external OCR, a nonblank `OCR__ENDPOINT` selects its endpoint and an explicit
-blank value disables OCR. For Dedicated OCR, leave `OCR__ENDPOINT` unset and do
-not enable the legacy OCR flags. A saved external route must be deliberately
+blank value starts with OCR Off. In a prepared combined profile the browser
+toggle can subsequently opt in, including installations with an older explicitly
+blank endpoint. A nonblank external endpoint remains operator-owned and cannot
+be changed by the Dedicated OCR toggle. For a new Dedicated OCR installation,
+leave `OCR__ENDPOINT` unset and do not enable the legacy OCR flags. A saved
+external route must be deliberately
 reconciled before switching. Ordinary OCR formatting, repair and classification
 use text and evidence. Direct vision needs an image-capable selected model.
 
@@ -82,11 +89,16 @@ In a combined install, sign in as the administrator and open **Settings →
 Dedicated OCR**. Verify that your LLM endpoint is dedicated to Vision Bill,
 has eager loading disabled, and has unloaded its models. With llama.cpp use
 the [dedicated router lifecycle](../OPENAI_COMPATIBLE.md#configure-a-dedicated-llamacpp-router).
-Confirm those conditions and choose **Enable Dedicated OCR**. Downloads and
+Preparing the combined GPU profile is a one-time operator step. Ordinary base
+Windows Compose cannot add native OCR through this button alone.
+Confirm those conditions and turn **Dedicated OCR** On. Downloads and
 native setup run in the background. The app invokes OCR for receipts after the
 managed service verifies the installed models and starts with its worker parked.
 During setup, inference waits. If setup fails, review the status and explicitly
-retry after fixing the cause.
+retry after fixing the cause. Turning it Off routes new work to direct vision
+and retains the verified cache and idle native worker. Turning it On again reuses
+the verified generation instead of repeating installation. Frozen pending work
+may still require an explicit current-policy retry.
 
 For a configuration-driven installation, set both values in `runtime.env` once
 the same conditions are met.

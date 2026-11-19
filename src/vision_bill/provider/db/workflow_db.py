@@ -903,7 +903,7 @@ class WorkflowDB:
                 linked = await conn.fetch("SELECT id FROM receipts WHERE image_id=$1", image_id)
                 if any(item["id"] != (resource_id if receipt else None) for item in linked):
                     raise ValueError("resource_still_referenced")
-                if not receipt and row["status"] not in {"pending", "failed", "timed_out", "unreadable"}:
+                if not receipt and row["status"] not in {"pending", "needs_review", "failed", "timed_out", "unreadable"}:
                     raise ValueError("active_submission")
             deleted = DeletedResource(image_id=image_id, receipt_id=resource_id if receipt else None)
             if row is not None:

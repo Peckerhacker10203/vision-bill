@@ -35,8 +35,8 @@ afterEach(() => {
 	vi.unstubAllGlobals();
 });
 
-function status(state: string, reason: string | null = null, httpStatus = 200) {
-	return Response.json({ state, reason }, { status: httpStatus });
+function status(state: string, reason: string | null = null, httpStatus = 200, installed = false) {
+	return Response.json({ state, reason, installed }, { status: httpStatus });
 }
 
 function handoffConfirmation() {
@@ -64,7 +64,7 @@ it('shows that a GPU profile is required and offers no activation', async () => 
 	render(Settings);
 	await screen.findByText('Select a CUDA or ROCm profile to use Dedicated OCR.');
 
-	expect(screen.queryByRole('button', { name: 'Enable Dedicated OCR' })).toBeNull();
+	expect(screen.getByRole('switch', { name: 'Dedicated OCR' })).toHaveProperty('disabled', true);
 	expect(fetchStatus).toHaveBeenCalledOnce();
 	const [url, options] = fetchStatus.mock.calls[0];
 	expect(url).toBe('/api/v1/system/dedicated-ocr');
@@ -81,7 +81,7 @@ it('submits one explicit activation and polls until the formatter switches to te
 	vi.stubGlobal('fetch', fetchStatus);
 
 	render(Settings);
-	const enable = await screen.findByRole('button', { name: 'Enable Dedicated OCR' });
+	const enable = await screen.findByRole('switch', { name: 'Dedicated OCR' });
 	await waitFor(() => expect(api.listModels).toHaveBeenCalledWith('vision'));
 	expect((enable as HTMLButtonElement).disabled).toBe(true);
 	await fireEvent.click(enable);
@@ -93,7 +93,9 @@ it('submits one explicit activation and polls until the formatter switches to te
 	expect(posts).toHaveLength(1);
 	expect(posts[0][0]).toBe('/api/v1/system/dedicated-ocr');
 	expect(new Headers(posts[0][1].headers).get('X-Vision-Bill-Expected-User')).toBe('admin');
-	expect(posts[0][1].body).toBe('{"confirm_handoff":true}');
+	expect(posts[0][1].body).toBe('{"enabled":true,"confirm_handoff":true}');
+	expect(enable.getAttribute('aria-checked')).toBe('false');
+	expect(enable.getAttribute('aria-busy')).toBe('true');
 	expect((enable as HTMLButtonElement).disabled).toBe(true);
 
 	finishRequest(status('requested', null, 202));
@@ -122,7 +124,7 @@ it('offers an explicit retry after a failed download', async () => {
 
 	render(Settings);
 	await screen.findByText('Dedicated OCR model download failed.');
-	const retry = await screen.findByRole('button', { name: 'Retry setup' });
+	const retry = await screen.findByRole('switch', { name: 'Dedicated OCR' });
 	expect((retry as HTMLButtonElement).disabled).toBe(true);
 	await fireEvent.click(retry);
 	expect(fetchStatus).toHaveBeenCalledOnce();
@@ -143,9 +145,9 @@ it('refreshes status when activation conflicts with an operator change', async (
 
 	render(Settings);
 	await fireEvent.click(await handoffConfirmation());
-	await fireEvent.click(await screen.findByRole('button', { name: 'Enable Dedicated OCR' }));
+	await fireEvent.click(await screen.findByRole('switch', { name: 'Dedicated OCR' }));
 	await screen.findByText('Configure a supported LLM lifecycle before setting up Dedicated OCR.');
-	const retry = await screen.findByRole('button', { name: 'Retry setup' });
+	const retry = await screen.findByRole('switch', { name: 'Dedicated OCR' });
 	await fireEvent.click(retry);
 	expect(fetchStatus).toHaveBeenCalledTimes(3);
 	await fireEvent.click(await handoffConfirmation());
@@ -171,3 +173,106 @@ it('checks an unavailable installed runtime without offering another setup', asy
 	expect(fetchStatus).toHaveBeenCalledTimes(2);
 	expect(fetchStatus.mock.calls[1][1].method).toBeUndefined();
 });
+
+it('turns installed OCR off and on without downloading or reconfirming handoff', async () => {
+	vi.mocked(api.getUiConfig).mockResolvedValue({ ...directVision, ocr_enabled: true });
+	const fetchStatus = vi
+		.fn()
+		.mockResolvedValueOnce(status('active', null, 200, true))
+		.mockResolvedValueOnce(status('disabled', null, 200, true))
+		.mockResolvedValueOnce(status('active', null, 200, true));
+	vi.stubGlobal('fetch', fetchStatus);
+	render(Settings);
+	const toggle = await screen.findByRole('switch', { name: 'Dedicated OCR' });
+	await waitFor(() => expect(toggle.getAttribute('aria-checked')).toBe('true'));
+	await waitFor(() => expect(api.listModels).toHaveBeenCalledWith('text'));
+	vi.mocked(api.listModels).mockClear();
+	vi.mocked(api.getUiConfig).mockResolvedValue(directVision);
+	await fireEvent.click(toggle);
+	await screen.findByText(
+		'Dedicated OCR is off. Installed models are retained; turn it on to resume OCR.'
+	);
+	expect(fetchStatus.mock.calls[1][1].body).toBe('{"enabled":false,"confirm_handoff":false}');
+	expect(screen.queryByRole('checkbox', { name: /I confirm the LLM endpoint/ })).toBeNull();
+	await waitFor(() => expect(api.listModels).toHaveBeenCalledWith('vision'));
+	vi.mocked(api.listModels).mockClear();
+	vi.mocked(api.getUiConfig).mockResolvedValue({ ...directVision, ocr_enabled: true });
+	await fireEvent.click(toggle);
+	await screen.findByText('Dedicated OCR is active.');
+	expect(fetchStatus.mock.calls[2][1].body).toBe('{"enabled":true,"confirm_handoff":false}');
+	await waitFor(() => expect(api.listModels).toHaveBeenCalledWith('text'));
+});
+
+it('keeps the confirmed switch on when pausing fails and permits retry', async () => {
+	const fetchStatus = vi
+		.fn()
+		.mockResolvedValueOnce(status('active', null, 200, true))
+		.mockRejectedValueOnce(new Error('offline'))
+		.mockResolvedValueOnce(status('active', null, 200, true))
+		.mockResolvedValueOnce(status('disabled', null, 200, true));
+	vi.stubGlobal('fetch', fetchStatus);
+	render(Settings);
+	const toggle = await screen.findByRole('switch', { name: 'Dedicated OCR' });
+	await screen.findByText('Dedicated OCR is active.');
+	await fireEvent.click(toggle);
+	await screen.findByText('Could not confirm the Dedicated OCR change.');
+	expect(toggle.getAttribute('aria-checked')).toBe('true');
+	await fireEvent.click(toggle);
+	await screen.findByText(
+		'Dedicated OCR is off. Installed models are retained; turn it on to resume OCR.'
+	);
+});
+
+it('lets an admin turn off selected OCR when runtime health requires action', async () => {
+	const fetchStatus = vi
+		.fn()
+		.mockResolvedValueOnce(
+			Response.json({
+				state: 'action_required',
+				reason: 'ocr_runtime_unavailable',
+				installed: true,
+				selected: true
+			})
+		)
+		.mockResolvedValueOnce(Response.json({ state: 'disabled', installed: true, selected: false }));
+	vi.stubGlobal('fetch', fetchStatus);
+	render(Settings);
+	const toggle = await screen.findByRole('switch', { name: 'Dedicated OCR' });
+	await screen.findByText(
+		'Dedicated OCR is installed. Restore its service before processing receipts.'
+	);
+	expect(toggle.getAttribute('aria-checked')).toBe('true');
+	expect(toggle).toHaveProperty('disabled', false);
+	await fireEvent.click(toggle);
+	await screen.findByText(
+		'Dedicated OCR is off. Installed models are retained; turn it on to resume OCR.'
+	);
+	expect(fetchStatus.mock.calls[1][1].body).toBe('{"enabled":false,"confirm_handoff":false}');
+});
+
+it.each([
+	[
+		'llm_request_recovery_required',
+		'Confirm the previous LLM request has ended and follow the Dedicated OCR recovery guide.'
+	],
+	['llm_quiescence_required', 'Wait for the LLM endpoint to become idle before retrying setup.']
+])(
+	'explains a blocked OFF request from %s while refreshed status stays selected',
+	async (reason, message) => {
+		const active = () => Response.json({ state: 'active', installed: true, selected: true });
+		const fetchStatus = vi
+			.fn()
+			.mockResolvedValueOnce(active())
+			.mockResolvedValueOnce(Response.json({ detail: reason }, { status: 409 }))
+			.mockResolvedValueOnce(active());
+		vi.stubGlobal('fetch', fetchStatus);
+		render(Settings);
+		const toggle = await screen.findByRole('switch', { name: 'Dedicated OCR' });
+		await screen.findByText('Dedicated OCR is active.');
+		await fireEvent.click(toggle);
+		const alert = await screen.findByRole('alert');
+		expect(alert.textContent).toBe(message);
+		expect(toggle.getAttribute('aria-checked')).toBe('true');
+		expect(screen.queryByText('Could not confirm the Dedicated OCR change.')).toBeNull();
+	}
+);

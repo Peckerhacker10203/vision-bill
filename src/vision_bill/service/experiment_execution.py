@@ -88,6 +88,11 @@ def effective_policy(
     options = options.model_copy(update={"allow_ocr_fallback": False})
     ocr = service._ocr_provider
     if options.pipeline == ExtractionPipeline.OCR:
+        from .activation_admission import activation_enabled
+        if activation_enabled() and not settings.enabled:
+            raise HandoffWait(HandoffStatus(
+                state="configuration_required", reason_code="dedicated_ocr_disabled",
+            ))
         settings = settings.model_copy(
             update={
                 "enabled": True,

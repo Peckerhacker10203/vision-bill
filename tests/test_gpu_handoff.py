@@ -894,3 +894,66 @@ async def test_extraction_admission_probe_expires_before_outer_work_timeout(
     assert not llm.handoff.journal.exists()
     for effect in (ocr.claim, ocr.load, ocr.park, llm._client.chat):
         effect.assert_not_awaited()
+
+
+def test_prepared_off_retains_coordinator_without_advertising_ocr(monkeypatch, tmp_path):
+    from vision_bill.config import OcrSettings, settings
+    from vision_bill.model.experiment import ExperimentOptions
+    from vision_bill.model.handoff import HandoffWait
+    from vision_bill.service.benchmark_service import BenchmarkService
+    from vision_bill.service.experiment_execution import effective_policy
+    from vision_bill.service.gpu_handoff import ModelHandoff
+    from vision_bill.service.receipt_service import ReceiptService
+
+    monkeypatch.setenv("VISION_BILL_OCR_ACTIVATION", "true")
+    monkeypatch.setattr(settings.ocr, "enabled", False)
+    provider = Llm([])
+    provider.supports_thinking_control = True
+    provider.handoff = ModelHandoff(tmp_path / "handoff", provider, Ocr([]))
+    receipts = object.__new__(ReceiptService)
+    receipts._provider = provider
+    receipts.set_ocr_route(None, OcrSettings(enabled=False, coordination_path=provider.handoff.path))
+    assert receipts.execution_handoff(receipts._ocr_settings) is provider.handoff
+    service = object.__new__(BenchmarkService)
+    service._provider, service._receipts = provider, receipts
+    assert not service.capabilities()["ocr_available"]
+    with pytest.raises(HandoffWait, match="dedicated_ocr_disabled"):
+        effective_policy(receipts, ExperimentOptions(pipeline="ocr"))
+
+
+async def test_prepared_off_session_permits_parking_but_refuses_native_load(monkeypatch, tmp_path):
+    from vision_bill.config import settings
+    from vision_bill.model.handoff import HandoffWait
+    from vision_bill.service.gpu_handoff import ModelHandoff
+
+    monkeypatch.setenv("VISION_BILL_OCR_ACTIVATION", "true")
+    monkeypatch.setattr(settings.ocr, "enabled", False)
+    events = []
+    ocr = Ocr(events)
+    ocr.managed_lifecycle = True
+    handoff = ModelHandoff(tmp_path / "handoff", Llm(events), ocr)
+    async with handoff.session(monotonic() + 1) as owner:
+        with pytest.raises(HandoffWait, match="dedicated_ocr_disabled"):
+            await owner.ocr_phase()
+    assert events == ["claim_park", "park_ocr"]
+
+
+def test_prepared_profile_preserves_explicit_external_ocr_benchmark(monkeypatch):
+    from types import SimpleNamespace
+
+    from vision_bill.config import OcrSettings, settings
+    from vision_bill.model.experiment import ExperimentOptions
+    from vision_bill.service.benchmark_service import BenchmarkService
+    from vision_bill.service.experiment_execution import effective_policy
+
+    monkeypatch.setenv("VISION_BILL_OCR_ACTIVATION", "true")
+    external = object()
+    ocr_settings = OcrSettings(enabled=True, service_url="http://external-ocr.test", manage_model_lifecycle=False)
+    monkeypatch.setattr(settings, "ocr", ocr_settings)
+    receipts = SimpleNamespace(_ocr_settings=ocr_settings, _ocr_provider=external)
+    service = object.__new__(BenchmarkService)
+    service._provider = SimpleNamespace(supports_thinking_control=True)
+    service._receipts = receipts
+    assert service.capabilities()["ocr_available"]
+    selected, effective, _ = effective_policy(receipts, ExperimentOptions(pipeline="ocr"))
+    assert selected is external and effective.enabled

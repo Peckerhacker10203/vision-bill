@@ -9,6 +9,7 @@
 	import { queryClient } from '$lib/query/client';
 	import { queryKeys } from '$lib/query/keys';
 	import type { SettingsUpdate } from '$lib/types';
+	import AppearanceSelect from '$lib/ui/AppearanceSelect.svelte';
 	import DedicatedOcr from './DedicatedOcr.svelte';
 
 	const isCurrentView = sessionViewGuard();
@@ -39,6 +40,7 @@
 		llm: { provider: 'ollama', host: '', model_name: '', temperature: 0 },
 		allow_registration: true
 	});
+	let baseline = $state<SettingsUpdate | null>(null);
 	let initialized = $state(false);
 	let saving = $state(false);
 	let saved = $state(false);
@@ -50,6 +52,7 @@
 				llm: { ...settings.data.llm },
 				allow_registration: settings.data.allow_registration
 			};
+			baseline = structuredClone($state.snapshot(form));
 			initialized = true;
 		}
 	});
@@ -64,10 +67,6 @@
 		return settings.data?.sources[field] ?? 'default';
 	}
 
-	function isLocked(field: string): boolean {
-		return source(field) === 'environment';
-	}
-
 	function sourceLabel(field: string): string {
 		return $t(`settings.source${source(field)[0].toUpperCase()}${source(field).slice(1)}`);
 	}
@@ -78,11 +77,23 @@
 		saved = false;
 		error = '';
 		try {
-			const result = await api.updateSettings(form);
+			const changed_paths = ['provider', 'host', 'model_name', 'temperature']
+				.filter(
+					(key) =>
+						form.llm[key as keyof typeof form.llm] !== baseline?.llm[key as keyof typeof form.llm]
+				)
+				.map((key) => `llm.${key}`);
+			if (form.allow_registration !== baseline?.allow_registration)
+				changed_paths.push('auth.allow_registration');
+			const result = await api.updateSettings({ ...form, changed_paths });
 			if (!isCurrentView()) return;
 			form = { llm: { ...result.llm }, allow_registration: result.allow_registration };
+			baseline = structuredClone($state.snapshot(form));
 			queryClient.setQueryData(queryKeys.settings(), result);
-			await queryClient.invalidateQueries({ queryKey: queryKeys.uiConfig() });
+			await Promise.all([
+				queryClient.invalidateQueries({ queryKey: queryKeys.uiConfig() }),
+				queryClient.invalidateQueries({ queryKey: queryKeys.dedicatedOcr() })
+			]);
 			if (isCurrentView()) saved = true;
 		} catch (cause) {
 			if (!isCurrentView()) return;
@@ -100,6 +111,9 @@
 <section>
 	<h1 class="text-2xl font-semibold">{$t('pages.settings.title')}</h1>
 	<p class="mt-2 text-on-surface-variant">{$t('settings.description')}</p>
+	<div class="mt-6 max-w-2xl rounded-xl border border-outline-variant bg-surface-container-low p-5">
+		<AppearanceSelect />
+	</div>
 
 	{#if settings.isLoading}
 		<p class="mt-6 text-sm text-on-surface-variant">{$t('common.loading')}</p>
@@ -125,7 +139,6 @@
 						<select
 							class="mt-1 block w-full rounded-lg border border-outline-variant bg-surface p-2.5"
 							bind:value={form.llm.provider}
-							disabled={isLocked('llm.provider')}
 						>
 							<option value="ollama">Ollama</option><option value="openai">OpenAI</option>
 						</select>
@@ -139,7 +152,6 @@
 						<input
 							class="mt-1 block w-full rounded-lg border border-outline-variant bg-surface p-2.5"
 							bind:value={form.llm.host}
-							disabled={isLocked('llm.host')}
 						/>
 					</label>
 					<label class="block text-sm">
@@ -152,7 +164,6 @@
 							class="mt-1 block w-full rounded-lg border border-outline-variant bg-surface p-2.5"
 							list="formatter-models"
 							bind:value={form.llm.model_name}
-							disabled={isLocked('llm.model_name')}
 						/>
 					</label>
 					<datalist id="formatter-models">
@@ -186,7 +197,6 @@
 							max="2"
 							step="0.1"
 							bind:value={form.llm.temperature}
-							disabled={isLocked('llm.temperature')}
 						/>
 					</label>
 				</div>
@@ -207,7 +217,7 @@
 						type="checkbox"
 						class="size-4"
 						bind:checked={form.allow_registration}
-						disabled={isLocked('auth.allow_registration')}
+						disabled={source('auth.allow_registration') === 'environment'}
 					/>
 				</label>
 			</fieldset>
@@ -221,7 +231,7 @@
 			{#if saved}<p class="text-sm text-primary" role="status">{$t('settings.saved')}</p>{/if}
 			<button
 				type="submit"
-				class="rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-on-primary disabled:opacity-50"
+				class="rounded-lg bg-action px-4 py-2.5 text-sm font-medium text-on-primary disabled:opacity-50"
 				disabled={saving}
 			>
 				{saving ? $t('common.loading') : $t('common.save')}

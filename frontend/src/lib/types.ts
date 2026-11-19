@@ -364,11 +364,14 @@ export interface SettingsView {
 }
 
 export interface SettingsUpdate {
+	changed_paths?: string[];
 	llm: EditableLlmSettings;
 	allow_registration: boolean;
 }
 
 export interface DedicatedOcrStatus {
+	selected?: boolean;
+	installed?: boolean;
 	state:
 		| 'unavailable'
 		| 'disabled'

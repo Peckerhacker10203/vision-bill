@@ -339,3 +339,14 @@ async def test_activation_environment_opt_out_preserves_direct_transport(
     with activation_store.admission(exclusive=True):
         assert await connect_provider(respond).send_message("fixture", _MESSAGE) == "normal response"
     assert not activation_store.request_dir.exists()
+
+
+def test_ready_runtime_toggle_holds_stale_worker_route(activation_store, monkeypatch):
+    from vision_bill.config import settings
+
+    request = activation_store.submit_request(MaintenanceIntent.EXTERNAL_LLM_QUIESCED)
+    activation_store.publish_status(ActivationStatus(request.generation, ActivationPhase.READY))
+    activation_store.set_runtime_enabled(request, False)
+    monkeypatch.setattr(settings.ocr, "enabled", True)
+    with pytest.raises(HandoffWait, match="execution_policy_changed"), inference_admission():
+        pytest.fail("An OCR-enabled worker entered after the durable OFF intent")

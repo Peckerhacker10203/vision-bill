@@ -28,7 +28,7 @@ def test_app_without_a_gpu_profile_reports_unavailable() -> None:
     client = TestClient(app)
     response = client.get("/system/dedicated-ocr")
     assert response.status_code == 200
-    assert response.json() == {"state": "unavailable", "reason": "gpu_profile_required"}
+    assert response.json() == {"state": "unavailable", "reason": "gpu_profile_required", "installed": False, "selected": False}
     response = client.post("/system/dedicated-ocr", json={})
     assert response.status_code == 409
     assert response.json()["detail"] == "gpu_profile_required"
@@ -154,10 +154,127 @@ def test_startup_request_can_wait_for_an_idle_controller(tmp_path, monkeypatch) 
             store.publish_status(ActivationStatus(request.generation, ActivationPhase.FAILED))
             await asyncio.sleep(1)
             assert store.read_request() == request
-            assert (await activation.status()).state == "failed"
+            failed = await activation.status()
+            assert failed.state == "failed" and not failed.selected
+            async def live() -> bool:
+                return True
+            monkeypatch.setattr(activation, "_controller_is_live", live)
+            app = app_with_system()
+            app.state.dedicated_ocr = activation
+            app.dependency_overrides[require_admin] = lambda: None
+            client = TestClient(app)
+            failed_response = client.get("/system/dedicated-ocr")
+            assert failed_response.json()["selected"] is False
+            retry = client.post("/system/dedicated-ocr", json={"confirm_handoff": True, "enabled": True})
+            assert retry.status_code == 202
+            assert retry.json()["state"] == "requested" and not retry.json()["selected"]
+            assert store.read_request().generation != request.generation
         finally:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
 
     asyncio.run(run())
+
+
+def test_toggle_contract_retains_install_and_legacy_default() -> None:
+    from vision_bill.model.dedicated_ocr import DedicatedOcrRequest, DedicatedOcrStatus
+
+    assert DedicatedOcrRequest().enabled is True
+    assert DedicatedOcrRequest(enabled=False).enabled is False
+    assert DedicatedOcrStatus(state="disabled", installed=True).installed is True
+    assert DedicatedOcrStatus(state="active", selected=True).selected is True
+
+
+async def test_ready_install_can_disable_restart_and_reenable_without_new_generation(tmp_path, monkeypatch):
+    from ocr_contract.activation import ActivationPhase, ActivationStatus, ActivationStore
+
+    from vision_bill.config import settings
+    from vision_bill.service import gpu_handoff
+    from vision_bill.service.dedicated_ocr import DedicatedOcrActivation
+
+    config = settings.model_copy(deep=True)
+    config.ocr.enabled = False
+    config.ocr.service_url = ""
+    config.ocr.coordination_path = tmp_path / "old.lock"
+    monkeypatch.setenv("OCR_ACTIVATION_ENDPOINT", "http://prepared-ocr.test")
+    monkeypatch.setattr(gpu_handoff, "managed_ocr_enabled", lambda: True)
+    store = ActivationStore(tmp_path / "request", tmp_path / "status", tmp_path / "lock")
+    events = []
+
+    async def idle(**_kwargs):
+        return frozenset()
+
+    provider = SimpleNamespace(supports_model_release=True, lifecycle_identity="openai:test",
+                               resident_model_ids=idle, handoff=None)
+
+    def create():
+        selected = DedicatedOcrActivation(config, provider, lambda *_args: None,
+                                          lambda: None, store=store, handoff_path=tmp_path / "gpu.lock")
+        async def live():
+            return True
+        async def claim(token, deadline):
+            events.append("claim")
+        async def park(token, deadline):
+            events.append("park")
+        monkeypatch.setattr(selected, "_controller_is_live", live)
+        monkeypatch.setattr(selected, "_runtime_is_serving", live)
+        monkeypatch.setattr(selected.ocr, "claim", claim)
+        monkeypatch.setattr(selected.ocr, "park", park)
+        return selected
+
+    activation = create()
+    assert (await activation.submit(confirm_handoff=True)).state == "requested"
+    request = store.read_request()
+    store.publish_status(ActivationStatus(request.generation, ActivationPhase.READY))
+    await activation.reconcile()
+    assert (await activation.status()).installed
+    assert (await activation.submit(enabled=False, confirm_handoff=False)).state == "disabled"
+    assert not config.ocr.enabled
+    store.set_runtime_enabled(request, True)
+    peer = await activation.status()
+    assert peer.state == "installing" and peer.selected
+    store.set_runtime_enabled(request, False)
+    assert provider.handoff is activation.handoff
+    assert events == ["claim", "park"]
+    assert store.read_request() == request
+    activation = create()
+    await activation.reconcile()
+    status = await activation.status()
+    assert status.state == "disabled" and status.installed
+    assert not config.ocr.enabled
+    assert (await activation.submit(enabled=True, confirm_handoff=False)).state == "active"
+    assert config.ocr.enabled
+    assert store.read_request() == request
+    assert events == ["claim", "park", "claim", "park"]
+    with store.admission(exclusive=False):
+        blocked = await activation.submit(enabled=False, confirm_handoff=False)
+        assert blocked.reason == "llm_quiescence_required"
+    assert store.runtime_enabled(request)
+    journal = activation.handoff.read_journal()
+    activation.handoff.journal.write_text(journal.model_copy(update={"unsettled": True}).model_dump_json())
+    blocked = await activation.submit(enabled=False, confirm_handoff=False)
+    assert blocked.reason == "model_request_unsettled"
+    assert config.ocr.enabled and store.runtime_enabled(request)
+    config.llm.model_name = "unadopted-model"
+    assert (await activation.status()).reason == "model_handoff_model_not_adopted"
+    assert (await activation.status()).selected is True
+    config.llm.model_name = activation.handoff.read_binding().model_ids[0]
+    activation.handoff.journal.write_text(journal.model_copy(update={
+        "models": [config.llm.model_name], "unsettled": False,
+    }).model_dump_json())
+    async def refuse_release(_model):
+        raise RuntimeError("model_release_unconfirmed")
+    provider.release_model = refuse_release
+    blocked = await activation.submit(enabled=False, confirm_handoff=False)
+    assert blocked.reason == "model_release_unconfirmed"
+    assert blocked.selected is True and blocked.installed
+    assert config.ocr.enabled and store.runtime_enabled(request)
+    from vision_bill.service import dedicated_ocr
+    monkeypatch.setattr(dedicated_ocr, "runtime_restart_required", lambda _settings: True)
+    async def release(_model):
+        return None
+    provider.release_model = release
+    assert (await activation.status()).reason == "llm_lifecycle_required"
+    disabled = await activation.submit(enabled=False, confirm_handoff=False)
+    assert disabled.state == "disabled" and not disabled.selected

@@ -106,6 +106,12 @@ def inference_admission(
             lock.enter_context(selected.admission(exclusive=False, blocking=False))
             request = selected.read_request()
             status = selected.read_status(request) if request is not None else None
+            if request is not None and status is not None and status.phase == ActivationPhase.READY:
+                from ..config import settings
+                if selected.runtime_enabled(request) != settings.ocr.enabled:
+                    raise HandoffWait(HandoffStatus(
+                        state="configuration_required", reason_code="execution_policy_changed",
+                    ))
         except ActivationBusy:
             raise HandoffWait(HandoffStatus(state="busy", reason_code="dedicated_ocr_activation_pending")) from None
         except (ActivationStateError, OSError):

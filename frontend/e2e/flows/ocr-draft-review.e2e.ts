@@ -44,8 +44,11 @@ test.describe('draft review and versioned receipt editing', () => {
 		expect(partial.tax_total).toBeNull();
 		expect(partial.total).toBe(draft.document.total);
 		await page.getByRole('button', { name: 'Finalize draft' }).click();
-		await expect(page.getByRole('alert')).toContainText('tax_total');
-		await page.getByLabel('Tax total', { exact: true }).fill(fixture.expected.tax_total);
+		await expect(page.getByRole('alert')).toContainText('Required missing fields');
+		const taxTotal = page.getByLabel('Tax total', { exact: true });
+		await page.getByRole('button', { name: 'Tax total', exact: true }).click();
+		await expect(taxTotal).toBeFocused();
+		await taxTotal.fill(fixture.expected.tax_total);
 		const addTags = page.getByRole('button', { name: 'Add tags', exact: true });
 		const missingTags = await addTags.count();
 		for (let i = 0; i < missingTags; i++) await addTags.first().click();

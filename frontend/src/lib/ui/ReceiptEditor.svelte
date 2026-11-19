@@ -719,6 +719,7 @@
 						<div class="flex items-start gap-2">
 							<input
 								class="{inputClass} flex-1"
+								id={`li-${index}-description`}
 								aria-label={$t('editor.description')}
 								placeholder={$t('editor.description')}
 								value={line.description}
@@ -945,7 +946,7 @@
 				{#if onSaveAndVerify !== undefined}
 					<button
 						type="button"
-						class="flex items-center justify-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-on-primary hover:opacity-90 disabled:opacity-50"
+						class="flex items-center justify-center gap-2 rounded-lg bg-action px-4 py-2.5 text-sm font-medium text-on-primary hover:opacity-90 disabled:opacity-50"
 						disabled={busy || childPending || !valid}
 						onclick={() => {
 							if (!busy && !childPending && valid) onSaveAndVerify(buildWrite());

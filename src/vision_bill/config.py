@@ -228,6 +228,18 @@ class AuthSettings(BaseModel):
     pepper: str | None = None
 
 
+class AdminSettingsSource(YamlConfigSettingsSource):
+    def __init__(
+        self, settings_cls: type[BaseSettings],
+        lower_sources: tuple[PydanticBaseSettingsSource, ...],
+    ) -> None:
+        super().__init__(settings_cls)
+        self.lower_sources = lower_sources
+
+    def __call__(self) -> dict[str, Any]:
+        return _guarded_admin_overrides(super().__call__(), [source() for source in self.lower_sources])
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=(".env", ".env.local"),
@@ -254,13 +266,14 @@ class Settings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """Load YAML before dotenv/environment values.
+        """Keep env defaults unless an admin explicitly adopted a safe YAML field.
 
-        Pydantic Settings gives earlier sources precedence, so environment
-        variables and dotenv files override the persistent YAML file.
+        Earlier sources win. Credentials and infrastructure settings always keep
+        their existing environment-over-YAML precedence.
         """
         return (
             init_settings,
+            AdminSettingsSource(settings_cls, (init_settings, env_settings, dotenv_settings, file_secret_settings)),
             env_settings,
             dotenv_settings,
             YamlConfigSettingsSource(settings_cls),
@@ -281,6 +294,70 @@ def _read_yaml_config(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+LLM_ADOPTION_KEYS = frozenset(key for key in EDITABLE_ENV_KEYS if key.startswith("llm."))
+
+
+def has_real_api_key(value: str) -> bool:
+    return value.strip().lower() not in {"", "none"}
+
+
+def llm_origin(host: str) -> str:
+    parsed = urlsplit(host if "://" in host else "http://" + host)
+    port = parsed.port if parsed.port is not None else (443 if parsed.scheme.lower() == "https" else 80)
+    return f"{parsed.scheme.lower()}://{parsed.hostname}:{port}"
+
+
+ADMIN_OVERRIDES_KEY = "admin_setting_overrides"
+
+
+def _admin_settings_overrides(data: dict[str, Any]) -> dict[str, Any]:
+    """Only explicitly adopted safe fields may take precedence over environment."""
+    result: dict[str, Any] = {}
+    marked = data.get(ADMIN_OVERRIDES_KEY, [])
+    if not isinstance(marked, list):
+        return result
+    for field in LLM_ADOPTION_KEYS:
+        section, key = field.split(".", 1)
+        if field in marked and isinstance(data.get(section), dict) and key in data[section]:
+            result.setdefault(section, {})[key] = data[section][key]
+    return result
+
+
+def _guarded_admin_overrides(data: dict[str, Any], sources: list[dict[str, Any]]) -> dict[str, Any]:
+    """Use the actual instance sources to keep a credential with its operator endpoint."""
+    adopted = _admin_settings_overrides(data)
+    pinned_origin = data.get("llm_credential_origin")
+    if pinned_origin is None:
+        return adopted
+
+    def llm_values(source: dict[str, Any]) -> dict[str, Any]:
+        value = source.get("llm", {})
+        if isinstance(value, BaseModel):
+            return value.model_dump()
+        return value if isinstance(value, dict) else {}
+
+    # Source order is init, env, dotenv, secrets. YAML retains its ordinary
+    # precedence above secrets and below dotenv; only the allowlist can outrank env.
+    effective = dict(llm_values(sources[-1]))
+    effective.update(llm_values(data))
+    deployment: dict[str, Any] = {}
+    for source in reversed(sources[:-1]):
+        deployment.update(llm_values(source))
+    effective.update(deployment)
+    if not has_real_api_key(effective.get("api_key", "")):
+        return adopted
+    deployment_host = deployment.get("host")
+    if deployment_host is not None and llm_origin(deployment_host) != pinned_origin:
+        # A rotated operator endpoint/key wins over a stale browser adoption.
+        adopted.get("llm", {}).pop("host", None)
+        return adopted
+    effective.update(adopted.get("llm", {}))
+    effective.update(llm_values(sources[0]))  # Explicit init values retain highest precedence.
+    if llm_origin(effective["host"]) != pinned_origin:
+        raise ValueError("LLM credential endpoint changed; operator approval in private configuration required")
+    return adopted
+
+
 def editable_setting_sources() -> dict[str, str]:
     """Return the source of each setting shown in the admin UI."""
     environment = EnvSettingsSource(Settings)()
@@ -288,8 +365,12 @@ def editable_setting_sources() -> dict[str, str]:
     config_data = _read_yaml_config(get_config_path())
     sources: dict[str, str] = {}
 
+    adopted = _guarded_admin_overrides(config_data, [{}, environment, dotenv, {}])
     for field_name in EDITABLE_ENV_KEYS:
         section, key = field_name.split(".", 1)
+        if key in adopted.get(section, {}):
+            sources[field_name] = "config"
+            continue
         if any(
             isinstance(data, dict) and key in data
             for data in (environment.get(section), dotenv.get(section))
@@ -303,9 +384,9 @@ def editable_setting_sources() -> dict[str, str]:
     return sources
 
 
-def write_config_file(config: Settings, *, changed_paths: frozenset[str] | None = None) -> None:
+def write_config_file(config: Settings, *, changed_paths: frozenset[str] | None = None, credential_origin: str | None = None) -> None:
     """Merge a save under the bootstrap lock without discarding private metadata."""
-    _publish_config_file(get_config_path(), config, changed_paths=changed_paths)
+    _publish_config_file(get_config_path(), config, changed_paths=changed_paths, credential_origin=credential_origin)
 
 
 def _publish_config_file(
@@ -314,6 +395,7 @@ def _publish_config_file(
     *,
     changed_paths: frozenset[str] | None = None,
     create_only: bool = False,
+    credential_origin: str | None = None,
 ) -> bool:
     from .distribution.bootstrap import (
         BootstrapError,
@@ -354,7 +436,7 @@ def _publish_config_file(
         if not existing and prepared:
             raise BootstrapError("Incomplete installation requires explicit recovery")
         resolved = config.model_dump(mode="json", exclude={"pg": {"database_url", "pg_dsn"}})
-        data = read_mapping(path) if existing else resolved
+        data = read_mapping(path) if existing else (resolved if changed_paths is None else {})
         if existing:
             # Source deployments can keep credentials and other required fields in
             # the environment. Fill missing validation inputs only, without copying
@@ -375,17 +457,27 @@ def _publish_config_file(
                     validate_saved_ocr_config(data[section], effective_enabled=config.ocr.enabled)
                 else:
                     TypeAdapter(model_field.annotation).validate_python(validation[section])
-            if changed_paths is None:
+        if changed_paths is None:
+            if existing:
                 merge(data, resolved)
+        else:
+            for field in sorted(changed_paths):
+                section, key = field.split(".", 1)
+                section_data = data.setdefault(section, {})
+                if not isinstance(section_data, dict):
+                    raise BootstrapError("Persistent configuration has a conflicting section type")
+                section_data[key] = resolved[section][key]
+        if credential_origin is not None:
+            if has_real_api_key(config.llm.api_key):
+                data["llm_credential_origin"] = credential_origin
             else:
-                for field in sorted(changed_paths):
-                    section, key = field.split(".", 1)
-                    section_data = data.setdefault(section, {})
-                    if not isinstance(section_data, dict):
-                        raise BootstrapError(
-                            "Persistent configuration has a conflicting section type"
-                        )
-                    section_data[key] = resolved[section][key]
+                data.setdefault("llm_credential_origin", credential_origin)
+        if changed_paths:
+            sources = editable_setting_sources()
+            adopted = set(data.get(ADMIN_OVERRIDES_KEY, []))
+            adopted.update(field for field in changed_paths if field in LLM_ADOPTION_KEYS and sources[field] == "environment")
+            if adopted:
+                data[ADMIN_OVERRIDES_KEY] = sorted(adopted & EDITABLE_ENV_KEYS.keys())
         write_private(path, yaml.safe_dump(data, sort_keys=False), replace=existing)
         return True
 

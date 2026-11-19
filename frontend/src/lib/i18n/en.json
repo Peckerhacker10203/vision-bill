@@ -1,4 +1,13 @@
 {
+	"receiptWorkspace": {
+		"data": "Data",
+		"receipt": "Receipt",
+		"zoomIn": "Zoom in",
+		"zoomOut": "Zoom out",
+		"working": "Working image",
+		"selection": "{count} / 10 photos · Upload order",
+		"field": "Go to field"
+	},
 	"submission": {
 		"captureHint": "Long receipt? Add up to 10 clear close-up photos of the same receipt. Arrange them from top to bottom, with a few overlapping rows. Include the header and total.",
 		"limits": "Use at most 10 photos, each no larger than 20 MB.",
@@ -74,9 +83,10 @@
 		"error": "Something went wrong."
 	},
 	"theme": {
-		"light": "Light",
-		"dark": "Dark",
-		"toggle": "Toggle theme"
+		"label": "Appearance",
+		"black": "Black",
+		"purple": "Purple",
+		"light": "Light"
 	},
 	"language": {
 		"label": "Language"
@@ -222,6 +232,8 @@
 		"errorGeneric": "Upload failed"
 	},
 	"queue": {
+		"openJob": "Open job",
+		"shownJobs": "{count} jobs shown (up to 100)",
 		"title": "Analysis queue",
 		"emptyTitle": "The queue is empty",
 		"emptyBody": "Pending and failed images will appear here.",
@@ -234,7 +246,7 @@
 		"deleteTitle": "Delete image?",
 		"deleteBody": "“{file}” will be removed from the queue and disk.",
 		"deleted": "Image deleted",
-		"deleteConflict": "This image can no longer be deleted.",
+		"deleteConflict": "This job could not be deleted because it is processing, linked to a receipt, or still in use. The queue has been refreshed. Open the job to check its current state.",
 		"deleteFailed": "Deleting failed",
 		"loadError": "Could not load the queue."
 	},
@@ -273,6 +285,8 @@
 		"unknownVendor": "Unknown merchant"
 	},
 	"search": {
+		"resultCount": "{count, plural, one {# purchase} other {# purchases}}",
+		"purchases": "Purchases",
 		"placeholder": "Search products…",
 		"emptyTitle": "Search your purchases",
 		"emptyBody": "Enter a product name to see past prices and the stores you bought it at. Only verified receipts are searched.",
@@ -287,6 +301,11 @@
 		"tableUnitPrice": "Unit price"
 	},
 	"dashboard": {
+		"openReview": "Open review",
+		"noOpenReview": "No unverified receipts found. Drafts and analysis jobs are in the queue.",
+		"chartData": "Show weekly values",
+		"weekStarting": "Week starting",
+		"total": "Total",
 		"verifiedOnly": "Verified receipts only",
 		"openStatistics": "Open statistics",
 		"loadError": "Could not load the dashboard.",
@@ -300,6 +319,15 @@
 		"topMerchants": "Top merchants"
 	},
 	"statistics": {
+		"itemPeriod": "Item spending period: {from} – {to}",
+		"itemMonths": "Item spending: months (independent of receipt statistics)",
+		"receiptScope": "Receipt statistics: all verified receipts in the selected collection scope. The weekly chart starts 11 weeks before the current week; the item period does not change these figures.",
+		"weeklyScope": "From 11 weeks before the current week; independent of the item spending period.",
+		"chartData": "Show chart data",
+		"week": "Week starting",
+		"amount": "Amount",
+		"activeCollection": "Capturing into: {name}",
+		"captureInactive": "Capture is off",
 		"itemTitle": "Spending by item category",
 		"itemIntro": "Your spending trends reflect prices, quantities, and what you chose to buy. They are not an inflation measure.",
 		"itemEmpty": "No item spending in this period.",
@@ -402,9 +430,9 @@
 		"temperature": "Temperature",
 		"registration": "Registration",
 		"allowRegistration": "Allow new registrations",
-		"providerWarning": "Changing the provider or host requires a server restart. The model and temperature apply immediately.",
-		"restartRequired": "The running provider differs from the configured provider or host. Restart the server to apply that change.",
-		"sourceEnvironment": "Environment",
+		"providerWarning": "Save adopts changed settings into the private configuration, overriding environment defaults. Provider or host changes require a backend restart by your operator; model and temperature apply immediately.",
+		"restartRequired": "The running provider still uses its previous provider or host. Ask your operator to restart the backend to apply the saved connection.",
+		"sourceEnvironment": "Environment default",
 		"sourceConfig": "Config",
 		"sourceDefault": "Default",
 		"contextWindow": "Context window (tokens)",
@@ -420,7 +448,7 @@
 			"confirmHandoff": "I confirm the LLM endpoint is dedicated to Vision Bill and idle, with eager model loading turned off.",
 			"submitting": "Requesting setup…",
 			"loadError": "Could not read Dedicated OCR status.",
-			"requestError": "Could not confirm the Dedicated OCR setup request.",
+			"requestError": "Could not confirm the Dedicated OCR change.",
 			"states": {
 				"unavailable": "Dedicated OCR is unavailable with the current server configuration.",
 				"disabled": "Enable Dedicated OCR to download and install the models on this server.",
@@ -438,8 +466,15 @@
 				"llm_request_recovery_required": "Confirm the previous LLM request has ended and follow the Dedicated OCR recovery guide.",
 				"ocr_handoff_confirmation_required": "Confirm that the LLM endpoint is ready for handoff before starting Dedicated OCR setup.",
 				"ocr_runtime_unavailable": "Dedicated OCR is installed. Restore its service before processing receipts.",
-				"ocr_download_failed": "Dedicated OCR model download failed."
-			}
+				"ocr_download_failed": "Dedicated OCR model download failed.",
+				"model_request_unsettled": "Resolve the pending model operation before changing Dedicated OCR.",
+				"model_handoff_model_not_adopted": "Save and adopt the current formatter model before enabling Dedicated OCR.",
+				"ocr_setup_pending": "Wait for the current Dedicated OCR setup to finish before changing it.",
+				"ocr_activation_state_invalid": "Restore a valid Dedicated OCR activation configuration using the recovery guide."
+			},
+			"installedOff": "Dedicated OCR is off. Installed models are retained; turn it on to resume OCR.",
+			"prerequisites": "Requires a prepared CUDA or ROCm GPU profile on the server. The browser cannot install GPU drivers or runtimes; follow the setup guide.",
+			"setupGuide": "GPU setup and recovery guide"
 		}
 	},
 	"editor": {
@@ -660,5 +695,80 @@
 		"readinessWait": "Readiness waits do not use an attempt.",
 		"visionModels": "Vision models",
 		"formatterModels": "OCR text formatter models"
+	},
+	"benchmarkUi": {
+		"processingSuccessRate": "Processing success rate",
+		"modelOutcomes": "Model outcomes: {model}",
+		"failedCases": "Failed cases: {count}",
+		"moreMetrics": "More metrics",
+		"modelDigest": "Model identity",
+		"experimentHint": "These settings apply only to this run. Extraction and classification are scored separately. Normal upload uses text from OCR when configured and stops on OCR failure. Direct vision skips OCR. OCR followed by model requires OCR and stops on OCR failure.",
+		"thinkingHint": "Thinking overrides are available with Ollama. This provider retains its existing reasoning settings.",
+		"create": "Create benchmark",
+		"intro": "Compare complete local pipelines using explicitly qualified frozen human references. Normal receipt data is not changed.",
+		"selection": "Verified receipt selection",
+		"ids": "Explicit receipt IDs",
+		"idPlaceholder": "Comma-separated receipt UUIDs",
+		"referenceHint": "Explicit IDs override filters. Existing verification alone does not qualify a benchmark reference.",
+		"preview": "Preview human references",
+		"inspect": "Inspect receipt and originals",
+		"scored": "Scored observations:",
+		"consent": "I checked these current receipts and originals and explicitly qualify them as benchmark references.",
+		"category": "Category",
+		"confidence": "Maximum source confidence",
+		"limit": "Maximum receipts",
+		"execution": "Execution",
+		"timeout": "Request timeout (seconds)",
+		"before": "Before creating:",
+		"warning": "This can take a long time, consume substantial energy, and make the local LLM unavailable for normal receipt extraction while it runs.",
+		"confirm": "Create benchmark?",
+		"start": "Confirm and start",
+		"modelsSummary": "Selected models: {models}",
+		"receiptsSummary": "Explicit references: {count}",
+		"filtersSummary": "Existing qualified references matching the filters",
+		"review": "Review",
+		"explicitRequired": "Enter explicit receipt IDs to qualify new references. Filters use existing qualified references.",
+		"previewError": "Unable to preview references.",
+		"modelsError": "Unable to load local models.",
+		"stalePreview": "Preview the current selection again.",
+		"createError": "Unable to create benchmark.",
+		"experiment": "Extraction experiment",
+		"pipeline": "Pipeline",
+		"upload": "Normal upload pipeline",
+		"direct": "Direct vision model",
+		"ocr": "OCR followed by model",
+		"temperature": "Temperature",
+		"thinking": "Thinking",
+		"default": "Server default",
+		"off": "Disabled",
+		"on": "Enabled",
+		"classification": "Include categories and tags",
+		"noOcr": "The OCR extension is not configured. Normal upload currently uses direct vision.",
+		"providerSetting": "Current provider setting",
+		"results": "Benchmarks",
+		"resultsIntro": "Live local-model evaluation results.",
+		"noRuns": "No benchmark runs yet.",
+		"run": "Benchmark run",
+		"scoringVersion": "Scoring version:",
+		"reuse": "Reuse this receipt selection",
+		"settings": "Run settings",
+		"completed": "Completed",
+		"queued": "Queued",
+		"running": "Running",
+		"retrying": "Retrying",
+		"waiting": "Waiting for model",
+		"loadDetails": "Load individual results",
+		"previous": "Previous 50",
+		"next": "Next 50",
+		"separateScoring": "Extraction and classification are evaluated separately.",
+		"historical": "Historical scoring; no stored individual outputs.",
+		"detailsError": "Unable to load individual results.",
+		"resultsError": "Unable to load benchmark results.",
+		"status": {
+			"queued": "Queued",
+			"running": "Running",
+			"completed": "Completed",
+			"failed": "Failed"
+		}
 	}
 }

@@ -103,7 +103,7 @@ def test_malformed_existing_document_is_not_replaced(saved_settings, content):
     assert settings.model_dump() == previous_runtime
 
 
-def test_environment_locked_setting_stays_effective_without_being_persisted(
+def test_unchanged_environment_setting_stays_effective_until_explicit_edit(
     saved_settings, monkeypatch
 ):
     path, original, settings, client = saved_settings
@@ -117,11 +117,12 @@ def test_environment_locked_setting_stays_effective_without_being_persisted(
     assert result.json()["sources"]["llm.host"] == "environment"
     assert result.json()["restart_required"] is True
     before = path.read_bytes()
+    settings.llm.api_key = "none"
     assert (
         client.put("/system/settings", json=payload(settings, host="http://other")).status_code
-        == 409
+        == 200
     )
-    assert path.read_bytes() == before
+    assert yaml.safe_load(path.read_text())["llm"]["host"] == "http://other"
 
 
 def test_full_save_merges_unknown_nested_keys(saved_settings):
@@ -198,10 +199,11 @@ async def test_ollama_to_openai_update_constructs_fresh_provider(
 
     response = client.put(
         "/system/settings",
-        json=payload(before_restart, provider="openai", host="http://router.example/v1"),
+        json=payload(before_restart, provider="openai", host="http://ollama:11434/v1"),
     )
     assert response.status_code == 200
-    original["llm"].update(provider="openai", host="http://router.example/v1")
+    original["llm"].update(provider="openai", host="http://ollama:11434/v1")
+    original["llm_credential_origin"] = "http://ollama:11434"
     assert yaml.safe_load(path.read_text()) == original
     after_restart = config.Settings()
     provider = get_llm_provider(after_restart.llm)
@@ -214,7 +216,7 @@ async def test_ollama_to_openai_update_constructs_fresh_provider(
 
 
 @pytest.mark.parametrize("source", ["lowercase env", "JSON env", "JSON dotenv", "dotenv local"])
-def test_actual_settings_sources_lock_overrides(saved_settings, monkeypatch, source):
+def test_actual_settings_sources_allow_explicit_adoption(saved_settings, monkeypatch, source):
     path, _, _, client = saved_settings
     monkeypatch.setitem(config.Settings.model_config, "yaml_file", str(path))
     if source == "lowercase env":
@@ -236,8 +238,8 @@ def test_actual_settings_sources_lock_overrides(saved_settings, monkeypatch, sou
     assert response.json()["sources"]["llm.host"] == "environment"
     assert response.json()["sources"]["llm.model_name"] == "config"
     blocked = client.put("/system/settings", json=payload(settings, host="http://other"))
-    assert blocked.status_code == 409
-    assert path.read_bytes() == before
+    assert blocked.status_code == 200
+    assert config.Settings().llm.host == "http://other"
 
 
 def test_settings_save_accepts_yaml_merge_with_explicit_override(saved_settings):
@@ -351,3 +353,223 @@ def test_edits_sparse_runtime_config_without_saving_environment_credentials(
         assert response.json()["sources"]["llm.temperature"] == "config"
     else:
         assert path.read_bytes() == before
+
+
+def test_explicit_admin_edit_adopts_only_changed_safe_environment_fields(saved_settings, monkeypatch):
+    path, original, _, client = saved_settings
+    monkeypatch.setitem(config.Settings.model_config, "yaml_file", str(path))
+    monkeypatch.setenv("LLM__HOST", "http://environment.example")
+    monkeypatch.setenv("LLM__MODEL_NAME", "environment-model")
+    monkeypatch.setenv("LLM__API_KEY", "private-env-key")
+    active = config.Settings()
+    monkeypatch.setattr(system, "settings", active)
+    response = client.put('/system/settings', json=payload(active, host='http://environment.example/v1', temperature=0.72))
+    assert response.status_code == 200
+    restarted = config.Settings()
+    assert restarted.llm.host == 'http://environment.example/v1'
+    assert restarted.llm.temperature == 0.72
+    assert restarted.llm.model_name == 'environment-model'
+    assert restarted.llm.api_key == 'private-env-key'
+    assert yaml.safe_load(path.read_text())['llm']['model_name'] == original['llm']['model_name']
+    assert response.json()['sources']['llm.host'] == 'config'
+
+
+@pytest.mark.parametrize('host', ['file:///tmp/model', 'not a URL', 'http://', 'https://user:secret@example.com'])
+def test_invalid_host_update_is_atomic(saved_settings, host):
+    path, _, settings, client = saved_settings
+    before = path.read_bytes()
+    response = client.put('/system/settings', json=payload(settings, host=host))
+    assert response.status_code == 422
+    assert path.read_bytes() == before
+
+
+def test_non_admin_cannot_adopt_environment_defaults(saved_settings):
+    from types import SimpleNamespace
+    from vision_bill.security.dependencies import get_current_user
+
+    path, _, settings, client = saved_settings
+    client.app.dependency_overrides.pop(require_admin)
+    client.app.dependency_overrides[get_current_user] = lambda: SimpleNamespace(is_admin=False)
+    before = path.read_bytes()
+    assert client.put('/system/settings', json=payload(settings, host='https://admin.example')).status_code == 403
+    assert path.read_bytes() == before
+
+
+def test_noop_save_does_not_adopt_environment_tuple(saved_settings, monkeypatch):
+    path, _, _, client = saved_settings
+    monkeypatch.setitem(config.Settings.model_config, 'yaml_file', str(path))
+    monkeypatch.setenv('LLM__HOST', 'http://environment.example')
+    monkeypatch.setenv('LLM__MODEL_NAME', 'environment-model')
+    active = config.Settings()
+    monkeypatch.setattr(system, 'settings', active)
+    before = yaml.safe_load(path.read_text())
+    assert client.put('/system/settings', json=payload(active)).status_code == 200
+    assert yaml.safe_load(path.read_text()) == before
+    monkeypatch.setenv('LLM__MODEL_NAME', 'new-environment-model')
+    assert config.Settings().llm.model_name == 'new-environment-model'
+
+
+def test_environment_hot_fields_adopt_on_save(saved_settings, monkeypatch):
+    path, _, _, client = saved_settings
+    monkeypatch.setitem(config.Settings.model_config, 'yaml_file', str(path))
+    monkeypatch.setenv('LLM__MODEL_NAME', 'environment-model')
+    monkeypatch.setenv('LLM__TEMPERATURE', '0.2')
+    monkeypatch.setenv('AUTH__ALLOW_REGISTRATION', 'true')
+    active = config.Settings()
+    monkeypatch.setattr(system, 'settings', active)
+    body = payload(active, model_name='adopted-model', temperature=0.6)
+    response = client.put('/system/settings', json=body)
+    assert response.status_code == 200
+    assert (active.llm.model_name, active.llm.temperature, active.auth.allow_registration) == ('adopted-model', 0.6, True)
+    restarted = config.Settings()
+    assert (restarted.llm.model_name, restarted.llm.temperature, restarted.auth.allow_registration) == ('adopted-model', 0.6, True)
+
+
+def test_override_marker_cannot_adopt_credentials_or_database_fields(saved_settings, monkeypatch):
+    path, original, _, _ = saved_settings
+    monkeypatch.setitem(config.Settings.model_config, 'yaml_file', str(path))
+    original['admin_setting_overrides'] = ['llm.api_key', 'pg.password', 'auth.secret_key', 'distribution.other']
+    path.write_text(yaml.safe_dump(original))
+    monkeypatch.setenv('LLM__API_KEY', 'runtime-key')
+    monkeypatch.setenv('PG__PASSWORD', 'runtime-db')
+    monkeypatch.setenv('AUTH__SECRET_KEY', 'runtime-secret')
+    restarted = config.Settings()
+    assert (restarted.llm.api_key, restarted.pg.password, restarted.auth.secret_key) == ('runtime-key', 'runtime-db', 'runtime-secret')
+
+
+def test_legacy_host_remains_readable_and_allows_unrelated_edits(saved_settings):
+    path, original, settings, client = saved_settings
+    settings.llm.host = 'localhost'
+    original['llm']['host'] = 'localhost'
+    path.write_text(yaml.safe_dump(original))
+    assert client.get('/system/settings').status_code == 200
+    response = client.put('/system/settings', json=payload(settings, temperature=0.8))
+    assert response.status_code == 200
+    assert yaml.safe_load(path.read_text())['llm']['host'] == 'localhost'
+
+
+def test_real_key_cannot_follow_browser_host_to_another_origin(saved_settings):
+    path, _, settings, client = saved_settings
+    before = path.read_bytes()
+    assert client.put('/system/settings', json=payload(settings, host='https://unapproved.example')).status_code == 409
+    assert path.read_bytes() == before
+
+
+def test_changed_paths_preserve_another_tabs_model_edit(saved_settings):
+    _, _, settings, client = saved_settings
+    stale = payload(settings, temperature=0.8)
+    assert client.put('/system/settings', json=payload(settings, model_name='other-tab')).status_code == 200
+    stale['changed_paths'] = ['llm.temperature']
+    assert client.put('/system/settings', json=stale).status_code == 200
+    assert settings.llm.model_name == 'other-tab'
+    assert settings.llm.temperature == 0.8
+
+
+def test_missing_selective_config_never_copies_runtime_secrets(saved_settings):
+    path, _, settings, client = saved_settings
+    path.unlink()
+    assert client.put('/system/settings', json=payload(settings, temperature=0.8)).status_code == 200
+    assert yaml.safe_load(path.read_text()) == {'llm': {'temperature': 0.8}}
+
+
+def test_new_key_cannot_follow_previously_adopted_no_key_endpoint(saved_settings, monkeypatch):
+    path, _, settings, client = saved_settings
+    monkeypatch.setitem(config.Settings.model_config, 'yaml_file', str(path))
+    monkeypatch.setenv('LLM__API_KEY', 'none')
+    settings.llm.api_key = 'none'
+    response = client.put('/system/settings', json=payload(settings, host='https://unapproved.example'))
+    assert response.status_code == 200
+    assert config.Settings().llm.host == 'https://unapproved.example'
+    monkeypatch.setenv('LLM__API_KEY', 'new-private-key')
+    with pytest.raises(ValueError, match='operator approval'):
+        config.Settings()
+
+
+def test_real_key_same_origin_path_change_survives_restart(saved_settings, monkeypatch):
+    path, _, settings, client = saved_settings
+    monkeypatch.setitem(config.Settings.model_config, 'yaml_file', str(path))
+    monkeypatch.setenv('LLM__API_KEY', 'real-private-key')
+    settings.llm.api_key = 'real-private-key'
+    assert client.put('/system/settings', json=payload(settings, host='http://ollama:11434/v1')).status_code == 200
+    assert config.Settings().llm.host == 'http://ollama:11434/v1'
+
+
+def test_registration_environment_control_remains_locked(saved_settings, monkeypatch):
+    path, _, settings, client = saved_settings
+    monkeypatch.setenv('AUTH__ALLOW_REGISTRATION', 'true')
+    settings.auth.allow_registration = True
+    body = payload(settings)
+    body['allow_registration'] = False
+    before = path.read_bytes()
+    assert client.put('/system/settings', json=body).status_code == 409
+    assert path.read_bytes() == before
+
+
+def test_credential_origin_distinguishes_explicit_zero_port():
+    assert config.llm_origin('http://trusted.example:0') != config.llm_origin('http://trusted.example')
+    assert config.llm_origin('https://trusted.example') == config.llm_origin('https://trusted.example:443/v1')
+
+
+def test_operator_endpoint_and_key_rotation_supersedes_stale_host_adoption(saved_settings, monkeypatch):
+    path, _, _, client = saved_settings
+    monkeypatch.setitem(config.Settings.model_config, 'yaml_file', str(path))
+    monkeypatch.setenv('LLM__HOST', 'https://approved-a.example/v1')
+    monkeypatch.setenv('LLM__API_KEY', 'key-a')
+    active = config.Settings()
+    monkeypatch.setattr(system, 'settings', active)
+    assert client.put('/system/settings', json=payload(active, host='https://approved-a.example/v2')).status_code == 200
+    monkeypatch.setenv('LLM__HOST', 'https://approved-b.example/v1')
+    monkeypatch.setenv('LLM__API_KEY', 'key-b')
+    restarted = config.Settings()
+    assert restarted.llm.host == 'https://approved-b.example/v1'
+    assert restarted.llm.api_key == 'key-b'
+    monkeypatch.setattr(system, 'settings', restarted)
+    assert client.put('/system/settings', json=payload(restarted, host='https://approved-b.example/v2')).status_code == 200
+    assert config.Settings().llm.host == 'https://approved-b.example/v2'
+    assert config.Settings().llm.api_key == 'key-b'
+
+
+def test_per_instance_dotenv_rotation_supersedes_stale_host_adoption(saved_settings, monkeypatch):
+    path, original, _, _ = saved_settings
+    monkeypatch.setitem(config.Settings.model_config, 'yaml_file', str(path))
+    monkeypatch.delenv('LLM__API_KEY', raising=False)
+    original['llm']['host'] = 'https://approved-a.example/v2'
+    original['admin_setting_overrides'] = ['llm.host']
+    original['llm_credential_origin'] = 'https://approved-a.example:443'
+    path.write_text(yaml.safe_dump(original))
+    dotenv = path.parent / 'operator.env'
+    dotenv.write_text('LLM__HOST=https://approved-b.example/v1\nLLM__API_KEY=key-b\n')
+    restarted = config.Settings(_env_file=dotenv)
+    assert restarted.llm.host == 'https://approved-b.example/v1'
+    assert restarted.llm.api_key == 'key-b'
+
+
+def test_explicit_init_host_retains_precedence_over_unkeyed_adoption(saved_settings, monkeypatch):
+    path, original, _, _ = saved_settings
+    monkeypatch.setitem(config.Settings.model_config, 'yaml_file', str(path))
+    monkeypatch.delenv('LLM__API_KEY', raising=False)
+    original['llm']['host'] = 'https://unkeyed-b.example/v2'
+    original['admin_setting_overrides'] = ['llm.host']
+    original['llm_credential_origin'] = 'https://approved-a.example:443'
+    path.write_text(yaml.safe_dump(original))
+    restarted = config.Settings(llm={'host': 'https://approved-a.example/v1', 'api_key': 'real-key'})
+    assert restarted.llm.host == 'https://approved-a.example/v1'
+    assert restarted.llm.api_key == 'real-key'
+
+
+def test_per_instance_file_secret_key_cannot_follow_unkeyed_adoption(saved_settings, monkeypatch):
+    import json
+
+    path, original, _, _ = saved_settings
+    monkeypatch.setitem(config.Settings.model_config, 'yaml_file', str(path))
+    monkeypatch.delenv('LLM__API_KEY', raising=False)
+    original['llm'].pop('api_key')
+    original['llm']['host'] = 'https://unapproved-b.example/v2'
+    original['admin_setting_overrides'] = ['llm.host']
+    original['llm_credential_origin'] = 'https://approved-a.example:443'
+    path.write_text(yaml.safe_dump(original))
+    secret_dir = path.parent / 'secrets'
+    secret_dir.mkdir()
+    (secret_dir / 'llm').write_text(json.dumps({'api_key': 'private-secret-key'}))
+    with pytest.raises(ValueError, match='operator approval'):
+        config.Settings(_env_file=None, _secrets_dir=secret_dir)

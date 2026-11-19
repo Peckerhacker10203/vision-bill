@@ -1,9 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import AnyHttpUrl, BaseModel, Field, TypeAdapter, ValidationError
 
 from ...config import (
+    EDITABLE_ENV_KEYS,
     LLMProviderEnum,
     editable_setting_sources,
+    has_real_api_key,
+    llm_origin,
     runtime_restart_required,
     settings,
     write_config_file,
@@ -24,6 +27,7 @@ class LLMSettingsUpdate(BaseModel):
 class SettingsUpdate(BaseModel):
     llm: LLMSettingsUpdate
     allow_registration: bool
+    changed_paths: frozenset[str] | None = Field(default=None, exclude=True)
 
 
 class SettingsView(SettingsUpdate):
@@ -52,7 +56,9 @@ async def activate_dedicated_ocr(
     activation = getattr(request.app.state, "dedicated_ocr", None)
     if activation is None:
         raise HTTPException(status_code=409, detail="gpu_profile_required")
-    result: DedicatedOcrStatus = await activation.submit(confirm_handoff=body.confirm_handoff)
+    result: DedicatedOcrStatus = await activation.submit(
+        confirm_handoff=body.confirm_handoff, enabled=body.enabled,
+    )
     if result.state in {"unavailable", "action_required"}:
         raise HTTPException(status_code=409, detail=result.reason)
     return result
@@ -94,7 +100,6 @@ async def get_settings() -> SettingsView:
 @router.put("/settings", response_model=SettingsView, dependencies=[Depends(require_admin)])
 async def update_settings(request: Request, update: SettingsUpdate) -> SettingsView:
     """Persist admin-editable settings and apply safe changes immediately."""
-    sources = editable_setting_sources()
     requested = {
         "llm.provider": update.llm.provider,
         "llm.host": update.llm.host,
@@ -109,32 +114,33 @@ async def update_settings(request: Request, update: SettingsUpdate) -> SettingsV
         "llm.temperature": settings.llm.temperature,
         "auth.allow_registration": settings.auth.allow_registration,
     }
-    locked_changes = [
-        field
-        for field, value in requested.items()
-        if sources[field] == "environment" and value != current[field]
-    ]
-    if locked_changes:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "These settings are controlled by environment variables: "
-                + ", ".join(locked_changes)
-            ),
-        )
+    selected = update.changed_paths if update.changed_paths is not None else frozenset(requested)
+    if not selected <= EDITABLE_ENV_KEYS.keys():
+        raise HTTPException(status_code=422, detail="Unsupported setting path")
+    changed = frozenset(field for field in selected if requested[field] != current[field])
+    if "auth.allow_registration" in changed and editable_setting_sources()["auth.allow_registration"] == "environment":
+        raise HTTPException(status_code=409, detail="Registration is controlled by environment configuration")
+    credential_origin = None
+    if "llm.host" in changed:
+        try:
+            parsed = TypeAdapter(AnyHttpUrl).validate_python(update.llm.host)
+        except ValidationError:
+            raise HTTPException(status_code=422, detail="Host must be an HTTP(S) URL") from None
+        if parsed.username or parsed.password:
+            raise HTTPException(status_code=422, detail="Host must not contain credentials")
+        credential_origin = llm_origin(settings.llm.host)
+        if has_real_api_key(settings.llm.api_key) and llm_origin(update.llm.host) != credential_origin:
+            raise HTTPException(status_code=409, detail="Endpoint origin is bound to private credentials; ask your operator to approve the new endpoint")
 
     candidate = settings.model_copy(deep=True)
-    candidate.llm.provider = update.llm.provider
-    candidate.llm.host = update.llm.host
-    candidate.llm.model_name = update.llm.model_name
-    candidate.llm.temperature = update.llm.temperature
-    candidate.auth.allow_registration = update.allow_registration
+    for field in changed:
+        section, key = field.split(".", 1)
+        setattr(getattr(candidate, section), key, requested[field])
     try:
         write_config_file(
             candidate,
-            changed_paths=frozenset(
-                field for field, value in requested.items() if value != current[field]
-            ),
+            changed_paths=changed,
+            credential_origin=credential_origin,
         )
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=503, detail="Could not write application config") from exc

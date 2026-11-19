@@ -147,7 +147,9 @@ it('shows required missing fields without attempting incomplete finalization', a
 	render(ExtractionDraftEditor, { id: 'job' });
 	await screen.findByLabelText('Merchant');
 	await fireEvent.click(screen.getByRole('button', { name: 'Finalize draft' }));
-	expect(screen.getByRole('alert').textContent).toContain('merchant_name');
+	expect(screen.getByRole('alert').textContent).toContain('Required missing fields');
+	await fireEvent.click(screen.getByRole('button', { name: 'Merchant' }));
+	expect(document.activeElement).toBe(screen.getByLabelText('Merchant'));
 	expect(finalize).not.toHaveBeenCalled();
 });
 
@@ -456,4 +458,81 @@ it('ignores pending tag completion after draft replacement', async () => {
 	expect((screen.getByRole('button', { name: 'Save draft' }) as HTMLButtonElement).disabled).toBe(
 		true
 	);
+});
+
+it('reopens the same source after returning to Data and Original', async () => {
+	const source = { photo_index: 0, view_id: 'working', coordinate_space: 'working', bbox: null };
+	vi.mocked(api.getDraft).mockResolvedValue({
+		...completeDraft,
+		field_sources: { total: [source] },
+		source_views: [
+			{
+				view_id: 'working',
+				photo_index: 0,
+				coordinate_space: 'working',
+				width: 100,
+				height: 200,
+				url: '/working.png'
+			}
+		]
+	} as unknown as DraftView);
+	render(ExtractionDraftEditor, { id: 'job' });
+	const evidence = await screen.findByRole('button', { name: 'Show source' });
+	await fireEvent.click(evidence);
+	expect(screen.getByRole('button', { name: 'Receipt' }).getAttribute('aria-pressed')).toBe('true');
+	await fireEvent.click(screen.getByRole('button', { name: 'Original photos' }));
+	await fireEvent.click(screen.getByRole('button', { name: 'Data' }));
+	await fireEvent.click(evidence);
+	expect(screen.getByRole('button', { name: 'Receipt' }).getAttribute('aria-pressed')).toBe('true');
+	expect(screen.getByRole('button', { name: 'Working image' }).getAttribute('aria-pressed')).toBe(
+		'true'
+	);
+});
+
+it('summarizes missing tax names and amounts as navigable fields', async () => {
+	vi.mocked(api.getDraft).mockResolvedValue({
+		...completeDraft,
+		document: { ...completeDraft.document, taxes: [{ name: null, amount: null, rate: null }] }
+	});
+	const finalize = vi.spyOn(api, 'finalizeDraft');
+	render(ExtractionDraftEditor, { id: 'job' });
+	await screen.findByDisplayValue('Bread');
+	await fireEvent.click(screen.getByRole('button', { name: 'Finalize draft' }));
+	await fireEvent.click(screen.getByRole('button', { name: '1 · Amount' }));
+	expect(document.activeElement).toBe(screen.getByLabelText('Amount'));
+	expect(screen.getByRole('button', { name: '1 · Name' })).toBeTruthy();
+	expect(finalize).not.toHaveBeenCalled();
+});
+it('labels a missing taxes array as Taxes', async () => {
+	vi.mocked(api.getDraft).mockResolvedValue({
+		...completeDraft,
+		document: { ...completeDraft.document, taxes: null }
+	});
+	render(ExtractionDraftEditor, { id: 'job' });
+	await screen.findByDisplayValue('Bread');
+	await fireEvent.click(screen.getByRole('button', { name: 'Finalize draft' }));
+	await fireEvent.click(screen.getByRole('button', { name: 'Taxes' }));
+	expect(document.activeElement?.id).toBe('draft-taxes');
+});
+
+it('opens the receipt pane for an explicitly unknown field source', async () => {
+	vi.mocked(api.getDraft).mockResolvedValue({
+		...completeDraft,
+		field_sources: { total: [] },
+		source_views: [
+			{
+				view_id: 'first',
+				photo_index: 0,
+				coordinate_space: 'working',
+				width: 100,
+				height: 100,
+				url: '/first.png'
+			}
+		]
+	} as unknown as DraftView);
+	render(ExtractionDraftEditor, { id: 'job' });
+	await fireEvent.click(await screen.findByRole('button', { name: 'Show source' }));
+	expect(screen.getByRole('button', { name: 'Receipt' }).getAttribute('aria-pressed')).toBe('true');
+	expect(screen.queryByRole('img', { name: 'Source view' })).toBeNull();
+	expect(screen.getByText('Source mapping unknown')).toBeTruthy();
 });

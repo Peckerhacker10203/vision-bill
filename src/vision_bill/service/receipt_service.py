@@ -443,7 +443,7 @@ class ReceiptService:
             return OcrCapabilities(enabled=False, configured=False, reachable=False, ready=False)
         return await provider.get_capabilities()
 
-    def set_ocr_route(self, provider: OcrProvider, settings: OcrSettings) -> None:
+    def set_ocr_route(self, provider: OcrProvider | None, settings: OcrSettings) -> None:
         """Publish the qualified selection while the app holds activation admission."""
         self._ocr_provider = provider
         self._ocr_settings = settings
@@ -461,7 +461,7 @@ class ReceiptService:
 
         selected = self._extraction_pipeline(settings).coordinator()
         live = self._extraction_pipeline().coordinator() if self._ocr_provider is not None else selected
-        if (managed_ocr(settings) != (selected is not None)
+        if ((managed_ocr(settings) and selected is None)
                 or (selected is None) != (live is None)
                 or (live is not None and selected is not None and not selected.matches(live))):
             raise HandoffWait(HandoffStatus(

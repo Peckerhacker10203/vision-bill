@@ -3,15 +3,15 @@ import { loginAdmin } from '../helpers/auth';
 import { getSettings, putSettings } from '../helpers/api';
 
 test.describe('settings (admin)', () => {
-	test('loads with source labels and locked env fields', async ({ page, context }) => {
+	test('loads with source labels and editable environment defaults', async ({ page, context }) => {
 		await loginAdmin(context);
 		await page.goto('/settings');
 		await expect(page.getByRole('group', { name: 'Receipt formatter', exact: true })).toBeVisible();
-		await expect(page.getByText('Environment').first()).toBeVisible();
+		await expect(page.getByText('Environment default').first()).toBeVisible();
 		await expect(page.getByText('Config').first()).toBeVisible();
-		await expect(page.getByLabel('Provider')).toBeDisabled();
-		await expect(page.getByLabel('Host')).toBeDisabled();
-		await expect(page.getByLabel('Default model')).toBeDisabled();
+		await expect(page.getByLabel('Provider')).toBeEnabled();
+		await expect(page.getByLabel('Host')).toBeEnabled();
+		await expect(page.getByLabel('Default model')).toBeEnabled();
 		await expect(page.getByLabel('Temperature')).toBeEnabled();
 	});
 

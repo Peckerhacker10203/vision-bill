@@ -163,6 +163,8 @@ An actor mismatch returns 409 before the protected operation. The signed cookie 
 ordinary authorization rules determine access. Deliberate API clients may omit
 the actor expectation and act as the cookie user. Deletion first commits authorized
 database removal and a durable owned-file manifest, then removes validated
-originals, thumbnails and working derivatives and syncs their directories. Failed
-cleanup stays pending. Repeat the same authorized DELETE to finish it. Referenced receipts/active submissions conflict. See the
+originals, thumbnails and working derivatives and syncs their directories. An
+authorized user can discard an unfinalized submission that needs review from the
+queue. An active analysis or a submission linked to a receipt blocks queue deletion.
+Failed cleanup stays pending. Repeat the same authorized DELETE to finish it. See the
 [upgrade and recovery runbook](UPGRADE_AND_VERIFY.md).

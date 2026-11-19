@@ -45,7 +45,7 @@
 			detailsOffset = offset;
 		} catch (cause) {
 			if (current())
-				error = cause instanceof Error ? cause.message : 'Unable to load individual results.';
+				error = cause instanceof Error ? cause.message : $t('benchmarkUi.detailsError');
 		} finally {
 			if (current()) loadingDetails = false;
 		}
@@ -77,7 +77,7 @@
 			if (current()) error = '';
 		} catch (cause) {
 			if (current())
-				error = cause instanceof Error ? cause.message : 'Unable to load benchmark results.';
+				error = cause instanceof Error ? cause.message : $t('benchmarkUi.resultsError');
 		} finally {
 			if (refreshRequest === request) refreshing = false;
 		}
@@ -89,26 +89,26 @@
 	});
 </script>
 
-<svelte:head><title>Benchmarks · Vision Bill</title></svelte:head>
+<svelte:head><title>{$t('benchmarkUi.results')} · Vision Bill</title></svelte:head>
 <section class="mx-auto max-w-6xl">
 	<div class="flex flex-wrap items-start justify-between gap-3">
 		<div>
-			<h1 class="text-2xl font-semibold">Benchmarks</h1>
-			<p class="mt-1 text-sm text-on-surface-variant">Live local-model evaluation results.</p>
+			<h1 class="text-2xl font-semibold">{$t('benchmarkUi.results')}</h1>
+			<p class="mt-1 text-sm text-on-surface-variant">{$t('benchmarkUi.resultsIntro')}</p>
 		</div>
 		<a
-			class="rounded-lg bg-error px-4 py-2.5 text-sm font-medium text-on-error"
-			href={resolve('/benchmarks')}>Create benchmark</a
+			class="rounded-lg bg-error-action px-4 py-2.5 text-sm font-medium text-on-error"
+			href={resolve('/benchmarks')}>{$t('benchmarkUi.create')}</a
 		>
 	</div>
 	{#if error}<p class="mt-4 text-sm text-error" role="alert">{error}</p>{/if}
 	{#if runs.length === 0}<div
 			class="mt-6 rounded-xl border border-dashed border-outline-variant p-8 text-center text-sm text-on-surface-variant"
 		>
-			No benchmark runs yet.
+			{$t('benchmarkUi.noRuns')}
 		</div>{:else}
 		<label class="mt-6 block max-w-md text-sm font-medium"
-			>Benchmark run<select
+			>{$t('benchmarkUi.run')}<select
 				class="mt-1 block w-full rounded-lg border border-outline-variant bg-surface p-2"
 				value={selectedId ?? ''}
 				onchange={(event) => {
@@ -121,16 +121,18 @@
 					detailsOffset = 0;
 					void refresh(true);
 				}}
-				>{#each runs as run (run.id)}<option value={run.id}>#{run.id} — {run.status}</option
+				>{#each runs as run (run.id)}<option value={run.id}
+						>#{run.id} — {$t(`benchmarkUi.status.${run.status}`, { default: run.status })}</option
 					>{/each}</select
 			></label
 		>
 		{#if result}
 			<div class="mt-4 rounded-xl bg-surface-container p-4 text-sm">
 				<p>
-					Scoring version: {result.run.scoring_version}. {result.run.experiment
-						? 'Extraction and classification are evaluated separately.'
-						: 'Historical scoring; no stored individual outputs.'}
+					{$t('benchmarkUi.scoringVersion')}
+					{result.run.scoring_version}. {result.run.experiment
+						? $t('benchmarkUi.separateScoring')
+						: $t('benchmarkUi.historical')}
 				</p>
 				<a
 					class="mt-2 inline-block underline"
@@ -143,10 +145,10 @@
 							result.run.receipt_ids.join(',')
 						);
 						void goto(resolve('/benchmarks'));
-					}}>Reuse this receipt selection</a
+					}}>{$t('benchmarkUi.reuse')}</a
 				>
 				{#if result.run.experiment}<details class="mt-2">
-						<summary class="cursor-pointer">Run settings</summary>
+						<summary class="cursor-pointer">{$t('benchmarkUi.settings')}</summary>
 						<pre class="mt-2 overflow-x-auto whitespace-pre-wrap text-xs">{JSON.stringify(
 								result.run.experiment,
 								null,
@@ -154,31 +156,121 @@
 							)}</pre>
 					</details>{/if}
 			</div>
-			<div class="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+			<div class="mt-5 grid grid-cols-2 gap-2 sm:grid-cols-5">
 				<div class="rounded-xl bg-surface-container p-4">
-					<p class="text-xs text-on-surface-variant">Completed</p>
+					<p class="text-xs text-on-surface-variant">{$t('benchmarkUi.completed')}</p>
 					<p class="text-xl font-semibold">
 						{result.terminal} / {result.run.receipt_ids.length * result.run.model_ids.length}
 					</p>
 				</div>
 				<div class="rounded-xl bg-surface-container p-4">
-					<p class="text-xs text-on-surface-variant">Queued</p>
+					<p class="text-xs text-on-surface-variant">{$t('benchmarkUi.queued')}</p>
 					<p class="text-xl font-semibold">{result.queued}</p>
 				</div>
 				<div class="rounded-xl bg-surface-container p-4">
-					<p class="text-xs text-on-surface-variant">Running</p>
+					<p class="text-xs text-on-surface-variant">{$t('benchmarkUi.running')}</p>
 					<p class="text-xl font-semibold">{result.running}</p>
 				</div>
 				<div class="rounded-xl bg-surface-container p-4">
-					<p class="text-xs text-on-surface-variant">Retrying</p>
+					<p class="text-xs text-on-surface-variant">{$t('benchmarkUi.retrying')}</p>
 					<p class="text-xl font-semibold">{result.retrying}</p>
 				</div>
 				<div class="rounded-xl bg-surface-container p-4">
-					<p class="text-xs text-on-surface-variant">Waiting</p>
+					<p class="text-xs text-on-surface-variant">{$t('benchmarkUi.waiting')}</p>
 					<p class="text-xl font-semibold">{result.waiting_for_model}</p>
 				</div>
 			</div>
-			<div class="mt-6 overflow-x-auto rounded-xl border border-outline-variant">
+			<div class="mt-6 space-y-3 lg:hidden">
+				{#each result.summaries as summary (summary.model_id)}
+					<section
+						class="min-w-0 rounded-xl border border-outline-variant p-4 text-sm"
+						aria-label={$t('benchmarkUi.modelOutcomes', { values: { model: summary.model_id } })}
+					>
+						<h2 class="break-words font-semibold">{summary.model_id}</h2>
+						<dl class="mt-3 grid grid-cols-2 gap-3">
+							<div>
+								<dt class="text-xs text-on-surface-variant">
+									{$t('benchmarkUi.processingSuccessRate')}
+								</dt>
+								<dd class="mt-1 font-medium">
+									{@render rate(
+										summary.completed > 0 ? summary.succeeded / summary.completed : null,
+										summary.completed,
+										'completedCases'
+									)}
+								</dd>
+							</div>
+							<div>
+								<dt class="text-xs text-on-surface-variant">{$t('benchmarkResults.latency')}</dt>
+								<dd class="mt-1 font-medium">
+									{summary.average_latency_ms == null
+										? '—'
+										: `${fmt(summary.average_latency_ms, 0)} ms`}
+								</dd>
+							</div>
+						</dl>
+						<p class="mt-3">
+							{$t('benchmarkUi.failedCases', { values: { count: summary.failed } })}
+						</p>
+						<details class="mt-3 border-t border-outline-variant pt-3">
+							<summary class="cursor-pointer font-medium">{$t('benchmarkUi.moreMetrics')}</summary>
+							<dl class="mt-3 space-y-3">
+								<div>
+									<dt>{$t('benchmarkResults.fullyCorrectReceipts')}</dt>
+									<dd>
+										{@render rate(
+											summary.full_receipt_correct_rate,
+											summary.completed,
+											'completedCases'
+										)}
+									</dd>
+								</div>
+								<div>
+									<dt>{$t('benchmarkResults.allCaseScore')}</dt>
+									<dd>
+										{@render rate(
+											summary.all_case_average_score,
+											summary.completed,
+											'completedCases'
+										)}
+									</dd>
+								</div>
+								<div>
+									<dt>{$t('benchmarkResults.successOnlyScore')}</dt>
+									<dd>
+										{@render rate(summary.average_score, summary.succeeded, 'successfulCases')}
+									</dd>
+								</div>
+								<div>
+									<dt>{$t('benchmarkResults.confidence')}</dt>
+									<dd>
+										{summary.average_confidence == null
+											? '—'
+											: `${fmt(summary.average_confidence)}%`}
+									</dd>
+								</div>
+								<div>
+									<dt>{$t('benchmarkResults.successFailed')}</dt>
+									<dd>{summary.succeeded} / {summary.failed}</dd>
+								</div>
+								<div>
+									<dt>{$t('benchmarkResults.council')}</dt>
+									<dd>
+										{$t('benchmarkResults.findings', {
+											values: { count: summary.council_findings }
+										})}
+									</dd>
+								</div>
+								<div>
+									<dt>{$t('benchmarkUi.modelDigest')}</dt>
+									<dd class="break-all">{summary.model_digest ?? '—'}</dd>
+								</div>
+							</dl>
+						</details>
+					</section>
+				{/each}
+			</div>
+			<div class="hidden lg:block mt-6 overflow-x-auto rounded-xl border border-outline-variant">
 				<table class="w-full text-left text-sm">
 					<thead class="bg-surface-container text-xs text-on-surface-variant">
 						<tr>
@@ -238,17 +330,18 @@
 					<button
 						class="rounded-lg border border-outline-variant px-3 py-2 text-sm"
 						disabled={loadingDetails}
-						onclick={() => loadDetails(detailsOffset)}>Load individual results</button
+						onclick={() => loadDetails(detailsOffset)}>{$t('benchmarkUi.loadDetails')}</button
 					>
 					<button
 						class="text-sm underline"
 						disabled={loadingDetails || detailsOffset === 0}
-						onclick={() => loadDetails(Math.max(0, detailsOffset - 50))}>Previous 50</button
+						onclick={() => loadDetails(Math.max(0, detailsOffset - 50))}
+						>{$t('benchmarkUi.previous')}</button
 					>
 					<button
 						class="text-sm underline"
 						disabled={loadingDetails || details.length < 50}
-						onclick={() => loadDetails(detailsOffset + 50)}>Next 50</button
+						onclick={() => loadDetails(detailsOffset + 50)}>{$t('benchmarkUi.next')}</button
 					>
 				</div>
 				<BenchmarkResultDetails results={details} />

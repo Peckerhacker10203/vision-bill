@@ -706,3 +706,74 @@ async def test_changed_original_binding_is_explicit_integrity_error(photos):
         )
     assert hasattr(module, "OriginalSourceChangedError")
     assert isinstance(failure.value, module.OriginalSourceChangedError)
+
+
+async def test_dedicated_off_real_route_executes_direct_upload_and_holds_explicit_ocr(photos, tmp_path, monkeypatch):
+    from ocr_contract.activation import ActivationPhase, ActivationStatus, ActivationStore
+
+    from vision_bill.config import settings
+    from vision_bill.model.handoff import HandoffWait
+    from vision_bill.service import activation_admission
+    from vision_bill.service.dedicated_ocr import DedicatedOcrActivation
+    from vision_bill.service.experiment_execution import execute_submission
+    from vision_bill.service.receipt_service import ReceiptService
+
+    store = ActivationStore(tmp_path / "request", tmp_path / "status", tmp_path / "lock")
+    monkeypatch.setenv("VISION_BILL_OCR_ACTIVATION", "true")
+    monkeypatch.setenv("OCR_ACTIVATION_ENDPOINT", "http://prepared-ocr.test")
+    monkeypatch.setenv("OCR_ACTIVATION_HANDOFF_LOCK_PATH", str(tmp_path / "gpu.lock"))
+    monkeypatch.setattr(activation_admission, "ActivationStore", lambda: store)
+    monkeypatch.setattr(settings, "ocr", OcrSettings(enabled=False, coordination_path=tmp_path / "old.lock"))
+    monkeypatch.setattr(settings.llm, "model_name", "fixture")
+    llm = formatter()
+    monkeypatch.setattr(llm, "resident_model_ids", AsyncMock(return_value=frozenset()))
+    monkeypatch.setattr(llm, "release_model", AsyncMock())
+    receipts = object.__new__(ReceiptService)
+    receipts._provider = llm
+    receipts.set_ocr_route(None, settings.ocr)
+    activation = DedicatedOcrActivation(settings, llm, receipts.set_ocr_route, lambda: None,
+                                         store=store, handoff_path=tmp_path / "gpu.lock")
+    monkeypatch.setattr(activation, "_controller_is_live", AsyncMock(return_value=True))
+    monkeypatch.setattr(activation, "_runtime_is_serving", AsyncMock(return_value=True))
+    monkeypatch.setattr(activation.ocr, "claim", AsyncMock())
+    monkeypatch.setattr(activation.ocr, "park", AsyncMock())
+    monkeypatch.setattr(activation.ocr, "load", AsyncMock())
+    monkeypatch.setattr(activation.ocr, "get_capabilities", AsyncMock(return_value=OcrCapabilities(enabled=True, configured=True, reachable=True, ready=True)))
+    assert (await activation.submit(confirm_handoff=True)).state == "requested"
+    request = store.read_request()
+    store.publish_status(ActivationStatus(request.generation, ActivationPhase.READY))
+    await activation.reconcile()
+    assert (await activation.submit(confirm_handoff=False, enabled=False)).state == "disabled"
+    assert receipts.execution_handoff(settings.ocr) is activation.handoff
+    result = await receipts.extract_receipt(
+        "fixture", photos, ocr_settings=settings.ocr,
+        options=ExperimentOptions(include_classification=False), deadline=time.monotonic() + 5, tags=[],
+    )
+    assert result.receipt is not None
+    assert len(llm._client.chat.call_args.kwargs["messages"][0]["images"]) == 2
+    with pytest.raises(HandoffWait, match="dedicated_ocr_disabled"):
+        await execute_submission(receipts, "fixture", photos, ExperimentOptions(pipeline="ocr"), [])
+    activation.ocr.load.assert_not_awaited()
+    assert not activation.handoff.read_journal().unsettled
+    from uuid import uuid4
+
+    from vision_bill.service.benchmark_service import BenchmarkService
+
+    queued = object.__new__(BenchmarkService)
+    queued._provider, queued._receipts = llm, receipts
+    queued._settings = SimpleNamespace(max_attempts=3)
+    queued._db = SimpleNamespace(hold_before_inference=AsyncMock(return_value=True),
+                                 begin_attempt=AsyncMock(), finish_task=AsyncMock())
+    queued._run_digests = AsyncMock(return_value={"fixture": None})
+    task = {"receipt_id": uuid4(), "model_id": "fixture", "inference_attempt_count": 0,
+            "inference_started": False}
+    manifest = {"inputs": [{"receipt_id": str(task["receipt_id"]), "pipeline": "ocr"}],
+                "options": ExperimentOptions(pipeline="ocr").model_dump(mode="json")}
+    started = asyncio.get_running_loop().time()
+    await queued._execute_reserved(task, SimpleNamespace(model_ids=["fixture"]), manifest, started, started + 5)
+    queued._db.hold_before_inference.assert_awaited_once_with(
+        task, "dedicated_ocr_disabled", deadline=started + 5,
+    )
+    queued._db.begin_attempt.assert_not_awaited()
+    queued._db.finish_task.assert_not_awaited()
+    activation.ocr.load.assert_not_awaited()

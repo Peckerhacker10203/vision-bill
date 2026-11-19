@@ -7,6 +7,7 @@
 		revision,
 		onChange,
 		onSource,
+		onField,
 		editable = true
 	}: {
 		findings: ReviewFinding[];
@@ -14,6 +15,7 @@
 		onChange?: (value: { finding_id: string; comment: string }[]) => void;
 		onSource?: (sources: SourceRef[]) => void;
 		editable?: boolean;
+		onField?: (path: string) => void;
 	} = $props();
 	let comments = $state<Record<string, string>>({});
 	let identity = $derived(JSON.stringify([revision, findings, editable]));
@@ -40,7 +42,14 @@
 					finding.code
 				)}
 			</p>
-			<p class="text-xs text-on-surface-variant">{finding.code} · {finding.field_path}</p>
+			{#if onField && /^(merchant_name|merchant_address|receipt_number|date|time|currency|category|payment_method|subtotal|discount_total|tax_total|tip|total|line_items[.[]\d+\]?\.(description|quantity|unit_price|total_price|spending_category)|taxes[.[]\d+\]?\.(name|rate|amount))$/.test(finding.field_path)}<button
+					type="button"
+					class="text-sm text-primary underline"
+					onclick={() => onField?.(finding.field_path)}>{$t('receiptWorkspace.field')}</button
+				>{/if}
+			<details class="text-xs text-on-surface-variant">
+				<summary>{$t('editor.details')}</summary>{finding.code} · {finding.field_path}
+			</details>
 			{#each Object.entries(finding.comparison) as [key, value] (key)}<p class="text-sm">
 					{diagnosticLabel($t, 'comparison', key)}: {value ?? '—'}
 				</p>{/each}

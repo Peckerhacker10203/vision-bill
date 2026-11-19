@@ -34,12 +34,8 @@ it('displays purchases without invented quantities, unit prices or price summari
 	});
 	render(Page);
 	await fireEvent.input(screen.getByRole('searchbox'), { target: { value: 'bread' } });
-	const purchase = await screen.findByRole('row', { name: /Wholegrain bread/ });
-	expect(
-		within(purchase)
-			.getAllByRole('cell')
-			.slice(3)
-			.map((cell) => cell.textContent?.trim())
-	).toEqual(['—', '—']);
+	const purchase = await screen.findByRole('listitem');
+	expect(within(purchase).getAllByText('—')).toHaveLength(2);
+	expect(screen.getByRole('status').textContent).toContain('1 purchase');
 	expect(screen.queryByText('Latest')).toBeNull();
 });

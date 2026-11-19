@@ -10,7 +10,7 @@
 	import { t } from '$lib/i18n';
 	import type { SubmissionStatus } from '$lib/types';
 
-	let { id }: { id: string } = $props();
+	let { id, editingDraft = false }: { id: string; editingDraft?: boolean } = $props();
 	const actor = captureSessionActor();
 	let retrying = $state(false);
 	let retryError = $state('');
@@ -128,7 +128,7 @@
 	}
 </script>
 
-<div class="mt-4 rounded-xl border border-outline-variant bg-surface-container-low p-5">
+<div class="my-4 rounded-xl border border-outline-variant bg-surface-container-low p-4">
 	{#if job.error}
 		<p role="alert">{$t('submission.loadError')} {job.error.message}</p>
 		<button type="button" class="mt-3 text-primary underline" onclick={() => job.refetch()}
@@ -170,40 +170,51 @@
 						)}{/if}
 				</p>{/if}
 		{/if}
-		{#if job.data.result_code}<p class="mt-2 text-sm">
+		{#if job.data.result_code && !(editingDraft && job.data.result_code === 'needs_review')}<p
+				class="mt-2 text-sm"
+			>
 				{$t('submission.resultCode')}: {diagnosticLabel($t, 'reasons', job.data.result_code)} ({job
 					.data.result_code})
 			</p>{/if}
-		{#if job.data.error}<p class="mt-2 text-sm text-error">{job.data.error}</p>{/if}
-		{#if job.data.receipt_id}
-			<a
-				class="mt-4 inline-block rounded-lg bg-primary px-4 py-2 text-on-primary"
-				href={resolve(`/receipts/${job.data.receipt_id}`)}>{$t('submission.openReceipt')}</a
+		{#if job.data.error && job.data.error !== job.data.result_code}<p
+				class="mt-2 break-words text-sm text-error"
 			>
-		{/if}
-		{#if job.data.draft_available && !job.data.observations_available}
-			<a
-				class="mt-4 inline-block text-primary underline"
-				href={resolve(`/upload?job=${id}&draft=1`)}>{$t('submission.openDraft')}</a
+				{job.data.error}
+			</p>{/if}
+		<div class="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
+			{#if job.data.receipt_id}
+				<a
+					class="inline-block rounded-lg bg-action px-4 py-2 text-on-primary"
+					href={resolve(`/receipts/${job.data.receipt_id}`)}>{$t('submission.openReceipt')}</a
+				>
+			{/if}
+			{#if !editingDraft && job.data.draft_available && !job.data.observations_available}
+				<a
+					class="inline-block rounded-lg bg-action px-4 py-2 text-on-primary"
+					href={resolve(`/upload?job=${id}&draft=1`)}>{$t('submission.openDraft')}</a
+				>
+			{/if}
+			{#if job.data.terminal && job.data.status !== 'analyzed'}
+				<button
+					type="button"
+					class="rounded-lg border border-outline px-3 py-2 text-on-surface hover:bg-surface-container-high disabled:opacity-50"
+					disabled={retrying}
+					onclick={() => retry()}>{$t('submission.retry')}</button
+				>
+			{/if}
+			{#if policyHeld}
+				<button
+					type="button"
+					class="rounded-lg bg-action px-4 py-2 text-on-primary disabled:opacity-50"
+					disabled={retrying}
+					onclick={() => retry('current')}>{$t('submission.retryCurrentPolicy')}</button
+				>
+			{/if}
+			<a class="inline-block text-sm text-primary underline" href={resolve('/upload')}
+				>{$t('submission.newUpload')}</a
 			>
-		{/if}
-		{#if job.data.terminal && job.data.status !== 'analyzed'}
-			<button
-				type="button"
-				class="mt-4 rounded-lg bg-primary px-4 py-2 text-on-primary disabled:opacity-50"
-				disabled={retrying}
-				onclick={() => retry()}>{$t('submission.retry')}</button
-			>
-		{/if}
-		{#if policyHeld}
-			<button
-				type="button"
-				class="mt-4 rounded-lg bg-primary px-4 py-2 text-on-primary disabled:opacity-50"
-				disabled={retrying}
-				onclick={() => retry('current')}>{$t('submission.retryCurrentPolicy')}</button
-			>
-		{/if}
-		{#if job.data.source_views?.length}
+		</div>
+		{#if !editingDraft && job.data.source_views?.length}
 			<ul class="mt-4 flex flex-wrap gap-3">
 				{#each job.data.source_views as view (view.view_id)}
 					{@const href = api.sourceViewUrl(view.url, actor)}
@@ -212,17 +223,25 @@
 							<!-- Authenticated artifact URLs are supplied by the API. -->
 							<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -->
 							<a class="text-primary underline" {href} target="_blank" rel="noreferrer"
-								>{$t('submission.photo', { values: { number: view.photo_index + 1 } })} ({view.coordinate_space})</a
+								>{$t('submission.photo', { values: { number: view.photo_index + 1 } })} ({$t(
+									view.coordinate_space === 'working'
+										? 'receiptWorkspace.working'
+										: 'review.original'
+								)})</a
 							>
 						</li>
 					{/if}
 				{/each}
 			</ul>
 		{/if}
-		<p class="mt-4 break-all text-xs text-on-surface-variant">{$t('submission.reference')}: {id}</p>
+		<details class="mt-2 text-xs text-on-surface-variant">
+			<summary class="cursor-pointer">{$t('submission.reference')}</summary>
+			<p class="mt-1 break-all">{id}</p>
+		</details>
 	{/if}
 	{#if retryError}<p class="mt-3 text-sm text-error" role="alert">{retryError}</p>{/if}
-	<a class="mt-4 inline-block text-primary underline" href={resolve('/upload')}
-		>{$t('submission.newUpload')}</a
-	>
+	{#if !job.data || job.error}<a
+			class="mt-4 inline-block text-primary underline"
+			href={resolve('/upload')}>{$t('submission.newUpload')}</a
+		>{/if}
 </div>

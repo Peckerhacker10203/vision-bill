@@ -210,10 +210,14 @@
 	<title>{$t('pages.upload.title')} – {$t('app.name')}</title>
 </svelte:head>
 
-<section class="mx-auto max-w-2xl">
+<section
+	class="mx-auto min-w-0 {jobId && page.url.searchParams.get('draft') === '1'
+		? 'max-w-6xl'
+		: 'max-w-2xl'}"
+>
 	<h1 class="text-2xl font-semibold">{$t('pages.upload.title')}</h1>
 	{#if jobId}
-		<SubmissionStatus id={jobId} />
+		<SubmissionStatus id={jobId} editingDraft={page.url.searchParams.get('draft') === '1'} />
 		{#if page.url.searchParams.get('draft') === '1'}<ExtractionDraftEditor id={jobId} />{/if}
 	{:else}
 		<p class="mt-3 text-sm text-on-surface-variant">{$t('submission.captureHint')}</p>
@@ -224,6 +228,10 @@
 			</p>
 		{/if}
 
+		<p class="mt-3 text-sm text-on-surface-variant">{$t('submission.limits')}</p>
+		<p class="mt-2 text-sm font-medium" role="status">
+			{$t('receiptWorkspace.selection', { values: { count: photos.length } })}
+		</p>
 		<!-- Dropzone / preview -->
 		{#each photos as photo, index (photo.url)}
 			<div
@@ -234,7 +242,7 @@
 					alt={photo.file.name}
 					class="max-h-80 w-full bg-surface-container object-contain"
 				/>
-				<div class="flex items-center justify-between gap-3 p-3">
+				<div class="flex flex-wrap items-center justify-between gap-3 p-3">
 					<div class="min-w-0">
 						<p class="truncate text-sm font-medium">{index + 1}. {photo.file.name}</p>
 						<p class="text-xs text-on-surface-variant">{formatSize(photo.file.size)}</p>
@@ -281,7 +289,7 @@
 			<div class="flex flex-wrap items-center justify-center gap-2">
 				<button
 					type="button"
-					class="flex items-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-on-primary hover:opacity-90"
+					class="flex items-center gap-2 rounded-lg bg-action px-4 py-2.5 text-sm font-medium text-on-primary hover:opacity-90"
 					onclick={() => galleryInput?.click()}
 					disabled={uploading}
 				>
@@ -359,7 +367,7 @@
 
 		<button
 			type="button"
-			class="mt-4 w-full rounded-lg bg-primary px-4 py-3 text-sm font-medium text-on-primary hover:opacity-90 disabled:opacity-50"
+			class="mt-4 w-full rounded-lg bg-action px-4 py-3 text-sm font-medium text-on-primary hover:opacity-90 disabled:opacity-50"
 			disabled={!file ||
 				uploading ||
 				checkingRecovery ||

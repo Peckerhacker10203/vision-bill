@@ -3,4 +3,7 @@
 	import Probe from './PrivateSessionProbe.svelte';
 </script>
 
-<Layout><Probe /></Layout>
+<Layout
+	><h1>Receipts</h1>
+	<Probe /></Layout
+>

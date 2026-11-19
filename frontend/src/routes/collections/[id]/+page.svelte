@@ -9,9 +9,9 @@
 	import { queryClient } from '$lib/query/client';
 	import { queryKeys } from '$lib/query/keys';
 	import { formatMoney } from '$lib/ui/money';
-	import { formatRelativeTime } from '$lib/ui/time';
 	import { snackbar } from '$lib/ui/snackbar.svelte';
 	import { PRESET_COLORS, colorToStyle } from '$lib/collection-colors';
+	import Dialog from '$lib/ui/Dialog.svelte';
 	import ConfirmDialog from '$lib/ui/ConfirmDialog.svelte';
 	import Icon from '$lib/ui/Icon.svelte';
 	import StatisticsCharts from '$lib/ui/StatisticsCharts.svelte';
@@ -196,7 +196,7 @@
 		<p class="mt-1 text-on-surface-variant">{$t('collections.notFoundBody')}</p>
 		<a
 			href={resolve('/collections')}
-			class="mt-3 inline-block rounded-lg bg-primary px-4 py-2 text-on-primary hover:opacity-90"
+			class="mt-3 inline-block rounded-lg bg-action px-4 py-2 text-on-primary hover:opacity-90"
 		>
 			{$t('common.back')}
 		</a>
@@ -220,11 +220,13 @@
 				</a>
 				<span class="size-4 shrink-0 rounded-full" style={colorToStyle(data.color)}></span>
 				<div class="min-w-0">
-					<h1 class="truncate text-xl font-semibold">{data.name}</h1>
-					<p class="truncate text-xs text-on-surface-variant">
+					<h1 class="break-words text-xl font-semibold">{data.name}</h1>
+					<p class="text-sm text-on-surface-variant">
 						{dateRange(data)}
 						{#if data.active}
-							· {$t('collections.capturing')}
+							· {$t('statistics.activeCollection', { values: { name: data.name } })}
+						{:else}
+							· {$t('statistics.captureInactive')}
 						{/if}
 					</p>
 				</div>
@@ -276,7 +278,7 @@
 						<li class="flex items-center gap-3">
 							<a
 								href={resolve(`/receipts/${receipt.id}`)}
-								class="flex min-w-0 flex-1 items-center gap-3 rounded-xl border border-outline-variant bg-surface-container-low p-4 transition-colors hover:border-primary/50"
+								class="flex min-w-0 flex-1 flex-wrap items-center gap-3 rounded-xl border border-outline-variant bg-surface-container-low p-4 transition-colors hover:border-primary/50"
 							>
 								<span
 									class="flex size-12 shrink-0 items-center justify-center rounded-lg bg-surface-container"
@@ -284,21 +286,20 @@
 									<Icon icon="receipts" />
 								</span>
 								<div class="min-w-0 flex-1">
-									<p class="truncate text-sm font-medium">{vendor(receipt)}</p>
+									<p class="break-words text-sm font-medium">{vendor(receipt)}</p>
 									<p class="text-xs text-on-surface-variant">
-										{formatMoney(receipt.total, receipt.currency)}
 										{#if receipt.date}
-											· {receipt.date}
-										{/if}
-										{#if receipt.created_at}
-											· {formatRelativeTime(receipt.created_at)}
+											{receipt.date}
 										{/if}
 									</p>
 								</div>
+								<strong class="shrink-0 text-sm tabular-nums"
+									>{formatMoney(receipt.total, receipt.currency)}</strong
+								>
 								<span
 									class="shrink-0 rounded-full px-2.5 py-1 text-xs font-medium
 										{receipt.status === 'verified'
-										? 'bg-primary-container text-on-primary-container'
+										? 'bg-action-container text-on-primary-container'
 										: 'bg-surface-container-highest text-on-surface-variant'}"
 								>
 									{$t(receipt.status === 'verified' ? 'receipt.verified' : 'receipt.unverified')}
@@ -345,115 +346,107 @@
 	</section>
 
 	{#if editOpen}
-		<div class="fixed inset-0 z-40 flex items-center justify-center p-4" role="presentation">
-			<div class="absolute inset-0 bg-black/50" role="presentation" onclick={closeEdit}></div>
-			<div
-				role="dialog"
-				aria-modal="true"
-				aria-label={$t('collections.edit')}
-				class="relative w-full max-w-md rounded-xl bg-surface p-5 shadow-elevation-4"
+		<Dialog title={$t('collections.edit')} busy={saving} onCancel={closeEdit}>
+			<form
+				onsubmit={(event) => {
+					event.preventDefault();
+					void submitEdit();
+				}}
 			>
-				<form
-					onsubmit={(event) => {
-						event.preventDefault();
-						void submitEdit();
-					}}
-				>
-					<h2 class="text-lg font-semibold">{$t('collections.edit')}</h2>
+				<h2 class="text-lg font-semibold">{$t('collections.edit')}</h2>
 
-					<label class="mt-4 block text-sm">
-						{$t('collections.name')}
+				<label class="mt-4 block text-sm">
+					{$t('collections.name')}
+					<input
+						type="text"
+						required
+						class="mt-1 w-full rounded-lg border border-outline-variant bg-surface-container-lowest px-3 py-2 text-sm"
+						value={name}
+						oninput={(event) => (name = (event.currentTarget as HTMLInputElement).value)}
+					/>
+				</label>
+
+				<div class="mt-4">
+					<span class="block text-sm">{$t('collections.color')}</span>
+					<div class="mt-1 flex flex-wrap items-center gap-2">
+						{#each PRESET_COLORS as preset (preset)}
+							<button
+								type="button"
+								aria-label={preset}
+								aria-pressed={color === preset}
+								class="size-8 rounded-full ring-2 ring-offset-2 {color === preset
+									? 'ring-primary'
+									: 'ring-transparent'}"
+								style={colorToStyle(preset, true)}
+								onclick={() => (color = preset)}
+							></button>
+						{/each}
+						<!-- Custom color: a labeled pill (clearly not a preset dot) that
+						     opens the native color picker; selected when a non-preset color is set. -->
+						<label
+							class="flex h-8 cursor-pointer items-center gap-2 rounded-lg border border-outline-variant px-2.5 text-sm transition-colors hover:border-primary/50 focus-within:border-primary focus-within:ring-1 focus-within:ring-primary {isCustomColor
+								? 'border-primary ring-2 ring-primary/30'
+								: ''}"
+						>
+							<span
+								class="size-5 shrink-0 rounded-full border border-outline-variant"
+								style={colorToStyle(color, true)}
+							></span>
+							{$t('collections.colorCustom')}
+							<input
+								type="color"
+								class="sr-only"
+								aria-label={$t('collections.colorCustom')}
+								value={color && color !== '' ? color : '#64748B'}
+								oninput={onColorPicker}
+							/>
+						</label>
+					</div>
+				</div>
+
+				<div class="mt-4 grid gap-3 sm:grid-cols-2">
+					<label class="block text-sm">
+						{$t('collections.start')}
 						<input
-							type="text"
-							required
+							type="date"
 							class="mt-1 w-full rounded-lg border border-outline-variant bg-surface-container-lowest px-3 py-2 text-sm"
-							value={name}
-							oninput={(event) => (name = (event.currentTarget as HTMLInputElement).value)}
+							value={startDate}
+							oninput={(event) => (startDate = (event.currentTarget as HTMLInputElement).value)}
 						/>
 					</label>
+					<label class="block text-sm">
+						{$t('collections.end')}
+						<input
+							type="date"
+							class="mt-1 w-full rounded-lg border border-outline-variant bg-surface-container-lowest px-3 py-2 text-sm"
+							value={endDate}
+							oninput={(event) => (endDate = (event.currentTarget as HTMLInputElement).value)}
+						/>
+					</label>
+				</div>
 
-					<div class="mt-4">
-						<span class="block text-sm">{$t('collections.color')}</span>
-						<div class="mt-1 flex flex-wrap items-center gap-2">
-							{#each PRESET_COLORS as preset (preset)}
-								<button
-									type="button"
-									aria-label={preset}
-									aria-pressed={color === preset}
-									class="size-8 rounded-full ring-2 ring-offset-2 {color === preset
-										? 'ring-primary'
-										: 'ring-transparent'}"
-									style={colorToStyle(preset)}
-									onclick={() => (color = preset)}
-								></button>
-							{/each}
-							<!-- Custom color: a labeled pill (clearly not a preset dot) that
-						     opens the native color picker; selected when a non-preset color is set. -->
-							<label
-								class="flex h-8 cursor-pointer items-center gap-2 rounded-lg border border-outline-variant px-2.5 text-sm transition-colors hover:border-primary/50 focus-within:border-primary focus-within:ring-1 focus-within:ring-primary {isCustomColor
-									? 'border-primary ring-2 ring-primary/30'
-									: ''}"
-							>
-								<span
-									class="size-5 shrink-0 rounded-full border border-outline-variant"
-									style={colorToStyle(color)}
-								></span>
-								{$t('collections.colorCustom')}
-								<input
-									type="color"
-									class="sr-only"
-									aria-label={$t('collections.colorCustom')}
-									value={color && color !== '' ? color : '#64748B'}
-									oninput={onColorPicker}
-								/>
-							</label>
-						</div>
-					</div>
+				{#if formError}
+					<p class="mt-3 text-sm text-error" role="alert">{formError}</p>
+				{/if}
 
-					<div class="mt-4 grid grid-cols-2 gap-3">
-						<label class="block text-sm">
-							{$t('collections.start')}
-							<input
-								type="date"
-								class="mt-1 w-full rounded-lg border border-outline-variant bg-surface-container-lowest px-3 py-2 text-sm"
-								value={startDate}
-								oninput={(event) => (startDate = (event.currentTarget as HTMLInputElement).value)}
-							/>
-						</label>
-						<label class="block text-sm">
-							{$t('collections.end')}
-							<input
-								type="date"
-								class="mt-1 w-full rounded-lg border border-outline-variant bg-surface-container-lowest px-3 py-2 text-sm"
-								value={endDate}
-								oninput={(event) => (endDate = (event.currentTarget as HTMLInputElement).value)}
-							/>
-						</label>
-					</div>
-
-					{#if formError}
-						<p class="mt-3 text-sm text-error" role="alert">{formError}</p>
-					{/if}
-
-					<div class="mt-5 flex justify-end gap-2">
-						<button
-							type="button"
-							class="rounded-lg border border-outline-variant px-4 py-2 text-sm font-medium hover:bg-surface-container-high"
-							onclick={closeEdit}
-						>
-							{$t('collections.cancel')}
-						</button>
-						<button
-							type="submit"
-							disabled={saving}
-							class="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-on-primary hover:bg-primary/90 disabled:opacity-60"
-						>
-							{$t('collections.save')}
-						</button>
-					</div>
-				</form>
-			</div>
-		</div>
+				<div class="mt-5 flex justify-end gap-2">
+					<button
+						type="button"
+						class="rounded-lg border border-outline-variant px-4 py-2 text-sm font-medium hover:bg-surface-container-high"
+						onclick={closeEdit}
+					>
+						{$t('collections.cancel')}
+					</button>
+					<button
+						type="submit"
+						disabled={saving}
+						class="rounded-lg bg-action px-4 py-2 text-sm font-medium text-on-primary hover:bg-action/90 disabled:opacity-60"
+					>
+						{$t('collections.save')}
+					</button>
+				</div>
+			</form>
+		</Dialog>
 	{/if}
 
 	<ConfirmDialog

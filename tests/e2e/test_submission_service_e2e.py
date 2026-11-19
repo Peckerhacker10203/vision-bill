@@ -287,6 +287,58 @@ async def test_migrated_legacy_first_resolution_persisted_once(db, settings, tmp
         await w.destroy_db()
 
 
+async def test_delete_owned_unfinalized_review_draft(workflow_db, settings, tmp_path):
+    from fastapi import HTTPException
+
+    from vision_bill.api.images import delete_image
+
+    from .test_workflow_db_e2e import partial_draft
+
+    w, scope = workflow_db
+    path = tmp_path / "original.png"
+    image = await partial_draft(w, scope, path)
+    receipts = ReceiptService(settings.images, settings.pg, formatter())
+    receipts._workflow_db = w
+    receipts._db._pool = w.pool
+    images = ImageService(settings.images)
+    owner = User(id=scope.user_id, username="owner")
+    with pytest.raises(HTTPException) as error:
+        await delete_image(image.id, receipts, images, User(id=uuid4(), username="outsider"))
+    assert error.value.status_code == 404 and path.exists()
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM receipt_drafts WHERE image_id=$1", image.id) == 1
+    assert await delete_image(image.id, receipts, images, owner) == {"deleted": image.id}
+    assert not path.exists()
+    async with w.pool.acquire() as conn:
+        for table in ("images", "receipt_drafts", "receipt_extractions", "image_source_parts"):
+            column = "id" if table == "images" else "image_id"
+            assert await conn.fetchval(f"SELECT count(*) FROM {table} WHERE {column}=$1", image.id) == 0
+        assert await conn.fetchval("SELECT count(*) FROM resource_deletions") == 0
+
+
+@pytest.mark.parametrize("linked", [False, True])
+async def test_delete_active_or_receipt_linked_submission_conflicts(workflow_db, settings, tmp_path, linked):
+    from fastapi import HTTPException
+
+    from vision_bill.api.images import delete_image
+
+    w, scope = workflow_db
+    image, paths, _llm, _native, service = await setup(w, scope, settings, tmp_path)
+    claim = await w.claim_next()
+    if linked:
+        result = await service.process_claim(claim)
+        assert result.receipt is not None
+    service.receipts._db._pool = w.pool
+    with pytest.raises(HTTPException) as error:
+        await delete_image(image.id, service.receipts, service.images, User(id=scope.user_id, username="owner"))
+    assert error.value.status_code == 409 and all(path.exists() for path in paths)
+    async with w.pool.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM images WHERE id=$1", image.id) == 1
+        assert await conn.fetchval("SELECT count(*) FROM resource_deletions") == 0
+        if linked:
+            assert await conn.fetchval("SELECT count(*) FROM receipts WHERE image_id=$1", image.id) == 1
+
+
 @pytest.mark.parametrize('completed',[False,True])
 async def test_committed_resource_deletion_removes_owned_originals_and_working_files(workflow_db,settings,tmp_path,completed):
     from vision_bill.api.images import delete_image

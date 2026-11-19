@@ -4,10 +4,12 @@ import { goto } from '$app/navigation';
 import { tick } from 'svelte';
 import { session, signIn } from '$lib/auth';
 import Page from './+page.svelte';
+import { setLocale } from '$lib/i18n';
 vi.mock('$app/paths', () => ({ resolve: (path: string) => path }));
 vi.mock('$app/navigation', () => ({ goto: vi.fn() }));
 afterEach(() => {
 	cleanup();
+	setLocale('en');
 	session.set('loading');
 	vi.clearAllMocks();
 	vi.unstubAllGlobals();
@@ -51,6 +53,8 @@ it('requires unchecked explicit consent and sends the preview revision/hash exac
 	expect(calls.some((c) => c.init?.method === 'POST')).toBe(false);
 	await fireEvent.click(consent);
 	await fireEvent.click(screen.getByRole('button', { name: 'Create benchmark' }));
+	expect(screen.getByRole('dialog', { name: 'Create benchmark?' })).toBeTruthy();
+	expect(screen.getByText(/Selected models: model/)).toBeTruthy();
 	await fireEvent.click(screen.getByRole('button', { name: 'Confirm and start' }));
 	await waitFor(() => expect(calls.filter((c) => c.init?.method === 'POST')).toHaveLength(2));
 	const writes = calls.filter((c) => c.init?.method === 'POST');
@@ -173,3 +177,28 @@ it.each(['account change', 'view destruction'])(
 		expect(goto).not.toHaveBeenCalled();
 	}
 );
+
+it('localizes creation and the selected references summary in German', async () => {
+	setLocale('de');
+	session.set({ id: 'owner', username: 'admin', is_admin: true, can_see_all: false });
+	vi.stubGlobal(
+		'fetch',
+		vi.fn(async (url: string) =>
+			url.endsWith('/capabilities')
+				? Response.json({ ocr_available: false, ocr_enabled: false, thinking_control: false })
+				: Response.json([{ id: 'model' }])
+		)
+	);
+	render(Page);
+	await screen.findByText('model');
+	expect(screen.getByLabelText('Verarbeitungskette')).toBeTruthy();
+	await fireEvent.input(screen.getByLabelText('Explizite Beleg-IDs'), {
+		target: { value: 'first,second,first' }
+	});
+	await fireEvent.click(screen.getByRole('button', { name: 'Benchmark anlegen' }));
+	expect(screen.getByRole('dialog', { name: 'Benchmark anlegen?' })).toBeTruthy();
+	expect(screen.getByText('Gewählte Modelle: model')).toBeTruthy();
+	expect(screen.getByText('Explizite Referenzen: 2')).toBeTruthy();
+	await fireEvent.click(screen.getByRole('button', { name: 'Abbrechen' }));
+	expect(screen.queryByRole('dialog')).toBeNull();
+});

@@ -86,6 +86,13 @@ def managed_ocr_enabled() -> bool:
     return settings.ocr.enabled and settings.ocr.manage_model_lifecycle
 
 
+def managed_handoff_enabled() -> bool:
+    """A prepared dedicated installation still coordinates direct vision when OFF."""
+    from ..config import settings
+    from .activation_admission import activation_enabled
+    return managed_ocr_enabled() or (activation_enabled() and settings.ocr.manage_model_lifecycle)
+
+
 def handoff_resource_identity(resource: Any, name: str) -> str:
     """Validate a stable binding without contacting or acquiring the resource."""
     identity = getattr(resource, "lifecycle_identity", None)
@@ -142,6 +149,10 @@ class HandoffOwner:
             self.save()
 
     async def ocr_phase(self) -> None:
+        if getattr(self.coordinator.ocr, "managed_lifecycle", False) and not managed_ocr_enabled():
+            raise HandoffWait(HandoffStatus(
+                state="configuration_required", reason_code="dedicated_ocr_disabled",
+            ))
         if self.ocr_phase_closed:
             raise RuntimeError("model_handoff_ocr_phase_closed: start a fresh session for further OCR")
         await self.release_models()
@@ -432,7 +443,7 @@ class ModelHandoff:
         timeout: asyncio.Timeout, recovery_only: bool,
     ) -> AsyncIterator[HandoffOwner]:
         expires_at = asyncio.get_running_loop().time() + (deadline - monotonic())
-        if getattr(self.ocr, "managed_lifecycle", False) and not managed_ocr_enabled():
+        if getattr(self.ocr, "managed_lifecycle", False) and not managed_handoff_enabled():
             if expected_binding_sha256 is not None or before_dispatch is not None:
                 raise HandoffWait(HandoffStatus(
                     state="configuration_required", reason_code="model_handoff_managed_ocr_required",

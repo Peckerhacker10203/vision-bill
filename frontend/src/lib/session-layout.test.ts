@@ -33,7 +33,9 @@ it('same mounted SPA drops A receipts and active header collection when B signs 
 	vi.spyOn(api, 'me').mockResolvedValue(alice);
 	vi.spyOn(api, 'login').mockResolvedValue(bob);
 	vi.spyOn(api, 'logout').mockResolvedValue();
-	vi.spyOn(api, 'listImages').mockResolvedValue([]);
+	vi.spyOn(api, 'listImages').mockResolvedValue(
+		Array.from({ length: 51 }, (_, index) => ({ id: String(index) })) as never
+	);
 	vi.spyOn(api, 'getActiveCollection')
 		.mockResolvedValueOnce({ id: 'a', name: 'Alice private collection', color: '#ff0000' } as never)
 		.mockResolvedValue(null);
@@ -42,14 +44,21 @@ it('same mounted SPA drops A receipts and active header collection when B signs 
 		.mockResolvedValue([{ id: 'b', merchant_name: 'Bob shop' }] as never);
 	render(Harness);
 	await screen.findByText('Alice private shop');
-	await waitFor(() => expect(screen.getByLabelText('Capturing')).not.toBeNull());
+	await waitFor(() =>
+		expect(api.listImages).toHaveBeenCalledWith(expect.objectContaining({ limit: 51 }))
+	);
+	expect(screen.getAllByText('50+').length).toBeGreaterThan(0);
+	expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
+	await waitFor(() =>
+		expect(screen.getByRole('link', { name: 'Alice private collection' })).not.toBeNull()
+	);
 	queryClient.setQueryData(queryKeys.statistics(), { private: 'Alice totals' });
 	await signOut();
 	await tick();
 	await signIn('bob', 'x');
 	await tick();
 	expect(screen.queryByText('Alice private shop')).toBeNull();
-	expect(screen.queryByLabelText('Capturing')).toBeNull();
+	expect(screen.queryByRole('link', { name: 'Alice private collection' })).toBeNull();
 	await screen.findByText('Bob shop');
 	expect(queryClient.getQueryData(queryKeys.statistics())).toBeUndefined();
 });

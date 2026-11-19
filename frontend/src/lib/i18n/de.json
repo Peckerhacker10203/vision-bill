@@ -1,4 +1,13 @@
 {
+	"receiptWorkspace": {
+		"data": "Daten",
+		"receipt": "Beleg",
+		"zoomIn": "Vergrößern",
+		"zoomOut": "Verkleinern",
+		"working": "Arbeitsbild",
+		"selection": "{count} / 10 Fotos · Upload-Reihenfolge",
+		"field": "Zum Feld"
+	},
 	"submission": {
 		"captureHint": "Langer Beleg? Füge bis zu 10 scharfe Nahaufnahmen desselben Belegs hinzu. Ordne sie von oben nach unten mit einigen überlappenden Zeilen an. Kopf und Gesamtbetrag müssen enthalten sein.",
 		"limits": "Maximal 10 Fotos mit jeweils höchstens 20 MB.",
@@ -74,9 +83,10 @@
 		"error": "Etwas ist schiefgelaufen."
 	},
 	"theme": {
-		"light": "Hell",
-		"dark": "Dunkel",
-		"toggle": "Design wechseln"
+		"label": "Darstellung",
+		"black": "Schwarz",
+		"purple": "Lila",
+		"light": "Hell"
 	},
 	"language": {
 		"label": "Sprache"
@@ -222,6 +232,8 @@
 		"errorGeneric": "Hochladen fehlgeschlagen"
 	},
 	"queue": {
+		"openJob": "Auftrag öffnen",
+		"shownJobs": "{count} Aufträge angezeigt (bis zu 100)",
 		"title": "Analysewarteschlange",
 		"emptyTitle": "Die Warteschlange ist leer",
 		"emptyBody": "Ausstehende und fehlgeschlagene Bilder erscheinen hier.",
@@ -234,7 +246,7 @@
 		"deleteTitle": "Bild löschen?",
 		"deleteBody": "„{file}“ wird aus der Warteschlange und von der Festplatte entfernt.",
 		"deleted": "Bild gelöscht",
-		"deleteConflict": "Dieses Bild kann nicht mehr gelöscht werden.",
+		"deleteConflict": "Dieser Auftrag wird gerade verarbeitet, ist mit einem Beleg verknüpft oder wird noch verwendet und konnte nicht gelöscht werden. Die Warteschlange wurde aktualisiert. Öffne den Auftrag, um den aktuellen Stand zu prüfen.",
 		"deleteFailed": "Löschen fehlgeschlagen",
 		"loadError": "Warteschlange konnte nicht geladen werden."
 	},
@@ -273,6 +285,8 @@
 		"unknownVendor": "Unbekannter Händler"
 	},
 	"search": {
+		"resultCount": "{count} Einkaufstreffer",
+		"purchases": "Einkäufe",
 		"placeholder": "Produkte suchen…",
 		"emptyTitle": "Suche in deinen Einkäufen",
 		"emptyBody": "Gib einen Produktnamen ein, um frühere Preise und die Märkte zu sehen, in denen du ihn gekauft hast. Gesucht wird nur in verifizierten Belegen.",
@@ -287,6 +301,11 @@
 		"tableUnitPrice": "Stückpreis"
 	},
 	"dashboard": {
+		"openReview": "Offene Prüfungen",
+		"noOpenReview": "Keine ungeprüften Belege gefunden. Entwürfe und Analyseaufträge stehen in der Warteschlange.",
+		"chartData": "Wochenwerte anzeigen",
+		"weekStarting": "Wochenbeginn",
+		"total": "Summe",
 		"verifiedOnly": "Nur geprüfte Belege",
 		"openStatistics": "Statistiken öffnen",
 		"loadError": "Übersicht konnte nicht geladen werden.",
@@ -300,6 +319,15 @@
 		"topMerchants": "Häufigste Händler"
 	},
 	"statistics": {
+		"itemPeriod": "Zeitraum der Artikelausgaben: {from} – {to}",
+		"itemMonths": "Artikelausgaben: Monate (unabhängig von der Belegstatistik)",
+		"receiptScope": "Belegstatistik: alle geprüften Belege im gewählten Sammlungsumfang. Das Wochendiagramm beginnt 11 Wochen vor der aktuellen Woche; der Artikelzeitraum ändert diese Werte nicht.",
+		"weeklyScope": "Ab 11 Wochen vor der aktuellen Woche; unabhängig vom Zeitraum der Artikelausgaben.",
+		"chartData": "Diagrammdaten anzeigen",
+		"week": "Wochenbeginn",
+		"amount": "Betrag",
+		"activeCollection": "Aufnahme in: {name}",
+		"captureInactive": "Aufnahme ausgeschaltet",
 		"itemTitle": "Ausgaben nach Positionenkategorie",
 		"itemIntro": "Ihre Ausgabentrends spiegeln Preise, Mengen und Kaufentscheidungen wider. Sie messen nicht die Inflation.",
 		"itemEmpty": "In diesem Zeitraum gibt es keine Ausgaben für Positionen.",
@@ -402,9 +430,9 @@
 		"temperature": "Temperatur",
 		"registration": "Registrierung",
 		"allowRegistration": "Neue Registrierungen erlauben",
-		"providerWarning": "Eine Änderung des Anbieters oder Hosts erfordert einen Neustart des Servers. Modell und Temperatur gelten sofort.",
-		"restartRequired": "Der laufende Anbieter unterscheidet sich vom konfigurierten Anbieter oder Host. Starten Sie den Server neu, um die Änderung anzuwenden.",
-		"sourceEnvironment": "Umgebung",
+		"providerWarning": "Speichern übernimmt geänderte Einstellungen in die private Konfiguration und überschreibt Umgebungsvorgaben. Anbieter- oder Hoständerungen erfordern einen Backend-Neustart durch den Betreiber; Modell und Temperatur gelten sofort.",
+		"restartRequired": "Der laufende Anbieter verwendet noch den bisherigen Anbieter oder Host. Bitten Sie den Betreiber, das Backend neu zu starten, um die gespeicherte Verbindung anzuwenden.",
+		"sourceEnvironment": "Umgebungsvorgabe",
 		"sourceConfig": "Konfiguration",
 		"sourceDefault": "Standard",
 		"contextWindow": "Kontextfenster (Token)",
@@ -420,7 +448,7 @@
 			"confirmHandoff": "Ich bestätige, dass der LLM-Endpunkt ausschließlich für Vision Bill vorgesehen und im Leerlauf ist. Das Vorabladen von Modellen ist deaktiviert.",
 			"submitting": "Einrichtung wird angefordert …",
 			"loadError": "Der Status der dedizierten OCR konnte nicht abgerufen werden.",
-			"requestError": "Die Anforderung zur Einrichtung der dedizierten OCR konnte nicht bestätigt werden.",
+			"requestError": "Die Änderung der dedizierten OCR konnte nicht bestätigt werden.",
 			"states": {
 				"unavailable": "Dedizierte OCR ist mit der aktuellen Serverkonfiguration nicht verfügbar.",
 				"disabled": "Aktivieren Sie dedizierte OCR, um die Modelle auf diesem Server herunterzuladen und zu installieren.",
@@ -438,8 +466,15 @@
 				"llm_request_recovery_required": "Prüfen Sie, ob die vorherige LLM-Anfrage beendet ist, und folgen Sie der Wiederherstellungsanleitung für dedizierte OCR.",
 				"ocr_handoff_confirmation_required": "Bestätigen Sie vor der Einrichtung der dedizierten OCR, dass der LLM-Endpunkt zur Übergabe bereit ist.",
 				"ocr_runtime_unavailable": "Dedizierte OCR ist installiert. Stellen Sie den Dienst wieder her, bevor Sie Belege verarbeiten.",
-				"ocr_download_failed": "Die Modelle für dedizierte OCR konnten nicht heruntergeladen werden."
-			}
+				"ocr_download_failed": "Die Modelle für dedizierte OCR konnten nicht heruntergeladen werden.",
+				"model_request_unsettled": "Schließen Sie den ausstehenden Modellvorgang ab, bevor Sie dedizierte OCR ändern.",
+				"model_handoff_model_not_adopted": "Speichern und übernehmen Sie das aktuelle Formatierungsmodell, bevor Sie dedizierte OCR aktivieren.",
+				"ocr_setup_pending": "Warten Sie, bis die laufende Einrichtung der dedizierten OCR abgeschlossen ist.",
+				"ocr_activation_state_invalid": "Stellen Sie anhand der Wiederherstellungsanleitung eine gültige Aktivierungskonfiguration für dedizierte OCR her."
+			},
+			"installedOff": "Dedizierte OCR ist ausgeschaltet. Installierte Modelle bleiben erhalten; aktivieren Sie OCR zum Fortsetzen.",
+			"prerequisites": "Erfordert ein vorbereitetes CUDA- oder ROCm-GPU-Profil auf dem Server. Der Browser kann keine GPU-Treiber oder Laufzeitumgebungen installieren; folgen Sie der Einrichtungsanleitung.",
+			"setupGuide": "GPU-Einrichtung und Wiederherstellung"
 		}
 	},
 	"editor": {
@@ -660,5 +695,80 @@
 		"readinessWait": "Warten auf Bereitschaft verbraucht keinen Versuch.",
 		"visionModels": "Vision-Modelle",
 		"formatterModels": "Textformatierungsmodelle für OCR"
+	},
+	"benchmarkUi": {
+		"processingSuccessRate": "Erfolgsquote der Verarbeitung",
+		"modelOutcomes": "Modellergebnisse: {model}",
+		"failedCases": "Fehlgeschlagene Fälle: {count}",
+		"moreMetrics": "Weitere Messwerte",
+		"modelDigest": "Modellidentität",
+		"experimentHint": "Diese Einstellungen gelten nur für diesen Lauf. Extraktion und Klassifikation werden getrennt bewertet. Der normale Upload verwendet bei konfigurierter OCR deren Text und stoppt bei OCR-Fehlern. Direkte Bildmodelle überspringen OCR. OCR mit anschließendem Modell erfordert OCR und stoppt bei OCR-Fehlern.",
+		"thinkingHint": "Der Denkmodus kann mit Ollama angepasst werden. Dieser Anbieter behält seine bestehenden Denkeinstellungen.",
+		"create": "Benchmark anlegen",
+		"intro": "Vergleichen Sie vollständige lokale Verarbeitungsketten anhand ausdrücklich qualifizierter, eingefrorener menschlicher Referenzen. Normale Belegdaten bleiben unverändert.",
+		"selection": "Auswahl geprüfter Belege",
+		"ids": "Explizite Beleg-IDs",
+		"idPlaceholder": "Kommagetrennte Beleg-UUIDs",
+		"referenceHint": "Explizite IDs haben Vorrang vor Filtern. Eine bestehende Prüfung allein qualifiziert keine Benchmark-Referenz.",
+		"preview": "Menschliche Referenzen ansehen",
+		"inspect": "Beleg und Originale prüfen",
+		"scored": "Bewertete Beobachtungen:",
+		"consent": "Ich habe diese aktuellen Belege und Originale geprüft und qualifiziere sie ausdrücklich als Benchmark-Referenzen.",
+		"category": "Kategorie",
+		"confidence": "Maximale Quellenkonfidenz",
+		"limit": "Maximale Beleganzahl",
+		"execution": "Ausführung",
+		"timeout": "Zeitlimit je Anfrage (Sekunden)",
+		"before": "Vor dem Anlegen:",
+		"warning": "Dies kann lange dauern, viel Energie verbrauchen und das lokale Sprachmodell während des Laufs für normale Belegextraktionen blockieren.",
+		"confirm": "Benchmark anlegen?",
+		"start": "Bestätigen und starten",
+		"modelsSummary": "Gewählte Modelle: {models}",
+		"receiptsSummary": "Explizite Referenzen: {count}",
+		"filtersSummary": "Vorhandene qualifizierte Referenzen gemäß den Filtern",
+		"review": "Prüfstand",
+		"explicitRequired": "Geben Sie explizite Beleg-IDs ein, um neue Referenzen zu qualifizieren. Filter verwenden bereits qualifizierte Referenzen.",
+		"previewError": "Referenzen konnten nicht geladen werden.",
+		"modelsError": "Lokale Modelle konnten nicht geladen werden.",
+		"stalePreview": "Prüfen Sie die aktuelle Auswahl erneut.",
+		"createError": "Benchmark konnte nicht angelegt werden.",
+		"experiment": "Extraktionsexperiment",
+		"pipeline": "Verarbeitungskette",
+		"upload": "Normale Upload-Verarbeitung",
+		"direct": "Direktes Bildmodell",
+		"ocr": "OCR mit anschließendem Modell",
+		"temperature": "Temperatur",
+		"thinking": "Denkmodus",
+		"default": "Serverstandard",
+		"off": "Deaktiviert",
+		"on": "Aktiviert",
+		"classification": "Kategorien und Tags einbeziehen",
+		"noOcr": "Die OCR-Erweiterung ist nicht konfiguriert. Der normale Upload verwendet derzeit ein direktes Bildmodell.",
+		"providerSetting": "Aktuelle Anbietereinstellung",
+		"results": "Benchmarks",
+		"resultsIntro": "Aktuelle Ergebnisse der lokalen Modellbewertung.",
+		"noRuns": "Noch keine Benchmark-Läufe vorhanden.",
+		"run": "Benchmark-Lauf",
+		"scoringVersion": "Bewertungsversion:",
+		"reuse": "Diese Belegauswahl wiederverwenden",
+		"settings": "Laufeinstellungen",
+		"completed": "Abgeschlossen",
+		"queued": "Eingereiht",
+		"running": "In Bearbeitung",
+		"retrying": "Wiederholungsversuche",
+		"waiting": "Warten auf Modell",
+		"loadDetails": "Einzelergebnisse laden",
+		"previous": "Vorherige 50",
+		"next": "Nächste 50",
+		"separateScoring": "Extraktion und Klassifikation werden getrennt bewertet.",
+		"historical": "Historische Bewertung; keine gespeicherten Einzelergebnisse.",
+		"detailsError": "Einzelergebnisse konnten nicht geladen werden.",
+		"resultsError": "Benchmark-Ergebnisse konnten nicht geladen werden.",
+		"status": {
+			"queued": "Eingereiht",
+			"running": "In Bearbeitung",
+			"completed": "Abgeschlossen",
+			"failed": "Fehlgeschlagen"
+		}
 	}
 }

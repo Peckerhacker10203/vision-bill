@@ -8,6 +8,8 @@ class DedicatedOcrStatus(BaseModel):
         "unavailable", "disabled", "requested", "installing", "active", "failed", "action_required"
     ]
     reason: str | None = None
+    installed: bool = False
+    selected: bool = False
 
 
 class DedicatedOcrRequest(BaseModel):
@@ -15,3 +17,4 @@ class DedicatedOcrRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     confirm_handoff: StrictBool = False
+    enabled: StrictBool = True

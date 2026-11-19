@@ -37,7 +37,11 @@
 	let analyzing = $state(false);
 	let confirmDelete: ImageRow | null = $state(null);
 	let deleting = $state(false);
+	let currentDelete = $derived(
+		list.data?.find((image) => image.id === confirmDelete?.id) ?? confirmDelete
+	);
 	let analyzeError = $state('');
+	let deleteError = $state('');
 
 	async function analyzeNow() {
 		if (!isCurrentView() || analyzing) {
@@ -70,10 +74,17 @@
 	}
 
 	async function removeImage() {
-		if (!isCurrentView() || !confirmDelete || deleting) {
+		if (
+			!isCurrentView() ||
+			!confirmDelete ||
+			deleting ||
+			currentDelete?.receipt_id ||
+			currentDelete?.status === 'processing'
+		) {
 			return;
 		}
 		deleting = true;
+		deleteError = '';
 		try {
 			await api.deleteImage(confirmDelete.id);
 			if (!isCurrentView()) return;
@@ -82,12 +93,10 @@
 			await queryClient.invalidateQueries({ queryKey: ['images'] });
 		} catch (error) {
 			if (!isCurrentView()) return;
-			snackbar.notify(
-				'error',
-				error instanceof ApiError && error.status === 409
-					? translate('queue.deleteConflict')
-					: translate('queue.deleteFailed')
-			);
+			confirmDelete = null;
+			const conflict = error instanceof ApiError && error.status === 409;
+			deleteError = translate(conflict ? 'queue.deleteConflict' : 'queue.deleteFailed');
+			if (conflict) await queryClient.invalidateQueries({ queryKey: ['images'] });
 		} finally {
 			if (isCurrentView()) deleting = false;
 		}
@@ -103,7 +112,7 @@
 		<h1 class="text-2xl font-semibold">{$t('pages.queue.title')}</h1>
 		<button
 			type="button"
-			class="flex items-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-on-primary hover:opacity-90 disabled:opacity-50"
+			class="flex items-center gap-2 rounded-lg bg-action px-4 py-2.5 text-sm font-medium text-on-primary hover:opacity-90 disabled:opacity-50"
 			disabled={analyzing || list.data?.length === 0}
 			onclick={analyzeNow}
 		>
@@ -115,6 +124,8 @@
 			{/if}
 		</button>
 	</div>
+
+	{#if deleteError}<p class="mt-3 text-sm text-error" role="alert">{deleteError}</p>{/if}
 
 	{#if analyzeError}
 		<p class="mt-3 flex items-center gap-2 text-sm text-error" role="alert">
@@ -137,6 +148,9 @@
 			<p class="mt-1 text-sm text-on-surface-variant">{$t('queue.emptyBody')}</p>
 		</div>
 	{:else}
+		<p class="mt-4 text-sm text-on-surface-variant">
+			{$t('queue.shownJobs', { values: { count: list.data?.length ?? 0 } })}
+		</p>
 		<ul class="mt-4 space-y-3">
 			{#each list.data as image (image.id)}
 				<li
@@ -146,15 +160,16 @@
 						imageId={image.id}
 						thumbnailPath={image.thumbnail_path ?? null}
 						alt=""
+						previewLabel={`${$t('receipt.viewFullImage')}: ${image.original_filename ?? image.id}`}
 						class="size-14 shrink-0 rounded-lg object-cover"
 					/>
 					<div class="min-w-0 flex-1">
-						<p class="truncate text-sm font-medium">
+						<p class="break-words text-sm font-medium">
 							<a class="text-primary underline" href={resolve(`/upload?job=${image.id}`)}
 								>{image.original_filename ?? `#${image.id}`}</a
 							>
 						</p>
-						<p class="text-xs text-on-surface-variant">
+						<p class="text-sm text-on-surface-variant">
 							{#if image.created_at}
 								{formatRelativeTime(image.created_at)} ·
 							{/if}
@@ -174,39 +189,61 @@
 								<span>{$t(`submission.${image.status}`)}</span>
 							{/if}
 						</p>
-						<p class="mt-1 text-xs text-on-surface-variant">
+						<p class="mt-1 text-sm text-on-surface-variant">
 							{$t('submission.attempt', {
 								values: { count: image.attempt_count, max: image.max_attempts }
 							})}
 						</p>
 						{#if (image.status === 'pending' || image.status === 'processing') && image.retry_at}
-							<p class="mt-1 text-xs text-on-surface-variant">
+							<p class="mt-1 text-sm text-on-surface-variant">
 								{$t('submission.retryAt', {
 									values: { time: new Date(image.retry_at).toLocaleString() }
 								})}
 							</p>
 						{/if}
 						{#if (image.status === 'pending' || image.status === 'processing') && image.wait_reason}<p
-								class="mt-1 text-xs text-on-surface-variant"
+								class="mt-1 text-sm text-on-surface-variant"
 							>
-								{$t('submission.waitReason')}: {diagnosticLabel($t, 'reasons', image.wait_reason)} ({image.wait_reason})
+								{$t('submission.waitReason')}: {diagnosticLabel($t, 'reasons', image.wait_reason)}
 								{#if image.status === 'pending' && image.wait_reason !== 'retry_backoff'}{$t(
 										'diagnostics.readinessWait'
 									)}{/if}
 							</p>{/if}
-						{#if image.error}
-							<p class="mt-1 truncate text-xs text-error" title={image.error}>
+						{#if image.result_code}
+							<p class="mt-2 break-words text-sm text-on-surface-variant">
+								{diagnosticLabel($t, 'reasons', image.result_code)}
+							</p>
+						{/if}
+						{#if image.error && image.error !== image.result_code}
+							<p class="mt-1 break-words text-sm text-error">
 								{image.error}
 							</p>
 						{/if}
+						<a
+							class="mt-3 inline-flex rounded-lg border border-outline px-3 py-2 text-sm font-medium text-primary hover:bg-surface-container-high"
+							href={image.receipt_id
+								? resolve(`/receipts/${image.receipt_id}`)
+								: resolve(`/upload?job=${image.id}${image.draft_available ? '&draft=1' : ''}`)}
+						>
+							{$t(
+								image.receipt_id
+									? 'submission.openReceipt'
+									: image.draft_available
+										? 'submission.openDraft'
+										: 'queue.openJob'
+							)}
+						</a>
 					</div>
 					<button
 						type="button"
 						class="shrink-0 rounded-lg p-2 text-on-surface-variant hover:bg-error-container hover:text-on-error-container"
 						aria-label={$t('common.remove')}
 						title={$t('common.remove')}
-						onclick={() => (confirmDelete = image)}
-						disabled={image.status === 'processing'}
+						onclick={() => {
+							deleteError = '';
+							confirmDelete = image;
+						}}
+						disabled={deleting || !!image.receipt_id || image.status === 'processing'}
 					>
 						<Icon icon="trash" />
 					</button>
@@ -226,6 +263,7 @@
 		: ''}
 	confirmLabel={$t('common.delete')}
 	busy={deleting}
+	confirmDisabled={!!currentDelete?.receipt_id || currentDelete?.status === 'processing'}
 	onConfirm={removeImage}
 	onCancel={() => (confirmDelete = null)}
 />

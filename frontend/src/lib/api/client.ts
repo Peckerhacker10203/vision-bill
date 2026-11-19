@@ -317,14 +317,15 @@ export const api = {
 
 	requestDedicatedOcr(
 		actor: SessionActor | null,
-		confirmHandoff: true
+		confirmHandoff: boolean,
+		enabled = true
 	): Promise<DedicatedOcrStatus> {
 		return request<DedicatedOcrStatus>(
 			'/system/dedicated-ocr',
 			{
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ confirm_handoff: confirmHandoff })
+				body: JSON.stringify({ enabled, confirm_handoff: confirmHandoff })
 			},
 			actor
 		);

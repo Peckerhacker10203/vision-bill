@@ -34,7 +34,7 @@ test.describe('admin: benchmarks', () => {
 		// (the stub answers instantly; ground truth = the verified receipt).
 		await expect(page.getByText('Completed', { exact: true })).toBeVisible();
 		await expect(page.getByText('1 / 1')).toBeVisible({ timeout: 60_000 });
-		await expect(page.getByText('e2e-vision')).toBeVisible();
+		await expect(page.getByRole('cell', { name: /e2e-vision/ })).toBeVisible();
 		await page.getByRole('button', { name: 'Load individual results' }).click();
 		const individual = page.locator('summary').filter({ hasText: receiptId });
 		await expect(individual).toContainText('Extraction 100.0%');

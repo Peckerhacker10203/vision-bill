@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tick } from 'svelte';
 	import { createQuery } from '@tanstack/svelte-query';
 	import { page } from '$app/state';
 	import { resolve } from '$app/paths';
@@ -21,7 +22,7 @@
 		SourceRef
 	} from '$lib/types';
 	import ReviewFindings from '$lib/ui/ReviewFindings.svelte';
-	import ExtractionSourceViewer from '$lib/ui/ExtractionSourceViewer.svelte';
+	import ReceiptWorkspace from '$lib/ui/ReceiptWorkspace.svelte';
 
 	let id = $derived(page.url.pathname.split('/').pop() ?? '');
 	const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -41,7 +42,8 @@
 	let acknowledgementReset = $state(0);
 	let reviewMessage = $state('');
 	let needsReload = $state(false);
-	let selectedSources = $state<SourceRef[]>([]);
+	let selectedSources = $state<SourceRef[] | null>(null);
+	let workspaceView = $state('data');
 	const actor = captureSessionActor();
 	let activeView: { id: string } | null = null;
 	const isCurrentView = (view: typeof activeView) =>
@@ -58,7 +60,7 @@
 		previewing = false;
 		humanPreview = null;
 		humanAcknowledgements = [];
-		selectedSources = [];
+		selectedSources = null;
 		editorDirty = false;
 		childPending = false;
 		acknowledgements = [];
@@ -304,7 +306,7 @@
 		<p class="mt-1 text-on-surface-variant">{$t('receipt.notFoundBody')}</p>
 		<a
 			href={resolve('/receipts')}
-			class="mt-3 inline-block rounded-lg bg-primary px-4 py-2 text-on-primary hover:opacity-90"
+			class="mt-3 inline-block rounded-lg bg-action px-4 py-2 text-on-primary hover:opacity-90"
 		>
 			{$t('common.back')}
 		</a>
@@ -331,7 +333,7 @@
 			{#if canVerify || canReviewAsHuman}
 				<button
 					type="button"
-					class="flex items-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-on-primary hover:opacity-90 disabled:opacity-50"
+					class="flex items-center gap-2 rounded-lg bg-action px-4 py-2.5 text-sm font-medium text-on-primary hover:opacity-90 disabled:opacity-50"
 					disabled={reviewBlocked || previewing || (canVerify && !reviewReady)}
 					onclick={canReviewAsHuman ? openHumanReview : openVerify}
 				>
@@ -341,7 +343,7 @@
 			{/if}
 			{#if !canVerify}
 				<span
-					class="rounded-full bg-primary-container px-3 py-1 text-xs font-medium text-on-primary-container"
+					class="rounded-full bg-action-container px-3 py-1 text-xs font-medium text-on-primary-container"
 				>
 					{$t('receipt.verified')}
 				</span>
@@ -359,29 +361,45 @@
 				class="my-3 text-primary underline">{$t('review.discardReload')}</button
 			>{/if}
 		<ReviewFindings
+			onField={async (path) => {
+				workspaceView = 'data';
+				await tick();
+				const fields: Record<string, string> = {
+					merchant_name: 'merchant',
+					merchant_address: 'address',
+					receipt_number: 'number',
+					payment_method: 'payment'
+				};
+				const item = /^line_items[.[]([0-9]+)\]?[.]([^.]*)$/.exec(path);
+				const tax = /^taxes[.[]([0-9]+)\]?[.]([^.]*)$/.exec(path);
+				const target = item
+					? `li-${item[1]}-${({ quantity: 'qty', unit_price: 'unit', total_price: 'total', spending_category: 'category' } as Record<string, string>)[item[2]] ?? 'description'}`
+					: tax
+						? `tax-${tax[1]}-${tax[2]}`
+						: `re-${fields[path] ?? path}`;
+				document.getElementById(target)?.focus();
+			}}
 			findings={data.receipt.findings}
 			revision={`${id}:${data.receipt.review_revision}:${acknowledgementReset}`}
 			editable={canVerify && !reviewBlocked}
 			onChange={(value) => (acknowledgements = value)}
-			onSource={(sources) => (selectedSources = sources)}
+			onSource={(sources) => (selectedSources = [...sources])}
 		/>
-		{#if selectedSources.length}<ExtractionSourceViewer
-				views={sourceJob.data?.source_views ?? []}
-				sources={selectedSources}
-			/>{/if}
-		<div class="mt-6 min-w-0 lg:grid lg:grid-cols-[minmax(20rem,0.8fr)_minmax(0,1.2fr)] lg:gap-8">
-			{#if data.receipt.image_id !== null}
-				<aside class="mb-6 min-w-0 lg:mb-0">
-					<div class="min-w-0 lg:sticky lg:top-20">
-						<ReceiptPhotos
-							imageId={data.receipt.image_id}
-							thumbnailPath={data.receipt.thumbnail_path ?? null}
-							alt={data.receipt.merchant_name || $t('receipts.unknownVendor')}
-						/>
-					</div>
-				</aside>
-			{/if}
-
+		<ReceiptWorkspace
+			hasPhoto={data.receipt.image_id !== null}
+			bind:active={workspaceView}
+			showReceipt={selectedSources}
+		>
+			{#snippet photo()}
+				{#if data.receipt.image_id !== null}
+					<ReceiptPhotos
+						imageId={data.receipt.image_id}
+						alt={data.receipt.merchant_name || $t('receipts.unknownVendor')}
+						views={sourceJob.data?.source_views ?? []}
+						sources={selectedSources}
+					/>
+				{/if}
+			{/snippet}
 			<div class="min-w-0 {data.receipt.image_id === null ? 'lg:col-span-2' : ''}">
 				<ReceiptEditor
 					receipt={data.receipt}
@@ -395,11 +413,11 @@
 					onSaveAndVerify={canVerify ? saveAndVerify : undefined}
 					onDirtyChange={(dirty) => (editorDirty = dirty)}
 					onSnapshotChange={(version) => (renderedVersion = version)}
-					onSource={(sources) => (selectedSources = sources)}
+					onSource={(sources) => (selectedSources = [...sources])}
 					onPendingChange={(pending) => (childPending = pending)}
 				/>
 			</div>
-		</div>
+		</ReceiptWorkspace>
 	</section>
 
 	<ConfirmDialog

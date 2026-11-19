@@ -74,3 +74,20 @@ it('allows selecting an original without drawing working coordinates on it', asy
 	expect(screen.getByRole('img').getAttribute('src')).toBe('/original.png?vb_expected_user=viewer');
 	expect(document.querySelector('polygon')).toBeNull();
 });
+
+it('offers bounded zoom without replacing the selected image', async () => {
+	render(ExtractionSourceViewer, { views: [view], sources: [source] });
+	const image = screen.getByRole('img');
+	await fireEvent.click(screen.getByRole('button', { name: 'Zoom in' }));
+	expect(screen.getByRole('img')).toBe(image);
+	expect(screen.getByText('125%')).toBeTruthy();
+});
+
+it('reselects evidence on a repeated source request after manual page navigation', async () => {
+	const views = [view, { ...view, view_id: 'other', photo_index: 1, url: '/other.png' }];
+	const rendered = render(ExtractionSourceViewer, { views, sources: [source] });
+	await fireEvent.change(screen.getByRole('combobox'), { target: { value: 'other' } });
+	expect(screen.getByRole('img').getAttribute('src')).toContain('/other.png');
+	await rendered.rerender({ views, sources: [source] });
+	expect(screen.getByRole('img').getAttribute('src')).toContain('/exact-working.png');
+});

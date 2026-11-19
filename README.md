@@ -15,8 +15,10 @@ LLM, independent CUDA/ROCm OCR, or app with optional Dedicated OCR on CUDA/ROCm
 and an external LLM. Every app variant uses your endpoint. Prepare its private
 `runtime.env` and set a stable Compose project name before startup. In a combined
 installation the OCR controller starts idle and only downloads the four pinned
-PaddleOCR model archives when an admin enables **Dedicated OCR** or requests
-setup in the configuration. Follow the [installation guide](distribution/README.md).
+PaddleOCR model archives when an admin first turns **Dedicated OCR** On or
+explicitly requests setup in the configuration. Preparing the GPU profile is a
+one-time operator step; the browser toggle then controls receipt routing. Follow
+the [installation guide](distribution/README.md).
 
 **This change ships source and release gates only. No qualified native images or
 prepared public bundles were published or physically qualified here.** There is no
@@ -29,6 +31,12 @@ Once a verified bundle exists, app variants expose the UI at
 and private persisted credentials. Registration creates ordinary users; the first
 visitor is never promoted. Repeated startup preserves credentials and data.
 Read the [upgrade guide](UPGRADE_AND_VERIFY.md) before using existing data.
+
+Use **Appearance** to choose Light (black text on white), Black (white text on
+black), or Purple (the original palette). The choice is saved in the browser.
+Receipt review shows the photo alongside the fields on desktop. On smaller
+screens, switch between **Data** and **Receipt** to inspect the source while
+keeping your edits.
 
 ## Processing and review
 
@@ -45,8 +53,13 @@ Verify changes database workflow state without moving files. See the
 [multi-photo/API workflow](MULTI_IMAGE_RECEIPTS.md).
 
 For external OCR, set the canonical `OCR__ENDPOINT` to an HTTP(S) URL. Set it
-explicitly blank to keep direct vision. Leave it unset to use the combined
-installation's Dedicated OCR action. When OCR is configured, ordinary formatting,
+explicitly blank for initial direct vision. With a prepared GPU profile, an admin
+can still opt in through the Dedicated OCR toggle. Leave it unset for a new
+Dedicated OCR installation. A nonblank external endpoint remains operator-owned
+and cannot be switched with that toggle. Turning Dedicated OCR Off routes new
+work to direct vision while retaining the verified cache and idle native worker;
+turning it On again reuses the verified generation. When OCR is configured,
+ordinary formatting,
 repairs and classification use **text/evidence only**; OCR failure never sends
 receipt images to the LLM. Deprecated fallback fields remain for request replay
 and history, not as new permission. Compare OCR and direct vision only through an
@@ -55,12 +68,17 @@ current-policy retry; completed receipts are never automatically reprocessed.
 
 ## Configuration and comparisons
 
-Process environment > dotenv > persistent YAML controls settings. Prepared bundles
+Settings normally use process environment > dotenv > persistent YAML. An explicit
+admin save can adopt changed safe formatter fields as described below. Prepared bundles
 store `/app/config/config.yaml` in the private `app-config` volume. Developer
 Compose binds `server_data/config` there and requires the configuration directory
 and files to be owned by the app container's effective user. The admin Settings
-page reports sources. For writable fields, model, temperature and registration
-changes apply immediately, while provider and host changes require a restart. Credentials and database settings are not exposed there. Formatter output
+page reports sources and lets an admin edit formatter provider, endpoint, model
+and temperature, including safe fields initially supplied by environment defaults.
+An explicit save adopts changed fields into persistent settings. Model, temperature
+and registration changes apply immediately; provider and endpoint changes require
+a restart. Credentials remain in operator configuration and are not exposed there.
+Formatter output
 defaults to 8192 tokens; OCR's 4096-token cap and model context capacity are separate.
 Unknown context stays unknown. Managed same-GPU OCR/LLM work requires verified
 Ollama or the explicit dedicated llama.cpp router lifecycle, stable identities and
@@ -92,7 +110,9 @@ provider, reachable endpoint and installed model ID,
 then use `docker compose up -d --build`. For a fresh source installation, set
 `AUTH__BOOTSTRAP_USERNAME` and `AUTH__BOOTSTRAP_PASSWORD` before the first account
 if you need admin access. Ordinary users can register from the login page.
-Base Compose starts the app and PostgreSQL. For a native candidate and the
+Base Compose starts the app and PostgreSQL. An ordinary base Windows Compose
+installation cannot enable native OCR with the browser button alone. For a native
+candidate and the
 Dedicated OCR action, use the [source GPU profile instructions](paddleocr-service/README.md#dedicated-ocr-from-source).
 
 `make lint`, `make test`, `make fe-verify`, `make release-test`,

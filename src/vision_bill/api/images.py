@@ -251,7 +251,11 @@ async def delete_image(
     image_service: ImageService = Depends(get_image_service),  # noqa: B008
     current_user: User = Depends(get_current_user),  # noqa: B008
 ) -> dict[str, object]:
-    """Remove a queued (pending or failed) image resource and its on-disk file."""
+    """Delete an owned pending, needs-review, failed, timed-out or unreadable submission.
+
+    Unfinalized drafts and owned files are removed through durable cleanup;
+    processing submissions and submissions linked to receipts conflict.
+    """
     if not receipt_service.db_ready:
         raise HTTPException(status_code=503, detail="Database not available")
 

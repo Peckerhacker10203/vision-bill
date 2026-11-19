@@ -670,3 +670,38 @@ it.each([row, verifiedByBypass])(
 		);
 	}
 );
+
+it('uses a full-width data workspace without a receipt tab for image-less records', async () => {
+	render(Page);
+	await screen.findByLabelText('Merchant');
+	expect(screen.queryByRole('button', { name: 'Receipt' })).toBeNull();
+	expect(document.querySelector('.workspace.without-photo')).toBeTruthy();
+	expect(document.querySelector('.workspace > aside')).toBeNull();
+});
+
+it('opens unknown evidence requests from receipt source decisions', async () => {
+	vi.mocked(api.getReceipt).mockResolvedValue(
+		detail({ ...row, image_id: 'image', field_sources: { total: [] } })
+	);
+	vi.spyOn(api, 'getImage').mockResolvedValue({
+		additional_images: [],
+		source_views: [
+			{
+				view_id: 'first',
+				photo_index: 0,
+				coordinate_space: 'working',
+				width: 100,
+				height: 100,
+				url: '/first.png'
+			}
+		]
+	} as never);
+	render(Page);
+	await screen.findByLabelText('Merchant');
+	const sourceDecisions = screen.getByText('Source decisions').closest('details')!;
+	sourceDecisions.open = true;
+	await fireEvent.click(within(sourceDecisions).getByRole('button', { name: 'Show source' }));
+	expect(screen.getByRole('button', { name: 'Receipt' }).getAttribute('aria-pressed')).toBe('true');
+	expect(screen.queryByRole('img', { name: 'Source view' })).toBeNull();
+	expect(screen.getByText('Source mapping unknown')).toBeTruthy();
+});

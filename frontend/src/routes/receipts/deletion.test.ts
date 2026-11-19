@@ -47,7 +47,10 @@ afterEach(() => {
 });
 
 async function confirmDelete() {
-	await screen.findByRole('link', { name: /Shop/ });
+	const receiptLink = await screen.findByRole('link', { name: /Shop/ });
+	expect(receiptLink.tagName).toBe('A');
+	expect(receiptLink.getAttribute('href')).toBe('/receipts/receipt');
+	expect(receiptLink.querySelector('button')).toBeNull();
 	await fireEvent.click(screen.getByRole('button', { name: 'Remove' }));
 	await fireEvent.click(
 		within(screen.getByRole('dialog', { name: 'Delete receipt?' })).getByRole('button', {

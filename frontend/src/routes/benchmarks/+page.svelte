@@ -7,6 +7,7 @@
 	import { session } from '$lib/auth';
 	import { captureSessionActor, isCurrentSessionActor } from '$lib/session-lifetime';
 	import type { BenchmarkCreate, BenchmarkReferencePreview, ModelInfo } from '$lib/types';
+	import ConfirmDialog from '$lib/ui/ConfirmDialog.svelte';
 	import BenchmarkExperimentControls from '$lib/ui/BenchmarkExperimentControls.svelte';
 	import { defaultExperiment, experimentRequest } from '$lib/benchmark-experiments';
 
@@ -43,10 +44,7 @@
 		const selection = receiptIds;
 		try {
 			const ids = selectedReceiptIds(selection);
-			if (!ids.length)
-				throw new Error(
-					'Enter explicit receipt IDs to qualify new references. Filters use existing qualified references.'
-				);
+			if (!ids.length) throw new Error($t('benchmarkUi.explicitRequired'));
 			const previews = await Promise.all(ids.map((id) => api.previewBenchmarkReference(id, actor)));
 			if (current() && receiptIds === selection) {
 				referenceSelection = selection;
@@ -54,7 +52,7 @@
 			}
 		} catch (cause) {
 			if (current() && receiptIds === selection)
-				error = cause instanceof Error ? cause.message : 'Unable to preview references.';
+				error = cause instanceof Error ? cause.message : $t('benchmarkUi.previewError');
 		} finally {
 			if (current()) previewing = false;
 		}
@@ -81,7 +79,7 @@
 				}
 			})
 			.catch(() => {
-				if (active && current()) error = 'Unable to load local models.';
+				if (active && current()) error = $t('benchmarkUi.modelsError');
 			});
 		return () => {
 			active = false;
@@ -143,7 +141,7 @@
 		try {
 			if (qualify) {
 				if (!references.length || receiptIds !== referenceSelection)
-					throw new Error('Preview the current selection again.');
+					throw new Error($t('benchmarkUi.stalePreview'));
 				for (const reference of references) {
 					await api.qualifyBenchmarkReference(
 						reference.receipt_identity,
@@ -159,7 +157,7 @@
 			await api.createBenchmark(body, actor);
 			if (current()) await goto(resolve('/benchmarks/results'));
 		} catch (cause) {
-			if (current()) error = cause instanceof Error ? cause.message : 'Unable to create benchmark.';
+			if (current()) error = cause instanceof Error ? cause.message : $t('benchmarkUi.createError');
 		} finally {
 			if (current()) {
 				creating = false;
@@ -169,12 +167,11 @@
 	}
 </script>
 
-<svelte:head><title>Create benchmark · Vision Bill</title></svelte:head>
+<svelte:head><title>{$t('benchmarkUi.create')} · Vision Bill</title></svelte:head>
 <section class="mx-auto max-w-3xl">
-	<h1 class="text-2xl font-semibold">Create benchmark</h1>
+	<h1 class="text-2xl font-semibold">{$t('benchmarkUi.create')}</h1>
 	<p class="mt-1 text-sm text-on-surface-variant">
-		Compare complete local pipelines using explicitly qualified frozen human references. Normal
-		receipt data is not changed.
+		{$t('benchmarkUi.intro')}
 	</p>
 	{#if error}<p class="mt-4 text-sm text-error" role="alert">{error}</p>{/if}
 	<form
@@ -198,32 +195,35 @@
 				>{/each}
 		</fieldset>
 		<fieldset class="rounded-xl border border-outline-variant p-4">
-			<legend class="px-1 font-medium">Verified receipt selection</legend><label
+			<legend class="px-1 font-medium">{$t('benchmarkUi.selection')}</legend><label
 				class="block text-sm"
-				>Explicit receipt IDs <input
+				>{$t('benchmarkUi.ids')}
+				<input
 					class="mt-1 block w-full rounded-lg border border-outline-variant p-2"
 					bind:value={receiptIds}
-					placeholder="Comma-separated receipt UUIDs"
+					placeholder={$t('benchmarkUi.idPlaceholder')}
 				/></label
 			>
 			<p class="mt-1 text-xs text-on-surface-variant">
-				Explicit IDs override filters. Existing verification alone does not qualify a benchmark
-				reference.
+				{$t('benchmarkUi.referenceHint')}
 			</p>
 			<button
 				type="button"
 				class="mt-3 rounded-lg border p-2"
 				disabled={previewing}
-				onclick={previewReferences}>Preview human references</button
+				onclick={previewReferences}>{$t('benchmarkUi.preview')}</button
 			>
 			{#if references.length}
 				{#each references as reference (reference.receipt_identity)}
 					<details class="mt-3 rounded border p-2">
-						<summary>{reference.receipt_identity} · review {reference.review_revision}</summary>
-						<a href={resolve('/receipts/[id]', { id: reference.receipt_identity })}
-							>Inspect receipt and originals</a
+						<summary
+							>{reference.receipt_identity} · {$t('benchmarkUi.review')}
+							{reference.review_revision}</summary
 						>
-						<p>Scored observations: {reference.scored_fields.join(', ')}</p>
+						<a href={resolve('/receipts/[id]', { id: reference.receipt_identity })}
+							>{$t('benchmarkUi.inspect')}</a
+						>
+						<p>{$t('benchmarkUi.scored')} {reference.scored_fields.join(', ')}</p>
 						<pre class="overflow-auto text-xs">{JSON.stringify(
 								{
 									expected: reference.expected,
@@ -236,18 +236,17 @@
 					</details>
 				{/each}
 				<label class="mt-3 block"
-					><input type="checkbox" bind:checked={qualify} /> I checked these current receipts and originals
-					and explicitly qualify them as benchmark references.</label
+					><input type="checkbox" bind:checked={qualify} /> {$t('benchmarkUi.consent')}</label
 				>
 			{/if}
 			<div class="mt-3 grid gap-3 sm:grid-cols-3">
 				<label class="text-sm"
-					>Category<input
+					>{$t('benchmarkUi.category')}<input
 						class="mt-1 block w-full rounded-lg border border-outline-variant p-2"
 						bind:value={category}
 					/></label
 				><label class="text-sm"
-					>Maximum source confidence<input
+					>{$t('benchmarkUi.confidence')}<input
 						class="mt-1 block w-full rounded-lg border border-outline-variant p-2"
 						type="number"
 						min="0"
@@ -255,7 +254,7 @@
 						bind:value={maxConfidence}
 					/></label
 				><label class="text-sm"
-					>Maximum receipts<input
+					>{$t('benchmarkUi.limit')}<input
 						class="mt-1 block w-full rounded-lg border border-outline-variant p-2"
 						type="number"
 						min="1"
@@ -270,9 +269,9 @@
 			thinkingControl={capabilities.thinking_control}
 		/>
 		<fieldset class="rounded-xl border border-outline-variant p-4">
-			<legend class="px-1 font-medium">Execution</legend>
+			<legend class="px-1 font-medium">{$t('benchmarkUi.execution')}</legend>
 			<label class="text-sm"
-				>Request timeout (seconds)
+				>{$t('benchmarkUi.timeout')}
 				<input
 					class="mt-1 block w-full rounded-lg border border-outline-variant p-2"
 					type="number"
@@ -283,29 +282,37 @@
 			</label>
 		</fieldset>
 		<p class="rounded-lg bg-error-container p-3 text-sm text-on-error-container">
-			<strong>Before creating:</strong> this can take a long time, consume substantial energy, and make
-			the local LLM unavailable for normal receipt extraction while it runs.
+			<strong>{$t('benchmarkUi.before')}</strong>
+			{$t('benchmarkUi.warning')}
 		</p>
 		<button
-			class="rounded-lg bg-error px-4 py-2.5 text-sm font-medium text-on-error disabled:opacity-50"
-			disabled={selected.length === 0 || creating}>Create benchmark</button
+			class="rounded-lg bg-error-action px-4 py-2.5 text-sm font-medium text-on-error disabled:opacity-50"
+			disabled={selected.length === 0 || creating}>{$t('benchmarkUi.create')}</button
 		>
 	</form>
-	{#if confirm}<div class="fixed inset-0 z-40 grid place-items-center bg-black/50 p-4">
-			<div class="max-w-md rounded-xl bg-surface p-5 shadow-elevation-4">
-				<h2 class="text-lg font-semibold">Create benchmark?</h2>
-				<p class="mt-2 text-sm text-on-surface-variant">
-					This can take a long time, consume substantial energy, and make the local LLM unavailable
-					for normal receipt extraction while it runs.
-				</p>
-				<div class="mt-5 flex justify-end gap-2">
-					<button class="rounded-lg px-4 py-2" onclick={() => (confirm = false)}>Cancel</button
-					><button
-						class="rounded-lg bg-error px-4 py-2 text-on-error"
-						disabled={creating}
-						onclick={create}>Confirm and start</button
-					>
-				</div>
-			</div>
-		</div>{/if}
+	<ConfirmDialog
+		open={confirm}
+		title={$t('benchmarkUi.confirm')}
+		body={$t('benchmarkUi.warning')}
+		confirmLabel={$t('benchmarkUi.start')}
+		busy={creating}
+		onConfirm={create}
+		onCancel={() => (confirm = false)}
+	>
+		<div class="mt-3 space-y-2 break-words text-sm">
+			<p>{$t('benchmarkUi.modelsSummary', { values: { models: selected.join(', ') } })}</p>
+			<p>
+				{selectedReceiptIds(receiptIds).length
+					? $t('benchmarkUi.receiptsSummary', {
+							values: { count: selectedReceiptIds(receiptIds).length }
+						})
+					: $t('benchmarkUi.filtersSummary')}
+			</p>
+			{#if !selectedReceiptIds(receiptIds).length}
+				{#if category}<p>{$t('benchmarkUi.category')}: {category}</p>{/if}
+				{#if maxConfidence !== undefined}<p>{$t('benchmarkUi.confidence')}: {maxConfidence}</p>{/if}
+				{#if limit !== undefined}<p>{$t('benchmarkUi.limit')}: {limit}</p>{/if}
+			{/if}
+		</div>
+	</ConfirmDialog>
 </section>

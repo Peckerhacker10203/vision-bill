@@ -28,17 +28,9 @@
 	import { colorToStyle } from '$lib/collection-colors';
 	import Snackbar from '$lib/ui/Snackbar.svelte';
 	import Icon from '$lib/ui/Icon.svelte';
+	import AppearanceSelect from '$lib/ui/AppearanceSelect.svelte';
 
 	let { children }: { children: Snippet } = $props();
-
-	let theme = $state<'light' | 'dark'>(
-		document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light'
-	);
-	function toggleTheme() {
-		theme = theme === 'light' ? 'dark' : 'light';
-		document.documentElement.dataset.theme = theme;
-		localStorage.setItem('vb-theme', theme);
-	}
 
 	function onLocaleChange(event: Event) {
 		const select = event.currentTarget as HTMLSelectElement;
@@ -78,12 +70,14 @@
 		() => ({
 			queryKey: [
 				...queryKeys.images({
+					limit: 51,
 					status: ['pending', 'processing', 'failed', 'timed_out', 'unreadable', 'needs_review']
 				}),
 				$sessionGeneration
 			],
 			queryFn: () =>
 				api.listImages({
+					limit: 51,
 					status: ['pending', 'processing', 'failed', 'timed_out', 'unreadable', 'needs_review']
 				}),
 			staleTime: 30_000,
@@ -94,6 +88,7 @@
 	);
 
 	let queueCount = $derived(currentUser ? (queue.data?.length ?? 0) : 0);
+	let queueLabel = $derived(queueCount > 50 ? '50+' : String(queueCount));
 
 	// The caller's active (auto-capturing) collection, if any — drives the
 	// header status dot and is one of the three surfaces kept in sync by
@@ -136,7 +131,7 @@
 			href: resolve('/queue'),
 			label: $t('nav.queue'),
 			icon: Clock,
-			badge: queueCount || undefined
+			badge: queueCount ? queueLabel : undefined
 		},
 		{
 			id: 'benchmarks',
@@ -162,7 +157,21 @@
 		</div>
 	{:else if currentUser === null}
 		{#if activePath === '/login'}
-			<div class="flex min-h-[calc(100vh-4rem)] items-center justify-center p-4">
+			<div class="flex min-h-screen flex-col items-center justify-center gap-6 p-4">
+				<div class="flex flex-wrap items-center justify-center gap-4">
+					<AppearanceSelect />
+					<label class="flex items-center gap-2 text-sm"
+						>{$t('language.label')}
+						<select
+							class="rounded-lg border border-outline bg-surface p-2"
+							value={$locale}
+							onchange={onLocaleChange}
+						>
+							{#each LOCALES as code (code)}<option value={code}>{code.toUpperCase()}</option
+								>{/each}
+						</select>
+					</label>
+				</div>
 				{@render children()}
 			</div>
 		{/if}
@@ -170,7 +179,7 @@
 		{#key $sessionGeneration}
 			<AppShell
 				brand={$t('app.name')}
-				appLabel="Tendstead"
+				appLabel={$t('nav.receipts')}
 				pageTitle={$t('app.name')}
 				pathname={activePath}
 				{destinations}
@@ -191,13 +200,13 @@
 				{#snippet pageActions()}
 					{#if activeCollection}
 						<a
-							href={resolve('/')}
+							href={resolve('/collections/[id]', { id: activeCollection.id })}
 							title={$t('collections.capturing')}
-							aria-label={$t('collections.capturing')}
-							class="flex size-8 shrink-0 items-center justify-center rounded-full hover:bg-surface-container-high"
+							class="flex min-w-0 items-center gap-2 rounded-full px-3 py-2 text-sm hover:bg-surface-container-high"
 						>
 							<span class="size-2.5 rounded-full" style={colorToStyle(activeCollection.color)}
 							></span>
+							<span class="max-w-32 truncate">{activeCollection.name}</span>
 						</a>
 					{/if}
 					{#if queueCount > 0}
@@ -206,7 +215,7 @@
 							title={$t('nav.queue')}
 							class="flex items-center gap-1 rounded-full bg-tertiary-container px-3 py-1 text-sm font-medium text-on-tertiary-container"
 						>
-							<Icon icon="queue" />{queueCount}
+							<Icon icon="queue" />{queueLabel}
 						</a>
 					{/if}
 				{/snippet}
@@ -226,15 +235,7 @@
 								{#each LOCALES as code (code)}<option value={code}>{code.toUpperCase()}</option
 									>{/each}
 							</select>
-							<button
-								type="button"
-								class="rounded-lg p-2 hover:bg-surface-container-high"
-								title={$t('theme.toggle')}
-								aria-label={$t('theme.toggle')}
-								onclick={toggleTheme}
-							>
-								<Icon icon={theme === 'dark' ? 'theme-light' : 'theme-dark'} />
-							</button>
+							<AppearanceSelect />
 							<button
 								type="button"
 								class="rounded-lg border border-outline-variant px-3 py-2 text-sm font-medium hover:bg-surface-container-high"

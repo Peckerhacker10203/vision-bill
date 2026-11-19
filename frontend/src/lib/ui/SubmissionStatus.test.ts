@@ -101,7 +101,8 @@ describe('SubmissionStatus', () => {
 							: 'Analyseergebnis: Der Beleg konnte nicht zuverlässig gelesen werden. Prüfe die Datei oder versuche es mit deutlicheren Fotos. (unreadable)'
 					)
 				).not.toBeNull();
-				expect(screen.getByRole('link', { name: /1.*working/ }).getAttribute('href')).toBe(
+				const previewLabel = language === 'en' ? 'Photo 1 (Working image)' : 'Foto 1 (Arbeitsbild)';
+				expect(screen.getByRole('link', { name: previewLabel }).getAttribute('href')).toBe(
 					'/api/v1/images/job/views/working?vb_expected_user=viewer'
 				);
 				expect(screen.queryByText('Photo is too blurry', { exact: true })).toBeNull();
@@ -158,6 +159,30 @@ describe('SubmissionStatus', () => {
 		expect(screen.getByRole('link', { name: /Photo 1/ }).getAttribute('href')).toBe(
 			'/api/v1/images/job/views/view?vb_expected_user=viewer'
 		);
+	});
+	it('keeps status and retry visible without duplicating the open draft or its photos', async () => {
+		vi.spyOn(api, 'getImage').mockResolvedValue(
+			status({
+				terminal: true,
+				status: 'needs_review',
+				result_code: 'needs_review',
+				error: 'needs_review',
+				draft_available: true,
+				source_views: [
+					{
+						view_id: 'view',
+						photo_index: 0,
+						coordinate_space: 'working',
+						url: '/api/v1/images/job/views/view'
+					}
+				]
+			}) as never
+		);
+		render(SubmissionStatus, { id: 'job', editingDraft: true });
+		expect(await screen.findByRole('button', { name: 'Retry analysis' })).toBeTruthy();
+		expect(screen.queryByRole('link', { name: /open.*draft/i })).toBeNull();
+		expect(screen.queryByRole('link', { name: /Photo 1/ })).toBeNull();
+		expect(screen.getByRole('status').textContent).toContain('needs review');
 	});
 	it('suppresses duplicate retry clicks and preserves stale-generation detail', async () => {
 		vi.spyOn(api, 'getImage').mockResolvedValue(

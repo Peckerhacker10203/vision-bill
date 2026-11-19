@@ -294,7 +294,7 @@
 		>
 			{#each standardTags as tag (tag)}
 				<span
-					class="inline-flex items-center gap-1 rounded-full bg-primary-container py-1 pl-3 pr-1 text-sm font-medium text-on-primary-container"
+					class="inline-flex items-center gap-1 rounded-full bg-action-container py-1 pl-3 pr-1 text-sm font-medium text-on-primary-container"
 				>
 					{tag}
 					<button
@@ -315,7 +315,7 @@
 					class="inline-flex items-center gap-1.5 rounded-full border border-warning/50 bg-warning-container py-1 pl-3 pr-1 text-sm font-medium text-on-warning-container"
 				>
 					<span
-						class="rounded-full bg-warning px-1.5 py-0.5 text-[0.65rem] font-semibold uppercase tracking-wide text-on-warning"
+						class="rounded-full bg-warning-action px-1.5 py-0.5 text-[0.65rem] font-semibold uppercase tracking-wide text-on-warning"
 					>
 						{$t('editor.tagsSuggestedBadge')}
 					</span>

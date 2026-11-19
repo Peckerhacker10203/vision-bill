@@ -182,3 +182,15 @@ def test_controller_lock_is_independent_of_admission(store):
         pytest.fail("another controller entered while the first was present")
     with store.controller(), store.admission(exclusive=True):
         assert store.read_request() is None
+
+
+def test_runtime_intent_is_generation_bound_and_missing_defaults_enabled(tmp_path):
+    store = ActivationStore(tmp_path / "request", tmp_path / "status", tmp_path / "lock")
+    request = store.submit_request(MaintenanceIntent.EXTERNAL_LLM_QUIESCED)
+    assert store.runtime_enabled(request)
+    store.set_runtime_enabled(request, False)
+    assert not store.runtime_enabled(request)
+    assert ActivationStore(store.request_dir, store.status_dir, store.lock_dir).runtime_enabled(request) is False
+    store.publish_status(ActivationStatus(request.generation, ActivationPhase.FAILED))
+    replacement = store.submit_request(MaintenanceIntent.EXTERNAL_LLM_QUIESCED, retry_generation=request.generation)
+    assert store.runtime_enabled(replacement)

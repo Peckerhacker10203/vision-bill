@@ -86,3 +86,38 @@ it('does not repopulate the settings cache when the actor changes after response
 	expect(queryClient.getQueryData(queryKeys.settings())).toBeUndefined();
 	expect(screen.queryByText('Settings saved.')).toBeNull();
 });
+
+it('lets an admin explicitly save environment defaults and keeps restart guidance visible', async () => {
+	session.set({ id: 'admin', username: 'admin', is_admin: true, can_see_all: true });
+	const initial: SettingsView = {
+		llm: { provider: 'ollama', host: 'http://local', model_name: 'original', temperature: 0 },
+		allow_registration: true,
+		sources: {
+			'llm.provider': 'environment',
+			'llm.host': 'environment',
+			'llm.model_name': 'environment',
+			'llm.temperature': 'environment'
+		},
+		restart_required: false
+	};
+	vi.spyOn(api, 'getSettings').mockResolvedValue(initial);
+	vi.spyOn(api, 'getUiConfig').mockResolvedValue({
+		bypass_review_default: false,
+		registration_open: true
+	});
+	vi.spyOn(api, 'listModels').mockResolvedValue([]);
+	vi.spyOn(api, 'updateSettings').mockResolvedValue({ ...initial, restart_required: true });
+	render(Settings);
+	const model = await screen.findByLabelText(/Default model/);
+	expect((model as HTMLInputElement).disabled).toBe(false);
+	for (const field of document.querySelectorAll('form input, form select'))
+		expect((field as HTMLInputElement).disabled).toBe(false);
+	await fireEvent.input(model, { target: { value: 'edited-model' } });
+	await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+	expect(await screen.findByText(/Settings saved/)).toBeTruthy();
+	expect(api.updateSettings).toHaveBeenCalledWith(
+		expect.objectContaining({ changed_paths: ['llm.model_name'] })
+	);
+	await waitFor(() => expect(api.getDedicatedOcr).toHaveBeenCalledTimes(2));
+	expect(screen.getByText(/Ask your operator to restart the backend/)).toBeTruthy();
+});

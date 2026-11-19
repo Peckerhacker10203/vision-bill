@@ -14,6 +14,25 @@
 
 	const isCurrentView = sessionViewGuard();
 
+	const review = createQuery(
+		() => ({
+			queryKey: queryKeys.receipts({ status: ['unverified'], limit: 5 }),
+			queryFn: () => api.listReceipts({ status: ['unverified'], limit: 5 })
+		}),
+		() => queryClient
+	);
+
+	const draftReview = createQuery(
+		() => ({
+			queryKey: queryKeys.images({ status: ['needs_review'], limit: 5 }),
+			queryFn: () => api.listImages({ status: ['needs_review'], limit: 5 })
+		}),
+		() => queryClient
+	);
+	let reviewDrafts = $derived(
+		(draftReview.data ?? []).filter((image) => !image.receipt_id && image.draft_available)
+	);
+
 	const statistics = createQuery(
 		() => ({
 			queryKey: queryKeys.statistics(12),
@@ -119,6 +138,56 @@
 		</a>
 	</div>
 
+	<div class="mt-6 rounded-xl border border-primary/50 bg-surface-container-low p-5">
+		<h2 class="text-lg font-semibold">{$t('dashboard.openReview')}</h2>
+		<div class="mt-4">
+			<h3 class="text-sm font-medium">{$t('nav.receipts')}</h3>
+			{#if review.isLoading}<p class="mt-2 text-sm">{$t('common.loading')}</p>{/if}
+			{#if review.error}<p class="mt-2 text-sm text-error">{$t('common.error')}</p>{/if}
+			{#if review.data?.length}<ul class="mt-1 divide-y divide-outline-variant">
+					{#each review.data ?? [] as receipt (receipt.id)}
+						<li>
+							<a
+								href={resolve(`/receipts/${receipt.id}`)}
+								class="flex flex-wrap items-center justify-between gap-2 py-3 text-sm text-primary hover:underline"
+								><span class="break-words font-medium"
+									>{receipt.merchant_name || $t('receipts.unknownVendor')} · {receipt.date}</span
+								><span class="font-semibold tabular-nums"
+									>{formatMoney(receipt.total, receipt.currency)}</span
+								></a
+							>
+						</li>
+					{/each}
+				</ul>{/if}
+		</div>
+		<div class="mt-4">
+			<h3 class="text-sm font-medium">{$t('submission.openDraft')}</h3>
+			{#if draftReview.isLoading}<p class="mt-2 text-sm">{$t('common.loading')}</p>{/if}
+			{#if draftReview.error}<p class="mt-2 text-sm text-error">{$t('common.error')}</p>{/if}
+			{#if reviewDrafts.length}<ul class="mt-1 divide-y divide-outline-variant">
+					{#each reviewDrafts as image (image.id)}
+						<li>
+							<a
+								href={resolve(`/upload?job=${image.id}&draft=1`)}
+								class="block break-words py-3 text-sm font-medium text-primary hover:underline"
+								>{$t('submission.openDraft')}: {image.original_filename ?? image.id}</a
+							>
+						</li>
+					{/each}
+				</ul>{/if}
+		</div>
+		{#if review.isSuccess && draftReview.isSuccess && !review.data?.length && !reviewDrafts.length}
+			<p class="mt-3 text-sm text-on-surface-variant">{$t('dashboard.noOpenReview')}</p>
+		{/if}
+		<div class="mt-3 flex flex-wrap gap-4">
+			<a href={resolve('/receipts')} class="text-sm font-medium text-primary hover:underline"
+				>{$t('nav.receipts')}</a
+			><a href={resolve('/queue')} class="text-sm font-medium text-primary hover:underline"
+				>{$t('upload.openQueue')}</a
+			>
+		</div>
+	</div>
+
 	<!-- Active collection capture -->
 	<div class="mt-6 rounded-xl border border-outline-variant bg-surface-container-low p-5">
 		{#if active.isLoading}
@@ -196,7 +265,7 @@
 				<div class="rounded-xl border border-outline-variant bg-surface-container-low p-5">
 					<h2 class="font-semibold">{$t('dashboard.weeklySpending')} · {chart.currency}</h2>
 					<div
-						class="mt-5 flex h-40 items-end gap-1"
+						class="mt-5 hidden h-40 items-end gap-1 sm:flex"
 						role="img"
 						aria-label={$t('dashboard.weeklySpending')}
 					>
@@ -209,12 +278,35 @@
 										title={`${point.week_start}: ${formatMoney(point.total, chart.currency)}`}
 									></div>
 								</div>
-								<span class="text-[10px] text-on-surface-variant"
-									>{weekLabel(point.week_start)}</span
-								>
+								<span class="text-xs text-on-surface-variant">{weekLabel(point.week_start)}</span>
 							</div>
 						{/each}
 					</div>
+					<details class="mt-4 text-sm" open>
+						<summary class="cursor-pointer font-medium text-primary"
+							>{$t('dashboard.chartData')}</summary
+						>
+						<table class="mt-3 w-full text-left text-sm">
+							<caption class="sr-only">{$t('dashboard.weeklySpending')} · {chart.currency}</caption>
+							<thead
+								><tr class="border-b border-outline-variant"
+									><th scope="col" class="py-2">{$t('dashboard.weekStarting')}</th><th
+										scope="col"
+										class="py-2 text-right">{$t('dashboard.total')}</th
+									></tr
+								></thead
+							>
+							<tbody
+								>{#each chart.points as point (point.week_start)}<tr
+										class="border-b border-outline-variant"
+										><th scope="row" class="py-2 font-normal">{point.week_start}</th><td
+											class="py-2 text-right tabular-nums"
+											>{formatMoney(point.total, chart.currency)}</td
+										></tr
+									>{/each}</tbody
+							>
+						</table>
+					</details>
 				</div>
 			{/each}
 		</div>
@@ -228,7 +320,7 @@
 							<li class="flex items-center justify-between gap-3 text-sm">
 								<span class="min-w-0 truncate">{merchant.name} · {merchant.receipt_count}</span>
 								<span class="shrink-0 font-medium"
-									>{formatMoney(Number(merchant.total), group.currency)}</span
+									>{formatMoney(merchant.total, group.currency)}</span
 								>
 							</li>
 						{/each}

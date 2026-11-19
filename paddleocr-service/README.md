@@ -43,7 +43,9 @@ The operator's separate text or vision LLM endpoint remains the receipt formatte
 ## Dedicated OCR from source
 
 The base Compose install runs direct vision. To prepare an idle Dedicated OCR
-controller, select the `ocr` profile and the accelerator overlay.
+controller, select the `ocr` profile and the accelerator overlay once. An ordinary
+base Windows Compose installation cannot enable native OCR with the browser
+button alone.
 
 ```bash
 docker compose --profile ocr -f docker-compose.yml -f docker-compose.cuda.yml up -d
@@ -64,7 +66,13 @@ native release catalog.
 
 Leave `OCR__ENDPOINT` unset and legacy `OCR__ENABLED=false` for Dedicated OCR.
 After preparing the LLM handoff, open **Settings → Dedicated OCR** as an admin
-and request setup. The same [startup configuration and recovery procedure](../distribution/README.md#enable-dedicated-ocr)
+and turn it On to request setup. No model downloads occur before this explicit
+request (or explicit startup activation). Off routes new work to direct vision
+and keeps the verified cache and idle native worker; On reuses the verified
+generation. An older explicitly blank `OCR__ENDPOINT` starts Off but permits
+browser opt-in with the prepared profile. Nonblank external OCR endpoints remain
+operator-owned and cannot be switched through this toggle. The same
+[startup configuration and recovery procedure](../distribution/README.md#enable-dedicated-ocr)
 applies to source installs using their service names. The explicit manual GPU
 qualification path below is available separately.
 

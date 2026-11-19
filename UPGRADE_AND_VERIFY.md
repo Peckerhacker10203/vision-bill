@@ -336,3 +336,37 @@ Use isolated environments and unique owned E2E stacks. Safe documentation checks
 can run help/parsers, local links and synthetic effective Compose without launching
 services; they cannot replace real operator/hardware acceptance. Publishing remains
 a separate [manual release](RELEASES.md) action; no tag/release/deployment is implied.
+
+### Admin formatter settings and environment defaults
+
+Existing `.env` and container values continue to supply settings until an admin
+changes a field and clicks **Save** in Settings. Changed provider, HTTP(S) host,
+model, and temperature fields are saved in the private mounted YAML.
+An allowlisted `admin_setting_overrides` list records only adopted environment
+fields; those YAML values then take precedence across backend restarts. Registration
+remains locked when intentionally controlled by environment. An unchanged field is never adopted merely because the full form was submitted.
+Secrets, API keys, database configuration and managed distribution identity remain
+under their existing controls and are never copied from the environment by this save.
+
+Model and temperature changes apply to subsequent work immediately. Provider or
+host changes retain the existing restart contract: Settings keeps a warning visible
+until the operator restarts the backend. The browser does not restart containers or
+receive Docker credentials. To return an adopted field to environment control, an
+operator can remove its path from `admin_setting_overrides` in the private YAML and
+restart the backend; preserve the private mount and its permissions.
+
+Settings submits only edited field paths, so another open admin tab cannot overwrite
+unrelated settings with stale form values. Older API clients may still send a full
+PUT. Each formatter save refreshes Dedicated OCR status so a binding or restart
+requirement remains visible.
+
+A real private API key is bound to its trusted endpoint origin: browser host edits
+may change paths within that origin, but cannot send the key to another origin.
+With an empty or `none` key, a host edit is allowed and records the original
+`llm_credential_origin` in private YAML. Adding a real key later refuses startup
+when the effective endpoint differs from that origin. An explicit operator
+rotation of the deployment host takes precedence over stale browser host adoption
+so a newly rotated key follows its deployment endpoint. The operator must verify
+the new endpoint and approve the credential binding in private configuration
+before restarting; removing the origin marker after that review permits the
+verified endpoint. Never put keys in a host URL.

@@ -116,6 +116,27 @@ class ActivationStore:
             _write_record(self.request_dir, _REQUEST, request.generation, maintenance_intent=intent)
             return request
 
+    def runtime_enabled(self, request: ActivationRequest) -> bool:
+        """Missing intent preserves legacy activation; old generations do not apply."""
+        record = _read_record(self.request_dir, "runtime.json")
+        if record is None:
+            return True
+        try:
+            generation = _generation(record, {"enabled"})
+            enabled = record["enabled"]
+            if enabled not in ("true", "false"):
+                raise ValueError("Invalid runtime intent")
+            return generation != request.generation or enabled == "true"
+        except (TypeError, ValueError) as exc:
+            raise ActivationStateError("Invalid OCR runtime intent") from exc
+
+    def set_runtime_enabled(self, request: ActivationRequest, enabled: bool) -> None:
+        """Caller holds exclusive admission through routing publication."""
+        if self.read_request() != request:
+            raise ActivationConflict("OCR activation generation changed")
+        _write_record(self.request_dir, "runtime.json", request.generation,
+                      enabled="true" if enabled else "false")
+
     def publish_status(self, status: ActivationStatus) -> bool:
         """Publish for the current generation. The controller owns the status writer."""
         phase = ActivationPhase(status.phase)

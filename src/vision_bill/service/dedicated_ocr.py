@@ -31,7 +31,7 @@ class DedicatedOcrActivation:
         self,
         settings: Settings,
         provider: LLMProvider,
-        apply_route: Callable[[PaddleOcrProvider, OcrSettings], None],
+        apply_route: Callable[[PaddleOcrProvider | None, OcrSettings], None],
         wake_receipts: Callable[[], None],
         *,
         store: ActivationStore | None = None,
@@ -42,7 +42,9 @@ class DedicatedOcrActivation:
         self.apply_route = apply_route
         self.wake_receipts = wake_receipts
         self.store = store if store is not None else ActivationStore()
-        self.external_mode = settings.ocr.enabled or not settings.ocr.service_url
+        self.external_mode = settings.ocr.enabled or (
+            not settings.ocr.service_url and not os.environ.get("OCR_ACTIVATION_ENDPOINT", "").strip()
+        )
         self.prior_handoff = settings.ocr.coordination_path
         self.ocr_settings = settings.ocr.model_copy(update={
             "enabled": True,
@@ -56,6 +58,7 @@ class DedicatedOcrActivation:
         )
         self.handoff = ModelHandoff(self.ocr_settings.coordination_path, provider, self.ocr)
         self._applied: UUID | None = None
+        self._enabled: bool | None = None
         self._blocker: str | None = None
 
     async def _controller_is_live(self) -> bool:
@@ -81,22 +84,51 @@ class DedicatedOcrActivation:
             return "llm_lifecycle_required"
         return None
 
+    def _with_selection(self, result: DedicatedOcrStatus) -> DedicatedOcrStatus:
+        if self.external_mode:
+            return result
+        try:
+            request = self.store.read_request()
+            current = self.store.read_status(request) if request else None
+            selected = bool(
+                request and current and current.phase == ActivationPhase.READY
+                and self.store.runtime_enabled(request)
+            )
+            return result.model_copy(update={"selected": selected})
+        except (ActivationStateError, OSError):
+            return result
+
     async def status(self) -> DedicatedOcrStatus:
+        return self._with_selection(await self._status())
+
+    async def _status(self) -> DedicatedOcrStatus:
         if self.external_mode:
             return DedicatedOcrStatus(state="unavailable", reason="ocr_config_managed_externally")
         try:
             request = self.store.read_request()
             current = self.store.read_status(request) if request else None
+            enabled = self.store.runtime_enabled(request) if request else True
         except ActivationStateError:
             return DedicatedOcrStatus(state="action_required", reason="ocr_activation_state_invalid")
         if current and current.phase == ActivationPhase.READY:
-            if self._applied == current.generation:
+            if not enabled and self._applied == current.generation and self._enabled is False:
+                return DedicatedOcrStatus(state="disabled", installed=True)
+            if blocker := self._lifecycle_blocker():
+                return DedicatedOcrStatus(state="action_required", reason=blocker, installed=True)
+            try:
+                if self.settings.llm.model_name not in self.handoff.read_binding().model_ids:
+                    return DedicatedOcrStatus(
+                        state="action_required", reason="model_handoff_model_not_adopted", installed=True,
+                    )
+            except (HandoffWait, OSError, ValueError):
+                return DedicatedOcrStatus(state="action_required", reason="ocr_activation_state_invalid", installed=True)
+            if self._applied == current.generation and self._enabled == enabled:
                 if await self._runtime_is_serving():
-                    return DedicatedOcrStatus(state="active")
-                return DedicatedOcrStatus(state="action_required", reason="ocr_runtime_unavailable")
+                    return DedicatedOcrStatus(state="active", installed=True)
+                return DedicatedOcrStatus(state="action_required", reason="ocr_runtime_unavailable", installed=True)
             if self._blocker:
-                return DedicatedOcrStatus(state="action_required", reason=self._blocker)
-            return DedicatedOcrStatus(state="installing")
+                return DedicatedOcrStatus(state="action_required", reason=self._blocker, installed=True)
+            return DedicatedOcrStatus(state="installing", installed=True)
         if current and current.phase == ActivationPhase.FAILED:
             return DedicatedOcrStatus(state="failed", reason=current.reason_code or "ocr_setup_failed")
         if request:
@@ -107,9 +139,76 @@ class DedicatedOcrActivation:
             return DedicatedOcrStatus(state="action_required", reason=blocker)
         return DedicatedOcrStatus(state="disabled")
 
-    async def submit(self, *, confirm_handoff: bool) -> DedicatedOcrStatus:
+    def _publish_route(self, generation: UUID, enabled: bool) -> None:
+        selected = self.ocr_settings.model_copy(update={"enabled": enabled, "required": False})
+        # Keep the shared coordinator on direct vision calls while OCR is OFF.
+        self.provider.handoff = self.handoff
+        self.settings.ocr = selected
+        self.apply_route(self.ocr if enabled else None, selected)
+        self._applied = generation
+        self._enabled = enabled
+        self._blocker = None
+        self.wake_receipts()
+
+    async def _toggle(self, enabled: bool) -> DedicatedOcrStatus:
+        try:
+            async with asyncio.timeout(6):
+                with self.store.admission(exclusive=True):
+                    request = self.store.read_request()
+                    current = self.store.read_status(request) if request else None
+                    if request is None or current is None or current.phase != ActivationPhase.READY:
+                        return DedicatedOcrStatus(state="action_required", reason="ocr_setup_pending")
+                    if unsettled_direct_calls(self.store):
+                        return DedicatedOcrStatus(state="action_required", reason="llm_request_recovery_required", installed=True)
+                    if enabled and (blocker := self._lifecycle_blocker()):
+                        return DedicatedOcrStatus(state="action_required", reason=blocker, installed=True)
+                    if not self.provider.supports_model_release:
+                        return DedicatedOcrStatus(
+                            state="action_required", reason="llm_lifecycle_required", installed=True,
+                        )
+                    if enabled and not await self._runtime_is_serving():
+                        return DedicatedOcrStatus(state="action_required", reason="ocr_runtime_unavailable", installed=True)
+                    # Session refuses unsettled requests, recovers settled journals,
+                    # parks the real native worker and releases owned LLM models.
+                    async with self.handoff.session(
+                        monotonic() + 5, model_id=self.settings.llm.model_name if enabled else None,
+                    ):
+                        pass
+                    self.store.set_runtime_enabled(request, enabled)
+                    self._publish_route(request.generation, enabled)
+                    return DedicatedOcrStatus(state="active" if enabled else "disabled", installed=True)
+        except HandoffWait as exc:
+            return DedicatedOcrStatus(state="action_required", reason=exc.status.reason_code, installed=True)
+        except (ActivationBusy, ActivationConflict, httpx.HTTPError, TimeoutError):
+            return DedicatedOcrStatus(state="action_required", reason="llm_quiescence_required", installed=True)
+        except (ActivationStateError, OSError, ValueError):
+            return DedicatedOcrStatus(state="action_required", reason="ocr_activation_state_invalid")
+
+    async def submit(self, *, confirm_handoff: bool, enabled: bool = True) -> DedicatedOcrStatus:
+        try:
+            result = await self._submit(confirm_handoff=confirm_handoff, enabled=enabled)
+        except RuntimeError as exc:
+            if str(exc) != "model_release_unconfirmed":
+                raise
+            result = DedicatedOcrStatus(
+                state="action_required", reason="model_release_unconfirmed", installed=True,
+            )
+        return self._with_selection(result)
+
+    async def _submit(self, *, confirm_handoff: bool, enabled: bool) -> DedicatedOcrStatus:
         if self.external_mode:
             return await self.status()
+        try:
+            request = self.store.read_request()
+            activation_status = self.store.read_status(request) if request else None
+            if activation_status and activation_status.phase == ActivationPhase.READY:
+                return await self._toggle(enabled)
+            if not enabled:
+                if request:
+                    return DedicatedOcrStatus(state="action_required", reason="ocr_setup_pending")
+                return DedicatedOcrStatus(state="disabled")
+        except (ActivationStateError, OSError):
+            return DedicatedOcrStatus(state="action_required", reason="ocr_activation_state_invalid")
         if not confirm_handoff:
             self._blocker = "ocr_handoff_confirmation_required"
             return DedicatedOcrStatus(state="action_required", reason=self._blocker)
@@ -164,24 +263,33 @@ class DedicatedOcrActivation:
             return
         try:
             request = self.store.read_request()
-            if request is None or request.generation == self._applied:
+            if request is None:
+                return
+            enabled = self.store.runtime_enabled(request)
+            if request.generation == self._applied and enabled == self._enabled:
                 return
             current = self.store.read_status(request)
             if current is None or current.phase != ActivationPhase.READY:
                 return
             with self.store.admission(exclusive=True):
+                request = self.store.read_request()
+                current = self.store.read_status(request) if request else None
+                if request is None or current is None or current.phase != ActivationPhase.READY:
+                    return
+                enabled = self.store.runtime_enabled(request)
                 binding = self.handoff.read_binding()
-                if self._lifecycle_blocker() or self.settings.llm.model_name not in binding.model_ids:
+                if (enabled and self._lifecycle_blocker()) or not self.provider.supports_model_release:
                     self._blocker = "llm_lifecycle_required"
+                    return
+                if enabled and self.settings.llm.model_name not in binding.model_ids:
+                    self._blocker = "model_handoff_model_not_adopted"
                     return
                 # Existing services keep the same provider and receipt store. All
                 # route-facing references are replaced together under admission.
-                self.provider.handoff = self.handoff
-                self.settings.ocr = self.ocr_settings
-                self.apply_route(self.ocr, self.ocr_settings)
-                self._applied = request.generation
-                self._blocker = None
-                self.wake_receipts()
+                if unsettled_direct_calls(self.store):
+                    self._blocker = "llm_request_recovery_required"
+                    return
+                self._publish_route(request.generation, enabled)
         except ActivationBusy:
             return
         except (ActivationStateError, HandoffWait, OSError, ValueError):
@@ -190,7 +298,7 @@ class DedicatedOcrActivation:
     async def run(self) -> None:
         setup_on_startup = os.environ.get("OCR_ACTIVATION_ON_STARTUP") == "true"
         confirm_handoff = os.environ.get("OCR_ACTIVATION_CONFIRM_HANDOFF") == "true"
-        while self._applied is None and not self.external_mode:
+        while not self.external_mode:
             if setup_on_startup:
                 try:
                     if self.store.read_request() is None:

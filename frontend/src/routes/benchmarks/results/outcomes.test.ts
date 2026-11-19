@@ -220,3 +220,77 @@ it('localizes the v4 headings and unavailable text in German', async () => {
 	expect(column('Vollständig korrekte Belege').textContent).toBe('Nicht verfügbar');
 	expect(column('Bewertung aller Fälle').textContent).toBe('Nicht verfügbar');
 });
+
+it('offers compact model outcomes with secondary metrics collapsed', async () => {
+	showResults();
+	const card = await screen.findByRole('region', { name: 'Model outcomes: model' });
+	expect(within(card).getByText('Fully correct receipts')).toBeTruthy();
+	expect(within(card).getByText('Fully correct receipts').parentElement?.textContent).toContain(
+		'10.00%'
+	);
+	expect(within(card).getByText('Failed cases: 9')).toBeTruthy();
+	const more = within(card).getByText('More metrics').closest('details');
+	expect(more?.open).toBe(false);
+});
+
+it.each([
+	{ language: 'en' as const, label: 'Processing success rate' },
+	{ language: 'de' as const, label: 'Erfolgsquote der Verarbeitung' }
+])(
+	'separates $language processing success from scoring correctness',
+	async ({ language, label }) => {
+		setLocale(language);
+		showResults({
+			runSummary: {
+				...summary,
+				completed: 4,
+				succeeded: 3,
+				failed: 1,
+				full_receipt_correct_rate: 0.25
+			}
+		});
+		const card = await screen.findByRole('region', {
+			name: language === 'en' ? 'Model outcomes: model' : 'Modellergebnisse: model'
+		});
+		const success = within(card).getByText(label);
+		expect(success.parentElement?.textContent).toContain('75.00%');
+		expect(success.closest('details')).toBeNull();
+		const correct = within(card).getByText(
+			language === 'en' ? 'Fully correct receipts' : 'Vollständig korrekte Belege'
+		);
+		expect(correct.parentElement?.textContent).toContain('25.00%');
+		expect(correct.closest('details')?.open).toBe(false);
+	}
+);
+
+it('shows historical processing success independently of unavailable correctness scoring', async () => {
+	showResults({
+		version: '3',
+		runSummary: { ...summary, succeeded: 8, failed: 2, full_receipt_correct_rate: null }
+	});
+	const card = await screen.findByRole('region', { name: 'Model outcomes: model' });
+	expect(within(card).getByText('Processing success rate').parentElement?.textContent).toContain(
+		'80.00%'
+	);
+	expect(within(card).getByText('Fully correct receipts').parentElement?.textContent).toContain(
+		'Unavailable'
+	);
+});
+
+it('shows processing success as unavailable before any terminal cases', async () => {
+	showResults({
+		runSummary: {
+			...summary,
+			completed: 0,
+			succeeded: 0,
+			failed: 0,
+			full_receipt_correct_rate: null
+		}
+	});
+	const card = await screen.findByRole('region', { name: 'Model outcomes: model' });
+	expect(within(card).getByText('Processing success rate').parentElement?.textContent).toContain(
+		'Unavailable'
+	);
+	expect(card.textContent).not.toContain('NaN');
+	expect(card.textContent).not.toContain('Infinity');
+});
