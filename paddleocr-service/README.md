@@ -162,9 +162,10 @@ full OCR pipeline on representative hardware.
 ## Build inputs
 
 `runtime-lock.json` records the immutable Ubuntu base, Ubuntu package snapshot,
-Paddle/PaddleOCR/PaddleX/TheRock source pins, compatibility patch hash, Rust
-archive hash, default RDNA2 target list and upstream optional exclusions. The
-selected build candidate profile is recorded in build evidence/kernels.json.
+APT TLS bootstrap image, Paddle/PaddleOCR/PaddleX/TheRock source pins,
+compatibility patch hash, Rust archive hash, default RDNA2 target list and
+upstream optional exclusions. The selected build candidate profile is recorded
+in build evidence/kernels.json.
 The common Python execution and native build locks contain real resolved hashes.
 `requirements.txt` is not the production build/install contract; use the selected
 Dockerfile and hashed accelerator/runtime locks.

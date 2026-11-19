@@ -1,10 +1,14 @@
 # syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
+FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS apt-ca
 FROM ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5
+# Bootstrap HTTPS until Ubuntu's own ca-certificates package is installed.
+COPY --from=apt-ca /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources \
- && echo 'deb http://snapshot.ubuntu.com/ubuntu/20261101T000000Z noble main universe' > /etc/apt/sources.list \
- && echo 'deb http://snapshot.ubuntu.com/ubuntu/20261101T000000Z noble-updates main universe' >> /etc/apt/sources.list \
- && echo 'deb http://snapshot.ubuntu.com/ubuntu/20261101T000000Z noble-security main universe' >> /etc/apt/sources.list \
- && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+ && echo 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/20261101T000000Z noble main universe' > /etc/apt/sources.list \
+ && echo 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/20261101T000000Z noble-updates main universe' >> /etc/apt/sources.list \
+ && echo 'deb [signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://snapshot.ubuntu.com/ubuntu/20261101T000000Z noble-security main universe' >> /etc/apt/sources.list \
+ && apt-get update --error-on=any \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates python3.12 python3.12-venv python3.12-dev libgl1 libglib2.0-0 libgomp1 \
     git curl build-essential gfortran ninja-build cmake pkg-config xxd automake libtool \
     libegl1-mesa-dev texinfo bison flex xz-utils libssl-dev libnuma-dev zlib1g-dev \

@@ -34,6 +34,28 @@ def test_separate_digest_pinned_native_images_and_cuda_lock():
     assert "requirements.cuda.lock" not in (SERVICE / "Dockerfile.rocm").read_text()
 
 
+@pytest.mark.parametrize(("accelerator", "stage_count"), [("cuda", 1), ("rocm", 2)])
+def test_native_apt_bootstraps_signed_https_snapshot(accelerator, stage_count):
+    lock = json.loads((SERVICE / "runtime-lock.json").read_text())
+    recipe = (SERVICE / f"Dockerfile.{accelerator}").read_text()
+    assert re.search(r"^FROM \S+@sha256:[0-9a-f]{64} AS apt-ca$", recipe, re.MULTILINE)
+    assert f"FROM {lock['apt_ca_image']} AS apt-ca\n" in recipe
+    stages = re.split(r"^FROM ", recipe, flags=re.MULTILINE)
+    apt_stages = [stage for stage in stages if "apt-get update" in stage]
+    assert len(apt_stages) == stage_count
+    ca_copy = "COPY --from=apt-ca /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/"
+    snapshot = f"https://snapshot.ubuntu.com/ubuntu/{lock['ubuntu_snapshot']}"
+    keyring = "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+    for stage in apt_stages:
+        before_update, update, install = stage.partition("apt-get update --error-on=any")
+        assert update, "APT must fail on any package-index update error"
+        assert ca_copy in before_update
+        assert "http://snapshot.ubuntu.com" not in before_update
+        for suite in ("noble", "noble-updates", "noble-security"):
+            assert f"deb [signed-by={keyring}] {snapshot} {suite} " in before_update
+        assert "ca-certificates" in install
+
+
 def test_rocm_exact_pins_full_sdk_targets_and_no_spoofing():
     path = SERVICE / "build/build_rocm.sh"
     assert path.is_file(), "native source build missing"
