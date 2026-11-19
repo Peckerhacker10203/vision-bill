@@ -1,0 +1,25 @@
+{
+  "commit": "0c316c259c754c72a933ea8f015e0e379b3b7c2f",
+  "runtime_downloads_and_extraction": {
+    "PP-DocLayoutV3": {
+      "files": 6,
+      "sha256": "7795b8d3a5dbf82a2f9934a953f7b9a48946c43a173a07cc0d9ef87de036113d",
+      "size_bytes": 132034560
+    },
+    "PP-LCNet_x1_0_doc_ori": {
+      "files": 7,
+      "sha256": "86316265982aa2274c7133df9679b33a99c4d0c133d6b530c8d9daec3637a160",
+      "size_bytes": 6891520
+    },
+    "PaddleOCR-VL-1.6-0.9B": {
+      "files": 14,
+      "sha256": "f85479c597305c48152b2334ea295fd02833edf5f7350a71d4a4b074229d6626",
+      "size_bytes": 1930332160
+    },
+    "UVDoc": {
+      "files": 7,
+      "sha256": "3055177d4129739e734c537af3d4dd3f3f2de724f0ef7c60ffabaad6aacb21c3",
+      "size_bytes": 32276480
+    }
+  }
+}
