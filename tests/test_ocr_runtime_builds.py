@@ -25,8 +25,8 @@ def test_separate_digest_pinned_native_images_and_cuda_lock():
         assert "vision_bill" not in text and "COPY paddleocr-service/" not in text
         assert "/health" in text
     cuda = (SERVICE / "requirements.cuda.lock").read_text()
-    assert "paddlepaddle_gpu-3.3.1" in cuda and "cu126" in cuda
     if "UNRESOLVED" in cuda:
+        assert "paddlepaddle_gpu-3.3.1" in cuda and "cu126" in cuda
         with pytest.raises(ValueError, match="unresolved"):
             load_build_module("resolve_cuda").validate_lock(SERVICE / "requirements.cuda.lock")
     else:
@@ -182,10 +182,56 @@ def test_cuda_resolver_selects_only_exact_official_cp312_artifact():
     assert module.select_wheel(html) == official
     import pytest
 
-    with pytest.raises(ValueError):
-        module.select_wheel(html + f'<a href="{official}?other">duplicate</a>')
+    assert module.select_wheel(html + f'<a href="{official}?other">untrusted</a>') == official
     with pytest.raises(ValueError):
         module.select_wheel(html.replace("3.3.1", "3.3.0"))
+
+
+def test_cuda_resolver_selects_only_requested_channel():
+    module = load_build_module("resolve_cuda")
+    wheel = "paddlepaddle_gpu-3.3.1-cp312-cp312-linux_x86_64.whl"
+    legacy = f"https://paddle-whl.bj.bcebos.com/stable/cu126/{wheel}"
+    blackwell = f"https://paddle-whl.cdn.bcebos.com/stable/cu129/paddlepaddle-gpu/{wheel}"
+    html = f'<a href="{legacy}">legacy</a><a href="{blackwell}#sha256=abc">candidate</a>'
+    assert module.select_wheel(html) == legacy
+    assert module.select_wheel(html, "cu129") == blackwell
+    with pytest.raises(ValueError, match="cu129"):
+        module.select_wheel(f'<a href="{legacy}">legacy</a>', "cu129")
+    with pytest.raises(ValueError, match="channel"):
+        module.select_wheel(html, "cu128")
+
+
+@pytest.mark.parametrize(
+    "untrusted",
+    [
+        "http://paddle-whl.cdn.bcebos.com/stable/cu129/",
+        "https://user:pass@paddle-whl.cdn.bcebos.com/stable/cu129/",
+        "https://paddle-whl.cdn.bcebos.com:443/stable/cu129/",
+        "https://paddle-whl.cdn.bcebos.com/stable/cu129/../cu126/",
+        "https://paddle-whl.cdn.bcebos.com/stable/cu129/%2e%2e/cu126/",
+        "https://paddle-whl.cdn.bcebos.com/stable/cu126/cu129/",
+        "https://paddle-whl.cdn.bcebos.com/experimental/cu129/",
+        "https://paddle-whl.cdn.bcebos.com.evil.invalid/stable/cu129/",
+    ],
+)
+def test_cuda_resolver_rejects_untrusted_wheel_links(untrusted):
+    module = load_build_module("resolve_cuda")
+    wheel = "paddlepaddle_gpu-3.3.1-cp312-cp312-linux_x86_64.whl"
+    with pytest.raises(ValueError, match="cu129"):
+        module.select_wheel(f'<a href="{untrusted}{wheel}">wheel</a>', "cu129")
+
+
+def test_cuda_resolver_refuses_redirect_before_sending_followup_request():
+    from http.client import HTTPMessage
+    from io import BytesIO
+    from urllib.request import Request
+
+    module = load_build_module("resolve_cuda")
+    index = "https://www.paddlepaddle.org.cn/packages/stable/cu129/paddlepaddle-gpu/"
+    with pytest.raises(ValueError, match="redirect"):
+        module.NoRedirects().redirect_request(
+            Request(index), BytesIO(), 302, "Found", HTTPMessage(), "https://evil.invalid/index"
+        )
 
 
 def test_unresolved_cuda_lock_is_explicit_and_build_validation_rejects_it(tmp_path):
@@ -326,6 +372,46 @@ def cuda_lock_fixture(tmp_path):
 def test_cuda_validator_accepts_complete_resolver_shaped_executable_lock(tmp_path):
     module, write, _, _ = cuda_lock_fixture(tmp_path)
     assert module.validate_lock(write())["metadata_version"] == "3.3.1"
+
+
+def test_cuda_validator_binds_channel_to_index_and_lock(tmp_path):
+    module, write, text, _ = cuda_lock_fixture(tmp_path)
+    candidate = text.replace("cu126/", "cu129/")
+
+    def attestation(data):
+        return {
+            **data,
+            "cuda_channel": "cu129",
+            "index": data["index"].replace("cu126/", "cu129/"),
+            "wheel_url": data["wheel_url"].replace("cu126/", "cu129/"),
+        }
+
+    assert module.validate_lock(write(candidate, attestation))["cuda_channel"] == "cu129"
+    with pytest.raises(ValueError, match="attestation mismatch"):
+        module.validate_lock(write(candidate, attestation), channel="cu126")
+    for field, value in [
+        ("cuda_channel", "cu126"),
+        ("cuda_channel", "cu128"),
+        ("index", module.INDEX),
+    ]:
+        with pytest.raises(ValueError, match="attestation mismatch"):
+            module.validate_lock(
+                write(
+                    candidate,
+                    lambda data, field=field, value=value: {**attestation(data), field: value},
+                )
+            )
+    with pytest.raises(ValueError, match="attestation mismatch"):
+        module.validate_lock(write(candidate, lambda data: {**data, "cuda_channel": "cu129"}))
+    with pytest.raises(ValueError, match="attestation mismatch"):
+        module.validate_lock(
+            write(
+                candidate,
+                lambda data: {k: v for k, v in attestation(data).items() if k != "cuda_channel"},
+            )
+        )
+    with pytest.raises(ValueError, match="differs"):
+        module.validate_lock(write(text, attestation))
 
 
 def test_cuda_validator_rejects_comment_only_and_shadowed_native_requirements(tmp_path):

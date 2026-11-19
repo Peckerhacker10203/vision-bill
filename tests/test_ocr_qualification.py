@@ -93,6 +93,11 @@ def test_dependency_sealer_traverses_extras_and_hashes_real_identity(monkeypatch
         "paddlex": ['extra-child[fast]>=1; extra == "ocr"'],
         "extra-child": ['leaf==2; extra == "fast"', 'ignored; python_version < "2"'],
     }
+    monkeypatch.setattr(
+        module.metadata,
+        "distributions",
+        lambda: [SimpleNamespace(metadata={"Name": "paddlepaddle-gpu"})],
+    )
     monkeypatch.setattr(module.metadata, "requires", lambda name: requirements.get(name, []))
     monkeypatch.setattr(module.metadata, "version", lambda name: "2" if name == "leaf" else "1")
     seen = []
@@ -109,6 +114,115 @@ def test_case_manifest_requires_all_five_real_hash_bound_inputs(tmp_path):
     manifest.write_text('[[cases]]\nkind="upright"\npath="a.png"\nsha256="' + "a" * 64 + '"\n')
     with pytest.raises(ValueError):
         module.load_cases(manifest)
+
+
+@pytest.fixture
+def dcu_metadata(tmp_path, monkeypatch):
+    site_packages = tmp_path / "site-packages"
+    monkeypatch.syspath_prepend(str(site_packages))
+
+    def install(name, version, requires=()):
+        info = site_packages / f"{name.lower().replace('-', '_')}-{version}.dist-info"
+        info.mkdir(parents=True)
+        (info / "METADATA").write_text(
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+            + "".join(f"Requires-Dist: {entry}\n" for entry in requires)
+        )
+        (info / "RECORD").write_text(f"{info.name}/METADATA,,\n")
+
+    install("paddlepaddle-dcu", "3.3.1", ["numpy>=2"])
+    install("paddlex", "3.7.2", ['layout-extra>=1; extra == "ocr"'])
+    for name, version in {
+        "paddleocr": "3.7.0",
+        "layout-extra": "1.0",
+        "pillow": "12.3.0",
+        "pillow-heif": "1.7.0",
+        "numpy": "2.2.6",
+        "pydantic": "2.13.4",
+        "packaging": "26.2",
+    }.items():
+        install(name, version)
+    return install
+
+
+def test_rocm_binding_seals_exact_installed_metadata_closure(dcu_metadata):
+    from ocr_service.bootstrap import bind_approved_dependencies, seal_dependencies
+    from ocr_service.profile import verify_dependencies
+
+    approved = {"paddlepaddle-dcu": "3.3.1", "paddleocr": "3.7.0", "paddlex": "3.7.2"}
+    versions = bind_approved_dependencies(approved, accelerator="rocm")
+    assert versions == {
+        **approved,
+        "layout-extra": "1.0",
+        "pillow": "12.3.0",
+        "pillow-heif": "1.7.0",
+        "numpy": "2.2.6",
+        "pydantic": "2.13.4",
+        "packaging": "26.2",
+    }
+    assert seal_dependencies("paddlepaddle-dcu")[0] == versions
+    _, sealed = seal_dependencies("paddlepaddle-dcu", accelerator="rocm")
+    assert verify_dependencies(versions, sealed, accelerator="rocm")[0] == versions
+    with pytest.raises(ValueError, match="accelerator"):
+        verify_dependencies(versions, sealed, accelerator="cuda")
+    with pytest.raises(ValueError, match="approved numpy"):
+        bind_approved_dependencies({**approved, "numpy": "2.2.5"})
+
+
+@pytest.mark.parametrize("extra_native", ["paddlepaddle", "paddlepaddle-gpu", "PaddlePaddle_DCU"])
+def test_undeclared_native_install_rejected_during_sealing_and_verification(
+    dcu_metadata, extra_native
+):
+    from ocr_service.bootstrap import seal_dependencies
+    from ocr_service.profile import verify_dependencies
+
+    versions, sealed = seal_dependencies("paddlepaddle-dcu")
+    dcu_metadata(extra_native, "3.3.1+extra")
+    with pytest.raises(ValueError, match="one.*Paddle"):
+        seal_dependencies("paddlepaddle-dcu")
+    with pytest.raises(ValueError, match="one.*Paddle"):
+        verify_dependencies(versions, sealed)
+
+
+def test_rocm_qualification_passes_dcu_metadata_to_inspection(tmp_path, monkeypatch, dcu_metadata):
+    module = qualification()
+    from ocr_service.profile import MODEL_NAMES, RuntimeSettings
+
+    model_dirs = {name: tmp_path / name for name in MODEL_NAMES}
+    for directory in model_dirs.values():
+        directory.mkdir()
+        (directory / "weights").write_text("synthetic model data")
+    runtime = RuntimeSettings(
+        accelerator="rocm",
+        gpu_index=0,
+        model_dirs=model_dirs,
+        cache_dir=tmp_path,
+        qualification_manifest=tmp_path / "manifest.json",
+        expected_packages={},
+        expected_paddle_commit="1234567",
+        image_identity="sha256:" + "a" * 64,
+    )
+    cases = [
+        module.QualificationCase(kind=kind, path=tmp_path / kind, sha256=str(i) * 64)
+        for i, kind in enumerate(sorted(module.KINDS))
+    ]
+    monkeypatch.setattr(module, "load_cases", lambda path: cases)
+    handoff = []
+
+    def stop_before_hardware(stage, payload, directory):
+        handoff.append((stage, payload))
+        raise RuntimeError("Native inspection requires actual hardware")
+
+    monkeypatch.setattr(module, "run_stage", stop_before_hardware)
+    output = tmp_path / "qualification.json"
+    report = module.qualify_runtime(runtime, tmp_path / "cases.toml", output)
+    assert not report.qualified
+    assert not output.with_suffix(".runtime.json").exists()
+    assert report.stage == "artifact_inspection"
+    [(stage, payload)] = handoff
+    assert stage == "inspect"
+    assert payload["runtime"]["expected_packages"]["paddlepaddle-dcu"] == "3.3.1"
+    assert payload["dependencies"]["paddlepaddle-dcu"]["version"] == "3.3.1"
 
 
 def test_failure_report_does_not_claim_native_success_or_leak_errors(tmp_path, monkeypatch):
@@ -350,14 +464,11 @@ def successful_qualification(tmp_path, monkeypatch):
     ]
     monkeypatch.setattr(module, "load_cases", lambda path: cases)
     monkeypatch.setattr(
-        module.importlib.metadata,
-        "distributions",
-        lambda: [SimpleNamespace(metadata={"Name": "paddlepaddle-gpu"})],
+        module,
+        "seal_dependencies",
+        lambda **kwargs: ({"native": "version"}, {"native": "identity"}),
     )
-    monkeypatch.setattr(
-        module, "seal_dependencies", lambda package: ({"native": "version"}, {"native": "identity"})
-    )
-    monkeypatch.setattr(module, "verify_dependencies", lambda *args: None)
+    monkeypatch.setattr(module, "verify_dependencies", lambda *args, **kwargs: None)
     monkeypatch.setattr(module, "tree_identity", lambda path: "actual-model-hash")
     stages = []
 

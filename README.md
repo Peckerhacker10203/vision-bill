@@ -20,11 +20,9 @@ explicitly requests setup in the configuration. Preparing the GPU profile is a
 one-time operator step; the browser toggle then controls receipt routing. Follow
 the [installation guide](distribution/README.md).
 
-**This change ships source and release gates only. No qualified native images or
-prepared public bundles were published or physically qualified here.** There is no
-release download URL to substitute yet. Maintainers must complete the real artifact
-and hardware gates before advertising an installable native bundle. Linux AMD
-candidates start at RX6000/RDNA2; each selected board requires qualification.
+**Status: Unreleased.** Source candidates and release tooling are available.
+Public native bundle downloads require a release run with real artifacts and physical
+qualification of the selected GPU.
 
 Once a verified bundle exists, app variants expose the UI at
 `http://127.0.0.1:8080` by default. First setup creates a real bootstrap administrator
@@ -110,10 +108,10 @@ provider, reachable endpoint and installed model ID,
 then use `docker compose up -d --build`. For a fresh source installation, set
 `AUTH__BOOTSTRAP_USERNAME` and `AUTH__BOOTSTRAP_PASSWORD` before the first account
 if you need admin access. Ordinary users can register from the login page.
-Base Compose starts the app and PostgreSQL. An ordinary base Windows Compose
-installation cannot enable native OCR with the browser button alone. For a native
-candidate and the
-Dedicated OCR action, use the [source GPU profile instructions](paddleocr-service/README.md#dedicated-ocr-from-source).
+Base Compose starts the app and PostgreSQL. To try a local Dedicated OCR
+candidate, prepare the GPU profile once and then enable it from admin Settings.
+Use CUDA on Linux or WSL 2 with Docker Desktop and NVIDIA, or ROCm on native
+Linux with a selected Radeon. [Source GPU setup](paddleocr-service/README.md#dedicated-ocr-from-source)
 
 `make lint`, `make test`, `make fe-verify`, `make release-test`,
 `make distribution-test`, `make distribution-pid1-test`, `make compose-check`,
@@ -121,4 +119,4 @@ Dedicated OCR action, use the [source GPU profile instructions](paddleocr-servic
 owned stacks. See the [architecture guide](AGENTS.md),
 [frontend guide](frontend/README.md),
 [accepted evidence and limits](UPGRADE_AND_VERIFY.md#verification-evidence), and
-[release procedures](RELEASES.md). This package is Unreleased.
+[release procedures](RELEASES.md).

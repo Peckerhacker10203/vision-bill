@@ -55,7 +55,7 @@ fe-test-e2e: ## Run Playwright in a unique owned stack
 	$(NODE) uv run python e2e/run.py run --policy fallback $(E2E_OVERRIDE_ARG) -- npm --prefix frontend run test:e2e
 
 PYTHON_CHECK_PATHS := src paddleocr-service/ocr_contract paddleocr-service/ocr_service paddleocr-service/server.py \
-	paddleocr-service/build e2e scripts/ocr_harness \
+	paddleocr-service/build e2e scripts/ocr_harness scripts/ocr_source_up.py \
 	scripts/receipt_split_experiment.py scripts/standalone_benchmark.py scripts/test_ocr_service.py
 
 .PHONY: compose-check
@@ -138,11 +138,12 @@ fe: ## Run an npm script in frontend/ (make fe CMD=<script> [ARGS="..."])
 	$(NODE) (cd $(FE) && npm run $(CMD) $(ARGS))
 
 .PHONY: ocr-lock-cuda ocr-build-cuda ocr-build-rocm ocr-qualify-cuda ocr-qualify-rocm
-ocr-lock-cuda: ## Resolve official cu126 wheel + full hash lock (network required)
-	SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEX=3.7.2 SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEOCR=3.7.0 uv run --no-project --with packaging==26.2 python paddleocr-service/build/resolve_cuda.py
+ocr-lock-cuda ocr-build-cuda: export OCR_CUDA_CHANNEL ?= cu126
+ocr-lock-cuda: ## Resolve official CUDA lock (default cu126, optional OCR_CUDA_CHANNEL=cu129)
+	SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEX=3.7.2 SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEOCR=3.7.0 uv run --no-project --with packaging==26.2 python paddleocr-service/build/resolve_cuda.py --channel="$${OCR_CUDA_CHANNEL:-cu126}"
 
 ocr-build-cuda: ## Build candidate CUDA image after official lock resolution
-	uv run --no-project --with packaging==26.2 python paddleocr-service/build/resolve_cuda.py --check paddleocr-service/requirements.cuda.lock
+	uv run --no-project --with packaging==26.2 python paddleocr-service/build/resolve_cuda.py --check paddleocr-service/requirements.cuda.lock --channel="$${OCR_CUDA_CHANNEL:-cu126}"
 	docker compose --profile ocr -f docker-compose.yml -f docker-compose.cuda.yml build paddleocr-service
 
 ocr-build-rocm: ## Build native full-SDK RDNA2 candidate (large build; no support claim)

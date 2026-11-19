@@ -42,39 +42,91 @@ The operator's separate text or vision LLM endpoint remains the receipt formatte
 
 ## Dedicated OCR from source
 
-The base Compose install runs direct vision. To prepare an idle Dedicated OCR
-controller, select the `ocr` profile and the accelerator overlay once. An ordinary
-base Windows Compose installation cannot enable native OCR with the browser
-button alone.
+The source setup command builds a local candidate, selects the accelerator
+profile, binds approved inputs to the exact Docker image and selected device, and
+starts Compose with an idle OCR controller. Run it from the repository root with
+Python 3.12+, a local Linux x86_64 Docker engine and Docker Compose 2.30+. CUDA builds
+also require `make`, `uv` and access to the official Paddle wheel host. Prepare the
+app's private `.env` once and reuse its Compose project name, app settings and
+data on subsequent starts. The command supplies the OCR image and bundle metadata
+automatically. [Source app configuration](../README.md#advanced-develop-from-source)
+
+### NVIDIA CUDA on Windows or Linux
+
+On Windows, install or update WSL 2 with Ubuntu (`wsl --install -d Ubuntu` on a
+fresh system and `wsl --update`), install a current NVIDIA Windows driver with
+WSL GPU support, and enable Docker Desktop's WSL 2 engine and Ubuntu integration.
+Run the commands inside Ubuntu. Keep the source checkout and working files on
+Ubuntu's Linux filesystem, such as `~/src/vision-bill`. Linux file ownership and
+permissions and build I/O are more reliable there than under `/mnt/c`.
+For a separate WSL test checkout, choose a new Compose project name. Stop the
+old source stack from its original checkout with `docker compose down` before
+starting the test. That preserves its database volume and bind-mounted files.
+To continue an existing installation, use its original project and data paths.
+[WSL setup](https://learn.microsoft.com/en-us/windows/wsl/install) ·
+[Docker Desktop GPU support](https://docs.docker.com/desktop/features/gpu/)
+
+On native Linux, configure the NVIDIA driver and NVIDIA Container Toolkit for
+Docker GPU access. `OCR_CUDA_DEVICE_ID` selects one host GPU by index or UUID
+and defaults to `0`. Point the command at the private approved directory with
+`bundle.json` and its declared local fixture tar. The approved metadata lists the
+four model archives at HTTPS URLs. [Prepare approved inputs](../distribution/README.md#prepare-approved-native-inputs)
 
 ```bash
-docker compose --profile ocr -f docker-compose.yml -f docker-compose.cuda.yml up -d
+python3 scripts/ocr_source_up.py cuda /private/approved-cuda-inputs
 ```
 
-For ROCm substitute `docker-compose.rocm.yml`. The source profile can build the
-selected runtime image. Preparing that runtime does not download model weights.
-The CUDA lock and device qualification constraints below still apply.
+CUDA defaults to `cu126`. For a modern Blackwell candidate, provide
+`OCR_CUDA_CHANNEL=cu129` for the initial build and use an NVIDIA driver that
+supports CUDA 12.9 on the host. Check the runtime's device support through
+qualification on the actual board. [CUDA build inputs](#build-inputs)
 
-Put the approved `bundle.json`, `image-config.json` and declared fixture assets
-matching the selected image in `server_data/ocr-release/`, or set `OCR_RELEASE_DIR`
-to their directory. Set `OCR_IMAGE_ID` to that local image's exact Docker config
-digest. Profiles can run idle while those inputs are being prepared. Setup
-requires a trusted manifest with remote HTTPS model archives and exact hashes.
-Use the [release input workflow](../distribution/README.md#maintainers-real-artifact-inputs-and-workflows)
-for this metadata. A source checkout carries neither model archives nor a qualified
-native release catalog.
+```bash
+OCR_CUDA_CHANNEL=cu129 python3 scripts/ocr_source_up.py cuda /private/approved-cuda-inputs
+```
 
-Leave `OCR__ENDPOINT` unset and legacy `OCR__ENABLED=false` for Dedicated OCR.
-After preparing the LLM handoff, open **Settings → Dedicated OCR** as an admin
-and turn it On to request setup. No model downloads occur before this explicit
-request (or explicit startup activation). Off routes new work to direct vision
-and keeps the verified cache and idle native worker; On reuses the verified
-generation. An older explicitly blank `OCR__ENDPOINT` starts Off but permits
-browser opt-in with the prepared profile. Nonblank external OCR endpoints remain
-operator-owned and cannot be switched through this toggle. The same
-[startup configuration and recovery procedure](../distribution/README.md#enable-dedicated-ocr)
-applies to source installs using their service names. The explicit manual GPU
-qualification path below is available separately.
+### AMD ROCm on native Linux
+
+Use the host's `/dev/kfd` and the selected `/dev/dri/renderD*` node. The source
+command derives the two container group IDs from those device nodes. Set
+`OCR_RENDER_NODE` to the actual render node and `OCR_AMDGPU_TARGETS` to the
+device's actual GFX target when it differs from the default RDNA2 candidate
+list. The example selects a `gfx1030` board at `/dev/dri/renderD128`.
+[ROCm build inputs](#build-inputs)
+
+```bash
+OCR_RENDER_NODE=/dev/dri/renderD128 OCR_AMDGPU_TARGETS=gfx1030 \
+  python3 scripts/ocr_source_up.py rocm /private/approved-rocm-inputs
+```
+
+### Enable and restart
+
+Keep the existing `.env` OCR settings for a base install using the template
+defaults or an explicitly blank `OCR__ENDPOINT`. A configured external OCR route
+must be reconciled before switching. For a private llama.cpp server, use the
+dedicated router mode with autoload enabled, startup loading disabled, and all
+models unloaded before activation. Keep the server reachable
+from the app container on a trusted private network, configure
+`LLM__MODEL_LIFECYCLE=llamacpp`, and use the exact installed model ID.
+[llama.cpp router setup](../OPENAI_COMPATIBLE.md#configure-a-dedicated-llamacpp-router)
+
+Sign in as an administrator, open **Settings → Dedicated OCR** and turn it On.
+The controller waits for this first explicit request before downloading the
+model archives and running native qualification.
+Turning it Off routes new work to direct vision and keeps the verified cache for
+reuse. On each OCR receipt, Vision Bill confirms the paired formatter model is
+unloaded before loading OCR. It waits for the OCR worker process to exit before
+requesting formatting with text and evidence. An unconfirmed release blocks the
+handoff. Other applications still have normal GPU access. [Activation and retry](../distribution/README.md#enable-dedicated-ocr)
+
+Use `--restart` on subsequent starts to reuse the prepared app and OCR images,
+Compose project and GPU selection. Use `rocm` for AMD. Before replacing an
+existing prepared runtime, drain it and plan a cutover that preserves its
+activation and handoff state. [Stop, cut over and recover](../distribution/README.md#stop-cut-over-and-recover)
+
+```bash
+python3 scripts/ocr_source_up.py cuda --restart
+```
 
 ## Consumer GPU release targets
 
@@ -99,8 +151,8 @@ Evaluate one CUDA bundle against all four NVIDIA generations before splitting
 the binaries by architecture. Paddle publishes a 3.3.1 CPython 3.12 Linux x86_64
 wheel in its CUDA 12.9 channel. CUDA 12.8 introduced native SM 12.0 compilation.
 Verify the wheel and linked libraries, then run device allocation and the
-full OCR pipeline on representative hardware. The current CUDA 12.6 lock
-remains unresolved. [Official Paddle CUDA 12.9 wheel index](https://www.paddlepaddle.org.cn/packages/stable/cu129/paddlepaddle-gpu/) ·
+full OCR pipeline on representative hardware.
+[Official Paddle CUDA 12.9 wheel index](https://www.paddlepaddle.org.cn/packages/stable/cu129/paddlepaddle-gpu/) ·
 [CUDA 12.8 release notes](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-toolkit-release-notes/index.html#new-features)
 
 ## Build inputs
@@ -116,14 +168,15 @@ Source packages are built without dependency resolution, using the hashed build
 bootstrap. The archived PaddleOCR/PaddleX sources use their pinned release
 versions through `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_*`.
 
-CUDA deliberately has an unresolved **build gate** in `requirements.cuda.lock`:
-the execution environment returned CONNECT 403 for the official index and wheel
-host. On a connected machine run `make ocr-lock-cuda`. This downloads only the
-exact official cu126 Paddle GPU 3.3.1 cp312 x86_64 wheel, inspects its real
+The checked-in `requirements.cuda.lock` is unresolved. The source setup command
+resolves the selected channel on a connected host when a matching lock is
+unavailable. To resolve it manually, run `make ocr-lock-cuda` for `cu126` or
+`OCR_CUDA_CHANNEL=cu129 make ocr-lock-cuda` for `cu129`. The resolver selects the
+exact official Paddle GPU 3.3.1 cp312 x86_64 wheel for that channel, inspects its
 METADATA, freezes the full closure, hashes the bytes, and emits the lock plus
-`requirements.cuda.attestation.json`. Review both outputs before
-`make ocr-build-cuda`. Missing, changed, substituted or unresolved locks fail the
-Docker check; there is no PyPI/CPU/ROCm wheel fallback. Validation parses actual
+`requirements.cuda.attestation.json`. Review both outputs and use the same
+channel for `make ocr-build-cuda`. The Docker build requires a valid, resolved
+lock and attestation for the official GPU wheel. Validation parses actual
 executable requirements, preserves every entry of the pinned common runtime lock,
 and requires the complete attestation. Includes, install options, duplicate or
 conditional native requirements and comment-only evidence are rejected. The Make

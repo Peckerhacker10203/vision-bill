@@ -430,6 +430,11 @@ def test_factory_bootstraps_then_requires_real_forward_for_all_models(
         image_identity="image-sha256",
     )
     versions = runtime.expected_packages
+    monkeypatch.setattr(
+        factory.importlib.metadata,
+        "distributions",
+        lambda: [SimpleNamespace(metadata={"Name": "paddlepaddle-gpu"})],
+    )
     monkeypatch.setattr(factory.importlib.metadata, "version", versions.__getitem__)
     # Sources verified independently against official hard pins above. This fake
     # framework test intentionally isolates construction and execution behavior.
@@ -748,6 +753,11 @@ def test_factory_rejects_dependency_identity_drift_before_heavy_imports(
     )
     from ocr_service import profile as profile_module
 
+    monkeypatch.setattr(
+        factory.importlib.metadata,
+        "distributions",
+        lambda: [SimpleNamespace(metadata={"Name": "paddlepaddle-gpu"})],
+    )
     monkeypatch.setattr(factory.importlib.metadata, "version", actual_versions.__getitem__)
     monkeypatch.setattr(factory.importlib.metadata, "requires", lambda name: [])
     monkeypatch.setattr(profile_module, "dependency_identity", actual_contents.__getitem__)

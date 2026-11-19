@@ -1,9 +1,9 @@
 # Prepared installations and distribution maintenance
 
 Install a prepared bundle by downloading a verified release, configuring the
-selected variant and running Docker Compose. This package provides the distribution
-tools and local software verification. Public release assets and physical GPU
-qualification require a separate release run.
+selected variant and running Docker Compose. Public native bundles require a
+release run with physical GPU qualification. To build a local candidate before
+publication, use the source setup. [Dedicated OCR from source](../paddleocr-service/README.md#dedicated-ocr-from-source)
 
 ## Choose an installation
 
@@ -88,9 +88,8 @@ maintenance step below before `up`.
 In a combined install, sign in as the administrator and open **Settings →
 Dedicated OCR**. Verify that your LLM endpoint is dedicated to Vision Bill,
 has eager loading disabled, and has unloaded its models. With llama.cpp use
-the [dedicated router lifecycle](../OPENAI_COMPATIBLE.md#configure-a-dedicated-llamacpp-router).
-Preparing the combined GPU profile is a one-time operator step. Ordinary base
-Windows Compose cannot add native OCR through this button alone.
+a dedicated private router. [llama.cpp router setup](../OPENAI_COMPATIBLE.md#configure-a-dedicated-llamacpp-router)
+
 Confirm those conditions and turn **Dedicated OCR** On. Downloads and
 native setup run in the background. The app invokes OCR for receipts after the
 managed service verifies the installed models and starts with its worker parked.
@@ -237,7 +236,9 @@ docker compose up -d
 ```
 
 For source installs, use `vision_bill` in place of `app` and keep the same
-Compose files and profile as the original deployment.
+Compose files and profile as the original deployment. Include the generated
+`server_data/ocr-source/<accelerator>/compose.local.json` after the accelerator
+overlay when using the prepared source deployment.
 
 ## Maintainers: real artifact inputs and workflows
 
@@ -261,7 +262,64 @@ source/profile identities and actual target proof. Use actual artifact bytes and
 qualification evidence. Schema-v1 manifests and the retired `combined-*` variant
 names are rejected. Version 2 ships no LLM server or LLM weights.
 
-The shipped manual producer and consumer are:
+### Prepare approved native inputs
+
+Run the preparation commands from the repository root with Python 3.12+ and
+`uv`. Use a private directory outside Git and Docker build contexts. Create
+the parent directories first and choose fresh output directories. Allow
+several gigabytes for the downloaded files and generated model archives.
+
+Prepare deterministic tar archives from the pinned original Paddle files for
+`PP-DocLayoutV3`, `PP-LCNet_x1_0_doc_ori`, `UVDoc` and `PaddleOCR-VL-1.6-0.9B`.
+Provide the approved HTTPS base URL where you will serve those exact tar
+files. Replace the example URL with one reachable by the OCR container at
+activation. The command writes four `.tar` files and `models.json` with their
+verified identities, licenses and upstream provenance. Host the archives at
+the recorded URLs before attempting activation or release qualification.
+
+```bash
+PYTHONPATH=paddleocr-service uv run --no-project --with pydantic==2.13.4 --with packaging==26.2 \
+  python paddleocr-service/build/prepare_paddle_models.py \
+  --archive-base-url https://artifacts.example/ocr/models --output /private/ocr-models
+```
+
+Create `/private/approved-fixtures.json` with the five distinct, approved PNGs
+and a nonempty UTF-8 license file. Each asset path is relative to this JSON
+file. Use the actual license and source revision, and verify redistribution
+rights for all five images before staging. The table and formula images must
+contain those structures. An example manifest follows.
+
+```json
+{
+  "license": {"spdx": "CC-BY-4.0", "text_file": "LICENSE.txt", "redistribution_allowed": true},
+  "provenance": {"url": "https://artifacts.example/ocr/fixtures", "revision": "approved-fixtures-v1"},
+  "cases": {
+    "upright": "upright.png",
+    "rotated": "rotated.png",
+    "warped": "warped.png",
+    "table": "table.png",
+    "formula": "formula.png"
+  }
+}
+```
+
+```bash
+uv run --no-project --with pydantic==2.13.4 --with packaging==26.2 --with Pillow==12.3.0 \
+  python paddleocr-service/build/prepare_ocr_inputs.py cuda \
+  --models /private/ocr-models/models.json --fixtures /private/approved-fixtures.json \
+  --output /private/approved-cuda-inputs
+```
+
+Use `rocm` and a fresh output directory for AMD. The output is an unbound
+`bundle.json` and its local `fixtures.tar`. For a source install, pass that
+directory directly to `scripts/ocr_source_up.py`. For the release workflow,
+stage both files together under `cuda/` or `rocm/` beside the reviewed
+`release-inputs.json` at the exact source/version/variant path below. The
+producer includes the local fixture tar by its declared hash and size. The
+combined variants read model archives from the approved HTTPS URLs. The
+source command and release builder each bind the manifest to their built image.
+
+### Run the distribution workflows
 
 1. [Prepare approved distribution inputs](../.github/workflows/distribution-inputs.yml)
    runs `scripts/distribution-inputs.mjs --stage` on the runner labeled
@@ -303,8 +361,10 @@ uv and adequate build/archive capacity. Labels are `vision-bill-cuda` and
 `vision-bill-rocm`. Native release qualification requires explicit
 `DISTRIBUTION_MAINTENANCE_INTENT` for the runner's actual LLM quiescence or separate
 OCR device. ROCm selected targets must agree with compile inputs, kernel
-inventory and the actual qualified AMD device. CUDA requires real official wheel
-resolution/attestation; there is no CPU wheel or alternate-precision fallback.
+inventory and the actual qualified AMD device. For CUDA, `release-inputs.json`
+accepts `"cuda_channel": "cu129"` when qualifying the CUDA 12.9 candidate and
+defaults to `cu126`. The producer resolves and attests the official GPU wheel
+for that channel.
 
 OCI registry **manifest** digest identifies transport/pull bytes; local Docker image
 `.Id` identifies the config blob. Neither substitutes for the other. The producer

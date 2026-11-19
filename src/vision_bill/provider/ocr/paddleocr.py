@@ -12,6 +12,7 @@ import httpx
 from ocr_contract import limits
 from ocr_contract.document_image import decode_working_png, validate_working_png
 from PIL import Image
+from pydantic import ValidationError
 
 from ...helper.deadline import check_deadline, run_sync_before
 from ...model.ocr import OcrCapabilities, OcrResponse, WorkerReadiness
@@ -32,6 +33,24 @@ class PaddleOcrProvider(OcrProvider):
             response = await client.post(f"{self.service_url}/lifecycle/{action}",
                                          json={"owner_token": token})
             response.raise_for_status()
+
+        error = f"ocr_invalid_lifecycle_acknowledgement:{action}"
+        if response.status_code != 200:
+            raise httpx.RemoteProtocolError(error, request=response.request)
+        try:
+            ready = WorkerReadiness.model_validate_json(response.content, strict=True)
+        except ValidationError:
+            raise httpx.RemoteProtocolError(error, request=response.request) from None
+
+        if action == "load":
+            confirmed = ready.ready and ready.reason_code is None and bool(ready.profile_id)
+        else:
+            confirmed = (
+                not ready.ready and ready.reason_code == "ocr_parked"
+                and ready.profile_id is None and ready.runtime_fingerprint is None
+            )
+        if not confirmed:
+            raise httpx.RemoteProtocolError(error, request=response.request)
 
     async def claim(self, token: str, deadline: float) -> None:
         await self._lifecycle("claim", token, deadline)

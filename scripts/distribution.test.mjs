@@ -26,7 +26,25 @@ const image = (name) => ({
   reference: `ghcr.io/maintainer/vision-bill-${name}@${digest(name)}`,
   config_digest: digest(`${name}-config`),
 });
-function fixture() {
+function fixture({ cudaChannel, attestation = {}, lock, measuredLock } = {}) {
+  const cuda = {
+    index: `https://www.paddlepaddle.org.cn/packages/stable/${cudaChannel ?? "cu126"}/paddlepaddle-gpu/`,
+    index_sha256: hash("index"),
+    wheel_url:
+      "https://paddle-whl.bj.bcebos.com/stable/cu126/paddlepaddle_gpu-3.3.1-cp312-cp312-linux_x86_64.whl",
+    wheel_sha256: hash("wheel"),
+    metadata_sha256: hash("metadata"),
+    metadata_name: "paddlepaddle-gpu",
+    metadata_version: "3.3.1",
+    requires_dist: ["numpy"],
+    platform: "linux-x86_64-cp312",
+    ...(cudaChannel ? { cuda_channel: cudaChannel } : {}),
+    ...attestation,
+  };
+  const pin = `paddlepaddle-gpu @ ${cuda.wheel_url} --hash=sha256:${cuda.wheel_sha256}`;
+  const executable = lock ? lock(pin) : `${pin}\n`;
+  cuda.lock_sha256 = hash(executable);
+
   const assets = {};
   const bytes = {};
   function asset(path, value) {
@@ -65,7 +83,17 @@ function fixture() {
     const config = JSON.stringify({
       architecture: "amd64",
       os: "linux",
-      config: { Cmd: ["python", "-m", "ocr_service.entrypoint"] },
+      config: {
+        Cmd: ["python", "-m", "ocr_service.entrypoint"],
+        ...(accelerator === "cuda" && cudaChannel
+          ? {
+              Labels: {
+                "io.vision-bill.cuda.lock-sha256":
+                  measuredLock === undefined ? hash(executable) : measuredLock,
+              },
+            }
+          : {}),
+      },
     });
     manifest.images[`ocr-${accelerator}`].config_digest = digest(config);
     const nativeLicense = {
@@ -198,25 +226,13 @@ function fixture() {
       seal: asset(`${accelerator}/qualification-manifest.json`, seal),
       ...(accelerator === "cuda"
         ? {
-            cuda_lock: asset("cuda/lock-attestation.json", {
-              index:
-                "https://www.paddlepaddle.org.cn/packages/stable/cu126/paddlepaddle-gpu/",
-              index_sha256: hash("index"),
-              wheel_url:
-                "https://paddle-whl.bj.bcebos.com/stable/cu126/paddlepaddle_gpu-3.3.1-cp312-cp312-linux_x86_64.whl",
-              wheel_sha256: hash("wheel"),
-              metadata_sha256: hash("metadata"),
-              metadata_name: "paddlepaddle-gpu",
-              metadata_version: "3.3.1",
-              requires_dist: ["numpy"],
-              lock_sha256: hash("resolved-lock"),
-              platform: "linux-x86_64-cp312",
-            }),
+            cuda_lock: asset("cuda/lock-attestation.json", cuda),
+            ...(cudaChannel ? { cuda_channel: cudaChannel } : {}),
           }
         : {}),
     };
     if (accelerator === "cuda")
-      asset("cuda/requirements.cuda.lock", "resolved-lock");
+      asset("cuda/requirements.cuda.lock", executable);
   }
   return { manifest, bytes };
 }
@@ -449,6 +465,146 @@ test("materialization verifies raw OCI config and qualification before atomic co
   assert.ok(!readdirSync(directory).includes("failed"));
 });
 
+test("CUDA bundle requires the selected channel and exact official wheel evidence", (t) => {
+  const official =
+    "https://paddle-whl.cdn.bcebos.com/stable/cu129/paddlepaddle-gpu/paddlepaddle_gpu-3.3.1-cp312-cp312-linux_x86_64.whl";
+  const accepted = [
+    {},
+    { wheel_url: official.replace("/paddlepaddle-gpu/", "/") },
+    {
+      wheel_url: official.replace(
+        "paddle-whl.cdn.bcebos.com/stable/",
+        "www.paddlepaddle.org.cn/packages/stable/",
+      ),
+    },
+  ];
+  const rejected = [
+    { cuda_channel: undefined },
+    { cuda_channel: "cu126" },
+    {
+      index:
+        "https://www.paddlepaddle.org.cn/packages/stable/cu126/paddlepaddle-gpu/",
+    },
+    { wheel_url: official.replace("/cu129/", "/cu126/") },
+    { wheel_url: official.replace("/stable/", "/foreign/") },
+    { wheel_url: official.replace(".com/", ".com.evil.invalid/") },
+    { wheel_url: official.replace(".com/", ".com:443/") },
+    { wheel_url: official.replace("https://", "https://user@") },
+    { wheel_url: official + "?download=1" },
+    { wheel_url: official + "#wheel" },
+    { wheel_url: official.replace("3.3.1", "3.3.2") },
+    { wheel_url: official.replaceAll("cp312", "cp313") },
+    { wheel_url: official.replace("x86_64", "aarch64") },
+  ];
+  for (const change of [...accepted, ...rejected]) {
+    const directory = temp(t);
+    const { manifest, bytes } = fixture({
+      cudaChannel: "cu129",
+      attestation: { wheel_url: official, ...change },
+    });
+    seed(directory, bytes);
+    const output = join(directory, "out");
+    if (accepted.includes(change)) {
+      writeBundle(manifest, "ocr-cuda", output, directory);
+      const metadata = JSON.parse(readFileSync(join(output, "release.json")));
+      assert.equal(metadata.native.cuda.cuda_channel, "cu129");
+      delete manifest.native.cuda.cuda_channel;
+      assert.throws(
+        () =>
+          writeBundle(
+            manifest,
+            "ocr-cuda",
+            join(directory, "wrong"),
+            directory,
+          ),
+        /official CUDA/i,
+      );
+    } else {
+      assert.throws(
+        () => writeBundle(manifest, "ocr-cuda", output, directory),
+        /official CUDA/i,
+      );
+    }
+  }
+});
+
+test("CUDA bundle verifies executable Paddle pin and the lock measured by the built image", (t) => {
+  const wheelUrl =
+    "https://paddle-whl.cdn.bcebos.com/stable/cu129/paddlepaddle-gpu/paddlepaddle_gpu-3.3.1-cp312-cp312-linux_x86_64.whl";
+  const approvedDirectory = temp(t);
+  const approved = fixture({
+    cudaChannel: "cu129",
+    attestation: { wheel_url: wheelUrl },
+    lock: (pin) =>
+      "# Generated by uv\n" + pin.replace(" --hash", " \\\n    --hash") + "\n",
+  });
+  seed(approvedDirectory, approved.bytes);
+  writeBundle(
+    approved.manifest,
+    "ocr-cuda",
+    join(approvedDirectory, "out"),
+    approvedDirectory,
+  );
+  for (const lock of [
+    () => "resolved-lock",
+    (pin) => pin.replace("/cu129/", "/cu126/"),
+    (pin) => pin.replace(hash("wheel"), hash("wrong-wheel")),
+    (pin) => `${pin}\npaddlepaddle==3.3.1 --hash=sha256:${hash("other-wheel")}\n`,
+    (pin) => `${pin} ; python_version == "3.12"\n`,
+    (pin) => `${pin}\n-r alternate.lock\n`,
+  ]) {
+    const directory = temp(t);
+    const { manifest, bytes } = fixture({
+      cudaChannel: "cu129",
+      attestation: { wheel_url: wheelUrl },
+      lock,
+    });
+    seed(directory, bytes);
+    assert.throws(
+      () => writeBundle(manifest, "ocr-cuda", join(directory, "out"), directory),
+      /executable CUDA lock|Paddle.*pin/i,
+    );
+  }
+  for (const measuredLock of [null, hash("wrong-lock")]) {
+    const directory = temp(t);
+    const { manifest, bytes } = fixture({
+      cudaChannel: "cu129",
+      attestation: { wheel_url: wheelUrl },
+      measuredLock,
+    });
+    seed(directory, bytes);
+    assert.throws(
+      () => writeBundle(manifest, "ocr-cuda", join(directory, "out"), directory),
+      /candidate.*CUDA lock/i,
+    );
+  }
+});
+
+test("CUDA Make targets pass an expected channel by default and on explicit selection", (t) => {
+  const directory = temp(t);
+  writeFileSync(join(directory, "uv"), '#!/bin/sh\nprintf "%s\\n" "$@"\n', {
+    mode: 0o755,
+  });
+  writeFileSync(join(directory, "docker"), "#!/bin/sh\nexit 0\n", {
+    mode: 0o755,
+  });
+  for (const target of ["ocr-build-cuda", "ocr-lock-cuda"]) {
+    for (const channel of [undefined, "", "cu129"]) {
+      const env = { ...process.env, PATH: directory + ":" + process.env.PATH };
+      if (channel === undefined) delete env.OCR_CUDA_CHANNEL;
+      else env.OCR_CUDA_CHANNEL = channel;
+      const result = spawnSync("make", ["--no-print-directory", target], {
+        encoding: "utf8",
+        env,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.ok(
+        result.stdout.split("\n").includes("--channel=" + (channel || "cu126")),
+      );
+    }
+  }
+});
+
 test("same-hash evidence with wrong config or incomplete hardware qualification fails closed", (t) => {
   for (const mutate of [
     (m, b) => {
@@ -521,6 +677,40 @@ test("external native bundle requires complete model, fixture and licensed archi
     assert.throws(() =>
       writeBundle(manifest, "ocr-rocm", join(path, "out"), path),
     );
+  }
+});
+
+test("native release materialization recognizes the ROCm DCU wheel and rejects conflicting identities", (t) => {
+  for (const [accelerator, identities, rejection] of [
+    ["rocm", ["paddlepaddle-dcu"]],
+    ["rocm", ["paddlepaddle"]],
+    ["rocm", ["paddlepaddle-gpu"]],
+    ["rocm", ["paddlepaddle-dcu", "paddlepaddle-gpu"], /native Paddle/i],
+    ["rocm", ["paddlepaddle-dcu", "PaddlePaddle_DCU"], /native Paddle/i],
+    ["cuda", ["paddlepaddle-dcu"], /accelerator/i],
+  ]) {
+    const directory = temp(t);
+    const { manifest, bytes } = fixture();
+    const name = manifest.native[accelerator].bundle;
+    const bundle = JSON.parse(bytes[name]);
+    delete bundle.expected_packages["paddlepaddle-gpu"];
+    for (const identity of identities)
+      bundle.expected_packages[identity] = "3.3.1";
+    bytes[name] = JSON.stringify(bundle);
+    manifest.assets[name] = {
+      sha256: hash(bytes[name]),
+      size_bytes: Buffer.byteLength(bytes[name]),
+    };
+    seed(directory, bytes);
+    const output = join(directory, "out");
+    const materialize = () =>
+      writeBundle(manifest, `ocr-${accelerator}`, output, directory);
+    if (rejection) assert.throws(materialize, rejection);
+    else {
+      materialize();
+      const packaged = JSON.parse(readFileSync(join(output, "release", name)));
+      assert.equal(packaged.expected_packages[identities[0]], "3.3.1");
+    }
   }
 });
 
@@ -718,6 +908,24 @@ test("maintainer request rejects foreign forks, events, mutable source and missi
     },
   };
   assert.equal(release.validateReleaseInputs(plan, request), plan);
+  assert.throws(() =>
+    release.validateReleaseInputs({ ...plan, cuda_channel: "cu129" }, request),
+  );
+  const cudaRequest = { ...request, variant: "app-ocr-cuda" };
+  const { rocm, ...cudaPlan } = plan;
+  assert.equal(release.validateReleaseInputs(cudaPlan, cudaRequest), cudaPlan);
+  for (const cuda_channel of ["cu126", "cu129"]) {
+    const selected = { ...cudaPlan, cuda_channel };
+    assert.equal(
+      release.validateReleaseInputs(selected, cudaRequest),
+      selected,
+    );
+  }
+  for (const cuda_channel of ["cu130", null, "latest", "cu129 "]) {
+    assert.throws(() =>
+      release.validateReleaseInputs({ ...cudaPlan, cuda_channel }, cudaRequest),
+    );
+  }
   for (const mutate of [
     (p) => (p.ollama_base = image("retired").reference),
     (p) => (p.llm = {}),
@@ -734,6 +942,92 @@ test("maintainer request rejects foreign forks, events, mutable source and missi
   delete rootPlan.rocm.render_gid;
   delete rootPlan.rocm.video_gid;
   assert.equal(release.validateReleaseInputs(rootPlan, request), rootPlan);
+});
+
+test("qualification and publication reject a CUDA candidate that differs from the producer plan", (t) => {
+  const directory = temp(t);
+  const { manifest } = fixture();
+  const plan = {
+    schema_version: 2,
+    source: manifest.source,
+    version: manifest.version,
+    platform: manifest.platform,
+    cuda_channel: "cu129",
+  };
+  seed(directory, {
+    "manifest.json": JSON.stringify(manifest),
+    "plan.json": JSON.stringify(plan),
+    "images.json": "{}",
+  });
+  for (const phase of ["qualify", "publish"]) {
+    const result = spawnSync(
+      process.execPath,
+      [
+        "scripts/distribution-release.mjs",
+        "--phase",
+        phase,
+        "--output",
+        directory,
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          GITHUB_EVENT_NAME: "workflow_dispatch",
+          GITHUB_REPOSITORY: manifest.source.repository,
+          DISTRIBUTION_FORK_REPOSITORY: manifest.source.repository,
+          GITHUB_SHA: manifest.source.commit,
+          DISTRIBUTION_SOURCE_SHA: manifest.source.commit,
+          DISTRIBUTION_VERSION: manifest.version,
+          DISTRIBUTION_VARIANT: "ocr-cuda",
+          GITHUB_RUN_ID: "123",
+          DISTRIBUTION_CI_RESULT: "success",
+        },
+      },
+    );
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /Candidate CUDA channel differs from approved producer plan/,
+    );
+  }
+});
+
+test("release binds approved package pins and source identities to the exact candidate image", async () => {
+  const { candidateBundleEvidence } =
+    await import("./distribution-release.mjs");
+  const bundle = {
+    accelerator: "cuda",
+    expected_packages: { "paddlepaddle-gpu": "3.3.1", paddleocr: "3.7.0" },
+  };
+  const expected_packages = { ...bundle.expected_packages, numpy: "2.2.6" };
+  const source_files = {
+    "profile.json": hash("profile"),
+    "runtime-lock.json": hash("runtime"),
+  };
+  const actual = candidateBundleEvidence(
+    "immutable-candidate:local",
+    bundle,
+    (command, args) => {
+      assert.equal(command, "docker");
+      assert.deepEqual(args.slice(0, 8), [
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--entrypoint",
+        "python",
+        "immutable-candidate:local",
+        "-c",
+      ]);
+      const [probe, pins, accelerator] = args.slice(8);
+      assert.match(probe, /bind_approved_dependencies/);
+      assert.deepEqual(JSON.parse(pins), bundle.expected_packages);
+      assert.equal(accelerator, bundle.accelerator);
+      return Buffer.from(JSON.stringify({ expected_packages, source_files }));
+    },
+  );
+  assert.deepEqual(actual, { expected_packages, source_files });
 });
 
 test("native bundles reject non-root image config", (t) => {
@@ -1481,6 +1775,7 @@ test("v2 producers stage and verify every external-only variant while native bun
       version: manifest.version,
       platform: manifest.platform,
       ...(app ? { postgres: manifest.images.postgres.reference } : {}),
+      ...(accelerator === "cuda" ? { cuda_channel: "cu129" } : {}),
       ...(accelerator === "rocm"
         ? { rocm: { targets: ["gfx1030"], render_node: "/dev/dri/renderD128" } }
         : {}),

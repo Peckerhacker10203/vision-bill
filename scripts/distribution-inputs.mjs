@@ -80,30 +80,13 @@ function trusted(path, file = false) {
 }
 function approvedFiles(directory, request) {
   selection(request);
-  const plan = validateReleaseInputs(
+  validateReleaseInputs(
     read(trusted(join(directory, "release-inputs.json"), true)),
     request,
   );
-  check(
-    equal(Object.keys(plan.source).sort(), ["commit", "repository"]),
-    "Unknown source metadata",
-  );
   const appOcr = request.variant.startsWith("app-ocr"),
-    app = request.variant === "app" || appOcr,
     accelerator =
       request.variant === "app" ? null : request.variant.split("-").at(-1);
-  const allowed = [
-    "schema_version",
-    "source",
-    "version",
-    "platform",
-    ...(app ? ["postgres"] : []),
-    ...(accelerator === "rocm" ? ["rocm"] : []),
-  ];
-  check(
-    Object.keys(plan).every((key) => allowed.includes(key)),
-    "Input metadata outside selected variant",
-  );
   const files = new Map([["release-inputs.json", null]]);
   if (accelerator) {
     const name = `${accelerator}/bundle.json`,

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Resolve the official cu126 wheel BEFORE build; never infer its hash or metadata.
+"""Resolve an official CUDA wheel before build using downloaded bytes and metadata.
 
-Requires Python 3.12, uv and packaging (provided by the Make targets). Network failures leave the committed unresolved gate
-intact. Output lock and attestation belong together and are verified by Docker.
+Requires Python 3.12, uv and packaging (provided by the Make targets). Network
+failures leave the existing inputs intact. Docker verifies the generated lock
+and attestation together.
 """
 
 import argparse
@@ -17,47 +18,87 @@ import tempfile
 import urllib.parse
 import urllib.request
 import zipfile
+from http.client import HTTPMessage
 from pathlib import Path
-from typing import Any
+from typing import IO, Any, Never
 
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
-INDEX = "https://www.paddlepaddle.org.cn/packages/stable/cu126/paddlepaddle-gpu/"
-HOSTS = {"www.paddlepaddle.org.cn", "paddle-whl.bj.bcebos.com"}
+INDEXES = {
+    channel: f"https://www.paddlepaddle.org.cn/packages/stable/{channel}/paddlepaddle-gpu/"
+    for channel in ("cu126", "cu129")
+}
+DEFAULT_CHANNEL = "cu126"
+INDEX = INDEXES[DEFAULT_CHANNEL]
+HOSTS = {"www.paddlepaddle.org.cn", "paddle-whl.bj.bcebos.com", "paddle-whl.cdn.bcebos.com"}
 WHEEL = re.compile(
-    r"paddlepaddle_gpu-3\.3\.1-cp312-cp312-(?:linux_x86_64|manylinux[^/]*x86_64)\.whl$"
+    r"paddlepaddle_gpu-3\.3\.1-cp312-cp312-(?:linux_x86_64|manylinux[\w.]*x86_64)\.whl$",
+    re.ASCII,
 )
 
 
+class NoRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: HTTPMessage,
+        newurl: str,
+    ) -> Never:
+        raise ValueError("Official CUDA input attempted an HTTP redirect")
+
+
 class Links(html.parser.HTMLParser):
-    def __init__(self) -> None:
+    def __init__(self, index: str) -> None:
         super().__init__()
+        self.index = index
         self.urls: set[str] = set()
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag == "a":
             for key, value in attrs:
-                if key == "href" and value:
-                    self.urls.add(urllib.parse.urljoin(INDEX, value))
+                if key == "href" and value and re.fullmatch(r"[\x21-\x7e]+", value):
+                    try:
+                        self.urls.add(urllib.parse.urljoin(self.index, value.split("#", 1)[0]))
+                    except ValueError:
+                        continue
 
 
-def select_wheel(document: str) -> str:
-    links = Links()
-    links.feed(document)
-    candidates = []
-    for url in links.urls:
+def official_index(channel: str) -> str:
+    if channel not in INDEXES:
+        raise ValueError(f"Unsupported CUDA channel {channel!r}")
+    return INDEXES[channel]
+
+
+def official_wheel(url: str, channel: str) -> bool:
+    try:
         parsed = urllib.parse.urlsplit(url)
-        if (
-            parsed.scheme == "https"
-            and parsed.hostname in HOSTS
-            and "/cu126/" in parsed.path
-            and WHEEL.fullmatch(parsed.path.rsplit("/", 1)[-1])
-        ):
-            candidates.append(url.split("#", 1)[0])
-    if len(set(candidates)) != 1:
-        raise ValueError("Official index must identify exactly one cu126 cp312 x86_64 wheel")
-    return candidates[0]
+    except ValueError:
+        return False
+    directory, _, filename = parsed.path.rpartition("/")
+    return (
+        parsed.netloc in HOSTS
+        and url == f"https://{parsed.netloc}{parsed.path}"
+        and directory
+        in {
+            f"/stable/{channel}",
+            f"/stable/{channel}/paddlepaddle-gpu",
+            f"/packages/stable/{channel}/paddlepaddle-gpu",
+        }
+        and WHEEL.fullmatch(filename) is not None
+    )
+
+
+def select_wheel(document: str, channel: str = DEFAULT_CHANNEL) -> str:
+    links = Links(official_index(channel))
+    links.feed(document)
+    candidates = {url for url in links.urls if official_wheel(url, channel)}
+    if len(candidates) != 1:
+        raise ValueError(f"Official index must identify exactly one {channel} cp312 x86_64 wheel")
+    return candidates.pop()
 
 
 def sha256(path: Path) -> str:
@@ -96,7 +137,9 @@ def executable_requirements(text: str) -> dict[str, tuple[Requirement, frozenset
     return entries
 
 
-def validate_lock(lock: Path, runtime_lock: Path | None = None) -> dict[str, Any]:
+def validate_lock(
+    lock: Path, runtime_lock: Path | None = None, *, channel: str | None = None
+) -> dict[str, Any]:
     text = lock.read_text()
     attestation = lock.with_suffix(".attestation.json")
     if "UNRESOLVED" in text or not text.strip() or not attestation.is_file():
@@ -114,7 +157,7 @@ def validate_lock(lock: Path, runtime_lock: Path | None = None) -> dict[str, Any
         "lock_sha256",
         "platform",
     }
-    if not isinstance(data, dict) or set(data) != fields:
+    if not isinstance(data, dict) or set(data) not in (fields, fields | {"cuda_channel"}):
         raise ValueError("CUDA attestation schema is incomplete or unsupported")
     for key in ("index_sha256", "wheel_sha256", "metadata_sha256", "lock_sha256"):
         if not isinstance(data[key], str) or not re.fullmatch(r"[0-9a-f]{64}", data[key]):
@@ -126,18 +169,13 @@ def validate_lock(lock: Path, runtime_lock: Path | None = None) -> dict[str, Any
         or not isinstance(data["wheel_url"], str)
     ):
         raise ValueError("CUDA attestation metadata is invalid")
-    parsed = urllib.parse.urlsplit(data["wheel_url"])
+    attested_channel = data.get("cuda_channel", DEFAULT_CHANNEL)
     if (
-        data["index"] != INDEX
-        or parsed.scheme != "https"
-        or parsed.hostname not in HOSTS
-        or parsed.username
-        or parsed.password
-        or parsed.port
-        or parsed.query
-        or parsed.fragment
-        or "/cu126/" not in parsed.path
-        or not WHEEL.fullmatch(parsed.path.rsplit("/", 1)[-1])
+        not isinstance(attested_channel, str)
+        or attested_channel not in INDEXES
+        or (channel is not None and channel != attested_channel)
+        or data["index"] != INDEXES[attested_channel]
+        or not official_wheel(data["wheel_url"], attested_channel)
         or data["lock_sha256"] != sha256(lock)
         or data["metadata_name"] != "paddlepaddle-gpu"
         or data["metadata_version"] != "3.3.1"
@@ -192,18 +230,18 @@ def validate_lock(lock: Path, runtime_lock: Path | None = None) -> dict[str, Any
     return data
 
 
-def resolve(service: Path) -> None:
+def resolve(service: Path, channel: str = DEFAULT_CHANNEL) -> None:
+    index = official_index(channel)
+    opener = urllib.request.build_opener(NoRedirects())
     os.environ["SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEX"] = "3.7.2"
     os.environ["SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEOCR"] = "3.7.0"
-    with urllib.request.urlopen(INDEX, timeout=60) as response:
+    with opener.open(index, timeout=60) as response:
         document = response.read().decode()
-    url = select_wheel(document)
+    url = select_wheel(document, channel)
     with tempfile.TemporaryDirectory(prefix="cuda-lock-") as scratch:
         directory = Path(scratch)
         wheel = directory / urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1]
-        with urllib.request.urlopen(url, timeout=600) as response, wheel.open("wb") as target:
-            if urllib.parse.urlsplit(response.geturl()).hostname not in HOSTS:
-                raise ValueError("Official wheel redirected to an unapproved host")
+        with opener.open(url, timeout=600) as response, wheel.open("wb") as target:
             while chunk := response.read(1024 * 1024):
                 target.write(chunk)
         digest = sha256(wheel)
@@ -249,7 +287,8 @@ def resolve(service: Path) -> None:
         with output.open("a") as stream:
             stream.write(f"\npaddlepaddle-gpu @ {url} \\\n    --hash=sha256:{digest}\n")
         data = {
-            "index": INDEX,
+            "cuda_channel": channel,
+            "index": index,
             "index_sha256": hashlib.sha256(document.encode()).hexdigest(),
             "wheel_url": url,
             "wheel_sha256": digest,
@@ -262,7 +301,7 @@ def resolve(service: Path) -> None:
         }
         attestation = output.with_suffix(".attestation.json")
         attestation.write_text(json.dumps(data, sort_keys=True, indent=2) + "\n")
-        validate_lock(output, service / "requirements.runtime.lock")
+        validate_lock(output, service / "requirements.runtime.lock", channel=channel)
         (service / output.name).write_bytes(output.read_bytes())
         (service / attestation.name).write_bytes(attestation.read_bytes())
 
@@ -270,9 +309,12 @@ def resolve(service: Path) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", type=Path)
+    parser.add_argument(
+        "--channel", choices=INDEXES, help="CUDA channel (resolution defaults to cu126)"
+    )
     parser.add_argument("--service", type=Path, default=Path(__file__).resolve().parents[1])
     args = parser.parse_args()
     if args.check:
-        validate_lock(args.check)
+        validate_lock(args.check, channel=args.channel)
     else:
-        resolve(args.service)
+        resolve(args.service, args.channel or DEFAULT_CHANNEL)

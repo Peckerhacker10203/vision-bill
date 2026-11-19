@@ -12,6 +12,8 @@ from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from pydantic import BaseModel, ConfigDict, Field
 
+from .paddle_distribution import installed_native_paddle, native_paddle_distribution
+
 ADAPTER_VERSION = "native-fp32-v1"
 NORMALIZER_VERSION = document_image.NORMALIZER_VERSION
 MODEL_NAMES = (
@@ -114,7 +116,10 @@ class DependencyRecord(BaseModel):
 
 
 def verify_dependencies(
-    expected_packages: dict[str, str], sealed_dependencies: dict[str, Any]
+    expected_packages: dict[str, str],
+    sealed_dependencies: dict[str, Any],
+    *,
+    accelerator: str | None = None,
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Verify only the active execution dependency closure, before native imports."""
 
@@ -126,16 +131,16 @@ def verify_dependencies(
 
     expected = canonical_entries(expected_packages)
     required = {"paddleocr", "paddlex", "pillow", "pillow-heif", "numpy", "pydantic", "packaging"}
-    paddle_names = {name for name in expected if name.startswith("paddlepaddle")}
-    if len(paddle_names) != 1 or not paddle_names <= {"paddlepaddle", "paddlepaddle-gpu"}:
-        raise ValueError("Exactly one intended native Paddle distribution identity is required")
-    required |= paddle_names
+    paddle = native_paddle_distribution(expected, accelerator=accelerator)
+    required.add(paddle)
     if not required <= expected.keys():
         raise ValueError("All required execution dependency identities must be supplied")
     if expected["paddleocr"] != "3.7.0" or expected["paddlex"] != "3.7.2":
         raise ValueError("Native dependency versions must match the pinned OCR adapter")
-    if any(expected[name].split("+", 1)[0] != "3.3.1" for name in paddle_names):
+    if expected[paddle].split("+", 1)[0] != "3.3.1":
         raise ValueError("Native Paddle source version must remain 3.3.1")
+    if installed_native_paddle(accelerator=accelerator) != paddle:
+        raise ValueError("Installed Paddle distribution differs from the expected identity")
     sealed = {
         name: DependencyRecord.model_validate(record)
         for name, record in canonical_entries(sealed_dependencies).items()

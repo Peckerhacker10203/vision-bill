@@ -122,6 +122,38 @@ def test_tiny_artifacts_provision_idempotently_without_selected_state(tmp_path, 
     assert not (state / "selected").exists()
 
 
+@pytest.mark.parametrize("native_name", ["paddlepaddle-dcu", "paddlepaddle", "paddlepaddle-gpu"])
+def test_rocm_release_provisions_one_native_paddle_identity(tmp_path, release, native_name):
+    from ocr_service.provision import provision_bundle
+
+    _, data, _ = release
+    data["accelerator"] = "rocm"
+    packages = data["expected_packages"]
+    packages[native_name] = packages.pop("paddlepaddle-gpu")
+    bundle = load(release)
+    assert bundle.expected_packages[native_name] == "3.3.1"
+    assert provision_bundle(bundle, tmp_path / "state").smoke_path.is_file()
+
+
+@pytest.mark.parametrize("conflicting", ["paddlepaddle", "paddlepaddle-gpu", "PaddlePaddle_DCU"])
+def test_rocm_release_rejects_two_native_paddle_identities(release, conflicting):
+    _, data, _ = release
+    data["accelerator"] = "rocm"
+    packages = data["expected_packages"]
+    packages["paddlepaddle-dcu"] = packages.pop("paddlepaddle-gpu")
+    packages[conflicting] = "3.3.1"
+    with pytest.raises(ValueError, match="one.*Paddle"):
+        load(release)
+
+
+def test_cuda_release_rejects_rocm_wheel_identity(release):
+    _, data, _ = release
+    packages = data["expected_packages"]
+    packages["paddlepaddle-dcu"] = packages.pop("paddlepaddle-gpu")
+    with pytest.raises(ValueError, match="accelerator"):
+        load(release)
+
+
 @pytest.mark.parametrize(
     "breakage",
     ["model", "case", "license", "provenance", "tree", "case_hash", "label", "packages", "source"],

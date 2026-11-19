@@ -17,6 +17,10 @@ import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import {
   validateArtifacts,
+  cudaChannels,
+  cudaLockDigestLabel,
+  defaultCudaChannel,
+  validateCudaLock,
   renderBundle,
   writeBundle,
   fileIdentity,
@@ -97,6 +101,7 @@ export function validateReleaseInputs(plan, request) {
     "version",
     "platform",
     ...(app ? ["postgres"] : []),
+    ...(request.variant.endsWith("cuda") ? ["cuda_channel"] : []),
     ...(request.variant.endsWith("rocm") ? ["rocm"] : []),
   ];
   check(
@@ -117,6 +122,8 @@ export function validateReleaseInputs(plan, request) {
       immutable(plan.postgres),
       "Immutable single-platform PostgreSQL manifest required",
     );
+  if (Object.hasOwn(plan, "cuda_channel"))
+    check(cudaChannels.includes(plan.cuda_channel), "Unsupported CUDA channel");
   if (request.variant.endsWith("rocm")) {
     check(
       plan.rocm &&
@@ -313,6 +320,29 @@ function inspectArchive(path) {
     config_digest: manifest.config.digest,
   };
 }
+export function candidateBundleEvidence(tag, bundle, execute = run) {
+  return JSON.parse(
+    execute("docker", [
+      "run",
+      "--rm",
+      "--network",
+      "none",
+      "--entrypoint",
+      "python",
+      tag,
+      "-c",
+      [
+        "import json, sys",
+        "from ocr_service.bootstrap import bind_approved_dependencies",
+        "from ocr_service.provision import source_identities",
+        "pins = bind_approved_dependencies(json.loads(sys.argv[1]), accelerator=sys.argv[2])",
+        "print(json.dumps(dict(expected_packages=pins, source_files=source_identities())))",
+      ].join("\n"),
+      JSON.stringify(bundle.expected_packages),
+      bundle.accelerator,
+    ]),
+  );
+}
 function build(request, inputs, output) {
   check(
     run("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim() ===
@@ -431,7 +461,9 @@ function build(request, inputs, output) {
       const nativeDirectory = join(output, accelerator);
       copyAssets(join(inputs, accelerator), nativeDirectory);
       const args = [];
+      let cudaLockDigest;
       if (accelerator === "cuda") {
+        const channel = plan.cuda_channel ?? defaultCudaChannel;
         run(
           "uv",
           [
@@ -441,17 +473,31 @@ function build(request, inputs, output) {
             "packaging==26.2",
             "python",
             "paddleocr-service/build/resolve_cuda.py",
+            "--channel",
+            channel,
           ],
           { stdio: "inherit" },
         );
+        const attestation = readFileSync(
+          "paddleocr-service/requirements.cuda.attestation.json",
+        );
+        const lock = readFileSync("paddleocr-service/requirements.cuda.lock");
+        const metadata = JSON.parse(attestation);
+        validateCudaLock(metadata, channel);
+        cudaLockDigest = hash(lock);
+        check(
+          cudaLockDigest === metadata.lock_sha256,
+          "Resolved CUDA lock differs from attestation",
+        );
         writeFileSync(
           join(nativeDirectory, "requirements.cuda.lock"),
-          readFileSync("paddleocr-service/requirements.cuda.lock"),
+          lock,
         );
         writeFileSync(
           join(nativeDirectory, "lock-attestation.json"),
-          readFileSync("paddleocr-service/requirements.cuda.attestation.json"),
+          attestation,
         );
+        args.push("--label", cudaLockDigestLabel + "=" + cudaLockDigest);
       } else
         args.push(
           "--build-arg",
@@ -464,6 +510,27 @@ function build(request, inputs, output) {
           "paddleocr-service",
           args,
         );
+      if (accelerator === "cuda") {
+        const installedLock = "/opt/locks/requirements.cuda.lock";
+        const measured = run(
+          "docker",
+          [
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--entrypoint",
+            "sha256sum",
+            tag,
+            installedLock,
+          ],
+          { encoding: "utf8" },
+        ).trim();
+        check(
+          measured === cudaLockDigest + "  " + installedLock,
+          "Candidate image CUDA lock differs from attested executable lock",
+        );
+      }
       // Export the exact Docker image-save config, then compare to actual inspect ID.
       const saved = join(output, "native-image-save.tar");
       run("docker", ["image", "save", "--output", saved, tag], {
@@ -492,19 +559,12 @@ function build(request, inputs, output) {
       );
       bundle.image_identity = manifest.images[name].reference;
       bundle.image_config_sha256 = hash(config);
-      bundle.source_files = JSON.parse(
-        run("docker", [
-          "run",
-          "--rm",
-          "--network",
-          "none",
-          "--entrypoint",
-          "python",
-          tag,
-          "-c",
-          "import json; from ocr_service.provision import source_identities; print(json.dumps(source_identities()))",
-        ]),
+      const { expected_packages, source_files } = candidateBundleEvidence(
+        tag,
+        bundle,
       );
+      bundle.expected_packages = expected_packages;
+      bundle.source_files = source_files;
       bundle.profile_sha256 = bundle.source_files["profile.json"];
       save(join(nativeDirectory, "bundle.json"), bundle);
       manifest.native = {
@@ -514,7 +574,12 @@ function build(request, inputs, output) {
           qualification: `${accelerator}/qualification.json`,
           seal: `${accelerator}/qualification-manifest.json`,
           ...(accelerator === "cuda"
-            ? { cuda_lock: `${accelerator}/lock-attestation.json` }
+            ? {
+                cuda_lock: `${accelerator}/lock-attestation.json`,
+                ...(plan.cuda_channel
+                  ? { cuda_channel: plan.cuda_channel }
+                  : {}),
+              }
             : {}),
         },
       };
@@ -537,6 +602,14 @@ function lstatExists(path) {
     throw error;
   }
 }
+function verifyCandidateCudaChannel(plan, manifest, accelerator) {
+  if (accelerator === "cuda")
+    check(
+      (manifest.native?.cuda?.cuda_channel ?? defaultCudaChannel) ===
+        (plan.cuda_channel ?? defaultCudaChannel),
+      "Candidate CUDA channel differs from approved producer plan",
+    );
+}
 function qualify(request, output, env) {
   check(
     env.DISTRIBUTION_CI_RESULT === "success",
@@ -547,6 +620,7 @@ function qualify(request, output, env) {
     plan = validateReleaseInputs(read(join(output, "plan.json")), request);
   const accelerator =
     request.variant === "app" ? null : request.variant.split("-").at(-1);
+  verifyCandidateCudaChannel(plan, manifest, accelerator);
   if (accelerator) {
     check(
       ["external-llm-quiesced", "separate-ocr-device"].includes(
@@ -710,7 +784,9 @@ async function publish(request, output, env) {
     "Exact-source CI gate must pass first",
   );
   const manifest = read(join(output, "manifest.json")),
-    records = read(join(output, "images.json"));
+    records = read(join(output, "images.json")),
+    plan = validateReleaseInputs(read(join(output, "plan.json")), request);
+  verifyCandidateCudaChannel(plan, manifest, request.variant.split("-").at(-1));
   check(
     manifest.source.repository === request.repository &&
       manifest.source.commit === request.sha &&

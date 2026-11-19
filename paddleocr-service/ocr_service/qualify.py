@@ -198,7 +198,9 @@ def compute_probe(paddle: Any, gpu_index: int) -> dict[str, Any]:
 
 def collect(payload: dict[str, Any]) -> dict[str, Any]:
     runtime = RuntimeSettings.model_validate(payload["runtime"])
-    verify_dependencies(runtime.expected_packages, payload["dependencies"])
+    verify_dependencies(
+        runtime.expected_packages, payload["dependencies"], accelerator=runtime.accelerator
+    )
     profile = load_profile(PROFILE)
     native, paddle, runner_type = construct_native(profile, runtime)
     device = device_identity(paddle, runtime)
@@ -350,21 +352,11 @@ def qualify_runtime(runtime: RuntimeSettings, cases: Path, output: Path) -> Qual
             raise ValueError("An immutable built image digest is required")
         report.profile = load_profile(PROFILE).model_dump()
         report.stage = "dependencies"
-        native_packages = [
-            name
-            for name in ("paddlepaddle", "paddlepaddle-gpu")
-            if any(
-                str(dist.metadata["Name"]).lower().replace("_", "-") == name
-                for dist in importlib.metadata.distributions()
-            )
-        ]
-        if len(native_packages) != 1:
-            raise ValueError("Exactly one native Paddle installation is required")
-        expected, dependencies = seal_dependencies(native_packages[0])
+        expected, dependencies = seal_dependencies(accelerator=runtime.accelerator)
         if runtime.expected_packages and runtime.expected_packages != expected:
             raise ValueError("Runtime expected packages differ from installed lock")
         runtime = runtime.model_copy(update={"expected_packages": expected})
-        verify_dependencies(expected, dependencies)
+        verify_dependencies(expected, dependencies, accelerator=runtime.accelerator)
         report.model_content = {
             name: tree_identity(runtime.model_dirs[name]) for name in MODEL_NAMES
         }
@@ -418,7 +410,7 @@ def qualify_runtime(runtime: RuntimeSettings, cases: Path, output: Path) -> Qual
                 name: tree_identity(runtime.model_dirs[name]) for name in MODEL_NAMES
             }:
                 raise ValueError("Model bytes changed during qualification")
-            verify_dependencies(expected, dependencies)
+            verify_dependencies(expected, dependencies, accelerator=runtime.accelerator)
         report.stage = "publish_runtime"
         write_json(serving, runtime.model_dump(mode="json"))
         target = report.device.get("gfx_target") or report.device.get("name")
@@ -463,7 +455,9 @@ def main() -> None:
         payload = json.loads(args.stage_input.read_bytes())
         if args.stage == "inspect":
             runtime = RuntimeSettings.model_validate(payload["runtime"])
-            verify_dependencies(runtime.expected_packages, payload["dependencies"])
+            verify_dependencies(
+                runtime.expected_packages, payload["dependencies"], accelerator=runtime.accelerator
+            )
             paddle = importlib.import_module("paddle")
             if str(paddle.version.commit) != runtime.expected_paddle_commit:
                 raise ValueError("Inspector Paddle source identity mismatch")

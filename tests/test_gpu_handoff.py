@@ -1,8 +1,11 @@
 """Internal model handoff tests; no hardware or inference is exercised."""
 import asyncio
 import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 from time import monotonic
 
+import httpx
 import pytest
 from PIL import Image
 
@@ -164,6 +167,93 @@ def test_native_ocr_resource_identity_is_stable_and_hides_endpoint_credentials()
     assert first.lifecycle_identity != PaddleOcrProvider("http://other-native:8000").lifecycle_identity
     assert "secret" not in first.lifecycle_identity
     assert "native" not in first.lifecycle_identity
+
+
+@pytest.fixture
+def ocr_lifecycle_http():
+    from vision_bill.provider.ocr.paddleocr import PaddleOcrProvider
+
+    parked = {"ready": False, "generation": 2, "reason_code": "ocr_parked",
+              "profile_id": None, "runtime_fingerprint": None}
+    active = {"ready": True, "generation": 2, "reason_code": None,
+              "profile_id": "profile", "runtime_fingerprint": "runtime"}
+    responses = {"claim": (200, parked), "load": (200, active), "park": (200, parked)}
+
+    class Endpoint(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            action = self.path.removeprefix("/lifecycle/")
+            status, payload = responses[action]
+            body = b"" if payload is None else json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Endpoint) as server:
+        thread = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+        thread.start()
+        try:
+            yield PaddleOcrProvider(f"http://127.0.0.1:{server.server_port}"), responses
+        finally:
+            server.shutdown()
+            thread.join()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "status", "payload"),
+    [
+        pytest.param("claim", 200, None, id="claim-empty"),
+        pytest.param("park", 200, None, id="park-empty"),
+        pytest.param("park", 202, {"ready": False, "generation": 2, "reason_code": "ocr_parked"},
+                     id="park-accepted"),
+        pytest.param("park", 200, {"ready": True, "generation": 2, "reason_code": "ocr_parked"},
+                     id="park-still-active"),
+        pytest.param("park", 200, {"ready": "false", "generation": 2, "reason_code": "ocr_parked"},
+                     id="park-invalid-type"),
+        pytest.param("park", 200, {"ready": False, "generation": 2, "reason_code": "ocr_starting"},
+                     id="park-starting"),
+        pytest.param("park", 200, {"ready": False, "reason_code": "ocr_parked"},
+                     id="park-missing-generation"),
+        pytest.param("load", 200, {"ready": False, "generation": 2, "reason_code": "ocr_parked"},
+                     id="load-still-parked"),
+    ],
+)
+async def test_invalid_ocr_lifecycle_acknowledgement_blocks_llm(
+    tmp_path, monkeypatch, ocr_lifecycle_http, action, status, payload,
+):
+    from vision_bill.service.gpu_handoff import ModelHandoff
+
+    enable_managed_ocr(monkeypatch)
+    provider, responses = ocr_lifecycle_http
+    handoff = ModelHandoff(tmp_path / "handoff", Llm([]), provider)
+    async with handoff.session(monotonic() + 2) as owner:
+        await owner.ocr_phase()
+        await owner.llm_phase("formatter")
+    assert handoff.read_journal().ocr_pending is False
+
+    previous = responses[action]
+    responses[action] = (status, payload)
+    with pytest.raises(httpx.RemoteProtocolError, match=f"ocr_invalid_lifecycle_acknowledgement:{action}"):
+        async with handoff.session(monotonic() + 2) as owner:
+            await owner.ocr_phase()
+            await owner.llm_phase("formatter")
+            pytest.fail("invalid OCR acknowledgement allowed LLM dispatch")
+
+    journal = handoff.read_journal()
+    assert journal.models == []
+    # A rejected load can be followed by a confirmed cleanup park.
+    assert journal.ocr_pending is (action != "load")
+
+    responses[action] = previous
+    async with handoff.session(monotonic() + 2) as owner:
+        await owner.llm_phase("formatter")
+        assert handoff.read_journal().ocr_pending is False
 
 
 @pytest.mark.asyncio

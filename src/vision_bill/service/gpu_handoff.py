@@ -496,7 +496,6 @@ class ModelHandoff:
                 owner.models = saved.models
                 owner.generation = saved.generation + 1
                 owner.unsettled = saved.unsettled
-                owner.ocr_pending = saved.ocr_pending
             if owner.unsettled:
                 raise HandoffWait(HandoffStatus(state="recovery_required", reason_code="model_request_unsettled"))
             if any(model not in owner.binding.model_ids for model in owner.models):

@@ -1,6 +1,7 @@
 import copy
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -84,8 +85,6 @@ def test_identity_separates_effective_content_from_device():
 
 
 def test_dependency_identity_hashes_installed_content_and_ignores_bytecode(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-
     from ocr_service import profile
 
     code = tmp_path / "module.py"
@@ -119,6 +118,11 @@ def native_dependencies(monkeypatch):
     }
     requirements = {name: [] for name in versions}
     contents = {name: "a" * 64 for name in versions}
+    monkeypatch.setattr(
+        profile.importlib.metadata,
+        "distributions",
+        lambda: [SimpleNamespace(metadata={"Name": "paddlepaddle-gpu"})],
+    )
     monkeypatch.setattr(profile.importlib.metadata, "version", versions.__getitem__)
     monkeypatch.setattr(profile.importlib.metadata, "requires", requirements.__getitem__)
     monkeypatch.setattr(profile, "dependency_identity", contents.__getitem__)

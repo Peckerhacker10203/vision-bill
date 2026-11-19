@@ -249,6 +249,16 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "External verified native OCR release bundle. Semantic validation additionally requires exactly four approved model names, five distinct case kinds, matching complete file/tree/size inventories, sealed license texts, pinned packages, and exhaustive installed source identities. No supplied artifact is release qualified until the unchanged full physical native gate succeeds.",
+  "if": {
+    "properties": { "accelerator": { "const": "cuda" } }
+  },
+  "then": {
+    "properties": {
+      "expected_packages": {
+        "properties": { "paddlepaddle-dcu": false }
+      }
+    }
+  },
   "properties": {
     "accelerator": {
       "enum": [
@@ -262,7 +272,13 @@
       "additionalProperties": {
         "type": "string"
       },
+      "description": "Pinned package versions with exactly one native Paddle distribution. The paddlepaddle-dcu identity is available for ROCm.",
       "minProperties": 3,
+      "oneOf": [
+        { "required": ["paddlepaddle"] },
+        { "required": ["paddlepaddle-gpu"] },
+        { "required": ["paddlepaddle-dcu"] }
+      ],
       "title": "Expected Packages",
       "type": "object"
     },

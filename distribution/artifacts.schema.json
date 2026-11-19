@@ -142,6 +142,9 @@
         },
         "cuda_lock": {
           "$ref": "#/$defs/path"
+        },
+        "cuda_channel": {
+          "enum": ["cu126", "cu129"]
         }
       }
     }

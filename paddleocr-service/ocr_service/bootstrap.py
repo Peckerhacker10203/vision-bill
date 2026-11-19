@@ -12,21 +12,25 @@ from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
 from .fp32 import floating_dtype
+from .paddle_distribution import installed_native_paddle, native_paddle_distribution
 from .precision import HookRecord, ParameterRecord
 from .profile import dependency_identity, file_digest
 
 INSPECTOR_VERSION = "pinned-export-inventory-v1"
 
 
-def seal_dependencies(native_package: str) -> tuple[dict[str, str], dict[str, Any]]:
-    if native_package not in {"paddlepaddle", "paddlepaddle-gpu"}:
-        raise ValueError("Unknown native Paddle distribution")
+def seal_dependencies(
+    native_package: str | None = None, *, accelerator: str | None = None
+) -> tuple[dict[str, str], dict[str, Any]]:
+    installed = installed_native_paddle(accelerator=accelerator)
+    if native_package is not None and native_package != installed:
+        raise ValueError("Installed Paddle distribution differs from the approved identity")
     active = {
         name: set[str]()
         for name in (
             "paddleocr",
             "paddlex",
-            native_package,
+            installed,
             "pillow",
             "pillow-heif",
             "numpy",
@@ -66,6 +70,18 @@ def seal_dependencies(native_package: str) -> tuple[dict[str, str], dict[str, An
         for name in sorted(active)
     }
     return versions, records
+
+
+def bind_approved_dependencies(
+    expected: dict[str, str], *, accelerator: str | None = None
+) -> dict[str, str]:
+    """Bind approved package pins to the installed execution dependency closure."""
+    native_package = native_paddle_distribution(expected, accelerator=accelerator)
+    versions, _ = seal_dependencies(native_package, accelerator=accelerator)
+    for name, version in expected.items():
+        if versions.get(name) != version:
+            raise ValueError(f"Installed package version differs from approved {name}")
+    return versions
 
 
 class HookCollector:

@@ -257,6 +257,7 @@ src/vision_bill/static/*
 server_data/ocr-cache/
 server_data/ocr-models/
 server_data/ocr-runtime/
+server_data/ocr-source/
 paddleocr-service/.native-build/
 paddleocr-service/.qualification/
 paddleocr-service/.wheelhouse/
@@ -270,5 +271,7 @@ paddleocr-service/build/*
 !paddleocr-service/build/source_inventory.py
 !paddleocr-service/build/inspect_kernels.py
 !paddleocr-service/build/resolve_cuda.py
+!paddleocr-service/build/prepare_paddle_models.py
+!paddleocr-service/build/prepare_ocr_inputs.py
 !paddleocr-service/build/runtime.in
 !paddleocr-service/build/native-build.in

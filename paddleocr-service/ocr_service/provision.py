@@ -4,6 +4,7 @@ The release bundle is external to the image. No native framework is imported her
 Local sources are resolved relative to that bundle; remote sources require HTTPS.
 """
 
+import ctypes
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ from typing import Annotated, Any, Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from .initialization_lock import installation_lock
+from .paddle_distribution import native_paddle_distribution
 
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 MODEL_NAMES = ("PP-DocLayoutV3", "PP-LCNet_x1_0_doc_ori", "UVDoc", "PaddleOCR-VL-1.6-0.9B")
@@ -30,6 +32,22 @@ SERVICE = Path(__file__).resolve().parents[1]
 def file_digest(path: Path) -> str:
     with path.open("rb") as source:
         return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+def publish_directory(staged: Path, output: Path) -> None:
+    # Linux renameat2 supports a no-replace directory rename. Path.rename could
+    # replace an empty directory created between staging and publication.
+    at_fdcwd, rename_noreplace = -100, 1
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        rename = libc.renameat2
+    except AttributeError as exc:
+        raise OSError("Atomic output publication requires Linux renameat2 support") from exc
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if rename(at_fdcwd, os.fsencode(staged), at_fdcwd, os.fsencode(output), rename_noreplace) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), output)
 
 
 def content_identity(value: Any) -> str:
@@ -164,10 +182,8 @@ class ReleaseBundle(Record):
             or self.expected_packages.get("paddlex") != "3.7.2"
         ):
             raise ValueError("Pinned OCR/PaddleX package identities required")
-        paddle = [
-            name for name in self.expected_packages if name in {"paddlepaddle", "paddlepaddle-gpu"}
-        ]
-        if len(paddle) != 1 or self.expected_packages[paddle[0]].split("+", 1)[0] != "3.3.1":
+        paddle = native_paddle_distribution(self.expected_packages, accelerator=self.accelerator)
+        if self.expected_packages.get(paddle, "").split("+", 1)[0] != "3.3.1":
             raise ValueError("One pinned native Paddle identity required")
         return self
 

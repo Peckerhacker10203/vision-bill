@@ -294,7 +294,9 @@ def build_pipeline(profile: OcrProfile, runtime: RuntimeSettings) -> PipelineAda
         raise ValueError("Build native pipeline in a fresh worker before importing PaddleX")
     manifest = json.loads(runtime.qualification_manifest.read_text())
     versions, dependency_content = verify_dependencies(
-        runtime.expected_packages, manifest.get("dependencies", {})
+        runtime.expected_packages,
+        manifest.get("dependencies", {}),
+        accelerator=runtime.accelerator,
     )
     inspector = f"paddle:{runtime.expected_paddle_commit}"
     if (

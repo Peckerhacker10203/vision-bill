@@ -31,6 +31,12 @@ const variants = [
   "app-ocr-cuda",
   "app-ocr-rocm",
 ];
+export const cudaChannels = ["cu126", "cu129"];
+export const defaultCudaChannel = "cu126";
+export const cudaLockDigestLabel = "io.vision-bill.cuda.lock-sha256";
+const cudaWheelUrl =
+  /^https:\/\/(?:www\.paddlepaddle\.org\.cn|paddle-whl\.(?:bj|cdn)\.bcebos\.com)\/(packages\/)?stable\/(cu126|cu129)\/(paddlepaddle-gpu\/)?paddlepaddle_gpu-3\.3\.1-cp312-cp312-(?:linux_x86_64|manylinux[\w.]*x86_64)\.whl$/;
+const nativeAssetPaths = ({ cuda_channel, ...paths }) => Object.values(paths);
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 const canonical = (value) =>
   Array.isArray(value)
@@ -148,9 +154,14 @@ export function validateArtifacts(manifest) {
       manifest.images[`ocr-${accelerator}`],
       "Missing native image identity",
     );
-    for (const path of Object.values(native)) requireAsset(path);
+    for (const path of nativeAssetPaths(native)) requireAsset(path);
     if (accelerator === "cuda")
       check(native.cuda_lock, "Missing resolved CUDA lock evidence");
+    else
+      check(
+        !Object.hasOwn(native, "cuda_channel"),
+        "CUDA channel requires CUDA image",
+      );
   }
   return manifest;
 }
@@ -371,7 +382,7 @@ export function renderBundle(manifest, variant) {
     volumes["ocr-state"] = {};
     volumes.coordination = {};
     const native = manifest.native[accelerator];
-    for (const path of Object.values(native)) assets.add(path);
+    for (const path of nativeAssetPaths(native)) assets.add(path);
     const mounts = [
       volume("ocr-state", "/var/lib/ocr"),
       volume("coordination", "/coord"),
@@ -512,6 +523,68 @@ function checkedRead(base, path, record) {
   );
   return full;
 }
+export function validateCudaLock(lock, channel) {
+  const wheel =
+    typeof lock?.wheel_url === "string" && cudaWheelUrl.exec(lock.wheel_url);
+  const attestedChannel = Object.hasOwn(lock ?? {}, "cuda_channel")
+    ? lock.cuda_channel
+    : defaultCudaChannel;
+  check(
+    cudaChannels.includes(channel) &&
+      attestedChannel === channel &&
+      lock?.index ===
+        `https://www.paddlepaddle.org.cn/packages/stable/${channel}/paddlepaddle-gpu/` &&
+      wheel?.[0] === lock.wheel_url &&
+      wheel?.[2] === channel &&
+      (!wheel[1] || wheel[3]),
+    "Official CUDA channel/index/wheel evidence mismatch",
+  );
+  check(
+    lock.metadata_name === "paddlepaddle-gpu" &&
+      lock.metadata_version === "3.3.1" &&
+      lock.platform === "linux-x86_64-cp312" &&
+      Array.isArray(lock.requires_dist) &&
+      lock.requires_dist.length > 0 &&
+      lock.requires_dist.every(
+        (requirement) => typeof requirement === "string",
+      ) &&
+      ["index_sha256", "wheel_sha256", "metadata_sha256", "lock_sha256"].every(
+        (key) =>
+          typeof lock[key] === "string" && /^[a-f0-9]{64}$/.test(lock[key]),
+      ),
+    "Official CUDA wheel/metadata resolution evidence missing",
+  );
+}
+function verifyExecutableCudaLock(text, lock) {
+  // uv emits one hashed requirement per logical line. Comments and wrapped
+  // hashes are allowed, but requirement files and installer options are not.
+  const statements = text
+    .replace(/(^|[ \t]+)#[^\r\n]*/gm, "")
+    .replace(/\\[ \t]*\r?\n/g, " ")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const paddle = [];
+  const expectedHash = "--hash=sha256:" + lock.wheel_sha256;
+  for (const statement of statements) {
+    const entry =
+      /^([a-zA-Z0-9][a-zA-Z0-9._-]*)\s*(?:@\s*(\S+)|==\s*[^\s;]+)((?:[ \t]+--hash=sha256:[a-f0-9]{64})+)$/.exec(
+        statement,
+      );
+    check(entry, "Invalid pinned requirement in executable CUDA lock");
+    const [, rawName, url, hashes] = entry;
+    const name = rawName.toLowerCase().replace(/[-_.]+/g, "-");
+    if (name.startsWith("paddlepaddle"))
+      paddle.push({ name, url, hashes: hashes.trim().split(/\s+/) });
+  }
+  check(
+    paddle.length === 1 &&
+      paddle[0].name === "paddlepaddle-gpu" &&
+      paddle[0].url === lock.wheel_url &&
+      paddle[0].hashes.every((value) => value === expectedHash),
+    "Executable CUDA lock must contain the one attested Paddle wheel pin",
+  );
+}
 function verifyEvidence(manifest, variant, contents) {
   const read = (path) => {
     check(
@@ -563,12 +636,19 @@ function verifyEvidence(manifest, variant, contents) {
     "Pinned OCR packages required",
   );
   const paddle = Object.keys(bundle.expected_packages).filter((name) =>
-    ["paddlepaddle", "paddlepaddle-gpu"].includes(name),
+    name.toLowerCase().startsWith("paddlepaddle"),
   );
   check(
     paddle.length === 1 &&
+      ["paddlepaddle", "paddlepaddle-gpu", "paddlepaddle-dcu"].includes(
+        paddle[0],
+      ) &&
       bundle.expected_packages[paddle[0]].split("+")[0] === "3.3.1",
     "Pinned native Paddle required",
+  );
+  check(
+    paddle[0] !== "paddlepaddle-dcu" || accelerator === "rocm",
+    "The paddlepaddle-dcu distribution requires the ROCm accelerator",
   );
   check(
     bundle.source_files["profile.json"] === bundle.profile_sha256 &&
@@ -577,7 +657,7 @@ function verifyEvidence(manifest, variant, contents) {
   );
   const allowedAssets = new Set([
     manifest.verification.app_checks,
-    ...Object.values(native),
+    ...nativeAssetPaths(native),
   ]);
   const activation = variant.startsWith("app-ocr-");
   for (const [name, archive] of Object.entries({
@@ -740,36 +820,24 @@ function verifyEvidence(manifest, variant, contents) {
     "Full native fresh-worker qualification missing",
   );
   if (accelerator === "cuda") {
-    allowedAssets.add("cuda/requirements.cuda.lock");
+    const lockPath = "cuda/requirements.cuda.lock";
+    allowedAssets.add(lockPath);
     const lock = read(native.cuda_lock);
+    validateCudaLock(lock, native.cuda_channel ?? defaultCudaChannel);
     check(
-      lock.index ===
-        "https://www.paddlepaddle.org.cn/packages/stable/cu126/paddlepaddle-gpu/" &&
-        ["www.paddlepaddle.org.cn", "paddle-whl.bj.bcebos.com"].includes(
-          new URL(lock.wheel_url).hostname,
-        ) &&
-        new URL(lock.wheel_url).protocol === "https:",
-      "Official CUDA host evidence missing",
-    );
-    check(
-      lock.metadata_name === "paddlepaddle-gpu" &&
-        lock.metadata_version === "3.3.1" &&
-        lock.platform === "linux-x86_64-cp312" &&
-        Array.isArray(lock.requires_dist) &&
-        lock.requires_dist.length > 0 &&
-        [
-          "index_sha256",
-          "wheel_sha256",
-          "metadata_sha256",
-          "lock_sha256",
-        ].every((key) => /^[a-f0-9]{64}$/.test(lock[key])),
-      "Official CUDA wheel/metadata resolution evidence missing",
-    );
-    check(
-      contents["cuda/requirements.cuda.lock"] &&
-        manifest.assets["cuda/requirements.cuda.lock"].sha256 ===
-          lock.lock_sha256,
+      contents[lockPath] &&
+        manifest.assets[lockPath].size_bytes <= 32 * 1024 * 1024 &&
+        manifest.assets[lockPath].sha256 === lock.lock_sha256,
       "Resolved CUDA lock hash mismatch",
+    );
+    verifyExecutableCudaLock(readFileSync(contents[lockPath], "utf8"), lock);
+    const measuredLock = config.config?.Labels?.[cudaLockDigestLabel];
+    check(
+      measuredLock === lock.lock_sha256 ||
+        (measuredLock === undefined &&
+          native.cuda_channel === undefined &&
+          !Object.hasOwn(lock, "cuda_channel")),
+      "Candidate image CUDA lock differs from attested executable lock",
     );
   }
   if (activation)
