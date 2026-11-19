@@ -1,4 +1,4 @@
-name: Verify Paddle snapshot metadata
+name: Verify first-click Paddle model acquisition
 
 on:
   push:
@@ -8,40 +8,54 @@ permissions:
   contents: write
 
 jobs:
-  metadata:
+  runtime-download:
     if: github.repository == 'Peckerhacker10203/vision-bill'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
-      - name: Verify immutable Paddle downloads and record digests
+      - name: Exercise runtime model archive acquisition against official hosts
         shell: bash
         run: |
           set -euo pipefail
-          scratch=$(mktemp -d)
-          trap 'rm -rf "$scratch"' EXIT
           export PYTHONPATH=paddleocr-service
-          uv run --no-project --with pydantic==2.13.4 --with packaging==26.2 \
-            python paddleocr-service/build/prepare_paddle_models.py \
-            --archive-base-url https://paddle-metadata.example/snapshots \
-            --output "$scratch/models"
-          python3 - "$scratch/models/models.json" <<'PY'
+          uv run --no-project --with pydantic==2.13.4 --with packaging==26.2 python - <<'PY'
           import json
+          import os
           from pathlib import Path
-          import sys
+          import tempfile
+          from unittest.mock import patch
 
-          records = json.loads(Path(sys.argv[1]).read_text())
-          assert len(records) == 4
-          for record in records.values():
-              provenance = record["provenance"]
-              assert provenance["url"].startswith("https://huggingface.co/PaddlePaddle/")
-              record["source"] = provenance["url"] + "/resolve/" + provenance["revision"]
-          path = Path("paddleocr-service/build/paddle-model-snapshots.json")
-          path.write_text(json.dumps(records, indent=2, sort_keys=True) + "\n")
+          from ocr_service.provision import Archive, extract_archive, fetch_archive
+
+          root = Path("paddleocr-service/build/paddle-model-snapshots.json")
+          records = json.loads(root.read_bytes())
+          result = {}
+          with tempfile.TemporaryDirectory() as temporary:
+              scratch = Path(temporary)
+              for name, record in records.items():
+                  asset = Archive.model_validate(record)
+                  cache = scratch / "cache"
+                  cache.mkdir()
+                  path = fetch_archive(asset, scratch, cache, model_name=name)
+                  with patch("ocr_service.paddle_snapshots.download_model", side_effect=AssertionError):
+                      assert fetch_archive(asset, scratch, cache, model_name=name) == path
+                  directory = scratch / "model"
+                  directory.mkdir()
+                  extract_archive(path, directory, asset)
+                  import shutil
+                  shutil.rmtree(directory)
+                  shutil.rmtree(cache)
+                  result[name] = {"sha256": asset.sha256, "size_bytes": asset.size_bytes, "files": len(asset.files)}
+                  print(name, result[name], flush=True)
+
+          Path("snapshot-verification.json").write_text(json.dumps(
+              {"commit": os.environ["GITHUB_SHA"], "runtime_downloads_and_extraction": result},
+              indent=2, sort_keys=True) + "\n")
           PY
-          git add -f -- paddleocr-service/build/paddle-model-snapshots.json
+          git add -- snapshot-verification.json
           git -c user.name='github-actions[bot]' \
             -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-            commit -m 'Record verified Paddle model archive metadata'
+            commit -m 'Record verified runtime Paddle download and extraction'
           git push origin HEAD:refs/heads/codex/vision-bill-ocr-model-metadata
