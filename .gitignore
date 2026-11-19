@@ -272,6 +272,7 @@ paddleocr-service/build/*
 !paddleocr-service/build/inspect_kernels.py
 !paddleocr-service/build/resolve_cuda.py
 !paddleocr-service/build/prepare_paddle_models.py
+!paddleocr-service/build/paddle-model-snapshots.json
 !paddleocr-service/build/prepare_ocr_inputs.py
 !paddleocr-service/build/runtime.in
 !paddleocr-service/build/native-build.in

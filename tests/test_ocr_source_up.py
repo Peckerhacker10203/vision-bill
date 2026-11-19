@@ -1,10 +1,12 @@
 import hashlib
+import io
 import json
 import os
 import platform
 import runpy
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 from typing import Any
 
@@ -14,15 +16,33 @@ from test_ocr_provision import release as ocr_release  # type: ignore[import-not
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/ocr_source_up.py"
 
 
-def test_source_command_requires_approved_inputs_or_restart() -> None:
+@pytest.mark.parametrize("accelerator", ["cuda", "rocm"])
+def test_source_command_prepares_default_inputs(
+    accelerator: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts import ocr_source_up
+
+    calls = []
+
+    def bootstrap(chosen: str, inputs: Path | None, *, restart: bool) -> None:
+        calls.append((chosen, inputs, restart))
+
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), accelerator])
+    monkeypatch.setattr(ocr_source_up, "bootstrap", bootstrap)
+    assert ocr_source_up.main() == 0
+    assert calls == [(accelerator, None, False)]
+
+
+def test_source_command_rejects_supplied_inputs_with_restart() -> None:
     result = subprocess.run(
-        [sys.executable, str(SCRIPT), "cuda"],
+        [sys.executable, str(SCRIPT), "cuda", "approved", "--restart"],
         capture_output=True,
         text=True,
         check=False,
     )
     assert result.returncode == 2
-    assert "approved input directory or --restart" in result.stderr
+    assert "APPROVED_DIRECTORY" in result.stderr
+    assert "--restart" in result.stderr
 
 
 def test_staging_keeps_approved_metadata_and_checks_fixture_bytes(tmp_path: Path) -> None:
@@ -82,8 +102,16 @@ def test_managed_overlay_pins_native_image_and_disables_startup_enable(tmp_path:
     ]
 
 
+@pytest.mark.parametrize(
+    ("automatic", "requested_channel", "selected_channel"),
+    [(False, None, "cu126"), (True, None, "cu129"), (True, "cu126", "cu126")],
+)
 def test_failed_candidate_cannot_create_restart_record(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    automatic: bool,
+    requested_channel: str | None,
+    selected_channel: str,
 ) -> None:
     from scripts import ocr_source_up
 
@@ -113,20 +141,39 @@ def test_failed_candidate_cannot_create_restart_record(
     }
     image_config = b'{"architecture":"amd64"}'
     image_id = "sha256:" + hashlib.sha256(image_config).hexdigest()
+    prepare_paths: list[Path] = []
 
     def docker_boundary(*args: str, capture: bool = False) -> str:
         if "config" in args:
             return json.dumps(config)
         if "ps" in args or args[1:3] == ("volume", "ls"):
             return ""
-        if "--check" in args or args[0] == "make" or args[1:3] == ("image", "tag"):
+        if args[0] == "uv" and any(arg.endswith("/prepare_ocr_inputs.py") for arg in args):
+            assert automatic
+            assert {"pydantic==2.13.4", "packaging==26.2", "pillow==12.3.0"} <= set(args)
+            assert args[args.index("--models") + 1].endswith("/build/paddle-model-snapshots.json")
+            assert args[args.index("--fixtures") + 1].endswith("/first-run-fixtures/fixtures.json")
+            output = Path(args[args.index("--output") + 1])
+            assert output.parent.parent == state
+            assert output.parent.stat().st_mode & 0o077 == 0
+            prepare_paths.append(output.parent)
+            prepared = subprocess.run(
+                [sys.executable, *args[args.index("python") + 1 :]],
+                cwd=SCRIPT.parents[1],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            assert prepared.returncode == 0, prepared.stderr
+            return prepared.stdout
+        if "--check" in args:
+            assert args[-2:] == ("--channel", selected_channel)
+            return ""
+        if args[0] == "make" or args[1:3] == ("image", "tag"):
             return ""
         if args[1:3] == ("image", "inspect"):
             return image_id
         if args[1:3] == ("image", "save"):
-            import io
-            import tarfile
-
             with tarfile.open(args[4], "w") as output:
                 records = {
                     "manifest.json": b'[{"Config":"config.json"}]',
@@ -140,14 +187,34 @@ def test_failed_candidate_cannot_create_restart_record(
         if args[1] == "run":
             assert args[2:7] == ("--rm", "--pull", "never", "--network", "none")
             assert args[7:9] == ("--gpus", "device=2")
+            if automatic:
+                release = Path(args[args.index("--volume") + 1].removesuffix(":/release:ro"))
+                assert {path.name for path in release.iterdir()} == {
+                    "bundle.json",
+                    "fixtures.tar",
+                    "image-config.json",
+                }
+                with tarfile.open(release / "fixtures.tar") as archive:
+                    assert set(archive.getnames()) == {
+                        "LICENSE.txt",
+                        "upright.png",
+                        "rotated.png",
+                        "warped.png",
+                        "table.png",
+                        "formula.png",
+                    }
+                assert all(not path.exists() for path in prepare_paths)
             raise subprocess.CalledProcessError(1, args)
         pytest.fail(f"Unexpected subprocess command: {args}")
 
     for key in ("OCR_CUDA_DEVICE_ID", "OCR_CUDA_CHANNEL", "VB_IMAGE_TAG", "OCR_IMAGE_TAG"):
         monkeypatch.delenv(key, raising=False)
+    if requested_channel is not None:
+        monkeypatch.setenv("OCR_CUDA_CHANNEL", requested_channel)
     monkeypatch.setattr(ocr_source_up, "command", docker_boundary)
     with pytest.raises(subprocess.CalledProcessError):
-        ocr_source_up.deploy(("docker", "compose"), state, "cuda", approved)
+        ocr_source_up.deploy(("docker", "compose"), state, "cuda", None if automatic else approved)
+    assert len(prepare_paths) == int(automatic)
     assert not managed.exists()
     assert not list(state.iterdir())
 
@@ -254,10 +321,10 @@ def test_restart_checks_pinned_images_and_waits_on_original_project(
     if bundle_altered:
         (release / "bundle.json").write_text("altered")
         with pytest.raises(ValueError, match="Prepared release file identity changed"):
-            ocr_source_up.deploy(("docker", "compose"), tmp_path, "cuda", None)
+            ocr_source_up.deploy(("docker", "compose"), tmp_path, "cuda", None, restart=True)
         assert not calls
         return
-    ocr_source_up.deploy(("docker", "compose"), tmp_path, "cuda", None)
+    ocr_source_up.deploy(("docker", "compose"), tmp_path, "cuda", None, restart=True)
     assert calls[-1] == (
         "docker",
         "compose",
@@ -315,7 +382,7 @@ def test_restart_rejects_a_different_container_image_in_its_project(
     monkeypatch.setattr(ocr_source_up, "acquire_project_claim", lambda *args: None)
     monkeypatch.setattr(ocr_source_up, "has_project_claim", lambda *args: False)
     with pytest.raises(ValueError, match="different OCR image"):
-        ocr_source_up.deploy(("docker", "compose"), tmp_path, "cuda", None)
+        ocr_source_up.deploy(("docker", "compose"), tmp_path, "cuda", None, restart=True)
 
 
 def test_prepare_rejects_the_other_accelerator_record_in_its_project(
@@ -522,4 +589,4 @@ def test_reserved_claim_cannot_adopt_database_before_admission(
     monkeypatch.setattr(ocr_source_up, "acquire_project_claim", lambda *args: None)
     monkeypatch.setattr(ocr_source_up, "command", docker_boundary)
     with pytest.raises(ValueError, match="existing database volume"):
-        ocr_source_up.deploy(("docker", "compose"), tmp_path, "cuda", None)
+        ocr_source_up.deploy(("docker", "compose"), tmp_path, "cuda", None, restart=True)

@@ -20,10 +20,48 @@ environment template and the selected assets and evidence under `release/`.
 | `app-ocr-rocm` | App, PostgreSQL and an idle Dedicated OCR controller | Qualified selected AMD device and a compatible dedicated LLM endpoint/model. |
 
 Provision the chosen model on your own Ollama or OpenAI-compatible endpoint.
-Installation starts the listed services. Combined bundles keep the four model
-archives at pinned HTTPS sources and fetch them only after setup is requested.
+Installation starts the listed services. Combined bundles fetch the four model
+snapshots or archives from pinned HTTPS sources after setup is requested.
 Benchmarking is a separate operator action.
 Native read-only routes and lifecycle control belong on trusted private networks.
+
+## Start a verified Windows bundle
+
+Extract a verified `app-ocr-cuda` bundle. Open Docker Desktop with its Linux
+WSL 2 engine and a supported NVIDIA Windows driver. The bundled launcher uses
+Docker Desktop directly. After verifying the release and checksum manifest,
+open PowerShell in the extracted directory and run the verified script.
+
+```powershell
+Unblock-File -LiteralPath .\start-windows.ps1
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\start-windows.ps1
+```
+
+First startup asks for your LLM connection mode, endpoint and model ID. Choose
+`llamacpp` for the supported dedicated router. The launcher keeps the local
+configuration and Compose project for subsequent starts. It opens the web UI
+with the OCR controller idle. Sign in and enable **Dedicated OCR** when you are
+ready to download and verify the model files. Use the launcher again to start
+the same installation. Keep `runtime.env`, `windows-project.state`, and the
+Docker project volumes together when upgrading. The command sets script
+policy for this PowerShell process. [Enable Dedicated OCR](#enable-dedicated-ocr)
+
+## Start a verified Linux bundle
+
+Extract the verified combined bundle for CUDA or ROCm on a Linux GPU host.
+Use the NVIDIA driver and Container Toolkit for CUDA. For ROCm, the selected
+Linux device and render node must be available to Docker. Start from the
+extracted bundle directory.
+
+```bash
+./start-linux.sh
+```
+
+The starter verifies the bundle, collects your private LLM endpoint and model
+on first use, and starts the app with an idle OCR controller. Use it again to
+reuse the same project. Keep `runtime.env`, `.vision-bill-install`, and the
+Docker project volumes together when upgrading.
+[Enable Dedicated OCR](#enable-dedicated-ocr)
 
 ## Configure and start
 
@@ -264,6 +302,24 @@ names are rejected. Version 2 ships no LLM server or LLM weights.
 
 ### Prepare approved native inputs
 
+The source launcher uses the project's pinned Paddle snapshot metadata and five
+synthetic fixture images by default. A release maintainer can use those inputs
+or stage approved alternatives. They exercise the native workflow on the selected
+device. Representative accuracy measurements use a separate evaluation dataset.
+[Project fixtures](../paddleocr-service/first-run-fixtures/README.md)
+
+To refresh the complete metadata from the four immutable official repositories,
+use the following command on a networked maintainer machine. The revision-specific
+sources allow the controller to reconstruct and verify the original archives.
+Use the generated `models.json` with the shipped fixture manifest in the next
+preparation step.
+
+```bash
+PYTHONPATH=paddleocr-service uv run --no-project --with pydantic==2.13.4 --with packaging==26.2 \
+  python paddleocr-service/build/prepare_paddle_models.py \
+  --official-snapshots --output /private/official-paddle-inputs
+```
+
 Run the preparation commands from the repository root with Python 3.12+ and
 `uv`. Use a private directory outside Git and Docker build contexts. Create
 the parent directories first and choose fresh output directories. Allow
@@ -283,7 +339,8 @@ PYTHONPATH=paddleocr-service uv run --no-project --with pydantic==2.13.4 --with 
   --archive-base-url https://artifacts.example/ocr/models --output /private/ocr-models
 ```
 
-Create `/private/approved-fixtures.json` with the five distinct, approved PNGs
+Use `paddleocr-service/first-run-fixtures/fixtures.json` for the project samples.
+For custom inputs, create `/private/approved-fixtures.json` with five distinct, approved PNGs
 and a nonempty UTF-8 license file. Each asset path is relative to this JSON
 file. Use the actual license and source revision, and verify redistribution
 rights for all five images before staging. The table and formula images must

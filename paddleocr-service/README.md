@@ -45,8 +45,9 @@ The operator's separate text or vision LLM endpoint remains the receipt formatte
 The source setup command builds a local candidate, selects the accelerator
 profile, binds approved inputs to the exact Docker image and selected device, and
 starts Compose with an idle OCR controller. Run it from the repository root with
-Python 3.12+, a local Linux x86_64 Docker engine and Docker Compose 2.30+. CUDA builds
-also require `make`, `uv` and access to the official Paddle wheel host. Prepare the
+Python 3.12+, a local Linux x86_64 Docker engine and Docker Compose 2.30+.
+Automatic fixture preparation uses `uv`. CUDA builds also use `make` and access
+the official Paddle wheel host. Prepare the
 app's private `.env` once and reuse its Compose project name, app settings and
 data on subsequent starts. The command supplies the OCR image and bundle metadata
 automatically. [Source app configuration](../README.md#advanced-develop-from-source)
@@ -66,24 +67,24 @@ To continue an existing installation, use its original project and data paths.
 [WSL setup](https://learn.microsoft.com/en-us/windows/wsl/install) ·
 [Docker Desktop GPU support](https://docs.docker.com/desktop/features/gpu/)
 
+For a verified prebuilt Windows bundle, use its included Windows launcher.
+The following steps are for building a candidate from this checkout.
+[Windows bundle setup](../distribution/README.md#start-a-verified-windows-bundle)
+
 On native Linux, configure the NVIDIA driver and NVIDIA Container Toolkit for
 Docker GPU access. `OCR_CUDA_DEVICE_ID` selects one host GPU by index or UUID
-and defaults to `0`. Point the command at the private approved directory with
-`bundle.json` and its declared local fixture tar. The approved metadata lists the
-four model archives at HTTPS URLs. [Prepare approved inputs](../distribution/README.md#prepare-approved-native-inputs)
+and defaults to `0`. Run the source launcher from this checkout.
 
 ```bash
-python3 scripts/ocr_source_up.py cuda /private/approved-cuda-inputs
+python3 scripts/ocr_source_up.py cuda
 ```
 
-CUDA defaults to `cu126`. For a modern Blackwell candidate, provide
-`OCR_CUDA_CHANNEL=cu129` for the initial build and use an NVIDIA driver that
-supports CUDA 12.9 on the host. Check the runtime's device support through
-qualification on the actual board. [CUDA build inputs](#build-inputs)
-
-```bash
-OCR_CUDA_CHANNEL=cu129 python3 scripts/ocr_source_up.py cuda /private/approved-cuda-inputs
-```
+The launcher stages the project's five synthetic qualification images and the
+verified official Paddle model metadata. The first admin activation downloads
+the model files from their pinned revisions. Automatic CUDA source preparation
+uses the official CUDA 12.9 candidate by default. Set `OCR_CUDA_CHANNEL=cu126`
+to select CUDA 12.6. Use a host driver that supports the selected runtime and
+verify it on the actual board. [CUDA build inputs](#build-inputs)
 
 ### AMD ROCm on native Linux
 
@@ -91,13 +92,16 @@ Use the host's `/dev/kfd` and the selected `/dev/dri/renderD*` node. The source
 command derives the two container group IDs from those device nodes. Set
 `OCR_RENDER_NODE` to the actual render node and `OCR_AMDGPU_TARGETS` to the
 device's actual GFX target when it differs from the default RDNA2 candidate
-list. The example selects a `gfx1030` board at `/dev/dri/renderD128`.
-[ROCm build inputs](#build-inputs)
+list. [ROCm build inputs](#build-inputs)
 
 ```bash
-OCR_RENDER_NODE=/dev/dri/renderD128 OCR_AMDGPU_TARGETS=gfx1030 \
-  python3 scripts/ocr_source_up.py rocm /private/approved-rocm-inputs
+python3 scripts/ocr_source_up.py rocm
 ```
+
+To test different approved inputs, pass their directory as a second argument
+after the accelerator. It must contain `bundle.json` and its declared local
+fixture tar. The CUDA custom-input path defaults to `cu126`.
+[Prepare custom inputs](../distribution/README.md#prepare-approved-native-inputs)
 
 ### Enable and restart
 

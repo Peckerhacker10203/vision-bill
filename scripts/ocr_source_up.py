@@ -229,6 +229,35 @@ def command(*args: str, capture: bool = False) -> str:
     )
 
 
+def stage_first_run_inputs(release: Path, accelerator: str) -> None:
+    with tempfile.TemporaryDirectory(prefix=".inputs-", dir=release.parent) as temporary:
+        prepared = Path(temporary) / "approved"
+        command(
+            "uv",
+            "run",
+            "--no-project",
+            "--python",
+            sys.executable,
+            "--with",
+            "pydantic==2.13.4",
+            "--with",
+            "packaging==26.2",
+            "--with",
+            "pillow==12.3.0",
+            "python",
+            f"{NATIVE}/build/prepare_ocr_inputs.py",
+            accelerator,
+            "--models",
+            f"{NATIVE}/build/paddle-model-snapshots.json",
+            "--fixtures",
+            f"{NATIVE}/first-run-fixtures/fixtures.json",
+            "--output",
+            str(prepared),
+            capture=True,
+        )
+        stage_approved_inputs(prepared, release, accelerator)
+
+
 def export_config(release: Path, image_id: str) -> None:
     with tempfile.TemporaryDirectory(dir=release.parent) as temporary:
         archive = Path(temporary) / "image.tar"
@@ -255,14 +284,19 @@ def read_tar_record(archive: tarfile.TarFile, name: str) -> bytes:
         return stream.read()
 
 
-def need_host(accelerator: str, build: bool) -> None:
+def need_host(accelerator: str, *, build: bool, automatic_inputs: bool) -> None:
     if sys.version_info < (3, 12):
         raise ValueError("Python 3.12 or later is required on the host")
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         raise ValueError("Run this command on Linux x86_64 or in Windows WSL 2 x86_64 for CUDA")
     if accelerator == "rocm" and "microsoft" in platform.release().lower():
         raise ValueError("The ROCm source overlay requires native Linux")
-    for tool in ["docker", *(["make", "uv"] if build and accelerator == "cuda" else [])]:
+    tools = ["docker"]
+    if build and accelerator == "cuda":
+        tools.append("make")
+    if automatic_inputs or (build and accelerator == "cuda"):
+        tools.append("uv")
+    for tool in tools:
         if not shutil.which(tool):
             raise ValueError(f"Required executable is missing: {tool}")
     if not (ROOT / ".env").is_file():
@@ -284,8 +318,8 @@ def need_host(accelerator: str, build: bool) -> None:
         raise ValueError("Use a local Docker engine with host bind mounts and GPU access")
 
 
-def bootstrap(accelerator: str, inputs: Path | None) -> None:
-    need_host(accelerator, inputs is not None)
+def bootstrap(accelerator: str, inputs: Path | None, *, restart: bool = False) -> None:
+    need_host(accelerator, build=not restart, automatic_inputs=not restart and inputs is None)
     deployment = ROOT / "server_data" / "ocr-source"
     state = deployment / accelerator
     for directory in (deployment, state):
@@ -310,7 +344,7 @@ def bootstrap(accelerator: str, inputs: Path | None) -> None:
     lock = deployment / "deploy.lock"
     with lock.open("a") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        deploy(compose, state, accelerator, inputs)
+        deploy(compose, state, accelerator, inputs, restart=restart)
 
 
 def gpu_args(accelerator: str, native: dict[str, Any]) -> tuple[list[str], dict[str, str]]:
@@ -562,9 +596,16 @@ def record_admission(managed: Path) -> None:
     pending.replace(marker)
 
 
-def deploy(compose: tuple[str, ...], state: Path, accelerator: str, inputs: Path | None) -> None:
+def deploy(
+    compose: tuple[str, ...],
+    state: Path,
+    accelerator: str,
+    inputs: Path | None,
+    *,
+    restart: bool = False,
+) -> None:
     managed = state / "compose.local.json"
-    if inputs is None:
+    if restart:
         trusted_file(managed)
         overlay = json.loads(managed.read_bytes())
         identity = overlay["x-vision-bill-source"]
@@ -618,7 +659,10 @@ def deploy(compose: tuple[str, ...], state: Path, accelerator: str, inputs: Path
     release = Path(tempfile.mkdtemp(prefix="release-", dir=state))
     pending = release / "compose.local.json"
     try:
-        stage_approved_inputs(inputs, release, accelerator)
+        if inputs is None:
+            stage_first_run_inputs(release, accelerator)
+        else:
+            stage_approved_inputs(inputs, release, accelerator)
         cuda_verification: list[str] = []
         if accelerator == "cuda":
             lock = [
@@ -632,7 +676,7 @@ def deploy(compose: tuple[str, ...], state: Path, accelerator: str, inputs: Path
                 "--check",
                 "paddleocr-service/requirements.cuda.lock",
             ]
-            channel = os.environ.get("OCR_CUDA_CHANNEL") or "cu126"
+            channel = os.environ.get("OCR_CUDA_CHANNEL") or ("cu129" if inputs is None else "cu126")
             if channel not in {"cu126", "cu129"}:
                 raise ValueError("OCR_CUDA_CHANNEL must be cu126 or cu129")
             os.environ["OCR_CUDA_CHANNEL"] = channel
@@ -717,17 +761,24 @@ def start(*compose: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("accelerator", choices=("cuda", "rocm"))
-    parser.add_argument("approved_inputs", nargs="?", type=Path, metavar="APPROVED_DIRECTORY")
+    parser.add_argument(
+        "approved_inputs",
+        nargs="?",
+        type=Path,
+        metavar="APPROVED_DIRECTORY",
+        help="use a custom approved directory in place of the repository snapshots and fixtures",
+    )
     parser.add_argument(
         "--restart", action="store_true", help="start the last prepared source deployment"
     )
     args = parser.parse_args()
-    if (args.approved_inputs is None) == (not args.restart):
-        parser.error("Supply an approved input directory or --restart")
+    if args.approved_inputs is not None and args.restart:
+        parser.error("Choose either APPROVED_DIRECTORY or --restart")
     try:
         bootstrap(
             args.accelerator,
             Path(os.path.abspath(args.approved_inputs)) if args.approved_inputs else None,
+            restart=args.restart,
         )
     except subprocess.CalledProcessError as exc:
         print(

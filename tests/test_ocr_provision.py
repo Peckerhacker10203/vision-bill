@@ -4,7 +4,9 @@ import hashlib
 import io
 import json
 import tarfile
+from http.client import HTTPMessage
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -120,6 +122,98 @@ def test_tiny_artifacts_provision_idempotently_without_selected_state(tmp_path, 
     assert (second.model_dirs[NAMES[0]] / "weights").read_bytes() == b"PP-DocLayoutV3"
     assert second.smoke_path.read_bytes() == b"tiny-private-test-upright"
     assert not (state / "selected").exists()
+
+
+@pytest.fixture
+def official_snapshot(tmp_path, release, monkeypatch):
+    from ocr_service import paddle_snapshots
+
+    name = NAMES[-1]
+    files = {
+        "LICENSE": b"Apache License\nVersion 2.0, January 2004\n",
+        "config.json": b"{}",
+        "model.safetensors": b"test weights",
+    }
+    model = paddle_snapshots.MODELS[name]._replace(
+        files=tuple(files), weight_sha256=sha(files["model.safetensors"])
+    )
+    monkeypatch.setitem(paddle_snapshots.MODELS, name, model)
+    record = archive(tmp_path, "canonical", files)
+    packed = Path(record["source"])
+    record.update(
+        source=model.source,
+        license={"spdx": "Apache-2.0", "text_file": "LICENSE", "redistribution_allowed": True},
+        provenance={"url": model.url, "revision": model.revision},
+    )
+    release[1]["models"][name] = record
+    requests = []
+
+    def get(url, timeout):
+        assert url.startswith(model.source + "/")
+        requests.append(url)
+        body = files[url.rsplit("/", 1)[1]]
+        response = io.BytesIO(body)
+        response.status = 200
+        response.headers = HTTPMessage()
+        response.headers["Content-Length"] = str(len(body))
+        return response
+
+    monkeypatch.setattr(paddle_snapshots, "build_opener", lambda *args: SimpleNamespace(open=get))
+    return name, record, files, packed, requests
+
+
+def test_pinned_snapshot_reproduces_archive_and_reuses_verified_tree(
+    tmp_path, release, official_snapshot
+):
+    from ocr_service.provision import provision_bundle
+
+    name, record, files, packed, requests = official_snapshot
+    state = tmp_path / "state"
+    bundle = load(release)
+    runtime = provision_bundle(bundle, state)
+    assert (state / "archives" / record["sha256"]).read_bytes() == packed.read_bytes()
+    assert {path.name: path.read_bytes() for path in runtime.model_dirs[name].iterdir()} == files
+    assert requests == [record["source"] + "/" + filename for filename in files]
+
+    requests.clear()
+    assert provision_bundle(bundle, state) == runtime
+    assert requests == []
+
+
+@pytest.mark.parametrize("tampered", ["file", "tar"])
+def test_pinned_snapshot_rejects_tampered_bytes_before_publication(
+    tmp_path, release, official_snapshot, tampered
+):
+    from ocr_service.provision import provision_bundle
+
+    _, record, files, _, _ = official_snapshot
+    if tampered == "file":
+        files["config.json"] = b"[]"
+        error = "Staged tree differs"
+    else:
+        record["sha256"] = "f" * 64
+        error = "Snapshot archive hash/size mismatch"
+    state = tmp_path / "state"
+    with pytest.raises(ValueError, match=error):
+        provision_bundle(load(release), state)
+    assert list((state / "bundles").iterdir()) == []
+    assert not (state / "archives" / record["sha256"]).exists()
+    assert list((state / "archives").glob(".snapshot-*")) == []
+
+
+@pytest.mark.parametrize("misbound", ["revision", "model", "fixture"])
+def test_snapshot_reference_requires_its_exact_approved_model(release, official_snapshot, misbound):
+    name, record, _, _, requests = official_snapshot
+    if misbound == "revision":
+        record["source"] = record["source"].rsplit("/", 1)[0] + "/main"
+    elif misbound == "model":
+        release[1]["models"][NAMES[0]] = record
+    else:
+        release[1]["fixtures"]["source"] = record["source"]
+    with pytest.raises(ValueError, match="Official model snapshot"):
+        load(release)
+    assert release[1]["models"][name] is record
+    assert requests == []
 
 
 @pytest.mark.parametrize("native_name", ["paddlepaddle-dcu", "paddlepaddle", "paddlepaddle-gpu"])

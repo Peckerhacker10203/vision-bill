@@ -8,6 +8,8 @@ from pathlib import Path
 from runpy import run_path
 
 import pytest
+from ocr_service import paddle_snapshots
+from ocr_service.paddle_snapshots import download as official_download
 from ocr_service.provision import MODEL_NAMES, Archive, extract_archive, publish_directory
 
 SCRIPT = Path(__file__).parents[1] / "paddleocr-service" / "build" / "prepare_paddle_models.py"
@@ -21,8 +23,6 @@ def digest(raw):
 @pytest.fixture
 def preparer(monkeypatch):
     prepare = run_path(str(SCRIPT))["prepare"]
-    config = prepare.__globals__
-    model = config["Model"]
     assets = {}
     models = {}
     for name in MODEL_NAMES:
@@ -31,19 +31,21 @@ def preparer(monkeypatch):
         companion = name != "PaddleOCR-VL-1.6-0.9B"
         if not companion:
             files += ("LICENSE",)
-        spec = model(name, "a" * 40, files, "weights", digest(weights))
+        spec = paddle_snapshots.Model(name, "a" * 40, files, "weights", digest(weights))
         models[name] = spec
         assets[spec.resolve_url("weights")] = weights
         assets[spec.resolve_url("README.md")] = b"---\nlicense: apache-2.0\n---\n"
-        assets[spec.resolve_url("LICENSE")] = config["APACHE_LICENSE_HEADER"]
-    assets[config["COMPANION_LICENSE_URL"]] = config["APACHE_LICENSE_HEADER"]
-    monkeypatch.setitem(config, "MODELS", models)
-    monkeypatch.setitem(config, "COMPANION_LICENSE_SHA256", digest(config["APACHE_LICENSE_HEADER"]))
+        assets[spec.resolve_url("LICENSE")] = paddle_snapshots.APACHE_LICENSE_HEADER
+    assets[paddle_snapshots.COMPANION_LICENSE_URL] = paddle_snapshots.APACHE_LICENSE_HEADER
+    monkeypatch.setattr(paddle_snapshots, "MODELS", models)
+    monkeypatch.setattr(
+        paddle_snapshots, "COMPANION_LICENSE_SHA256", digest(paddle_snapshots.APACHE_LICENSE_HEADER)
+    )
 
     def fetch(url, destination, limit):
         destination.write_bytes(assets[url])
 
-    monkeypatch.setitem(config, "download", fetch)
+    monkeypatch.setattr(paddle_snapshots, "download", fetch)
     return prepare, assets
 
 
@@ -81,6 +83,25 @@ def test_mismatched_weight_leaves_no_output(tmp_path, preparer):
     assert not output.exists()
 
 
+def test_official_snapshot_preparation_writes_only_sealed_metadata(tmp_path, preparer):
+    prepare, _ = preparer
+    hosted = tmp_path / "hosted"
+    official = tmp_path / "official"
+    prepare(hosted, BASE)
+    prepare(official, official_snapshots=True)
+
+    assert [path.name for path in official.iterdir()] == ["models.json"]
+    hosted_records = json.loads((hosted / "models.json").read_bytes())
+    official_records = json.loads((official / "models.json").read_bytes())
+    for name, record in official_records.items():
+        assert (
+            record.pop("source")
+            == f"https://huggingface.co/PaddlePaddle/{name}/resolve/" + "a" * 40
+        )
+        hosted_records[name].pop("source")
+        assert record == hosted_records[name]
+
+
 @pytest.mark.parametrize(
     "base",
     ["http://artifacts.example.invalid", "https://user@example.invalid", BASE + "?query=1"],
@@ -93,7 +114,7 @@ def test_archive_base_requires_a_clean_https_url(tmp_path, preparer, base):
 
 def test_mismatched_companion_license_leaves_no_output(tmp_path, preparer):
     prepare, assets = preparer
-    assets[prepare.__globals__["COMPANION_LICENSE_URL"]] += b"corruption"
+    assets[paddle_snapshots.COMPANION_LICENSE_URL] += b"corruption"
     output = tmp_path / "output"
     with pytest.raises(ValueError, match="companion license SHA-256 mismatch"):
         prepare(output, BASE)
@@ -123,7 +144,6 @@ def test_existing_output_is_preserved(tmp_path, preparer):
 )
 def test_download_response_framing(tmp_path, preparer, monkeypatch, status, header, error):
     prepare, assets = preparer
-    config = prepare.__globals__
     target = next(url for url in assets if url.endswith("/README.md"))
 
     class Socket:
@@ -147,9 +167,8 @@ def test_download_response_framing(tmp_path, preparer, monkeypatch, status, head
             response.begin()
             return response
 
-    download = run_path(str(SCRIPT))["download"]
-    monkeypatch.setitem(download.__globals__, "build_opener", lambda *handlers: Opener())
-    monkeypatch.setitem(config, "download", download)
+    monkeypatch.setattr(paddle_snapshots, "build_opener", lambda *handlers: Opener())
+    monkeypatch.setattr(paddle_snapshots, "download", official_download)
     output = tmp_path / "output"
     if error is None:
         prepare(output, BASE)

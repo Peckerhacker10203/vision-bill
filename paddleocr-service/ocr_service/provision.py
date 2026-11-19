@@ -20,6 +20,7 @@ from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
+from . import paddle_snapshots
 from .initialization_lock import installation_lock
 from .paddle_distribution import native_paddle_distribution
 
@@ -177,6 +178,11 @@ class ReleaseBundle(Record):
     def complete(self) -> Self:
         if set(self.models) != set(MODEL_NAMES):
             raise ValueError("Exactly the four approved model identities are required")
+        for name, asset in self.models.items():
+            if paddle_snapshots.is_snapshot_reference(asset.source):
+                verify_snapshot_record(name, asset)
+        if paddle_snapshots.is_snapshot_reference(self.fixtures.source):
+            raise ValueError("Official model snapshots cannot provision qualification fixtures")
         if (
             self.expected_packages.get("paddleocr") != "3.7.0"
             or self.expected_packages.get("paddlex") != "3.7.2"
@@ -250,7 +256,53 @@ def verify_tree(root: Path, asset: Archive) -> None:
         raise ValueError("Staged tree differs from complete archive inventory")
 
 
-def fetch_archive(asset: Archive, base: Path, cache: Path) -> Path:
+def verify_snapshot_record(name: str, asset: Archive) -> None:
+    model = paddle_snapshots.MODELS[name]
+    if (
+        not paddle_snapshots.is_official_snapshot(name, asset.source)
+        or asset.provenance.url != model.url
+        or asset.provenance.revision != model.revision
+    ):
+        raise ValueError("Official model snapshot repository or revision mismatch")
+    if (
+        asset.files.keys() != model.inventory
+        or asset.files[model.weights].sha256 != model.weight_sha256
+        or asset.license.spdx != "Apache-2.0"
+        or asset.license.text_file != "LICENSE"
+    ):
+        raise ValueError("Official model snapshot inventory or license mismatch")
+    if "LICENSE" not in model.files:
+        provenance = paddle_snapshots.companion_license_provenance(model)
+        if asset.files[
+            "LICENSE"
+        ].sha256 != paddle_snapshots.COMPANION_LICENSE_SHA256 or asset.files[
+            "LICENSE-PROVENANCE.txt"
+        ] != FileRecord(sha256=hashlib.sha256(provenance).hexdigest(), size_bytes=len(provenance)):
+            raise ValueError("Official model snapshot companion license mismatch")
+
+
+def materialize_snapshot(name: str, asset: Archive, target: Path) -> None:
+    verify_snapshot_record(name, asset)
+    with tempfile.TemporaryDirectory(prefix=".snapshot-", dir=target.parent) as scratch:
+        workspace = Path(scratch)
+        tree = workspace / "files"
+        tree.mkdir()
+        archived = workspace / "model.tar"
+        paddle_snapshots.download_model(
+            paddle_snapshots.MODELS[name],
+            tree,
+            {filename: record.size_bytes for filename, record in asset.files.items()},
+        )
+        verify_tree(tree, asset)
+        paddle_snapshots.write_model_archive(tree, archived)
+        if archived.stat().st_size != asset.size_bytes or file_digest(archived) != asset.sha256:
+            raise ValueError("Snapshot archive hash/size mismatch")
+        archived.replace(target)
+
+
+def fetch_archive(
+    asset: Archive, base: Path, cache: Path, *, model_name: str | None = None
+) -> Path:
     target = cache / asset.sha256
     if target.exists():
         if (
@@ -259,6 +311,9 @@ def fetch_archive(asset: Archive, base: Path, cache: Path) -> Path:
             or file_digest(target) != asset.sha256
         ):
             raise ValueError("Cached archive identity mismatch")
+        return target
+    if model_name is not None and paddle_snapshots.is_official_snapshot(model_name, asset.source):
+        materialize_snapshot(model_name, asset, target)
         return target
     source_url = urllib.parse.urlparse(asset.source)
     source: Any = (
@@ -339,20 +394,21 @@ def provision_bundle(bundle: ReleaseBundle, state_dir: Path) -> ProvisionedRunti
         cache.mkdir(exist_ok=True)
         bundles.mkdir(exist_ok=True)
         root = bundles / bundle.identity
-        assets: dict[str, Archive] = {
-            **{"models/" + name: asset for name, asset in bundle.models.items()},
-            "fixtures": bundle.fixtures,
-        }
+        assets: list[tuple[str, Archive, str | None]] = [
+            ("models/" + name, asset, name) for name, asset in bundle.models.items()
+        ]
+        assets.append(("fixtures", bundle.fixtures, None))
         if root.exists():
-            for name, asset in assets.items():
+            for name, asset, _ in assets:
                 verify_tree(root / name, asset)
         else:
             with tempfile.TemporaryDirectory(prefix=".staging-", dir=state_dir) as scratch:
                 staging = Path(scratch)
-                for name, asset in assets.items():
+                for name, asset, model_name in assets:
                     target = staging / name
                     target.mkdir(parents=True)
-                    extract_archive(fetch_archive(asset, bundle._base, cache), target, asset)
+                    archive = fetch_archive(asset, bundle._base, cache, model_name=model_name)
+                    extract_archive(archive, target, asset)
                 # Case paths remain relative to this generated TOML after atomic promotion.
                 lines = []
                 for case in bundle.fixtures.cases:

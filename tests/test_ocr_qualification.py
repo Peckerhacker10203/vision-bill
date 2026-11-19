@@ -408,7 +408,18 @@ def test_unverified_kernel_inventory_cannot_be_empty(tmp_path, monkeypatch):
         module.device_identity(paddle, runtime)
 
 
-def test_fresh_replay_reports_real_cold_smoke_separately_from_warm_case(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "native_label,recognized_formula",
+    [
+        ("formula", True),
+        ("display_formula", True),
+        ("inline_formula", True),
+        ("formula_number", False),
+    ],
+)
+def test_fresh_replay_checks_native_formula_and_reports_actual_timings(
+    tmp_path, monkeypatch, native_label, recognized_formula
+):
     module = qualification()
     from ocr_service.profile import RuntimeSettings
 
@@ -424,7 +435,7 @@ def test_fresh_replay_reports_real_cold_smoke_separately_from_warm_case(tmp_path
     )
     adapter = SimpleNamespace(
         qualify=lambda image: None,
-        predict=lambda *a, **k: SimpleNamespace(blocks=[]),
+        predict=lambda *a, **k: SimpleNamespace(blocks=[SimpleNamespace(label=native_label)]),
         evidence=[],
         profile_id="profile",
         runtime_fingerprint="runtime",
@@ -432,13 +443,21 @@ def test_fresh_replay_reports_real_cold_smoke_separately_from_warm_case(tmp_path
     )
     monkeypatch.setattr(module, "build_pipeline", lambda *a: adapter)
     monkeypatch.setattr(module, "audit_dynamic_model", lambda *a: 1)
-    result = module.replay(
-        {
-            "runtime": runtime.model_dump(mode="json"),
-            "smoke": str(tmp_path / "smoke.png"),
-            "case": {"path": str(tmp_path / "case.png"), "kind": "rotated", "sha256": "a" * 64},
-        }
-    )
+    payload = {
+        "runtime": runtime.model_dump(mode="json"),
+        "smoke": str(tmp_path / "smoke.png"),
+        "case": {
+            "path": str(tmp_path / "case.png"),
+            "kind": "formula",
+            "sha256": "a" * 64,
+            "required_labels": ["formula"],
+        },
+    }
+    if not recognized_formula:
+        with pytest.raises(ValueError, match="Required recognized structure absent"):
+            module.replay(payload)
+        return
+    result = module.replay(payload)
     assert "cold_smoke_seconds" in result and "first_case_seconds" in result
     assert "cold_seconds" not in result
 

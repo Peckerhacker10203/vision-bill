@@ -12,13 +12,12 @@ owner-scoped data and an optional admin-wide view support multiple users.
 The intended end-user installation is a **downloaded, verified prebuilt bundle**,
 then `docker compose up -d` from its extracted directory. Choose app with an external
 LLM, independent CUDA/ROCm OCR, or app with optional Dedicated OCR on CUDA/ROCm
-and an external LLM. Every app variant uses your endpoint. Prepare its private
-`runtime.env` and set a stable Compose project name before startup. In a combined
-installation the OCR controller starts idle and only downloads the four pinned
-PaddleOCR model archives when an admin first turns **Dedicated OCR** On or
-explicitly requests setup in the configuration. Preparing the GPU profile is a
-one-time operator step; the browser toggle then controls receipt routing. Follow
-the [installation guide](distribution/README.md).
+and an external LLM. Every app variant uses your endpoint. The combined CUDA
+bundle includes a Windows launcher for Docker Desktop. Combined CUDA and ROCm
+bundles also include a Linux launcher. The OCR controller starts idle
+and downloads the pinned Paddle models when an admin first turns **Dedicated
+OCR** On or explicitly requests setup in the configuration.
+[Installation guide](distribution/README.md)
 
 **Status: Unreleased.** Source candidates and release tooling are available.
 Public native bundle downloads require a release run with real artifacts and physical

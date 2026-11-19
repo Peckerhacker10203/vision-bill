@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from ocr_service.provision import (
     MODEL_NAMES,
+    Fixtures,
     ReleaseBundle,
     content_identity,
     extract_archive,
@@ -129,6 +130,36 @@ def test_prepares_deterministic_archive_and_round_trips_provisioning(
         ).read_bytes()
         assert case.provenance.model_dump() == specification["provenance"]
         assert case.required_labels == ([case.kind] if case.kind in {"table", "formula"} else [])
+
+
+def test_packages_project_owned_first_run_fixtures(
+    tmp_path: Path, approved: tuple[Path, Path, dict[str, Any]]
+) -> None:
+    models, _, _ = approved
+    sources = SERVICE / "first-run-fixtures"
+    output = tmp_path / "prepared"
+    result = prepare(models, sources / "fixtures.json", output)
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads((output / "bundle.json").read_bytes())
+    fixtures = Fixtures.model_validate(manifest["fixtures"])
+    extracted = tmp_path / "extracted"
+    extract_archive(output / fixtures.source, extracted, fixtures)
+    assert fixtures.license.spdx == "AGPL-3.0-or-later"
+    assert (extracted / fixtures.license.text_file).read_bytes() == (
+        SERVICE.parent / "LICENSE"
+    ).read_bytes()
+    assert {case.kind: case.required_labels for case in fixtures.cases} == {
+        "upright": [],
+        "rotated": [],
+        "warped": [],
+        "table": ["table"],
+        "formula": ["formula"],
+    }
+    for case in fixtures.cases:
+        with Image.open(extracted / case.path) as image:
+            assert image.format == "PNG"
+            assert min(image.size) >= 500
+            assert image.getexif().get(274, 1) == 1
 
 
 def test_rocm_inputs_pin_upstreams_dcu_distribution(

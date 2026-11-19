@@ -165,7 +165,7 @@ ocr-qualify-cuda ocr-qualify-rocm: ## Run an explicit supervised CUDA/ROCm sourc
 
 .PHONY: distribution-test
 distribution-test: ## Test prebuilt bundle generation/Compose and release gates on CPU (no publication)
-	$(NODE) node --test scripts/distribution.test.mjs
+	$(NODE) node --test scripts/distribution.test.mjs scripts/distribution-start-linux.test.mjs
 
 .PHONY: distribution-pid1-test
 distribution-pid1-test: ## Run native coordinator/provision software tests as CPU container PID1 (no GPU or weights)

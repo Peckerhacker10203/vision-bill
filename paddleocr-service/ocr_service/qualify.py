@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID
 
+from ocr_contract import OcrResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .bootstrap import (
@@ -98,6 +99,14 @@ def load_cases(path: Path) -> list[QualificationCase]:
     if len({case.sha256 for case in cases}) != len(cases):
         raise ValueError("Qualification cases must be distinct real inputs")
     return [case.model_copy(update={"path": (path.parent / case.path).resolve()}) for case in cases]
+
+
+def has_required_labels(case: QualificationCase, response: OcrResponse) -> bool:
+    labels = {block.label for block in response.blocks}
+    # The native layout model distinguishes display and inline formulas.
+    if labels.intersection({"display_formula", "inline_formula"}):
+        labels.add("formula")
+    return set(case.required_labels) <= labels
 
 
 def run_stage(stage: str, payload: dict[str, Any], directory: Path) -> dict[str, Any]:
@@ -259,7 +268,7 @@ def collect(payload: dict[str, Any]) -> dict[str, Any]:
                     transforms=normalized.transforms,
                     findings=normalized.findings,
                 )
-            if not set(case.required_labels) <= {block.label for block in response.blocks}:
+            if not has_required_labels(case, response):
                 raise ValueError("Required recognized structure absent")
             audit_dynamic_model(native.vl_rec_model.infer, runtime.gpu_index)
             for index, collector in enumerate(collectors):
@@ -299,7 +308,7 @@ def replay(payload: dict[str, Any]) -> dict[str, Any]:
             case.path, request_id=UUID(int=0), photo_index=0, source_sha256=case.sha256
         )
         timings.append(time.perf_counter() - started)
-        if not set(case.required_labels) <= {block.label for block in response.blocks}:
+        if not has_required_labels(case, response):
             raise ValueError("Required recognized structure absent in replay")
     return {
         "kind": case.kind,
