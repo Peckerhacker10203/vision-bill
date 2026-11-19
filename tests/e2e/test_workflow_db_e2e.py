@@ -1339,6 +1339,7 @@ async def test_finalized_draft_preserves_optional_amounts_and_item_values(workfl
     from vision_bill.model.workflow import DraftFinalize, DraftPatch
 
     workflow, scope = workflow_db
+    workflow._receipts._pool = workflow.pool
     image = await partial_draft(workflow, scope, tmp_path / "original.png")
     parts = await workflow.get_source_parts(image.id, scope=scope)
     originals = [
@@ -1371,7 +1372,7 @@ async def test_finalized_draft_preserves_optional_amounts_and_item_values(workfl
     assert result.total == Decimal("2.49")
     saved = await workflow._receipts.get_receipt_with_details(result.id, user_id=scope.user_id)
     assert saved is not None
-    assert saved.receipt.discount_total is None
+    assert saved.receipt.discount_total is saved.receipt.tip is None
     assert saved.line_items[0].quantity is saved.line_items[0].unit_price is None
     assert saved.line_items[0].total_price == Decimal("2.49")
 
