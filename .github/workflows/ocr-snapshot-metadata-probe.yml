@@ -1,4 +1,4 @@
-name: Verify packaged launcher on Windows
+name: Verify CUDA and ROCm snapshot bootstrap
 
 on:
   push:
@@ -8,25 +8,78 @@ permissions:
   contents: write
 
 jobs:
-  windows:
+  snapshot:
     if: github.repository == 'Peckerhacker10203/vision-bill'
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
-        with:
-          node-version: "24"
-      - name: Verify extracted bundle in Windows PowerShell
+      - name: Check the real signed package archives in Docker
         shell: bash
         run: |
           set -euo pipefail
-          node --test --test-reporter tap --test-name-pattern='Windows launcher|Windows PowerShell' scripts/distribution.test.mjs > "${RUNNER_TEMP}/windows-test.log"
-          cat "${RUNNER_TEMP}/windows-test.log"
-          grep -q '^# skipped 0$' "${RUNNER_TEMP}/windows-test.log"
-          node -e 'require("fs").writeFileSync("windows-launcher-verification.json", JSON.stringify({commit: process.env.GITHUB_SHA, runner: process.env.RUNNER_OS, scope: "Windows PowerShell verification and launcher contract"}, null, 2) + "\n")'
-          git add -- windows-launcher-verification.json
+          scratch=$(mktemp -d)
+          export scratch
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import sys
+
+          scratch = Path(os.environ["scratch"])
+          for accelerator, expected in [("cuda", 1), ("rocm", 2)]:
+              path = Path(f"paddleocr-service/Dockerfile.{accelerator}")
+              syntax, *stages = re.split(r"(?m)(?=^FROM )", path.read_text())
+              donor = stages[0]
+              snapshots = [stage for stage in stages[1:] if "snapshot.ubuntu.com" in stage]
+              if len(snapshots) != expected:
+                  sys.exit(f"Expected {expected} APT stages for {accelerator}")
+              for number, stage in enumerate(snapshots, 1):
+                  end = stage.index(" && rm -rf /var/lib/apt/lists/*") + len(" && rm -rf /var/lib/apt/lists/*")
+                  (scratch / f"{accelerator}-{number}.Dockerfile").write_text(
+                      syntax + donor + stage[:end] +
+                      "\nRUN test -s /etc/ssl/certs/ca-certificates.crt && "
+                      "dpkg-query -W ca-certificates python3.12\n"
+                  )
+          PY
+          docker run --rm --platform linux/amd64 \
+            ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5 \
+            sh -c 'if test -s /etc/ssl/certs/ca-certificates.crt; then echo present; else echo missing; fi' > "$scratch/base.log"
+          for stage in cuda-1 rocm-1 rocm-2; do
+            if docker build --progress=plain -f "$scratch/$stage.Dockerfile" \
+              -t "vision-bill-apt-probe:$stage" "$scratch" > "$scratch/$stage.log" 2>&1; then
+              echo "$stage passed"
+              echo passed > "$scratch/$stage.result"
+            else
+              echo "$stage failed"
+              echo failed > "$scratch/$stage.result"
+            fi
+            tail -20 "$scratch/$stage.log"
+          done
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          scratch = Path(os.environ["scratch"])
+          results = {
+              stage: {
+                  "result": (scratch / f"{stage}.result").read_text().strip(),
+                  "detail": (scratch / f"{stage}.log").read_text().splitlines()[-10:],
+              }
+              for stage in ("cuda-1", "rocm-1", "rocm-2")
+          }
+          Path("snapshot-bootstrap-verification.json").write_text(json.dumps({
+              "commit": os.environ["GITHUB_SHA"],
+              "original_ubuntu_ca_bundle": (scratch / "base.log").read_text().strip(),
+              "stages": results,
+          }, indent=2, sort_keys=True) + "\n")
+          PY
+          git add -- snapshot-bootstrap-verification.json
           git -c user.name='github-actions[bot]' \
             -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-            commit -m 'Record verified Windows launcher checks'
+            commit -m 'Record native OCR snapshot bootstrap checks'
           git push origin HEAD:refs/heads/codex/vision-bill-ocr-model-metadata
+          for stage in cuda-1 rocm-1 rocm-2; do
+            grep -qx passed "$scratch/$stage.result"
+          done
