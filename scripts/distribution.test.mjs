@@ -14,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import { spawnSync } from "node:child_process";
+import "./windows-launcher-project.test.mjs";
 import {
   validateArtifacts,
   renderBundle,
@@ -424,7 +425,9 @@ test("combined bundle starts a private idle controller without prequalifying or 
       assert.equal(app[target].source, ocr[target].source);
       assert.equal(app[target].type, "volume");
       assert.equal(ocr[target].type, "volume");
-      assert.deepEqual(volumes[app[target].source], {});
+      assert.deepEqual(volumes[app[target].source], {
+        labels: { "io.vision-bill.installation": "${VISION_BILL_INSTALLATION_ID:-manual}" },
+      });
       assert.equal(!!app[target].read_only, appReadOnly);
       assert.equal(!!ocr[target].read_only, ocrReadOnly);
     }
@@ -463,6 +466,121 @@ test("materialization verifies raw OCI config and qualification before atomic co
     /identity|hash|digest/i,
   );
   assert.ok(!readdirSync(directory).includes("failed"));
+});
+
+test("only the combined CUDA distribution ships a checksummed Windows launcher", (t) => {
+  const directory = temp(t);
+  const { manifest, bytes } = fixture();
+  const name = "start-windows.ps1";
+  for (const variant of variants) {
+    assert.equal(
+      Object.hasOwn(renderBundle(manifest, variant).files, name),
+      variant === "app-ocr-cuda",
+    );
+  }
+  seed(directory, bytes);
+  const output = join(directory, "out");
+  writeBundle(manifest, "app-ocr-cuda", output, directory);
+  const launcher = readFileSync(join(output, name));
+  assert.deepEqual(
+    launcher,
+    readFileSync(new URL(`../distribution/${name}`, import.meta.url)),
+  );
+  assert.ok(
+    readFileSync(join(output, "SHA256SUMS"), "utf8")
+      .split("\n")
+      .includes(`${hash(launcher)}  ${name}`),
+  );
+  assert.match(
+    launcher.toString(),
+    /^Assert-Bundle\r?\nif \(\$VerifyOnly\).*\r?\n[^]*Get-Command docker\.exe/m,
+  );
+  assert.doesNotMatch(launcher.toString(), /\[string\]\$ProjectName\s*=/);
+  assert.match(
+    launcher.toString(),
+    /\$project = Get-InstallProject[^]*Assert-ProjectClaim \$project\r?\n\s*Assert-ProjectResources \$project\.Name \$project\.Owner[^]*up --detach[^]*Assert-ProjectClaim \$project\r?\n\s*Assert-ProjectResources \$project\.Name \$project\.Owner[^]*initial-admin\.yaml/,
+  );
+});
+
+test("combined CUDA and ROCm bundles ship the Linux starter and label owned resources", (t) => {
+  const directory = temp(t);
+  const { manifest, bytes } = fixture();
+  const name = "start-linux.sh";
+  const label = "io.vision-bill.installation";
+  for (const variant of variants) {
+    const { files } = renderBundle(manifest, variant);
+    const combined = variant.startsWith("app-ocr-");
+    assert.equal(Object.hasOwn(files, name), combined);
+    const compose = JSON.parse(files["compose.yaml"]);
+    for (const resource of [
+      ...Object.values(compose.services),
+      ...Object.values(compose.volumes),
+      ...Object.values(compose.networks ?? {}),
+    ]) {
+      assert.equal(
+        resource.labels?.[label],
+        combined ? "${VISION_BILL_INSTALLATION_ID:-manual}" : undefined,
+      );
+    }
+  }
+  seed(directory, bytes);
+  const output = join(directory, "out");
+  writeBundle(manifest, "app-ocr-rocm", output, directory);
+  const launcher = readFileSync(join(output, name));
+  assert.deepEqual(
+    launcher,
+    readFileSync(new URL(`../distribution/${name}`, import.meta.url)),
+  );
+  assert.ok(
+    readFileSync(join(output, "SHA256SUMS"), "utf8")
+      .split("\n")
+      .includes(`${hash(launcher)}  ${name}`),
+  );
+});
+
+test("the Windows launcher verifies the complete file inventory without Docker", (t) => {
+  const powershellCommands = process.platform === "win32" ? ["powershell.exe", "pwsh"] : ["pwsh"];
+  const powershell = powershellCommands.find((command) => {
+    return spawnSync(command, ["-NoProfile", "-Command", "exit 0"]).status === 0;
+  });
+  if (!powershell) return t.skip("PowerShell is unavailable");
+
+  const directory = temp(t);
+  const { manifest, bytes } = fixture();
+  seed(directory, bytes);
+  const output = join(directory, "out");
+  writeBundle(manifest, "app-ocr-cuda", output, directory);
+  const checksum = hash(readFileSync(join(output, "SHA256SUMS")));
+  const verify = (expected = checksum) =>
+    spawnSync(
+      powershell,
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        ...(process.platform === "win32" ? ["-ExecutionPolicy", "RemoteSigned"] : []),
+        "-File",
+        join(output, "start-windows.ps1"),
+        "-VerifyOnly",
+        "-ExpectedManifestSha256",
+        expected,
+      ],
+      { encoding: "utf8" },
+    );
+
+  const success = verify();
+  assert.equal(success.status, 0, success.stderr);
+  assert.match(success.stdout, /Bundle files verified/);
+  assert.notEqual(verify("0".repeat(64)).status, 0);
+
+  writeFileSync(join(output, "runtime.env"), "LLM__API_KEY=$literal#value\n");
+  writeFileSync(join(output, "windows-project.state"), `owned test ${"a".repeat(32)}\n`);
+  assert.equal(verify().status, 0);
+  writeFileSync(join(output, "release", "unexpected.txt"), "unexpected");
+  assert.match(verify().stderr, /Unexpected file in the bundle/);
+  rmSync(join(output, "release", "unexpected.txt"));
+
+  writeFileSync(join(output, "compose.yaml"), "modified");
+  assert.match(verify().stderr, /Checksum mismatch: compose\.yaml/);
 });
 
 test("CUDA bundle requires the selected channel and exact official wheel evidence", (t) => {

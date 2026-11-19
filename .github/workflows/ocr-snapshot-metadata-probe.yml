@@ -1,4 +1,4 @@
-name: Verify first-click Paddle model acquisition
+name: Verify packaged launcher on Windows
 
 on:
   push:
@@ -8,54 +8,25 @@ permissions:
   contents: write
 
 jobs:
-  runtime-download:
+  windows:
     if: github.repository == 'Peckerhacker10203/vision-bill'
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    runs-on: windows-latest
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
-      - name: Exercise runtime model archive acquisition against official hosts
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: "24"
+      - name: Verify extracted bundle in Windows PowerShell
         shell: bash
         run: |
           set -euo pipefail
-          export PYTHONPATH=paddleocr-service
-          uv run --no-project --with pydantic==2.13.4 --with packaging==26.2 python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-          import tempfile
-          from unittest.mock import patch
-
-          from ocr_service.provision import Archive, extract_archive, fetch_archive
-
-          root = Path("paddleocr-service/build/paddle-model-snapshots.json")
-          records = json.loads(root.read_bytes())
-          result = {}
-          with tempfile.TemporaryDirectory() as temporary:
-              scratch = Path(temporary)
-              for name, record in records.items():
-                  asset = Archive.model_validate(record)
-                  cache = scratch / "cache"
-                  cache.mkdir()
-                  path = fetch_archive(asset, scratch, cache, model_name=name)
-                  with patch("ocr_service.paddle_snapshots.download_model", side_effect=AssertionError):
-                      assert fetch_archive(asset, scratch, cache, model_name=name) == path
-                  directory = scratch / "model"
-                  directory.mkdir()
-                  extract_archive(path, directory, asset)
-                  import shutil
-                  shutil.rmtree(directory)
-                  shutil.rmtree(cache)
-                  result[name] = {"sha256": asset.sha256, "size_bytes": asset.size_bytes, "files": len(asset.files)}
-                  print(name, result[name], flush=True)
-
-          Path("snapshot-verification.json").write_text(json.dumps(
-              {"commit": os.environ["GITHUB_SHA"], "runtime_downloads_and_extraction": result},
-              indent=2, sort_keys=True) + "\n")
-          PY
-          git add -- snapshot-verification.json
+          node --test --test-reporter tap --test-name-pattern='Windows launcher|Windows PowerShell' scripts/distribution.test.mjs > "${RUNNER_TEMP}/windows-test.log"
+          cat "${RUNNER_TEMP}/windows-test.log"
+          grep -q '^# skipped 0$' "${RUNNER_TEMP}/windows-test.log"
+          node -e 'require("fs").writeFileSync("windows-launcher-verification.json", JSON.stringify({commit: process.env.GITHUB_SHA, runner: process.env.RUNNER_OS, scope: "Windows PowerShell verification and launcher contract"}, null, 2) + "\n")'
+          git add -- windows-launcher-verification.json
           git -c user.name='github-actions[bot]' \
             -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-            commit -m 'Record verified runtime Paddle download and extraction'
+            commit -m 'Record verified Windows launcher checks'
           git push origin HEAD:refs/heads/codex/vision-bill-ocr-model-metadata

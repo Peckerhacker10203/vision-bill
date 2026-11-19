@@ -367,6 +367,21 @@ export function renderBundle(manifest, variant) {
       env_file: [{ path: "./runtime.env", format: "raw" }],
       extra_hosts: ["host.docker.internal:host-gateway"],
       ports: ["${APP_BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-8080}:8080"],
+      ...(appOcr
+        ? {
+            healthcheck: {
+              test: [
+                "CMD",
+                "python",
+                "-c",
+                "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/v1/system/ui-config', timeout=3)",
+              ],
+              interval: "5s",
+              timeout: "5s",
+              retries: 36,
+            },
+          }
+        : {}),
       volumes: [
         volume("app-config", "/app/config"),
         volume("uploads", "/app/uploads"),
@@ -455,6 +470,15 @@ export function renderBundle(manifest, variant) {
       });
     }
   }
+  const installationLabel = {
+    "io.vision-bill.installation": "${VISION_BILL_INSTALLATION_ID:-manual}",
+  };
+  if (appOcr) {
+    for (const service of Object.values(services))
+      service.labels = { ...service.labels, ...installationLabel };
+    for (const volume of Object.values(volumes))
+      volume.labels = { ...volume.labels, ...installationLabel };
+  }
   const metadata = {
     schema_version: 2,
     version: manifest.version,
@@ -478,10 +502,27 @@ export function renderBundle(manifest, variant) {
         name: "${COMPOSE_PROJECT_NAME:?Set a stable project name and reuse it for upgrades}",
         services,
         volumes,
+        ...(appOcr ? { networks: { default: { labels: installationLabel } } } : {}),
       }),
       "runtime.env.example": runtimeExample(appOcr),
       "check-compose.sh": composeCheck,
       "release.json": json(metadata),
+      ...(appOcr
+        ? {
+            "start-linux.sh": readFileSync(
+              new URL("../distribution/start-linux.sh", import.meta.url),
+              "utf8",
+            ),
+          }
+        : {}),
+      ...(variant === "app-ocr-cuda"
+        ? {
+            "start-windows.ps1": readFileSync(
+              new URL("../distribution/start-windows.ps1", import.meta.url),
+              "utf8",
+            ),
+          }
+        : {}),
     },
     assets: [...assets].sort(),
   };
