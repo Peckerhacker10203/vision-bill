@@ -8,6 +8,7 @@ from ...config import (
     settings,
     write_config_file,
 )
+from ...model.dedicated_ocr import DedicatedOcrRequest, DedicatedOcrStatus
 from ...security.dependencies import require_admin
 
 router = APIRouter(tags=["System"])
@@ -28,6 +29,33 @@ class SettingsUpdate(BaseModel):
 class SettingsView(SettingsUpdate):
     sources: dict[str, str]
     restart_required: bool
+
+
+@router.get(
+    "/dedicated-ocr", response_model=DedicatedOcrStatus, dependencies=[Depends(require_admin)]
+)
+async def dedicated_ocr_status(request: Request) -> DedicatedOcrStatus:
+    activation = getattr(request.app.state, "dedicated_ocr", None)
+    if activation is None:
+        return DedicatedOcrStatus(state="unavailable", reason="gpu_profile_required")
+    result: DedicatedOcrStatus = await activation.status()
+    return result
+
+
+@router.post(
+    "/dedicated-ocr", status_code=202, response_model=DedicatedOcrStatus,
+    dependencies=[Depends(require_admin)],
+)
+async def activate_dedicated_ocr(
+    request: Request, body: DedicatedOcrRequest,
+) -> DedicatedOcrStatus:
+    activation = getattr(request.app.state, "dedicated_ocr", None)
+    if activation is None:
+        raise HTTPException(status_code=409, detail="gpu_profile_required")
+    result: DedicatedOcrStatus = await activation.submit(confirm_handoff=body.confirm_handoff)
+    if result.state in {"unavailable", "action_required"}:
+        raise HTTPException(status_code=409, detail=result.reason)
+    return result
 
 
 @router.get("/ui-config")

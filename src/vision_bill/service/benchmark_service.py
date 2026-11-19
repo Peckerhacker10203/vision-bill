@@ -32,6 +32,7 @@ from ..provider.db.deadline import connection
 from ..provider.llm.base import LLMProvider
 from ..provider.llm.errors import UnreadableReceiptError
 from ..provider.llm.experiment import endpoint_fingerprint
+from .activation_admission import inference_admission
 from .benchmark_scoring import PROMPT_VERSION, dataset_fingerprint, score_receipts
 from .experiment_execution import (
     ExperimentFailure,
@@ -194,11 +195,14 @@ class BenchmarkService:
     async def _work(self) -> None:
         while not self._stopping.is_set():
             try:
-                task = await self._db.lease_task()
+                with inference_admission(self._provider):
+                    task = await self._db.lease_task()
+                    if task is not None:
+                        await self._execute(dict(task))
                 if task is None:
                     await asyncio.sleep(1)
-                    continue
-                await self._execute(dict(task))
+            except HandoffWait:
+                await asyncio.sleep(1)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - don't log private provider exception content

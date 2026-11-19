@@ -367,6 +367,18 @@ export interface SettingsUpdate {
 	allow_registration: boolean;
 }
 
+export interface DedicatedOcrStatus {
+	state:
+		| 'unavailable'
+		| 'disabled'
+		| 'requested'
+		| 'installing'
+		| 'active'
+		| 'failed'
+		| 'action_required';
+	reason?: string | null;
+}
+
 export interface LineItemWrite {
 	id?: string;
 	description: string;

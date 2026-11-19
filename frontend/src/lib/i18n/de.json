@@ -411,7 +411,36 @@
 		"formatterLimit": "Ausgabelimit des Formatierers (Token)",
 		"unknown": "Unbekannt",
 		"ocrLimitUnknown": "Gemeldetes OCR-Ausgabelimit: unbekannt. Konfigurierte Grenzen sind von tatsächlichem Tokenverbrauch getrennt.",
-		"modelsUnavailable": "Modellabfrage nicht verfügbar. Eine Modellkennung kann weiterhin eingegeben werden."
+		"modelsUnavailable": "Modellabfrage nicht verfügbar. Eine Modellkennung kann weiterhin eingegeben werden.",
+		"dedicatedOcr": {
+			"title": "Dedizierte OCR",
+			"enable": "Dedizierte OCR aktivieren",
+			"retry": "Einrichtung wiederholen",
+			"retryStatus": "Status erneut abfragen",
+			"confirmHandoff": "Ich bestätige, dass der LLM-Endpunkt ausschließlich für Vision Bill vorgesehen und im Leerlauf ist. Das Vorabladen von Modellen ist deaktiviert.",
+			"submitting": "Einrichtung wird angefordert …",
+			"loadError": "Der Status der dedizierten OCR konnte nicht abgerufen werden.",
+			"requestError": "Die Anforderung zur Einrichtung der dedizierten OCR konnte nicht bestätigt werden.",
+			"states": {
+				"unavailable": "Dedizierte OCR ist mit der aktuellen Serverkonfiguration nicht verfügbar.",
+				"disabled": "Aktivieren Sie dedizierte OCR, um die Modelle auf diesem Server herunterzuladen und zu installieren.",
+				"requested": "Die Einrichtung der dedizierten OCR steht in der Warteschlange.",
+				"installing": "Die Modelle für dedizierte OCR werden heruntergeladen und installiert …",
+				"active": "Dedizierte OCR ist aktiv.",
+				"failed": "Die Einrichtung der dedizierten OCR ist fehlgeschlagen.",
+				"action_required": "Vor der Einrichtung der dedizierten OCR muss der Serverbetreiber eingreifen."
+			},
+			"reasons": {
+				"gpu_profile_required": "Wählen Sie ein CUDA- oder ROCm-Profil, um dedizierte OCR zu verwenden.",
+				"ocr_config_managed_externally": "Die Serverkonfiguration bestimmt die OCR-Verarbeitung.",
+				"llm_lifecycle_required": "Konfigurieren Sie vor der Einrichtung der dedizierten OCR eine unterstützte LLM-Modellverwaltung.",
+				"llm_quiescence_required": "Warten Sie, bis der LLM-Endpunkt im Leerlauf ist, bevor Sie die Einrichtung wiederholen.",
+				"llm_request_recovery_required": "Prüfen Sie, ob die vorherige LLM-Anfrage beendet ist, und folgen Sie der Wiederherstellungsanleitung für dedizierte OCR.",
+				"ocr_handoff_confirmation_required": "Bestätigen Sie vor der Einrichtung der dedizierten OCR, dass der LLM-Endpunkt zur Übergabe bereit ist.",
+				"ocr_runtime_unavailable": "Dedizierte OCR ist installiert. Stellen Sie den Dienst wieder her, bevor Sie Belege verarbeiten.",
+				"ocr_download_failed": "Die Modelle für dedizierte OCR konnten nicht heruntergeladen werden."
+			}
+		}
 	},
 	"editor": {
 		"spendingCategory": "Ausgabenkategorie",

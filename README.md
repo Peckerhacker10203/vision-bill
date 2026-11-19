@@ -11,11 +11,12 @@ owner-scoped data and an optional admin-wide view support multiple users.
 
 The intended end-user installation is a **downloaded, verified prebuilt bundle**,
 then `docker compose up -d` from its extracted directory. Choose app with an external
-LLM, independent CUDA/ROCm OCR, or app with managed CUDA/ROCm OCR and an external
-LLM. Every app variant uses your endpoint. Prepare its private `runtime.env` and
-set a stable Compose project name before startup. Native bundles require an
-explicit maintenance initialization for a new GPU installation. Follow the
-[installation and distribution guide](distribution/README.md).
+LLM, independent CUDA/ROCm OCR, or app with optional Dedicated OCR on CUDA/ROCm
+and an external LLM. Every app variant uses your endpoint. Prepare its private
+`runtime.env` and set a stable Compose project name before startup. In a combined
+installation the OCR controller starts idle and only downloads the four pinned
+PaddleOCR model archives when an admin enables **Dedicated OCR** or requests
+setup in the configuration. Follow the [installation guide](distribution/README.md).
 
 **This change ships source and release gates only. No qualified native images or
 prepared public bundles were published or physically qualified here.** There is no
@@ -41,8 +42,9 @@ printed observations stay null and unavailable categories or tags remain visible
 Verify changes database workflow state without moving files. See the
 [multi-photo/API workflow](MULTI_IMAGE_RECEIPTS.md).
 
-Set the canonical `OCR__ENDPOINT` to an HTTP(S) URL to select OCR, or explicitly
-blank to select direct vision. When OCR is configured, ordinary formatting,
+For external OCR, set the canonical `OCR__ENDPOINT` to an HTTP(S) URL. Set it
+explicitly blank to keep direct vision. Leave it unset to use the combined
+installation's Dedicated OCR action. When OCR is configured, ordinary formatting,
 repairs and classification use **text/evidence only**; OCR failure never sends
 receipt images to the LLM. Deprecated fallback fields remain for request replay
 and history, not as new permission. Compare OCR and direct vision only through an
@@ -85,9 +87,11 @@ Python 3.12+, PostgreSQL, uv and Node/npm are used. `make help` lists commands;
 prepare a developer installation. For source Compose, copy `.env.example` to a
 private `.env`, set a random auth secret, database credentials and explicit LLM
 provider, reachable endpoint and installed model ID,
-then use `docker compose up -d --build`. This is a developer build path; it does
-not generate a qualified distribution. Base source Compose keeps OCR disabled;
-[GPU candidates and qualification](paddleocr-service/README.md) are advanced work.
+then use `docker compose up -d --build`. For a fresh source installation, set
+`AUTH__BOOTSTRAP_USERNAME` and `AUTH__BOOTSTRAP_PASSWORD` before the first account
+if you need admin access. Ordinary users can register from the login page.
+Base Compose starts the app and PostgreSQL. For a native candidate and the
+Dedicated OCR action, use the [source GPU profile instructions](paddleocr-service/README.md#dedicated-ocr-from-source).
 
 `make lint`, `make test`, `make fe-verify`, `make release-test`,
 `make distribution-test`, `make distribution-pid1-test`, `make compose-check`,

@@ -41,7 +41,9 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from vision_bill.model.handoff import HandoffWait
 from vision_bill.provider.llm.base import LLMProvider
+from vision_bill.service.activation_admission import direct_inference_call, inference_admission
 
 DEFAULT_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 DEFAULT_APP_URL = os.environ.get("VB_APP_URL", "http://localhost:8080")
@@ -287,7 +289,8 @@ class Budget:
         if settings.ocr.enabled and settings.ocr.manage_model_lifecycle:
             data = asyncio.run(self._managed_generate(payload))
         else:
-            data = self._post("/api/generate", payload)
+            with inference_admission(), direct_inference_call():
+                data = self._post("/api/generate", payload)
         count = data.get("prompt_eval_count")
         if type(count) is not int or count <= 0:
             raise ValueError("Prompt token count is unavailable")
@@ -298,10 +301,11 @@ class Budget:
     async def _managed_generate(self, payload: dict) -> dict:
         from vision_bill.provider.llm.ollama import OllamaProvider
         provider = OllamaProvider(self.host, analysis_timeout_seconds=self.timeout)
-        async with provider.handoff.session(monotonic() + min(600, self.timeout)) as owner:
-            await owner.llm_phase(self.model)
-            result: dict = await owner.model_call(asyncio.to_thread(self._post, "/api/generate", payload))
-            return result
+        with inference_admission(provider):
+            async with provider.handoff.session(monotonic() + min(600, self.timeout)) as owner:
+                await owner.llm_phase(self.model)
+                result: dict = await owner.model_call(asyncio.to_thread(self._post, "/api/generate", payload))
+                return result
 
     def measure(self, provider: LLMProvider, tag_probe: int, image_b64: str | None) -> None:
         self.context_length()
@@ -428,7 +432,7 @@ def main() -> int:
     print(f"Model: {model}\n")
     try:
         b.measure(provider, args.tag_probe, image_b64)
-    except (httpx.HTTPError, ValueError) as e:
+    except (HandoffWait, httpx.HTTPError, ValueError) as e:
         print(f"Measurement failed (is the model loaded / reachable?): {e}", file=sys.stderr)
         return 1
 
@@ -445,14 +449,18 @@ def main() -> int:
     print(f"Reserved output budget:  {args.output_budget} tokens\n")
 
     if args.db_sample > 0:
-        report_db_image_sample(
-            b=b,
-            provider=provider,
-            dsn=args.db_dsn,
-            n=args.db_sample,
-            current_tags=current_tags,
-            output_budget=args.output_budget,
-        )
+        try:
+            report_db_image_sample(
+                b=b,
+                provider=provider,
+                dsn=args.db_dsn,
+                n=args.db_sample,
+                current_tags=current_tags,
+                output_budget=args.output_budget,
+            )
+        except HandoffWait as e:
+            print(f"Measurement held: {e}", file=sys.stderr)
+            return 1
 
     def prompt_tokens(tag_count: int) -> int:
         return (

@@ -411,7 +411,36 @@
 		"formatterLimit": "Formatter output limit (tokens)",
 		"unknown": "Unknown",
 		"ocrLimitUnknown": "Reported OCR output limit: unknown. Configured limits are separate from actual token usage.",
-		"modelsUnavailable": "Model discovery is unavailable. You can still enter a model ID."
+		"modelsUnavailable": "Model discovery is unavailable. You can still enter a model ID.",
+		"dedicatedOcr": {
+			"title": "Dedicated OCR",
+			"enable": "Enable Dedicated OCR",
+			"retry": "Retry setup",
+			"retryStatus": "Check status again",
+			"confirmHandoff": "I confirm the LLM endpoint is dedicated to Vision Bill and idle, with eager model loading turned off.",
+			"submitting": "Requesting setup…",
+			"loadError": "Could not read Dedicated OCR status.",
+			"requestError": "Could not confirm the Dedicated OCR setup request.",
+			"states": {
+				"unavailable": "Dedicated OCR is unavailable with the current server configuration.",
+				"disabled": "Enable Dedicated OCR to download and install the models on this server.",
+				"requested": "Dedicated OCR setup is queued.",
+				"installing": "Downloading and installing Dedicated OCR models…",
+				"active": "Dedicated OCR is active.",
+				"failed": "Dedicated OCR setup failed.",
+				"action_required": "Operator action is required before Dedicated OCR setup can proceed."
+			},
+			"reasons": {
+				"gpu_profile_required": "Select a CUDA or ROCm profile to use Dedicated OCR.",
+				"ocr_config_managed_externally": "The server configuration controls OCR routing.",
+				"llm_lifecycle_required": "Configure a supported LLM lifecycle before setting up Dedicated OCR.",
+				"llm_quiescence_required": "Wait for the LLM endpoint to become idle before retrying setup.",
+				"llm_request_recovery_required": "Confirm the previous LLM request has ended and follow the Dedicated OCR recovery guide.",
+				"ocr_handoff_confirmation_required": "Confirm that the LLM endpoint is ready for handoff before starting Dedicated OCR setup.",
+				"ocr_runtime_unavailable": "Dedicated OCR is installed. Restore its service before processing receipts.",
+				"ocr_download_failed": "Dedicated OCR model download failed."
+			}
+		}
 	},
 	"editor": {
 		"spendingCategory": "Spending category",

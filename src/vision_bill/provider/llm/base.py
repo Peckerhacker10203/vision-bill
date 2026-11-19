@@ -41,6 +41,7 @@ from ...model.ocr import SourceRef, WorkingImage
 from ...model.receipt import Category, LineItem, Receipt
 from ...model.receipt_extraction import DuplicateCandidate, MultiImageReceipt, validate_overlap
 from ...model.review import AmountPolicy, ReviewFinding
+from ...service.activation_admission import inference_admission
 from ...service.gpu_handoff import current_owner
 from ...service.observation_admission import admit_observations
 from ...service.receipt_review import observation_values
@@ -246,10 +247,11 @@ class LLMProvider(ABC):
     ) -> AnalysisResult:
         """Explicit compatibility/replay path for historical Receipt-only responses."""
         deadline = monotonic() + self.analysis_timeout_seconds
-        async with asyncio.timeout(self.analysis_timeout_seconds), (
-            self.handoff.session(deadline, model_id=model_id) if self.handoff is not None else nullcontext()
-        ):
-            return await self._legacy_analysis_owned(model_id, messages, image_count=image_count)
+        with inference_admission(self):
+            async with asyncio.timeout(self.analysis_timeout_seconds), (
+                self.handoff.session(deadline, model_id=model_id) if self.handoff is not None else nullcontext()
+            ):
+                return await self._legacy_analysis_owned(model_id, messages, image_count=image_count)
 
     async def _legacy_analysis_owned(
         self, model_id: str, messages: list[dict[str, Any]], *, image_count: int = 1
@@ -287,11 +289,12 @@ class LLMProvider(ABC):
     ) -> InferenceEnvelope:
         """Extract observations first; classification is an independent enrichment call."""
         started = perf_counter()
-        async with asyncio.timeout(max(0, deadline - monotonic())), (
-            self.handoff.session(deadline, model_id=model_id) if self.handoff is not None else nullcontext()
-        ):
-            result = await self.extract_observations(model_id, input, tags=tags, deadline=deadline)
-            result = await self.enrich_observations(model_id, result, tags, work_deadline=deadline)
+        with inference_admission(self):
+            async with asyncio.timeout(max(0, deadline - monotonic())), (
+                self.handoff.session(deadline, model_id=model_id) if self.handoff is not None else nullcontext()
+            ):
+                result = await self.extract_observations(model_id, input, tags=tags, deadline=deadline)
+                result = await self.enrich_observations(model_id, result, tags, work_deadline=deadline)
         check_deadline(deadline)
         result.telemetry.elapsed_ms = (perf_counter() - started) * 1000
         return result

@@ -19,6 +19,7 @@ from ...provider.llm.base import (
     ModelInfo,
     inference_endpoint_identity,
 )
+from ...service.activation_admission import direct_inference_call, inference_admission
 from . import OPENAI_CREDENTIALLESS_API_KEY
 from .experiment import chat_telemetry
 from .llamacpp import LlamaCppLifecycle
@@ -223,18 +224,19 @@ class OpenAIProvider(LLMProvider):
     async def send_message(self, model_id: str, messages: Sequence[Mapping[str, Any]]) -> str:
         from ...service.gpu_handoff import current_owner
 
-        if self.handoff is not None and not self.supports_model_release:
-            raise ValueError("model_release_unsupported: managed OCR requires an unload-capable provider")
-        owner = current_owner()
-        if owner is not None:
-            if owner.resources.llm != self.lifecycle_identity:
-                raise ValueError("model_handoff_identity_changed")
-            await owner.llm_phase(model_id)
-        elif self.handoff is not None:
-            async with self.handoff.session(monotonic() + self.analysis_timeout_seconds, model_id=model_id) as owner:
+        with inference_admission(self):
+            if self.handoff is not None and not self.supports_model_release:
+                raise ValueError("model_release_unsupported: managed OCR requires an unload-capable provider")
+            owner = current_owner()
+            if owner is not None:
+                if owner.resources.llm != self.lifecycle_identity:
+                    raise ValueError("model_handoff_identity_changed")
                 await owner.llm_phase(model_id)
-                return await self._send_message(model_id, messages)
-        return await self._send_message(model_id, messages)
+            elif self.handoff is not None:
+                async with self.handoff.session(monotonic() + self.analysis_timeout_seconds, model_id=model_id) as owner:
+                    await owner.llm_phase(model_id)
+                    return await self._send_message(model_id, messages)
+            return await self._send_message(model_id, messages)
 
     async def _send_message(self, model_id: str, messages: Sequence[Mapping[str, Any]]) -> str:
         from ...service.gpu_handoff import current_owner
@@ -242,14 +244,15 @@ class OpenAIProvider(LLMProvider):
         # Plain dicts are exactly what the SDK serializes (verified against
         # the live server); cast() satisfies the TypedDict-parameter overloads.
         started = perf_counter()
-        call = self._client.chat.completions.create(
-            model=model_id,
-            messages=cast(Any, messages),
-            temperature=self._temperature,
-            max_tokens=self.max_output_tokens,
-        )
         owner = current_owner()
-        response = await owner.model_call(call) if owner is not None else await call
+        with direct_inference_call(coordinated=owner is not None):
+            call = self._client.chat.completions.create(
+                model=model_id,
+                messages=cast(Any, messages),
+                temperature=self._temperature,
+                max_tokens=self.max_output_tokens,
+            )
+            response = await owner.model_call(call) if owner is not None else await call
         if self.experiment_trace is not None:
             self.experiment_trace.append(
                 chat_telemetry(response, messages, (perf_counter() - started) * 1000)

@@ -35,6 +35,39 @@ The PNG bound accounts for row filters, worst-shape DEFLATE and chunk overhead.
 Readers validate lengths, dimensions, PNG integrity and hashes before accepting
 working artifacts. The 2 MP setting still applies to VLM regions.
 
+The OCR container hosts the complete PaddleOCR/PaddleX pipeline with the native
+PaddlePaddle inference engine. Layout, orientation, unwarping and VLM recognition
+execute in its disposable native worker. Vision Bill uses its private HTTP API.
+The operator's separate text or vision LLM endpoint remains the receipt formatter.
+
+## Dedicated OCR from source
+
+The base Compose install runs direct vision. To prepare an idle Dedicated OCR
+controller, select the `ocr` profile and the accelerator overlay.
+
+```bash
+docker compose --profile ocr -f docker-compose.yml -f docker-compose.cuda.yml up -d
+```
+
+For ROCm substitute `docker-compose.rocm.yml`. The source profile can build the
+selected runtime image. Preparing that runtime does not download model weights.
+The CUDA lock and device qualification constraints below still apply.
+
+Put the approved `bundle.json`, `image-config.json` and declared fixture assets
+matching the selected image in `server_data/ocr-release/`, or set `OCR_RELEASE_DIR`
+to their directory. Set `OCR_IMAGE_ID` to that local image's exact Docker config
+digest. Profiles can run idle while those inputs are being prepared. Setup
+requires a trusted manifest with remote HTTPS model archives and exact hashes.
+Use the [release input workflow](../distribution/README.md#maintainers-real-artifact-inputs-and-workflows)
+for this metadata. A source checkout carries neither model archives nor a qualified
+native release catalog.
+
+Leave `OCR__ENDPOINT` unset and legacy `OCR__ENABLED=false` for Dedicated OCR.
+After preparing the LLM handoff, open **Settings → Dedicated OCR** as an admin
+and request setup. The same [startup configuration and recovery procedure](../distribution/README.md#enable-dedicated-ocr)
+applies to source installs using their service names. The explicit manual GPU
+qualification path below is available separately.
+
 ## Build inputs
 
 `runtime-lock.json` records the immutable Ubuntu base, Ubuntu package snapshot,
@@ -240,7 +273,7 @@ OCR host port. The app's optional endpoint selector is independent of service mo
 
 ## First setup and serving handoff
 
-Ordinary prepared startup runs the cache-only `ocr-init` check before serving.
+Standalone prepared startup runs the cache-only `ocr-init` check before serving.
 It checks the selected installation against the
 [pinned release assets](release-bundle.schema.json), image config/source and device
 identities, licenses, qualification and model/fixture inventories. An exact healthy
@@ -249,7 +282,9 @@ cache is reused. A missing, damaged or mismatched cache requires explicit
 maintenance, `ocr_service.initialize maintain` provisions verified OCR assets and
 runs full native qualification before publishing the runtime and smoke paths.
 Maintenance runs independently of receipt attempts and comparative benchmarks.
-See the [prepared bundle instructions](../distribution/README.md).
+Combined bundles run this initializer after an explicit Dedicated OCR request.
+Their shared model handoff lock lives at `/coord/gpu-handoff.lock`. See the
+[prepared bundle instructions](../distribution/README.md).
 
 Each maintenance invocation requires `--maintenance-intent external-llm-quiesced`
 or `--maintenance-intent separate-ocr-device`. For an app/OCR pair, also give the

@@ -304,14 +304,13 @@ test("bundles are deterministic, isolated, immutable and contain only prebuilt i
       ]);
       assert.equal(compose.services.app.environment.OCR__ENDPOINT, undefined);
       assert.doesNotMatch(content, /ollama:11434|installation.lock/);
-    } else {
-      const appOcr = variant.startsWith("app-ocr");
+    } else if (variant.startsWith("ocr-")) {
       assert.equal(
         compose.services.ocr.environment.OCR_SERVICE_MODE,
-        appOcr ? "managed" : "${OCR_SERVICE_MODE:-standalone}",
+        "${OCR_SERVICE_MODE:-standalone}",
       );
-      assert.equal(!!compose.services.ocr.ports, !appOcr);
-      assert.equal(!!compose.services.app, appOcr);
+      assert.ok(compose.services.ocr.ports);
+      assert.equal(compose.services.app, undefined);
       assert.equal(compose.services.ollama, undefined);
       assert.equal(compose.services["ocr-init"].command[0], "check");
       const maintenance = compose.services["ocr-maintenance"];
@@ -322,7 +321,7 @@ test("bundles are deterministic, isolated, immutable and contain only prebuilt i
       assert.ok(!maintenance.command.includes("--handoff-lock"));
       assert.equal(
         maintenance.environment.OCR_MAINTENANCE_REQUIRE_HANDOFF,
-        appOcr ? "true" : undefined,
+        undefined,
       );
       assert.equal(compose.services["ocr-init"].restart, "no");
       assert.equal(compose.services["ocr-init"].init, false);
@@ -344,15 +343,86 @@ test("bundles are deterministic, isolated, immutable and contain only prebuilt i
         compose.services.ocr.environment.OCR_INSTALLATION_LOCK_PATH,
         "/coord/installation.lock",
       );
-      assert.ok(
-        rendered.assets.every(
-          (name) =>
-            !name.startsWith(variant.endsWith("cuda") ? "rocm/" : "cuda/"),
-        ),
-      );
     }
+    assert.ok(
+      rendered.assets.every(
+        (name) =>
+          !name.startsWith(variant.endsWith("cuda") ? "rocm/" : "cuda/"),
+      ),
+    );
   }
   assert.throws(() => renderBundle(manifest, "latest"));
+});
+
+test("combined bundle starts a private idle controller without prequalifying or selecting OCR", () => {
+  const { manifest } = fixture();
+  for (const accelerator of ["cuda", "rocm"]) {
+    const rendered = renderBundle(manifest, `app-ocr-${accelerator}`);
+    const { services, volumes } = JSON.parse(rendered.files["compose.yaml"]);
+    assert.deepEqual(Object.keys(services).sort(), [
+      "app",
+      "config-init",
+      "db",
+      "ocr",
+    ]);
+    assert.deepEqual(services.ocr.command, [
+      "python",
+      "-m",
+      "ocr_service.activation",
+    ]);
+    assert.equal(
+      services.ocr.environment.OCR_IMAGE_ID,
+      manifest.images[`ocr-${accelerator}`].config_digest,
+    );
+    assert.equal(services.ocr.env_file, undefined);
+    assert.equal(services.ocr.ports, undefined);
+    assert.equal(services.app.environment.VISION_BILL_OCR_ACTIVATION, "true");
+    assert.equal(
+      services.app.environment.OCR_ACTIVATION_ENDPOINT,
+      "http://ocr:8082",
+    );
+    assert.equal(
+      services.app.environment.OCR_ACTIVATION_HANDOFF_LOCK_PATH,
+      services.ocr.environment.OCR_HANDOFF_LOCK_PATH,
+    );
+    assert.equal(services.app.environment.OCR__ENDPOINT, undefined);
+    assert.equal(services.app.environment.OCR__COORDINATION_PATH, undefined);
+    assert.equal(
+      services["config-init"].environment.VISION_BILL_MANAGED_OCR,
+      undefined,
+    );
+    assert.doesNotMatch(rendered.files["runtime.env.example"], /^OCR__ENDPOINT=/m);
+    assert.match(rendered.files["runtime.env.example"], /^# OCR_ACTIVATION_CONFIRM_HANDOFF=false$/m);
+    const app = Object.fromEntries(
+      services.app.volumes.map((mount) => [mount.target, mount]),
+    );
+    const ocr = Object.fromEntries(
+      services.ocr.volumes.map((mount) => [mount.target, mount]),
+    );
+    for (const [target, appReadOnly, ocrReadOnly] of [
+      ["/activation/request", false, true],
+      ["/activation/status", true, false],
+      ["/activation/lock", false, false],
+      ["/coord", false, false],
+    ]) {
+      assert.equal(app[target].source, ocr[target].source);
+      assert.equal(app[target].type, "volume");
+      assert.equal(ocr[target].type, "volume");
+      assert.deepEqual(volumes[app[target].source], {});
+      assert.equal(!!app[target].read_only, appReadOnly);
+      assert.equal(!!ocr[target].read_only, ocrReadOnly);
+    }
+    assert.deepEqual(Object.keys(ocr).sort(), [
+      "/activation/lock",
+      "/activation/request",
+      "/activation/status",
+      "/coord",
+      "/release",
+      "/var/lib/ocr",
+    ]);
+    assert.equal(ocr["/release"].read_only, true);
+    assert.equal(ocr["/var/lib/ocr"].read_only, undefined);
+  }
 });
 
 test("materialization verifies raw OCI config and qualification before atomic complete bundle publication", (t) => {
@@ -454,6 +524,57 @@ test("external native bundle requires complete model, fixture and licensed archi
   }
 });
 
+test("combined materialization requires pinned HTTPS model sources and permits only the declared local fixture archive", (t) => {
+  const directory = temp(t);
+  const { manifest, bytes } = fixture();
+  const bundlePath = manifest.native.rocm.bundle;
+  const bundle = JSON.parse(bytes[bundlePath]);
+  const setAsset = (path, content) => {
+    bytes[path] = content;
+    manifest.assets[path] = {
+      sha256: hash(content),
+      size_bytes: Buffer.byteLength(content),
+    };
+  };
+  const fixtureBytes = "sealed synthetic fixture archive";
+  bundle.fixtures.source = "fixtures.tar";
+  bundle.fixtures.sha256 = hash(fixtureBytes);
+  bundle.fixtures.size_bytes = Buffer.byteLength(fixtureBytes);
+  setAsset("rocm/fixtures.tar", fixtureBytes);
+  setAsset(bundlePath, JSON.stringify(bundle));
+  seed(directory, bytes);
+  const accepted = join(directory, "accepted");
+  writeBundle(manifest, "app-ocr-rocm", accepted, directory);
+  assert.ok(
+    readdirSync(join(accepted, "release", "rocm")).includes("fixtures.tar"),
+  );
+  assert.doesNotMatch(
+    readFileSync(join(accepted, "SHA256SUMS"), "utf8"),
+    /UVDoc\.tar/,
+  );
+
+  const modelBytes = "sealed synthetic model archive";
+  setAsset("rocm/UVDoc.tar", modelBytes);
+  seed(directory, bytes);
+  const extra = join(directory, "extra");
+  assert.throws(
+    () => writeBundle(manifest, "app-ocr-rocm", extra, directory),
+    /unexpected.+asset/i,
+  );
+
+  bundle.models.UVDoc.source = "UVDoc.tar";
+  bundle.models.UVDoc.sha256 = hash(modelBytes);
+  bundle.models.UVDoc.size_bytes = Buffer.byteLength(modelBytes);
+  setAsset(bundlePath, JSON.stringify(bundle));
+  seed(directory, bytes);
+  const local = join(directory, "local");
+  assert.throws(
+    () => writeBundle(manifest, "app-ocr-rocm", local, directory),
+    /HTTPS.*model|model.*HTTPS/i,
+  );
+  writeBundle(manifest, "ocr-rocm", join(directory, "standalone"), directory);
+});
+
 test("CLI generates every variant and Docker Compose validates effective config without services", (t) => {
   const directory = temp(t);
   const { manifest, bytes } = fixture();
@@ -497,12 +618,18 @@ test("CLI generates every variant and Docker Compose validates effective config 
     );
     assert.equal(composed.status, 0, composed.stderr);
     const effective = JSON.parse(composed.stdout);
-    if (effective.services.ocr)
+    if (variant.startsWith("app-ocr")) {
+      assert.equal(effective.services.app.environment.OCR__ENDPOINT, undefined);
+      assert.match(
+        effective.volumes["ocr-activation-request"].name,
+        /^vb-distribution-test_/,
+      );
+    }
+    if (variant.startsWith("ocr-")) {
       assert.equal(
         effective.services.ocr.environment.OCR_SERVICE_MODE,
-        variant.startsWith("app-ocr") ? "managed" : "standalone",
+        "standalone",
       );
-    if (variant.startsWith("ocr-")) {
       const managed = spawnSync(
         "docker",
         [
@@ -991,22 +1118,48 @@ test("producer stages only approved exact-version inputs and consumer verifies a
     join(selected, "rocm/bundle.json"),
     JSON.stringify(localBundle),
   );
-  const localOutput = join(directory, "local-artifact");
+  assert.throws(
+    () =>
+      stageInputs(
+        request,
+        { actor: "maintainer", role: "maintain" },
+        sourceRoot,
+        join(directory, "combined-local-artifact"),
+      ),
+    /HTTPS.*model|model.*HTTPS/i,
+  );
+  const standaloneRequest = { ...request, variant: "ocr-rocm" };
+  const standalone = join(
+    sourceRoot,
+    standaloneRequest.sha,
+    standaloneRequest.version,
+    standaloneRequest.variant,
+  );
+  const { postgres, ...standalonePlan } = plan;
+  seed(standalone, {
+    "release-inputs.json": JSON.stringify(standalonePlan),
+    "rocm/bundle.json": JSON.stringify(localBundle),
+    "rocm/model.tar": localBytes,
+  });
+  const localOutput = join(directory, "standalone-local-artifact");
   stageInputs(
-    request,
+    standaloneRequest,
     { actor: "maintainer", role: "maintain" },
     sourceRoot,
     localOutput,
   );
-  verifyStagedInputs(localOutput, request, { actor: "maintainer", run: "123" });
+  verifyStagedInputs(localOutput, standaloneRequest, {
+    actor: "maintainer",
+    run: "123",
+  });
   assert.equal(
     readFileSync(join(localOutput, "rocm/model.tar"), "utf8"),
     localBytes,
   );
-  writeFileSync(join(selected, "rocm/model.tar"), "changed archive");
+  writeFileSync(join(standalone, "rocm/model.tar"), "changed archive");
   assert.throws(() =>
     stageInputs(
-      request,
+      standaloneRequest,
       { actor: "maintainer", role: "maintain" },
       sourceRoot,
       join(directory, "wrong-archive"),
@@ -1094,7 +1247,9 @@ function resolveExternal(t, variant, root, project = "vb-upgrade-stable") {
     'synthetic$HOME${NOT_EXPANDED}#hash "quotes" \\literal';
   const environment =
     `LLM__PROVIDER=openai\nLLM__HOST=http://host.docker.internal:1234/v1\nLLM__MODEL_NAME=operator-model\nLLM__API_KEY=${syntheticLiteralKey}\n` +
-    (variant.startsWith("app-ocr") ? "OCR__ENDPOINT=http://ocr:8082\n" : "");
+    (variant.startsWith("app-ocr")
+      ? "OCR__ENDPOINT=http://external-ocr:8082\n"
+      : "");
   writeFileSync(join(directory, "runtime.env"), environment, { mode: 0o600 });
   const env = { ...process.env, COMPOSE_PROJECT_NAME: project };
   const command = ["compose", "-f", join(directory, "compose.yaml"), "config"];
@@ -1164,6 +1319,11 @@ test("canonical_runtime_env_reaches_init_and_app", (t) => {
       assert.ok(
         !effective.services["config-init"].command.includes("--provider"),
       );
+      if (variant.startsWith("app-ocr"))
+        assert.equal(
+          effective.services.app.environment.OCR__ENDPOINT,
+          "http://external-ocr:8082",
+        );
     }
   }
 });

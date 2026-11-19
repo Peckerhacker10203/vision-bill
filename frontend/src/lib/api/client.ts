@@ -18,6 +18,7 @@ import type {
 	DraftView,
 	DraftPatch,
 	DraftFinalize,
+	DedicatedOcrStatus,
 	CategorySuggestion,
 	Collection,
 	CollectionCreate,
@@ -308,6 +309,25 @@ export const api = {
 
 	getSettings(): Promise<SettingsView> {
 		return request<SettingsView>('/system/settings');
+	},
+
+	getDedicatedOcr(actor: SessionActor | null): Promise<DedicatedOcrStatus> {
+		return request<DedicatedOcrStatus>('/system/dedicated-ocr', undefined, actor);
+	},
+
+	requestDedicatedOcr(
+		actor: SessionActor | null,
+		confirmHandoff: true
+	): Promise<DedicatedOcrStatus> {
+		return request<DedicatedOcrStatus>(
+			'/system/dedicated-ocr',
+			{
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ confirm_handoff: confirmHandoff })
+			},
+			actor
+		);
 	},
 
 	updateSettings(body: SettingsUpdate): Promise<SettingsView> {

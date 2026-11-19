@@ -24,6 +24,7 @@ from ..model.ocr import OcrPageMetadata, OcrResponse, SourceRef
 from ..model.review import ReviewFinding
 from ..provider.llm.base import LLMProvider, ModelInfo
 from ..provider.ocr.base import OcrProvider, compact_ocr_text
+from .activation_admission import inference_admission
 from .gpu_handoff import ModelHandoff, admission_deadline, current_owner
 from .observation_admission import admit_observations
 
@@ -101,27 +102,28 @@ class ExtractionPipeline:
             deadline = min(deadline, owner.deadline)
         started = perf_counter()
         handoff = self.coordinator()
-        async with asyncio.timeout(max(0, deadline - monotonic())), (
-            handoff.session(
-                deadline, model_id=model_id,
-                expected_binding_sha256=expected_binding_sha256,
-                lock_deadline=admission_deadline(min(deadline, handoff_deadline)
-                    if handoff_deadline is not None else deadline),
-            ) if handoff is not None else nullcontext()
-        ):
-            result = await self._extract(
-                model_id,
-                tuple(paths),
-                options=options.model_copy(deep=True),
-                deadline=deadline,
-                tags=tuple(tags),
-                checkpoint=checkpoint,
-                observation_checkpoint=observation_checkpoint,
-                unmanaged_classification_event=unmanaged_classification_event,
-                resume_pages=tuple(p.model_copy(deep=True) for p in resume_pages),
-                source_refs=tuple(r.model_copy(deep=True) for r in source_refs),
-                max_output_tokens=max_output_tokens,
-            )
+        with inference_admission(self.provider):
+            async with asyncio.timeout(max(0, deadline - monotonic())), (
+                handoff.session(
+                    deadline, model_id=model_id,
+                    expected_binding_sha256=expected_binding_sha256,
+                    lock_deadline=admission_deadline(min(deadline, handoff_deadline)
+                        if handoff_deadline is not None else deadline),
+                ) if handoff is not None else nullcontext()
+            ):
+                result = await self._extract(
+                    model_id,
+                    tuple(paths),
+                    options=options.model_copy(deep=True),
+                    deadline=deadline,
+                    tags=tuple(tags),
+                    checkpoint=checkpoint,
+                    observation_checkpoint=observation_checkpoint,
+                    unmanaged_classification_event=unmanaged_classification_event,
+                    resume_pages=tuple(p.model_copy(deep=True) for p in resume_pages),
+                    source_refs=tuple(r.model_copy(deep=True) for r in source_refs),
+                    max_output_tokens=max_output_tokens,
+                )
         check_deadline(deadline)
         result.telemetry.elapsed_ms = (perf_counter() - started) * 1000
         return result

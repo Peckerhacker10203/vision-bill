@@ -20,6 +20,7 @@ from ...provider.llm.base import (
     ModelInfo,
     inference_endpoint_identity,
 )
+from ...service.activation_admission import direct_inference_call, inference_admission
 from .experiment import chat_telemetry
 
 try:
@@ -179,16 +180,17 @@ class OllamaProvider(LLMProvider):
 
     async def send_message(self, model_id: str, messages: Sequence[Mapping[str, Any]]) -> str:
         from ...service.gpu_handoff import current_owner
-        owner = current_owner()
-        if owner is not None:
-            if owner.resources.llm != self.lifecycle_identity:
-                raise ValueError("model_handoff_identity_changed")
-            await owner.llm_phase(model_id)
-        elif self.handoff is not None:
-            async with self.handoff.session(monotonic() + self.analysis_timeout_seconds, model_id=model_id) as owner:
+        with inference_admission(self):
+            owner = current_owner()
+            if owner is not None:
+                if owner.resources.llm != self.lifecycle_identity:
+                    raise ValueError("model_handoff_identity_changed")
                 await owner.llm_phase(model_id)
-                return await self._send_message(model_id, messages)
-        return await self._send_message(model_id, messages)
+            elif self.handoff is not None:
+                async with self.handoff.session(monotonic() + self.analysis_timeout_seconds, model_id=model_id) as owner:
+                    await owner.llm_phase(model_id)
+                    return await self._send_message(model_id, messages)
+            return await self._send_message(model_id, messages)
 
     async def _send_message(self, model_id: str, messages: Sequence[Mapping[str, Any]]) -> str:
         from ...service.gpu_handoff import current_owner
@@ -196,15 +198,16 @@ class OllamaProvider(LLMProvider):
         extra: dict[str, Any] = {}
         if self.experiment_options and self.experiment_options.think is not None:
             extra["think"] = self.experiment_options.think
-        call = self._client.chat(
-            model=model_id,
-            # format=Receipt.model_json_schema(),
-            messages=messages,
-            options={"temperature": self._temperature, "num_predict": self.max_output_tokens},
-            **extra,
-        )
         owner = current_owner()
-        response = await owner.model_call(call) if owner is not None else await call
+        with direct_inference_call(coordinated=owner is not None):
+            call = self._client.chat(
+                model=model_id,
+                # format=Receipt.model_json_schema(),
+                messages=messages,
+                options={"temperature": self._temperature, "num_predict": self.max_output_tokens},
+                **extra,
+            )
+            response = await owner.model_call(call) if owner is not None else await call
         if self.experiment_trace is not None:
             self.experiment_trace.append(
                 chat_telemetry(response, messages, (perf_counter() - started) * 1000)

@@ -130,17 +130,7 @@ function rejectPlaceholders(value) {
       !/(?:^|@sha256:|^sha256:)([a-f0-9])\1{39,63}$/.test(value),
       "Placeholder digest",
     );
-    if (value.startsWith("https://")) {
-      const url = new URL(value);
-      check(
-        !url.username &&
-          !url.password &&
-          ![...url.searchParams.keys()].some((key) =>
-            /token|secret|password|signature|api.?key/i.test(key),
-          ),
-        "Credential-bearing asset URL",
-      );
-    }
+    if (value.startsWith("https://")) isHttpsAssetSource(value);
   } else if (value && typeof value === "object")
     for (const child of Object.values(value)) rejectPlaceholders(child);
 }
@@ -164,6 +154,24 @@ export function validateArtifacts(manifest) {
   }
   return manifest;
 }
+export function isHttpsAssetSource(source) {
+  if (typeof source !== "string" || !source.startsWith("https://"))
+    return false;
+  check(
+    /^https:\/\/[^/\s\\][^\s\\]*$/.test(source),
+    "Absolute HTTPS asset URL required",
+  );
+  const url = new URL(source);
+  check(
+    !url.username &&
+      !url.password &&
+      ![...url.searchParams.keys()].some((key) =>
+        /secret|token|signature|password|api.?key/i.test(key),
+      ),
+    "Credential-bearing asset URL",
+  );
+  return true;
+}
 const volume = (source, target, readOnly = false) => ({
   type: "volume",
   source,
@@ -180,6 +188,12 @@ const bind = (source, target) => ({
 const done = (name) => ({
   [name]: { condition: "service_completed_successfully" },
 });
+const activationHandoffLock = "/coord/gpu-handoff.lock";
+const activationMounts = (app) => [
+  volume("ocr-activation-request", "/activation/request", !app),
+  volume("ocr-activation-status", "/activation/status", app),
+  volume("ocr-activation-lock", "/activation/lock"),
+];
 const device = (accelerator) =>
   accelerator === "cuda"
     ? {
@@ -223,7 +237,7 @@ if [ -e "$runtime" ] && { [ -L "$runtime" ] || [ "$(stat -c %a "$runtime")" != "
 fi
 exec docker compose -f "$(dirname "$0")/compose.yaml" config --quiet
 `;
-function runtimeExample(managed) {
+function runtimeExample(activation) {
   return `# Requires Docker Compose >=2.30 (raw env_file support).
 # Copy to runtime.env and chmod 0600 runtime.env before running check-compose.sh.
 # Values are literal: do not add quoting, export, or shell interpolation.
@@ -238,7 +252,16 @@ function runtimeExample(managed) {
 # LLM__TEMPERATURE=0
 # Optional lifecycle control for a dedicated OpenAI-compatible llama.cpp router.
 # LLM__MODEL_LIFECYCLE=llamacpp
-${managed ? "OCR__ENDPOINT=http://ocr:8082\nOCR__TIMEOUT_SECONDS=600\nOCR__ALLOW_VISION_FALLBACK=false\n" : "# Optional OCR__ENDPOINT: omit to preserve YAML; set blank only to explicitly disable.\n"}`;
+# For externally managed OCR, explicitly set OCR__ENDPOINT to the service URL.
+# Omit to preserve saved configuration, or set blank to explicitly disable OCR.
+${activation ? `# Use Dedicated OCR in admin Settings to set up the selected GPU profile.
+# Or explicitly request setup once on startup.
+# OCR_ACTIVATION_ON_STARTUP=false
+# Set true with an idle, dedicated LLM endpoint and eager loading disabled.
+# OCR_ACTIVATION_CONFIRM_HANDOFF=false
+# Attest that the external LLM is quiesced, or select separate-ocr-device.
+# OCR_ACTIVATION_MAINTENANCE_INTENT=external-llm-quiesced
+` : ""}`;
 }
 
 export function renderBundle(manifest, variant) {
@@ -281,7 +304,6 @@ export function renderBundle(manifest, variant) {
       extra_hosts: ["host.docker.internal:host-gateway"],
       environment: {
         VISION_BILL_CONFIG_PATH: "/app/config/config.yaml",
-        ...(appOcr ? { VISION_BILL_MANAGED_OCR: "true" } : {}),
       },
       command: [
         "init",
@@ -323,7 +345,13 @@ export function renderBundle(manifest, variant) {
       },
       environment: {
         VISION_BILL_CONFIG_PATH: "/app/config/config.yaml",
-        ...(appOcr ? { VISION_BILL_MANAGED_OCR: "true" } : {}),
+        ...(appOcr
+          ? {
+              VISION_BILL_OCR_ACTIVATION: "true",
+              OCR_ACTIVATION_ENDPOINT: "http://ocr:8082",
+              OCR_ACTIVATION_HANDOFF_LOCK_PATH: activationHandoffLock,
+            }
+          : {}),
       },
       env_file: [{ path: "./runtime.env", format: "raw" }],
       extra_hosts: ["host.docker.internal:host-gateway"],
@@ -333,6 +361,9 @@ export function renderBundle(manifest, variant) {
         volume("uploads", "/app/uploads"),
         volume("uploads-tmp", "/app/uploads_tmp"),
         volume("logs", "/app/logs"),
+        ...(appOcr
+          ? [volume("coordination", "/coord"), ...activationMounts(true)]
+          : []),
       ],
     });
   }
@@ -358,55 +389,60 @@ export function renderBundle(manifest, variant) {
       OCR_INSTALLATION_LOCK_PATH: "/coord/installation.lock",
       OCR_STATE_DIR: "/var/lib/ocr",
     };
-    service("ocr-init", `ocr-${accelerator}`, {
-      init: false,
-      restart: "no",
-      entrypoint: ["python", "-m", "ocr_service.initialize"],
-      command: [
-        "check",
-        "--bundle",
-        "/release/bundle.json",
-        "--state-dir",
-        "/var/lib/ocr",
-        "--image-config",
-        "/release/image-config.json",
-        "--image-id",
-        manifest.images[`ocr-${accelerator}`].config_digest,
-      ],
-      environment: lock,
-      volumes: mounts,
-      ...device(accelerator),
-    });
-    service("ocr-maintenance", `ocr-${accelerator}`, {
-      ...services["ocr-init"],
-      profiles: ["ocr-maintenance"],
-      command: ["maintain", ...services["ocr-init"].command.slice(1)],
-      environment: {
-        ...lock,
-        ...(appOcr ? { OCR_MAINTENANCE_REQUIRE_HANDOFF: "true" } : {}),
-      },
-      volumes: [
-        ...mounts,
-        ...(appOcr ? [volume("app-config", "/app/config")] : []),
-      ],
-    });
-    service("ocr", `ocr-${accelerator}`, {
-      init: false,
-      restart: "unless-stopped",
-      command: ["python", "-m", "ocr_service.entrypoint"],
-      depends_on: done("ocr-init"),
-      environment: {
-        ...lock,
-        OCR_SERVICE_MODE: appOcr
-          ? "managed"
-          : "${OCR_SERVICE_MODE:-standalone}",
-      },
-      volumes: mounts,
-      ...(!appOcr
-        ? { ports: ["${OCR_BIND_ADDRESS:-127.0.0.1}:${OCR_PORT:-8082}:8082"] }
-        : {}),
-      ...device(accelerator),
-    });
+    if (appOcr) {
+      const controlMounts = activationMounts(false);
+      for (const mount of controlMounts) volumes[mount.source] = {};
+      service("ocr", `ocr-${accelerator}`, {
+        init: false,
+        restart: "unless-stopped",
+        command: ["python", "-m", "ocr_service.activation"],
+        environment: {
+          ...lock,
+          OCR_IMAGE_ID: manifest.images[`ocr-${accelerator}`].config_digest,
+          OCR_HANDOFF_LOCK_PATH: activationHandoffLock,
+        },
+        volumes: [...mounts, ...controlMounts],
+        ...device(accelerator),
+      });
+    } else {
+      service("ocr-init", `ocr-${accelerator}`, {
+        init: false,
+        restart: "no",
+        entrypoint: ["python", "-m", "ocr_service.initialize"],
+        command: [
+          "check",
+          "--bundle",
+          "/release/bundle.json",
+          "--state-dir",
+          "/var/lib/ocr",
+          "--image-config",
+          "/release/image-config.json",
+          "--image-id",
+          manifest.images[`ocr-${accelerator}`].config_digest,
+        ],
+        environment: lock,
+        volumes: mounts,
+        ...device(accelerator),
+      });
+      service("ocr-maintenance", `ocr-${accelerator}`, {
+        ...services["ocr-init"],
+        profiles: ["ocr-maintenance"],
+        command: ["maintain", ...services["ocr-init"].command.slice(1)],
+      });
+      service("ocr", `ocr-${accelerator}`, {
+        init: false,
+        restart: "unless-stopped",
+        command: ["python", "-m", "ocr_service.entrypoint"],
+        depends_on: done("ocr-init"),
+        environment: {
+          ...lock,
+          OCR_SERVICE_MODE: "${OCR_SERVICE_MODE:-standalone}",
+        },
+        volumes: mounts,
+        ports: ["${OCR_BIND_ADDRESS:-127.0.0.1}:${OCR_PORT:-8082}:8082"],
+        ...device(accelerator),
+      });
+    }
   }
   const metadata = {
     schema_version: 2,
@@ -539,6 +575,11 @@ function verifyEvidence(manifest, variant, contents) {
       bundle.source_files["runtime-lock.json"],
     "Source profile/lock identities missing",
   );
+  const allowedAssets = new Set([
+    manifest.verification.app_checks,
+    ...Object.values(native),
+  ]);
+  const activation = variant.startsWith("app-ocr-");
   for (const [name, archive] of Object.entries({
     ...bundle.models,
     fixtures: bundle.fixtures,
@@ -575,12 +616,11 @@ function verifyEvidence(manifest, variant, contents) {
       hash(JSON.stringify(tree)) === archive.tree_sha256,
       "Complete archive tree hash mismatch",
     );
-    if (/^https:\/\//.test(archive.source))
+    if (!isHttpsAssetSource(archive.source)) {
       check(
-        new URL(archive.source).protocol === "https:",
-        "HTTPS asset required",
+        !activation || name === "fixtures",
+        "Dedicated OCR model assets require HTTPS",
       );
-    else {
       const path = `${accelerator}/${safePath(archive.source)}`;
       check(
         contents[path] &&
@@ -588,6 +628,7 @@ function verifyEvidence(manifest, variant, contents) {
           manifest.assets[path].size_bytes === archive.size_bytes,
         `Missing archive identity: ${name}`,
       );
+      allowedAssets.add(path);
     }
   }
   check(
@@ -699,6 +740,7 @@ function verifyEvidence(manifest, variant, contents) {
     "Full native fresh-worker qualification missing",
   );
   if (accelerator === "cuda") {
+    allowedAssets.add("cuda/requirements.cuda.lock");
     const lock = read(native.cuda_lock);
     check(
       lock.index ===
@@ -730,6 +772,11 @@ function verifyEvidence(manifest, variant, contents) {
       "Resolved CUDA lock hash mismatch",
     );
   }
+  if (activation)
+    check(
+      Object.keys(contents).every((path) => allowedAssets.has(path)),
+      "Unexpected Dedicated OCR release asset",
+    );
   // Native initializer independently enforces the complete release-bundle schema,
   // source locks, model inventories/licenses and fresh hardware qualification.
   rejectPlaceholders(bundle);

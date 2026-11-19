@@ -1,6 +1,7 @@
+import asyncio
 import logging
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import asyncpg
@@ -24,9 +25,11 @@ from .provider.db.collection_db import CollectionDB
 from .provider.db.user_db import UserDB
 from .provider.factory import get_llm_provider, get_ocr_provider
 from .security.password import hash_password
+from .service.activation_admission import activation_enabled
 from .service.analysis_scheduler import AnalysisScheduler
 from .service.benchmark_service import BenchmarkService
 from .service.collection_service import CollectionService
+from .service.dedicated_ocr import DedicatedOcrActivation
 from .service.image_service import ImageService
 from .service.receipt_service import ReceiptService
 from .service.submission_service import SubmissionService
@@ -121,21 +124,34 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.analysis_scheduler = scheduler
     app.state.benchmark_service = benchmark_service
     app.state.collection_service = collection_service
+    activation = None
+    activation_task = None
+    if activation_enabled():
+        activation = DedicatedOcrActivation(
+            settings, provider, receipt_service.set_ocr_route, scheduler.trigger,
+        )
+        await activation.reconcile()
+        activation_task = asyncio.create_task(activation.run(), name="dedicated-ocr-activation")
+    app.state.dedicated_ocr = activation
 
     await scheduler.start()
     if benchmark_service is not None:
         await benchmark_service.start()
 
-    yield
-
-    await scheduler.stop()
-    if benchmark_service is not None:
-        await benchmark_service.stop()
-
     try:
-        await app.state.receipt_service.destroy_db()
-    except Exception:
-        logger.exception("Error while closing database pool")
+        yield
+    finally:
+        if activation_task is not None:
+            activation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await activation_task
+        await scheduler.stop()
+        if benchmark_service is not None:
+            await benchmark_service.stop()
+        try:
+            await app.state.receipt_service.destroy_db()
+        except Exception:
+            logger.exception("Error while closing database pool")
 
 
 app = FastAPI(title="Receipt Tracker API", lifespan=lifespan)

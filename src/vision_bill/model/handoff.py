@@ -8,6 +8,8 @@ ResourceIdentity = Annotated[str, Field(min_length=1)]
 DispatchDisposition = Literal["not_dispatched", "settled", "unknown"]
 
 HANDOFF_WAIT_REASONS = frozenset({
+    "dedicated_ocr_activation_pending",
+    "dedicated_ocr_activation_state_invalid",
     "execution_policy_changed",
     "model_release_unsupported",
     "model_handoff_binding_required",

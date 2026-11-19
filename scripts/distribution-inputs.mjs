@@ -16,7 +16,7 @@ import {
   releaseRequest,
   validateReleaseInputs,
 } from "./distribution-release.mjs";
-import { fileIdentity } from "./distribution.mjs";
+import { fileIdentity, isHttpsAssetSource } from "./distribution.mjs";
 export const PRODUCER_WORKFLOW = ".github/workflows/distribution-inputs.yml";
 const STAGING_ROOT = "/var/lib/vision-bill/distribution-inputs";
 const SYSTEM_OWNER = lstatSync("/").uid;
@@ -123,7 +123,10 @@ function approvedFiles(directory, request) {
       "Incomplete selected native input bundle",
     );
     files.set(name, null);
-    for (const archive of [...Object.values(bundle.models), bundle.fixtures]) {
+    for (const [name, archive] of Object.entries({
+      ...bundle.models,
+      fixtures: bundle.fixtures,
+    })) {
       check(
         archive &&
           /^[a-f0-9]{64}$/.test(archive.sha256) &&
@@ -132,24 +135,16 @@ function approvedFiles(directory, request) {
           archive.license?.redistribution_allowed === true,
         "Approved archive identity/license missing",
       );
-      if (
-        typeof archive.source === "string" &&
-        archive.source.startsWith("https://")
-      ) {
-        const url = new URL(archive.source);
+      if (!isHttpsAssetSource(archive.source)) {
         check(
-          !url.username &&
-            !url.password &&
-            ![...url.searchParams.keys()].some((key) =>
-              /secret|token|signature|password|api.?key/i.test(key),
-            ),
-          "Credential-bearing archive URL",
+          !appOcr || name === "fixtures",
+          "Dedicated OCR model assets require HTTPS",
         );
-      } else
         files.set(`${accelerator}/${safe(archive.source)}`, {
           sha256: archive.sha256,
           size_bytes: archive.size_bytes,
         });
+      }
     }
   }
   return files;

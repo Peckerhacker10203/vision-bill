@@ -12,6 +12,7 @@ export const queryKeys = {
 	collection: (id: string) => ['collections', id] as const,
 	collectionsActive: () => ['collections', 'active'] as const,
 	uiConfig: () => ['system', 'ui-config'] as const,
+	dedicatedOcr: () => ['system', 'dedicated-ocr'] as const,
 	statistics: (weeks = 12, collectionId = '') => ['statistics', weeks, collectionId] as const,
 	itemStatistics: (months = 12, collectionId = '') =>
 		['statistics', 'items', months, collectionId] as const,

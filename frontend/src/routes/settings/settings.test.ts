@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { api } from '$lib/api/client';
 import { queryClient } from '$lib/query/client';
 import { session, signIn } from '$lib/auth';
@@ -8,6 +8,9 @@ import type { SettingsView } from '$lib/types';
 import Settings from './+page.svelte';
 vi.mock('$app/paths', () => ({ resolve: (p: string) => p }));
 vi.mock('$app/navigation', () => ({ goto: vi.fn() }));
+beforeEach(() => {
+	vi.spyOn(api, 'getDedicatedOcr').mockResolvedValue({ state: 'unavailable' });
+});
 afterEach(() => {
 	cleanup();
 	queryClient.clear();

@@ -16,11 +16,13 @@ environment template and the selected assets and evidence under `release/`.
 | `app` | Config initializer, PostgreSQL, app | External LLM endpoint and explicit model ID. Optional OCR endpoint. |
 | `ocr-cuda` | Cache gate, maintenance and independent OCR | Qualified NVIDIA device and approved OCR assets. |
 | `ocr-rocm` | Cache gate, maintenance and independent OCR | Qualified selected AMD device and approved OCR assets. |
-| `app-ocr-cuda` | App, PostgreSQL, initializers and managed OCR | Qualified NVIDIA device, approved OCR assets and dedicated compatible LLM endpoint/model. |
-| `app-ocr-rocm` | App, PostgreSQL, initializers and managed OCR | Qualified selected AMD device, approved OCR assets and dedicated compatible LLM endpoint/model. |
+| `app-ocr-cuda` | App, PostgreSQL and an idle Dedicated OCR controller | Qualified NVIDIA device and a compatible dedicated LLM endpoint/model. |
+| `app-ocr-rocm` | App, PostgreSQL and an idle Dedicated OCR controller | Qualified selected AMD device and a compatible dedicated LLM endpoint/model. |
 
 Provision the chosen model on your own Ollama or OpenAI-compatible endpoint.
-Installation starts the listed services. Benchmarking is a separate operator action.
+Installation starts the listed services. Combined bundles keep the four model
+archives at pinned HTTPS sources and fetch them only after setup is requested.
+Benchmarking is a separate operator action.
 Native read-only routes and lifecycle control belong on trusted private networks.
 
 ## Configure and start
@@ -51,19 +53,13 @@ LLM__API_KEY=none
 Use the endpoint's actual model ID and reachable URL. Supply the real key for an
 authenticated endpoint. Fresh credentialless OpenAI installs can omit the key or
 use `none`. Ollama ignores it. On restored installations, a private empty runtime
-file takes its values from the saved configuration. In paired bundles retain the
-required managed OCR configuration described below.
+file takes its values from the saved configuration.
 
-For the `app` variant, a nonblank `OCR__ENDPOINT` selects OCR and an explicit
-blank value disables it. Omission preserves the applicable saved or legacy
-configuration. The app-and-OCR variants require compatible saved and runtime
-topology with `OCR__ENDPOINT=http://ocr:8082`, managed lifecycle and fallback
-disabled. Resolve conflicting saved OCR settings explicitly before startup. Ordinary OCR
-formatting, repair and classification use text and evidence. Direct vision needs
-an image-capable selected model. Managed native OCR needs stable identities,
-verified Ollama release or dedicated llama.cpp router lifecycle, and an explicit
-setup binding. An incompatible pair waits before spending an inference attempt.
-See [inference and handoff setup](../OPENAI_COMPATIBLE.md).
+For external OCR, a nonblank `OCR__ENDPOINT` selects its endpoint and an explicit
+blank value disables OCR. For Dedicated OCR, leave `OCR__ENDPOINT` unset and do
+not enable the legacy OCR flags. A saved external route must be deliberately
+reconciled before switching. Ordinary OCR formatting, repair and classification
+use text and evidence. Direct vision needs an image-capable selected model.
 
 App port defaults to `127.0.0.1:8080`, with `APP_BIND_ADDRESS` and `APP_PORT`
 available for Compose interpolation. Independent OCR defaults to
@@ -74,13 +70,39 @@ RX 6000/RDNA2 candidates. Qualify the exact device before relying on it.
 
 ```bash
 sh ./check-compose.sh
-# For an OCR variant, complete explicit native maintenance first.
 docker compose up -d
 ```
 
+For a standalone `ocr-cuda` or `ocr-rocm` installation, complete the native
+maintenance step below before `up`.
+
+### Enable Dedicated OCR
+
+In a combined install, sign in as the administrator and open **Settings →
+Dedicated OCR**. Verify that your LLM endpoint is dedicated to Vision Bill,
+has eager loading disabled, and has unloaded its models. With llama.cpp use
+the [dedicated router lifecycle](../OPENAI_COMPATIBLE.md#configure-a-dedicated-llamacpp-router).
+Confirm those conditions and choose **Enable Dedicated OCR**. Downloads and
+native setup run in the background. The app invokes OCR for receipts after the
+managed service verifies the installed models and starts with its worker parked.
+During setup, inference waits. If setup fails, review the status and explicitly
+retry after fixing the cause.
+
+For a configuration-driven installation, set both values in `runtime.env` once
+the same conditions are met.
+
+```dotenv
+OCR_ACTIVATION_ON_STARTUP=true
+OCR_ACTIVATION_CONFIRM_HANDOFF=true
+```
+
+`OCR_ACTIVATION_MAINTENANCE_INTENT` defaults to `external-llm-quiesced`, with
+`separate-ocr-device` available for a separate OCR GPU. Startup consent records
+one durable request. Fixing a failed generation requires an explicit retry.
+
 ### Native cache check and maintenance
 
-The ordinary `ocr-init` service checks the complete qualified cache.
+In a standalone OCR bundle, `ocr-init` checks the complete qualified cache.
 On a cold or changed installation, it reports that explicit maintenance is
 required. It cannot start qualification or load models. The profiled
 `ocr-maintenance` service verifies the release and runs full qualification
@@ -100,20 +122,32 @@ docker compose --profile ocr-maintenance run --rm --no-deps ocr-maintenance \
   --maintenance-intent external-llm-quiesced
 ```
 
-For `app-ocr-cuda` and `app-ocr-rocm`, add
-`--handoff-lock /app/config/gpu-handoff.lock`, using the original shared lock
-path if customized. With physically separate hardware use
-`--maintenance-intent separate-ocr-device`. The initializer checks ownership
-and app journal state. Only the operator can attest external GPU quiescence.
-`--force` requests requalification and leaves all crash and ownership fences
-in effect. The ordinary `up` can proceed after a successful maintenance run.
+For a combined bundle that reports its installed OCR service unavailable, check
+`docker compose logs ocr`. After draining all clients, stop `app` and `ocr`.
+If the installation needs repair, reuse the same image metadata and state and
+run the initializer with the original shared handoff lock.
+
+```bash
+image_id=$(jq -er '.images["ocr-cuda"].config_digest' release.json)
+docker compose run --rm --no-deps --entrypoint python ocr \
+  -m ocr_service.initialize maintain --bundle /release/bundle.json \
+  --state-dir /var/lib/ocr --image-config /release/image-config.json \
+  --image-id "$image_id" --maintenance-intent external-llm-quiesced \
+  --handoff-lock /coord/gpu-handoff.lock
+docker compose up -d
+```
+
+For ROCm read `.images["ocr-rocm"].config_digest`. With physically separate
+hardware use `--maintenance-intent separate-ocr-device`. The initializer checks
+ownership and app journal state. `--force` requests requalification and retains
+the crash and ownership fences. Restart a repaired instance with its original
+project name and volumes.
 
 Independent OCR bundles default to `OCR_SERVICE_MODE=standalone`. Direct clients
 use that service without an app or an LLM. Before pairing it with Vision Bill,
 set `OCR_SERVICE_MODE=managed` and arrange the original shared coordinator
-storage and dedicated endpoint. The app-and-OCR variants set managed mode and
-seed `OCR__ENDPOINT=http://ocr:8082` in their runtime template. Adopt the
-endpoint and selected model IDs deliberately before managed work.
+storage and dedicated endpoint. Adopt the endpoint and selected model IDs
+deliberately before managed work. Dedicated OCR records adoption during setup.
 See [native API and client](../paddleocr-service/README.md#independent-service-and-client)
 and [endpoint adoption](../OPENAI_COMPATIBLE.md#adopt-the-managed-pair).
 
@@ -148,6 +182,22 @@ saved endpoint and queued jobs can wait until it is reachable or updated.
 Handle unfinished routing changes through
 [explicit current-policy retry](../MULTI_IMAGE_RECEIPTS.md#attempts-and-explicit-recovery).
 
+An earlier combined bundle may have generated `OCR__ENDPOINT=http://ocr:8082`
+in `runtime.env` and saved that same route under `ocr` in `config.yaml`. Before
+upgrading that bundle, reconcile its original handoff journal and binding using
+the old deployment. Stop all participants, remove the generated endpoint from
+`runtime.env`, and remove the corresponding saved `ocr.endpoint` or set the
+saved `ocr.enabled` to false for a legacy `ocr.service_url` entry. Keep the old
+configuration backup and state volumes. Start the new combined bundle and
+enable Dedicated OCR to create the new binding. A genuinely external OCR
+endpoint uses the app-only variant and its own original coordinator.
+
+To switch an already activated project to external OCR, reconcile the current
+binding and stop its app, OCR controller and standalone clients. Start the
+app-only bundle with the same project and app data volumes, and configure the
+new external endpoint and its matching coordinator. Preserve the old native
+state and its locks for recovery.
+
 Native initializer and OCR roles use container PID1 supervision. Keep their
 installation and role lockfiles intact. A retained active marker blocks work
 regardless of age. For hard-crash recovery, confirm that every participant using
@@ -157,6 +207,25 @@ the relevant `installation.active-*.json` marker. Reconcile any separately
 retained app journal with the old endpoint before changing identity. Preserve
 persistent volumes during Compose teardown.
 See [native ownership and recovery](../paddleocr-service/README.md#internal-model-ownership).
+
+When Dedicated OCR reports an unsettled direct LLM request, confirm settlement
+at the original LLM endpoint, unload its models, and stop the app, OCR service
+and standalone clients that share the project. Archive the retained markers
+only after remote work has settled. This keeps evidence and leaves the app able
+to perform a fresh idle and ownership check at the next activation request.
+
+```bash
+docker compose run --rm --no-deps --entrypoint sh app -ec '
+  dir=/activation/request/direct-calls
+  if [ -d "$dir" ]; then
+    archive=$(mktemp -d /activation/request/reconciled.XXXXXX)
+    mv "$dir" "$archive/calls"
+  fi'
+docker compose up -d
+```
+
+For source installs, use `vision_bill` in place of `app` and keep the same
+Compose files and profile as the original deployment.
 
 ## Maintainers: real artifact inputs and workflows
 

@@ -123,8 +123,10 @@ encoding. See the [native contract](paddleocr-service/README.md#fixed-extraction
 
 ## Native OCR policy
 
-Base app OCR is off. CUDA/ROCm overlays explicitly activate OCR, with sidecar
-profile `ocr`; default Dockerfile fails and requires a selected accelerator.
+Base app OCR is off. CUDA/ROCm overlays and sidecar profile `ocr` prepare an
+idle controller. Admin activation or explicit startup configuration requests
+verified model downloads and native qualification. Default OCR Dockerfile
+requires a selected accelerator.
 Linux x86_64 candidates target CUDA and native ROCm, including intended consumer
 RX6000+/RDNA2. RDNA2 default gfx1030/1031/1032/1034 is distinct from a selected
 build-only candidate profile (`OCR_AMDGPU_TARGETS`) and actual per-board qualification.

@@ -38,8 +38,8 @@ directory or presets. Keep autoload enabled and set every preset's
 `load-on-startup=false`. Model discovery and readiness checks must not eagerly
 load weights. `--models-max=1` alone does not coordinate the separate OCR service.
 
-Replace the active LLM values in your private configuration, rather than appending
-a second conflicting definition:
+Replace the active LLM values in your private configuration. The following
+example shows a separately managed OCR endpoint.
 
 ```dotenv
 LLM__PROVIDER=openai
@@ -59,6 +59,11 @@ listen on an interface reachable from the app container and remain on a trusted
 private network. `none` is a placeholder for a router without authentication;
 otherwise use its configured API key in the ignored private configuration.
 The same Bearer key authenticates inference and lifecycle requests.
+
+For a combined **Dedicated OCR** install, leave `OCR__ENDPOINT` unset and keep
+the LLM settings above. Enable Dedicated OCR in admin Settings after the router
+is idle. The action checks residency and records the selected handoff binding
+before native setup. Use the manual adoption below for separately managed OCR.
 
 Replace `receipt-formatter` with its exact canonical `id` from the router's
 `GET /models` response. Managed release does not resolve aliases. OCR formatting

@@ -11,7 +11,10 @@ import shutil
 import sys
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 from uuid import uuid4
+
+from ocr_contract.activation import MaintenanceIntent
 
 from .device_inventory import inspect_device_identity
 from .initialization_lock import lock_path, maintenance_handoff
@@ -198,9 +201,10 @@ def initialize(
     image_config: Path,
     image_id: str,
     *,
-    maintenance_intent: Literal["external-llm-quiesced", "separate-ocr-device"],
+    maintenance_intent: Literal["external-llm-quiesced", "separate-ocr-device"] | MaintenanceIntent,
     handoff_lock: Path | None = None,
     force: bool = False,
+    require_remote_models: bool = False,
 ) -> Path:
     if maintenance_intent not in {"external-llm-quiesced", "separate-ocr-device"}:
         raise ValueError("Explicit maintenance intent is required for this invocation")
@@ -213,6 +217,11 @@ def initialize(
     ):
         bundle = load_release_bundle(bundle_path)
         verify_image(bundle, image_config, image_id)
+        if require_remote_models and any(
+            source.scheme != "https" or not source.hostname
+            for source in (urlsplit(model.source) for model in bundle.models.values())
+        ):
+            raise ValueError("Dedicated OCR activation requires pinned HTTPS model archives")
         device = inspect_device_identity(bundle.accelerator, bundle.gpu_index)
         state = state_dir.resolve()
         if (

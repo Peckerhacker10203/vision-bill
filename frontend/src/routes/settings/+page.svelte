@@ -9,6 +9,7 @@
 	import { queryClient } from '$lib/query/client';
 	import { queryKeys } from '$lib/query/keys';
 	import type { SettingsUpdate } from '$lib/types';
+	import DedicatedOcr from './DedicatedOcr.svelte';
 
 	const isCurrentView = sessionViewGuard();
 
@@ -226,5 +227,9 @@
 				{saving ? $t('common.loading') : $t('common.save')}
 			</button>
 		</form>
+	{/if}
+
+	{#if $session && $session !== 'loading' && $session.is_admin}
+		<DedicatedOcr />
 	{/if}
 </section>

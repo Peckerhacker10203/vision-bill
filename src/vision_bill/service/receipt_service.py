@@ -440,6 +440,11 @@ class ReceiptService:
             return OcrCapabilities(enabled=False, configured=False, reachable=False, ready=False)
         return await provider.get_capabilities()
 
+    def set_ocr_route(self, provider: OcrProvider, settings: OcrSettings) -> None:
+        """Publish the qualified selection while the app holds activation admission."""
+        self._ocr_provider = provider
+        self._ocr_settings = settings
+
     def _extraction_pipeline(self, settings: OcrSettings | None = None) -> "ExtractionPipeline":
         from ..provider.factory import get_ocr_provider
         from .extraction_pipeline import ExtractionPipeline

@@ -9,7 +9,6 @@ services:
       PYTHONUNBUFFERED: 1
       PG__HOST: db
       PG__PORT: "5432"
-      OCR__SERVICE_URL: http://paddleocr-service:8082
       OCR__TIMEOUT_SECONDS: "600"
     ports:
       - "${API__PORT:-8080}:8080"
@@ -32,7 +31,6 @@ services:
     build:
       context: ./paddleocr-service
       dockerfile: Dockerfile
-    container_name: paddleocr-service
     restart: always
     environment:
       OMP_NUM_THREADS: "4"
@@ -46,8 +44,6 @@ services:
       - ./server_data/ocr-cache:/var/cache/paddlex
       - ./server_data/ocr-runtime:/var/lib/ocr:ro
       - ./server_data/ocr-runtime/coord:/coord
-    networks:
-      - postgres_net
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8082/health')"]
       interval: 30s

@@ -25,6 +25,7 @@ from ..model.extraction import (
 )
 from ..model.handoff import HandoffStatus, HandoffWait
 from ..model.receipt import Receipt
+from .activation_admission import inference_admission
 from .execution_policy import EXECUTION_POLICY_VERSION
 from .extraction_pipeline import ExtractionPipeline as ReceiptExtractionPipeline
 from .gpu_handoff import admission_deadline
@@ -215,15 +216,16 @@ async def pipeline_identity(
     if ocr is not None and options.pipeline != ExtractionPipeline.DIRECT:
         if qualify and handoff is not None:
             deadline = monotonic() + provider.analysis_timeout_seconds
-            async with handoff.session(
-                deadline, model_ids=managed_model_ids, expected_binding_sha256=binding_sha256,
-                lock_deadline=admission_deadline(deadline),
-            ) as owner:
-                await owner.ocr_phase()
-                qualified = await ocr.get_capabilities()
-                if not qualified.ready or not qualified.runtime_fingerprint:
-                    raise ValueError("ocr_qualification_required")
-                capabilities = qualified.model_dump(mode="json")
+            with inference_admission(provider):
+                async with handoff.session(
+                    deadline, model_ids=managed_model_ids, expected_binding_sha256=binding_sha256,
+                    lock_deadline=admission_deadline(deadline),
+                ) as owner:
+                    await owner.ocr_phase()
+                    qualified = await ocr.get_capabilities()
+                    if not qualified.ready or not qualified.runtime_fingerprint:
+                        raise ValueError("ocr_qualification_required")
+                    capabilities = qualified.model_dump(mode="json")
         else:
             capabilities = (await ocr.get_capabilities()).model_dump(mode="json")
         if getattr(ocr, "managed_lifecycle", False):
