@@ -343,7 +343,7 @@
 			{/if}
 			{#if !canVerify}
 				<span
-					class="rounded-full bg-action-container px-3 py-1 text-xs font-medium text-on-primary-container"
+					class="rounded-full bg-primary-container px-3 py-1 text-xs font-medium text-on-primary-container"
 				>
 					{$t('receipt.verified')}
 				</span>

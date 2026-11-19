@@ -357,7 +357,8 @@ restart the backend; preserve the private mount and its permissions.
 
 Settings submits only edited field paths, so another open admin tab cannot overwrite
 unrelated settings with stale form values. Older API clients may still send a full
-PUT. Each formatter save refreshes Dedicated OCR status so a binding or restart
+PUT; these legacy requests retain environment locks. Adopting an environment
+default requires an explicit `changed_paths` mask, as sent by Settings. Each formatter save refreshes Dedicated OCR status so a binding or restart
 requirement remains visible.
 
 A real private API key is bound to its trusted endpoint origin: browser host edits

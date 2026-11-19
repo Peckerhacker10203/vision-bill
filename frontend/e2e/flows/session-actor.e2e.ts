@@ -310,9 +310,11 @@ test.describe('browser session actor', () => {
 			await first;
 			await qualified;
 
-			// Close the confirmation overlay to reach the real account controls.
-			// The original qualification has already committed under the admin.
-			await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+			// Starting closes confirmation so account controls remain available while
+			// the committed qualification response is still pending.
+			await expect(page.getByRole('dialog', { name: 'Create benchmark?' })).toHaveCount(0);
+			await expect(page.getByRole('status')).toHaveText('Starting benchmark…');
+			await expect(page.getByRole('button', { name: 'Create benchmark' })).toBeDisabled();
 			await accountChange(page, successor);
 			const completed = page.waitForResponse(
 				(response) => response.url().endsWith(reference) && response.request().method() === 'POST'

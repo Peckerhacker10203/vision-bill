@@ -294,7 +294,7 @@
 		>
 			{#each standardTags as tag (tag)}
 				<span
-					class="inline-flex items-center gap-1 rounded-full bg-action-container py-1 pl-3 pr-1 text-sm font-medium text-on-primary-container"
+					class="inline-flex items-center gap-1 rounded-full bg-primary-container py-1 pl-3 pr-1 text-sm font-medium text-on-primary-container"
 				>
 					{tag}
 					<button

@@ -299,7 +299,7 @@
 								<span
 									class="shrink-0 rounded-full px-2.5 py-1 text-xs font-medium
 										{receipt.status === 'verified'
-										? 'bg-action-container text-on-primary-container'
+										? 'bg-primary-container text-on-primary-container'
 										: 'bg-surface-container-highest text-on-surface-variant'}"
 								>
 									{$t(receipt.status === 'verified' ? 'receipt.verified' : 'receipt.unverified')}

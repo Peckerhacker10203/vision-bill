@@ -76,6 +76,33 @@ operator-owned and cannot be switched through this toggle. The same
 applies to source installs using their service names. The explicit manual GPU
 qualification path below is available separately.
 
+## Consumer GPU release targets
+
+Prepare a binary bundle for the accelerator and host platform before an end
+user starts the installation. The app uses the same Dedicated OCR settings on
+all GPU profiles. The native runtime validates the selected device against the
+included architecture and qualification evidence.
+
+| Accelerator | Intended device families | Architectures to qualify | Host |
+| --- | --- | --- | --- |
+| CUDA | NVIDIA RTX 2000, 3000, 4000 and 5000 | Turing SM 7.5, Ampere SM 8.6, Ada SM 8.9, Blackwell SM 12.0 | Linux, including Docker Desktop with WSL 2 on Windows |
+| ROCm | AMD Radeon RX 6000, RX 7000 and RX 9000 | RDNA2 `gfx1030/1031/1032/1034`, RDNA3 `gfx1100/1101/1102`, RDNA4 `gfx1200/1201` | Linux with the matching ROCm driver and device access |
+
+These are qualification targets. Release evidence records the architecture,
+driver and host environment for actual runs of the configured OCR pipeline.
+The current source defaults for ROCm build the listed RDNA2 candidates.
+[NVIDIA GPU architectures](https://developer.nvidia.com/cuda/gpus) ·
+[TheRock targets at the pinned revision](https://github.com/ROCm/TheRock/blob/b324869fb3116353ac7eec5e6926aa3d452ac987/cmake/therock_amdgpu_targets.cmake) ·
+[Docker Desktop GPU support](https://docs.docker.com/desktop/features/gpu/)
+
+Evaluate one CUDA bundle against all four NVIDIA generations before splitting
+the binaries by architecture. Paddle publishes a 3.3.1 CPython 3.12 Linux x86_64
+wheel in its CUDA 12.9 channel. CUDA 12.8 introduced native SM 12.0 compilation.
+Verify the wheel and linked libraries, then run device allocation and the
+full OCR pipeline on representative hardware. The current CUDA 12.6 lock
+remains unresolved. [Official Paddle CUDA 12.9 wheel index](https://www.paddlepaddle.org.cn/packages/stable/cu129/paddlepaddle-gpu/) ·
+[CUDA 12.8 release notes](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-toolkit-release-notes/index.html#new-features)
+
 ## Build inputs
 
 `runtime-lock.json` records the immutable Ubuntu base, Ubuntu package snapshot,

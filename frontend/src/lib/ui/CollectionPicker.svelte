@@ -150,7 +150,7 @@
 		{#if mode === 'multi'}
 			{#each selectedIds as id (id)}
 				<span
-					class="inline-flex items-center gap-1 rounded-full bg-action-container py-0.5 pl-2 pr-1 text-sm font-medium text-on-primary-container"
+					class="inline-flex items-center gap-1 rounded-full bg-primary-container py-0.5 pl-2 pr-1 text-sm font-medium text-on-primary-container"
 				>
 					{labelFor(id)}
 					<button

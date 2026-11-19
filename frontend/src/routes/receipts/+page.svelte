@@ -108,8 +108,8 @@
 							: 'border-outline-variant text-on-surface-variant hover:bg-surface-container'
 						: value === 'verified'
 							? statusFilter === value
-								? 'border-primary bg-action-container text-on-primary-container'
-								: 'border-primary/50 text-primary hover:bg-action-container'
+								? 'border-primary bg-primary-container text-on-primary-container'
+								: 'border-primary/50 text-primary hover:bg-primary-container'
 							: statusFilter === value
 								? 'border-error bg-error-container text-on-error-container'
 								: 'border-error/50 text-error hover:bg-error-container'}"
@@ -169,7 +169,7 @@
 							<span
 								class="shrink-0 rounded-full px-2.5 py-1 text-xs font-medium
 								{receipt.status === 'verified'
-									? 'bg-action-container text-on-primary-container'
+									? 'bg-primary-container text-on-primary-container'
 									: 'bg-surface-container-highest text-on-surface-variant'}"
 							>
 								{$t(receipt.status === 'verified' ? 'receipt.verified' : 'receipt.unverified')}

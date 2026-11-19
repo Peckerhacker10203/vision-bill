@@ -125,6 +125,7 @@
 	async function create() {
 		if (!actor || !current() || creating) return;
 		creating = true;
+		confirm = false;
 		error = '';
 		const ids = selectedReceiptIds(receiptIds);
 		const body: BenchmarkCreate = {
@@ -174,11 +175,14 @@
 		{$t('benchmarkUi.intro')}
 	</p>
 	{#if error}<p class="mt-4 text-sm text-error" role="alert">{error}</p>{/if}
+	{#if creating}<p class="mt-4 text-sm text-on-surface-variant" role="status">
+			{$t('benchmarkUi.starting')}
+		</p>{/if}
 	<form
 		class="mt-6 space-y-5"
 		onsubmit={(event) => {
 			event.preventDefault();
-			confirm = true;
+			if (!creating) confirm = true;
 		}}
 	>
 		<fieldset class="rounded-xl border border-outline-variant p-4">

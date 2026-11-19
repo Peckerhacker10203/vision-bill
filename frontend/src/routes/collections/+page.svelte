@@ -144,7 +144,7 @@
 
 	{#each (list.data ?? []).filter((collection) => collection.active) as active (active.id)}
 		<p
-			class="mt-4 rounded-xl border border-primary bg-action-container p-3 text-sm font-medium text-on-primary-container"
+			class="mt-4 rounded-xl border border-primary bg-primary-container p-3 text-sm font-medium text-on-primary-container"
 		>
 			{$t('statistics.activeCollection', { values: { name: active.name } })}
 		</p>
@@ -197,7 +197,7 @@
 						</div>
 						{#if c.active}
 							<span
-								class="shrink-0 rounded-full bg-action-container px-2.5 py-1 text-xs font-medium text-on-primary-container"
+								class="shrink-0 rounded-full bg-primary-container px-2.5 py-1 text-xs font-medium text-on-primary-container"
 								>{$t('collections.capturing')}</span
 							>
 						{/if}

@@ -118,7 +118,15 @@ async def update_settings(request: Request, update: SettingsUpdate) -> SettingsV
     if not selected <= EDITABLE_ENV_KEYS.keys():
         raise HTTPException(status_code=422, detail="Unsupported setting path")
     changed = frozenset(field for field in selected if requested[field] != current[field])
-    if "auth.allow_registration" in changed and editable_setting_sources()["auth.allow_registration"] == "environment":
+    sources = editable_setting_sources()
+    if update.changed_paths is None:
+        locked = sorted(field for field in changed if sources[field] == "environment")
+        if locked:
+            raise HTTPException(
+                status_code=409,
+                detail="These settings are controlled by environment variables: " + ", ".join(locked),
+            )
+    if "auth.allow_registration" in changed and sources["auth.allow_registration"] == "environment":
         raise HTTPException(status_code=409, detail="Registration is controlled by environment configuration")
     credential_origin = None
     if "llm.host" in changed:

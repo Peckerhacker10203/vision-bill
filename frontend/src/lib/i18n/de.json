@@ -697,6 +697,7 @@
 		"formatterModels": "Textformatierungsmodelle für OCR"
 	},
 	"benchmarkUi": {
+		"starting": "Benchmark wird gestartet…",
 		"processingSuccessRate": "Erfolgsquote der Verarbeitung",
 		"modelOutcomes": "Modellergebnisse: {model}",
 		"failedCases": "Fehlgeschlagene Fälle: {count}",

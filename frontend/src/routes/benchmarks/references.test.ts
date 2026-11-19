@@ -167,6 +167,15 @@ it.each(['account change', 'view destruction'])(
 		await fireEvent.click(screen.getByRole('button', { name: 'Create benchmark' }));
 		await fireEvent.click(screen.getByRole('button', { name: 'Confirm and start' }));
 		await waitFor(() => expect(protectedWrites).toEqual(['/api/v1/benchmarks/references/first']));
+		expect(screen.queryByRole('dialog')).toBeNull();
+		expect(
+			(screen.getByRole('button', { name: 'Create benchmark' }) as HTMLButtonElement).disabled
+		).toBe(true);
+		expect(screen.getByRole('status').textContent).toBe('Starting benchmark…');
+		await fireEvent.submit(
+			screen.getByRole('button', { name: 'Create benchmark' }).closest('form')!
+		);
+		expect(screen.queryByRole('dialog')).toBeNull();
 		if (boundary === 'account change') await signIn('bob', 'x');
 		else view.unmount();
 		finishQualification(Response.json({}));

@@ -56,6 +56,12 @@ def payload(settings, **llm):
     }
 
 
+def explicit_payload(settings, **llm):
+    body = payload(settings, **llm)
+    body['changed_paths'] = [f'llm.{field}' for field in llm]
+    return body
+
+
 def test_settings_save_preserves_nested_unknown_metadata(saved_settings):
     path, original, settings, client = saved_settings
     response = client.put("/system/settings", json=payload(settings, model_name="new-selection"))
@@ -109,7 +115,7 @@ def test_unchanged_environment_setting_stays_effective_until_explicit_edit(
     path, original, settings, client = saved_settings
     monkeypatch.setenv("LLM__HOST", "http://effective.example")
     settings.llm.host = "http://effective.example"
-    result = client.put("/system/settings", json=payload(settings, model_name="new-selection"))
+    result = client.put("/system/settings", json=explicit_payload(settings, model_name="new-selection"))
     assert result.status_code == 200
     saved = yaml.safe_load(path.read_text())
     assert saved["llm"]["host"] == original["llm"]["host"]
@@ -119,7 +125,7 @@ def test_unchanged_environment_setting_stays_effective_until_explicit_edit(
     before = path.read_bytes()
     settings.llm.api_key = "none"
     assert (
-        client.put("/system/settings", json=payload(settings, host="http://other")).status_code
+        client.put("/system/settings", json=explicit_payload(settings, host="http://other")).status_code
         == 200
     )
     assert yaml.safe_load(path.read_text())["llm"]["host"] == "http://other"
@@ -237,7 +243,7 @@ def test_actual_settings_sources_allow_explicit_adoption(saved_settings, monkeyp
     assert response.json()["llm"]["host"] == "http://effective.example"
     assert response.json()["sources"]["llm.host"] == "environment"
     assert response.json()["sources"]["llm.model_name"] == "config"
-    blocked = client.put("/system/settings", json=payload(settings, host="http://other"))
+    blocked = client.put("/system/settings", json=explicit_payload(settings, host="http://other"))
     assert blocked.status_code == 200
     assert config.Settings().llm.host == "http://other"
 
@@ -363,7 +369,7 @@ def test_explicit_admin_edit_adopts_only_changed_safe_environment_fields(saved_s
     monkeypatch.setenv("LLM__API_KEY", "private-env-key")
     active = config.Settings()
     monkeypatch.setattr(system, "settings", active)
-    response = client.put('/system/settings', json=payload(active, host='http://environment.example/v1', temperature=0.72))
+    response = client.put('/system/settings', json=explicit_payload(active, host='http://environment.example/v1', temperature=0.72))
     assert response.status_code == 200
     restarted = config.Settings()
     assert restarted.llm.host == 'http://environment.example/v1'
@@ -417,7 +423,7 @@ def test_environment_hot_fields_adopt_on_save(saved_settings, monkeypatch):
     monkeypatch.setenv('AUTH__ALLOW_REGISTRATION', 'true')
     active = config.Settings()
     monkeypatch.setattr(system, 'settings', active)
-    body = payload(active, model_name='adopted-model', temperature=0.6)
+    body = explicit_payload(active, model_name='adopted-model', temperature=0.6)
     response = client.put('/system/settings', json=body)
     assert response.status_code == 200
     assert (active.llm.model_name, active.llm.temperature, active.auth.allow_registration) == ('adopted-model', 0.6, True)
@@ -477,7 +483,7 @@ def test_new_key_cannot_follow_previously_adopted_no_key_endpoint(saved_settings
     monkeypatch.setitem(config.Settings.model_config, 'yaml_file', str(path))
     monkeypatch.setenv('LLM__API_KEY', 'none')
     settings.llm.api_key = 'none'
-    response = client.put('/system/settings', json=payload(settings, host='https://unapproved.example'))
+    response = client.put('/system/settings', json=explicit_payload(settings, host='https://unapproved.example'))
     assert response.status_code == 200
     assert config.Settings().llm.host == 'https://unapproved.example'
     monkeypatch.setenv('LLM__API_KEY', 'new-private-key')
@@ -517,14 +523,14 @@ def test_operator_endpoint_and_key_rotation_supersedes_stale_host_adoption(saved
     monkeypatch.setenv('LLM__API_KEY', 'key-a')
     active = config.Settings()
     monkeypatch.setattr(system, 'settings', active)
-    assert client.put('/system/settings', json=payload(active, host='https://approved-a.example/v2')).status_code == 200
+    assert client.put('/system/settings', json=explicit_payload(active, host='https://approved-a.example/v2')).status_code == 200
     monkeypatch.setenv('LLM__HOST', 'https://approved-b.example/v1')
     monkeypatch.setenv('LLM__API_KEY', 'key-b')
     restarted = config.Settings()
     assert restarted.llm.host == 'https://approved-b.example/v1'
     assert restarted.llm.api_key == 'key-b'
     monkeypatch.setattr(system, 'settings', restarted)
-    assert client.put('/system/settings', json=payload(restarted, host='https://approved-b.example/v2')).status_code == 200
+    assert client.put('/system/settings', json=explicit_payload(restarted, host='https://approved-b.example/v2')).status_code == 200
     assert config.Settings().llm.host == 'https://approved-b.example/v2'
     assert config.Settings().llm.api_key == 'key-b'
 
@@ -573,3 +579,18 @@ def test_per_instance_file_secret_key_cannot_follow_unkeyed_adoption(saved_setti
     (secret_dir / 'llm').write_text(json.dumps({'api_key': 'private-secret-key'}))
     with pytest.raises(ValueError, match='operator approval'):
         config.Settings(_env_file=None, _secrets_dir=secret_dir)
+
+
+def test_legacy_full_put_keeps_environment_fields_locked(saved_settings, monkeypatch):
+    path, _, settings, client = saved_settings
+    monkeypatch.setenv('LLM__PROVIDER', settings.llm.provider.value)
+    body = payload(settings, provider='openai')
+    before = path.read_bytes()
+    response = client.put('/system/settings', json=body)
+    assert response.status_code == 409
+    assert 'llm.provider' in response.json()['detail']
+    assert path.read_bytes() == before
+    body['changed_paths'] = ['llm.provider']
+    response = client.put('/system/settings', json=body)
+    assert response.status_code == 200
+    assert response.json()['sources']['llm.provider'] == 'config'
