@@ -3,11 +3,11 @@ from datetime import date as Date
 from decimal import Decimal
 from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, computed_field, field_validator
 
 from ..extraction import ClassificationEnrichment
 from ..ocr import SourceRef
-from ..review import AmountPolicy, FindingAcknowledgement, ReviewFinding
+from ..review import CHECKS_VERSION, AmountPolicy, FindingAcknowledgement, ReviewFinding
 
 
 class ReceiptRow(BaseModel):
@@ -23,7 +23,7 @@ class ReceiptRow(BaseModel):
     currency: str = "USD"
     category: str = "other"
     subtotal: Decimal
-    discount_total: Decimal = Decimal(0)
+    discount_total: Decimal | None = Decimal(0)
     tax_total: Decimal = Decimal(0)
     tip: Decimal | None = None
     total: Decimal
@@ -57,6 +57,13 @@ class ReceiptRow(BaseModel):
     def decode_review_json(cls, value: object) -> object:
         return json.loads(value) if isinstance(value, str) else value
 
+    def can_rereview(self) -> bool:
+        return (
+            self.verified
+            and self.status == "verified"
+            and (self.verification_source != "human" or self.checks_version != CHECKS_VERSION)
+        )
+
 
 class LineItemRow(BaseModel):
     """Represents a single row in the `line_items` table."""
@@ -67,8 +74,8 @@ class LineItemRow(BaseModel):
     original_description: str | None = None
     spending_category: str = "unknown"
     category_source: str = "unknown"
-    quantity: float
-    unit_price: Decimal
+    quantity: float | None
+    unit_price: Decimal | None
     total_price: Decimal
     tags: list[str] = Field(default_factory=list)
     position: int = 0
@@ -99,3 +106,8 @@ class ReceiptWithDetails(BaseModel):
     classification_enrichment: ClassificationEnrichment = Field(
         default_factory=ClassificationEnrichment
     )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def can_rereview(self) -> bool:
+        return self.receipt.can_rereview()

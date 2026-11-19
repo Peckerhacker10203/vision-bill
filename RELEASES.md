@@ -10,7 +10,7 @@ a separate release run. The app-image workflow below publishes the app image.
 
 ## Unreleased package
 
-Durable 202 uploads/retries, source-preserving review/checks2, exact money, explicit
+Durable 202 uploads/retries, source-preserving receipt review, exact money, explicit
 Gold/v4 diagnostics, strict optional OCR, independent native OCR candidates and external-only LLM distribution are integrated in this package. The update also
 includes account and view isolation and completion-only receipt recovery. Historical split/CPU results retain
 their original meaning. See [upgrade prerequisites and accepted evidence](UPGRADE_AND_VERIFY.md).

@@ -37,7 +37,7 @@ async def test_0010_upgrade_preserves_reports_and_unknown_legacy_poll_baseline(d
         reports = [await conn.fetch("SELECT to_jsonb(t)::text AS payload FROM " + table + " t ORDER BY run_id") for table in ("benchmark_results", "benchmark_summaries")]
         historic_run = await conn.fetchval("SELECT (to_jsonb(r)-'owner_id')::text FROM benchmark_runs r WHERE id=$1", runs[-1])
         migrate(db)
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0020"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0021"
         for table, before in zip(("benchmark_results", "benchmark_summaries"), reports, strict=True):
             assert await conn.fetch("SELECT to_jsonb(t)::text AS payload FROM " + table + " t ORDER BY run_id") == before
         assert await conn.fetchval("SELECT (to_jsonb(r)-'owner_id')::text FROM benchmark_runs r WHERE id=$1", runs[-1]) == historic_run
@@ -101,7 +101,7 @@ async def test_0017_downgrade_refuses_to_discard_tracked_unfinished_state(db, st
             await conn.execute("INSERT INTO benchmark_tasks(run_id,model_id,receipt_id,inference_attempt_count) VALUES($1,'old',$2,1)", run, receipt)
         result = migrate(db, "0016", "downgrade", check=False)
         assert result.returncode != 0 and "destructive benchmark claim downgrade refused" in result.stderr
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0020"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0021"
         assert await conn.fetchval("SELECT count(*) FROM benchmark_tasks") == 1
     finally:
         await conn.close()

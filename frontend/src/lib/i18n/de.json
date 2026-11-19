@@ -498,6 +498,7 @@
 		"amount": "Betrag",
 		"saveAndVerify": "Speichern & prüfen",
 		"merchantRequired": "Händler ist erforderlich.",
+		"descriptionRequired": "Jede Position braucht eine Beschreibung.",
 		"dateRequired": "Ein gültiges Datum ist erforderlich.",
 		"invalidCurrency": "Gib einen Währungscode aus drei Buchstaben ein.",
 		"invalidAmount": "Betrag muss eine nicht negative Zahl sein.",
@@ -605,6 +606,7 @@
 			"uncertain_net_subtotal_basis": "Eine Nettozwischensumme lässt sich nicht zuverlässig mit Bruttopositionen vergleichen, wenn die Steuerbasis eines zusätzlichen Rabatts oder Trinkgelds unklar ist. Prüfe das Original und erläutere die Basis.",
 			"amount_discrepancy": "Der Gesamtbetrag weicht von der Zwischensumme mit der gewählten Steuer-, Rabatt- und Trinkgeldbehandlung ab. Prüfe das Original; Beträge werden nicht automatisch geändert.",
 			"tax_discrepancy": "Die Steuersumme weicht von der Summe der Steuerzeilen ab.",
+			"invalid_tax_rate": "Gib den Steuersatz als Dezimalzahl zwischen 0 und 1 ein. Für 7 % gib zum Beispiel 0.07 ein.",
 			"tax_information_conflict": "Die Steuer ist ausdrücklich als null markiert, aber die Steuersumme ist nicht null."
 		},
 		"reasons": {

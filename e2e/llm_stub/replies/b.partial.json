@@ -8,8 +8,8 @@
   "line_items": [
     {
       "description": "Milk",
-      "quantity": 1,
-      "unit_price": "2.40",
+      "quantity": null,
+      "unit_price": null,
       "total_price": "2.40",
       "tags": null
     }
@@ -22,7 +22,7 @@
     }
   ],
   "subtotal": "2.40",
-  "tax_total": "0.43",
+  "tax_total": null,
   "total": "2.83",
   "payment_method": "debit_card",
   "discount_total": null,

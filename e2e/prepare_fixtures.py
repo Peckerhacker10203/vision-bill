@@ -116,7 +116,14 @@ def prepare(root: Path, directory: Path) -> None:
             "tax_information": "present" if complete["taxes"] else "explicit_zero",
         }
         (replies / f"{image.stem}.complete.json").write_text(json.dumps(complete))
-        (replies / f"{image.stem}.partial.json").write_text(
-            json.dumps({**complete, "discount_total": None})
-        )
+        partial = {
+            **complete,
+            "discount_total": None,
+            "tax_total": None,
+            "line_items": [
+                {**line, "quantity": None, "unit_price": None} if index == 0 else line
+                for index, line in enumerate(complete["line_items"])
+            ],
+        }
+        (replies / f"{image.stem}.partial.json").write_text(json.dumps(partial))
     (directory / "aliases.json").write_text(json.dumps(aliases))

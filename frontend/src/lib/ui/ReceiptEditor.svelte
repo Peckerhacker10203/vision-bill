@@ -124,8 +124,8 @@
 				id: line.id,
 				description: line.description,
 				original_description: line.original_description ?? line.description,
-				quantity: String(line.quantity),
-				unit_price: String(line.unit_price),
+				quantity: String(line.quantity ?? ''),
+				unit_price: String(line.unit_price ?? ''),
 				total_price: String(line.total_price),
 				spending_category: line.spending_category ?? 'unknown',
 				category_source: line.category_source ?? 'unknown',
@@ -281,7 +281,6 @@
 	});
 
 	const REQUIRED_AMOUNTS = ['subtotal', 'total'] as const;
-	const NON_NEGATIVE_AMOUNTS = ['discount_total', 'tax_total'] as const;
 
 	let errors = $derived.by(() => {
 		const set = new SvelteSet<string>();
@@ -299,12 +298,9 @@
 		if (!/^[a-z]{3}$/i.test(form.currency.trim())) {
 			set.add('editor.invalidCurrency');
 		}
-		for (const key of NON_NEGATIVE_AMOUNTS) {
-			if (!isPlainDecimal(form[key])) {
-				set.add('editor.invalidAmount');
-			}
-		}
-		if (form.tip.trim() !== '' && !isPlainDecimal(form.tip)) set.add('editor.invalidAmount');
+		if (!isPlainDecimal(form.tax_total)) set.add('editor.invalidAmount');
+		for (const amount of [form.discount_total, form.tip])
+			if (amount.trim() !== '' && !isPlainDecimal(amount)) set.add('editor.invalidAmount');
 		const confidence = Number(form.confidence);
 		if (
 			form.confidence.trim() === '' ||
@@ -315,11 +311,15 @@
 			set.add('editor.invalidConfidence');
 		}
 		for (const line of form.lines) {
+			if (!line.description.trim()) set.add('editor.descriptionRequired');
 			const quantity = Number(line.quantity);
-			if (line.quantity.trim() === '' || !Number.isFinite(quantity) || quantity <= 0) {
+			if (line.quantity.trim() !== '' && (!Number.isFinite(quantity) || quantity <= 0)) {
 				set.add('editor.invalidQuantity');
 			}
-			if (!isSignedDecimal(line.unit_price) || !isSignedDecimal(line.total_price)) {
+			if (
+				(line.unit_price.trim() !== '' && !isSignedDecimal(line.unit_price)) ||
+				!isSignedDecimal(line.total_price)
+			) {
 				set.add('editor.invalidNumber');
 			}
 		}
@@ -357,8 +357,8 @@
 			line_items: form.lines.map((line) => ({
 				...(line.id ? { id: line.id } : {}),
 				description: line.description.trim(),
-				quantity: Number(line.quantity),
-				unit_price: line.unit_price.trim(),
+				quantity: line.quantity.trim() === '' ? null : Number(line.quantity),
+				unit_price: line.unit_price.trim() || null,
 				total_price: line.total_price.trim(),
 				spending_category: line.spending_category,
 				...(line.remember_category ? { remember_category: true } : {}),
@@ -370,7 +370,7 @@
 				amount: tax.amount.trim()
 			})),
 			subtotal: form.subtotal.trim(),
-			discount_total: form.discount_total.trim(),
+			discount_total: form.discount_total.trim() || null,
 			tax_total: form.tax_total.trim(),
 			tip: form.tip.trim() === '' ? null : form.tip.trim(),
 			total: form.total.trim(),
@@ -383,7 +383,7 @@
 		form.lines.push({
 			description: '',
 			original_description: '',
-			quantity: '1',
+			quantity: '',
 			unit_price: '',
 			total_price: '',
 			spending_category: 'unknown',

@@ -403,7 +403,7 @@ async def test_migration_preserves_0019_receipt_attempt_and_human_draft_rows(db)
         )
 
         shared.migrate(db)
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0020"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0021"
         assert (
             await conn.fetch(
                 "SELECT to_jsonb(i)-'claim_purpose'-'observation_checkpoint' FROM images i ORDER BY id"

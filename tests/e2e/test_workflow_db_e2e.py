@@ -204,7 +204,7 @@ def complete(*, total="90071992547.91"):
 async def test_bootstrap_and_empty_downgrade(db):
     migrate(db)
     conn = await asyncpg.connect(db.pg_dsn)
-    assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0020"
+    assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0021"
     await conn.close()
     migrate(db, "0010", "downgrade")
     migrate(db)
@@ -502,7 +502,7 @@ async def test_finish_atomic_decimal_and_immutable_history(workflow_db, db):
         )
     assert migrate(db, "0010", "downgrade", check=False).returncode != 0
     async with w.pool.acquire() as conn:
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0020"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0021"
         assert await conn.fetchval("SELECT count(*) FROM receipt_review_revisions") == 1
 
 
@@ -803,7 +803,7 @@ async def test_upgrade_0010_preserves_precise_local_times_and_legacy_evidence(db
                 assert await conn.fetchval("SELECT image_path FROM images WHERE id=$1", image) == str(original)
         finally:
             await reader.destroy_db()
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0020"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0021"
     finally:
         await conn.close()
 
@@ -1332,6 +1332,48 @@ async def test_draft_finalize_missing_then_once_unverified_and_rollback(workflow
         assert (
             await conn.fetchval("SELECT receipt_id FROM images WHERE id=$1", image.id) == first.id
         )
+
+
+async def test_finalized_draft_preserves_optional_amounts_and_item_values(workflow_db, tmp_path):
+    from vision_bill.model.review import OriginalAvailability
+    from vision_bill.model.workflow import DraftFinalize, DraftPatch
+
+    workflow, scope = workflow_db
+    image = await partial_draft(workflow, scope, tmp_path / "original.png")
+    parts = await workflow.get_source_parts(image.id, scope=scope)
+    originals = [
+        OriginalAvailability(part_id=part.part_id, available=True, sha256_matches=True)
+        for part in parts
+    ]
+    document = {
+        "confidence": 90, "merchant_name": "Shop", "date": "2026-01-01",
+        "currency": "EUR", "payment_method": "cash", "subtotal": "2.33",
+        "tax_total": "0.16", "total": "2.49", "tip": None, "discount_total": None,
+        "taxes": [{"name": "VAT", "rate": 0.07, "amount": "0.16"}],
+        "line_items": [
+            {"description": "Item", "total_price": "2.49", "quantity": None, "unit_price": None}
+        ],
+        "amount_policy": {
+            "tax_basis": "gross", "subtotal_origin": "derived_net",
+            "tip_treatment": "none", "tax_information": "present",
+        },
+    }
+    draft = await workflow.patch_draft(
+        image.id, DraftPatch(expected_revision=1, changes=document), scope=scope,
+    )
+    assert draft is not None and draft.revision == 2
+    result = await workflow.finalize_draft(
+        image.id, DraftFinalize(expected_revision=2, request_key="optional-values"),
+        scope=scope, originals=originals,
+    )
+    assert result is not None and not result.verified
+    assert result.discount_total is result.tip is None
+    assert result.total == Decimal("2.49")
+    saved = await workflow._receipts.get_receipt_with_details(result.id, user_id=scope.user_id)
+    assert saved is not None
+    assert saved.receipt.discount_total is None
+    assert saved.line_items[0].quantity is saved.line_items[0].unit_price is None
+    assert saved.line_items[0].total_price == Decimal("2.49")
 
 
 async def test_draft_finalization_rolls_back_after_receipt_insert(workflow_db, monkeypatch, tmp_path):

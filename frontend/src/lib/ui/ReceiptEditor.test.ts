@@ -471,7 +471,7 @@ describe.each(['Save', 'Save & verify'])('%s time precision', (action) => {
 	});
 });
 
-it.each(['re-currency', 're-discount_total', 're-tax_total'])(
+it.each(['re-currency', 're-tax_total'])(
 	'requires an explicit completed receipt value in %s before either save action',
 	async (inputId) => {
 		const onSave = vi.fn();
@@ -495,9 +495,85 @@ it.each(['re-currency', 're-discount_total', 're-tax_total'])(
 		expect(onSaveAndVerify).toHaveBeenCalledOnce();
 		expect(onSaveAndVerify.mock.calls[0][0]).toMatchObject({
 			currency: inputId === 're-currency' ? 'CHF' : 'EUR',
-			discount_total: inputId === 're-discount_total' ? '0' : '2',
+			discount_total: '2',
 			tax_total: inputId === 're-tax_total' ? '0' : '1',
 			tip: null
 		});
 	}
 );
+
+it('shows stored null observations as blank and preserves them on save', async () => {
+	const onSave = vi.fn();
+	render(ReceiptEditor, {
+		receipt: { ...receipt, discount_total: null },
+		lineItems: [{ ...line(), quantity: null, unit_price: null }],
+		taxes: [],
+		onSave
+	});
+	for (const label of ['Discount', 'Tip', 'Qty', 'Unit price'])
+		expect((screen.getByLabelText(label) as HTMLInputElement).value).toBe('');
+	await fireEvent.input(screen.getByLabelText('Merchant'), { target: { value: 'Changed' } });
+	await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+	expect(onSave).toHaveBeenCalledWith(
+		expect.objectContaining({
+			discount_total: null,
+			tip: null,
+			line_items: [
+				expect.objectContaining({ quantity: null, unit_price: null, total_price: '2.00' })
+			]
+		})
+	);
+});
+
+it('allows clearing optional observations when saving and verifying', async () => {
+	const onSaveAndVerify = vi.fn();
+	render(ReceiptEditor, {
+		receipt: { ...receipt, discount_total: '0', tip: '0' },
+		lineItems: [line()],
+		taxes: [],
+		onSaveAndVerify
+	});
+	for (const label of ['Discount', 'Tip', 'Qty', 'Unit price'])
+		await fireEvent.input(screen.getByLabelText(label), { target: { value: '' } });
+	await fireEvent.click(screen.getByRole('button', { name: 'Save & verify' }));
+	expect(onSaveAndVerify).toHaveBeenCalledWith(
+		expect.objectContaining({
+			discount_total: null,
+			tip: null,
+			line_items: [expect.objectContaining({ quantity: null, unit_price: null })]
+		})
+	);
+});
+
+it('adds a line without assuming quantity or unit price', async () => {
+	const onSave = vi.fn();
+	const { container } = render(ReceiptEditor, { receipt, lineItems: [], taxes: [], onSave });
+	await fireEvent.click(screen.getByRole('button', { name: 'Add item' }));
+	await fireEvent.input(screen.getByLabelText('Description'), { target: { value: 'Bread' } });
+	await fireEvent.input(container.querySelector('#li-0-total')!, { target: { value: '2' } });
+	await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+	expect(onSave).toHaveBeenCalledWith(
+		expect.objectContaining({
+			line_items: [
+				expect.objectContaining({
+					description: 'Bread',
+					quantity: null,
+					unit_price: null,
+					total_price: '2'
+				})
+			]
+		})
+	);
+});
+
+it.each([
+	['Discount', '-1'],
+	['Qty', '0'],
+	['Unit price', 'invalid'],
+	['Description', ' ']
+])('rejects an invalid %s before saving', async (label, value) => {
+	const onSave = vi.fn();
+	render(ReceiptEditor, { receipt, lineItems: [line()], taxes: [], onSave });
+	await fireEvent.input(screen.getByLabelText(label), { target: { value } });
+	expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(true);
+});

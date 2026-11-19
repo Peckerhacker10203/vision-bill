@@ -3,6 +3,7 @@
 import hashlib
 import os
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from threading import Barrier
 
 import httpx
@@ -113,12 +114,14 @@ def test_concurrent_acceptance_draft_cas_finalize_and_cross_owner(http_factory, 
     assert sorted(r.status_code for r in responses) == [200, 409]
     current = owner.get(image_url + "/draft").json()
     assert current["document"]["discount_total"] is None
+    assert current["document"]["tax_total"] is None
+    tax_total = sum(Decimal(tax["amount"]) for tax in current["document"]["taxes"])
     completed = owner.patch(
         image_url + "/draft",
         json={
             "expected_revision": current["revision"],
             "changes": {
-                "discount_total": "0",
+                "tax_total": str(tax_total),
                 "line_items": [{**line, "tags": []} for line in current["document"]["line_items"]],
             },
         },
@@ -140,6 +143,7 @@ def test_concurrent_acceptance_draft_cas_finalize_and_cross_owner(http_factory, 
         responses = list(executor.map(lambda _: finalize(), range(2)))
     assert [r.status_code for r in responses] == [200, 200], [r.text for r in responses]
     assert responses[0].json()["id"] == responses[1].json()["id"]
+    assert responses[0].json()["discount_total"] is None
     assert (
         owner.get(image_url + "/draft").json()["finalized_receipt_id"] == responses[0].json()["id"]
     )

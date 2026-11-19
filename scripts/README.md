@@ -186,7 +186,7 @@ groups require admin/CREATEROLE first; then `make db-configure-roles` must use t
 actual Alembic owner for grants/default privileges on current/future tables and
 sequences. `MIGRATION_DATABASE_URL` is only this Make tool's connection; entrypoint
 Alembic uses `PG__*`. Runtime credentials cannot apply pending owner DDL. Stop/drain
-old workers, back up/restore-test DB and files, migrate to 0020 with owner credentials,
+old workers, back up/restore-test DB and files, migrate to 0021 with owner credentials,
 refresh grants and start only compatible workers. No automatic destructive backout.
 `bash scripts/pg-backup.sh --help` lists backup/restore options.
 

@@ -145,7 +145,7 @@ def test_native_never_falls_back_and_cpu_identity_tracks_late_adapter(tmp_path):
     assert load_replay(case, native, 'native')[0][0]['contract_version'] == 2
 
 
-@pytest.mark.parametrize('field', ['currency', 'discount_total', 'tax_total'])
+@pytest.mark.parametrize('field', ['currency', 'tax_total'])
 async def test_missing_financial_observations_never_inherit_defaults(tmp_path, field):
     from scripts.ocr_harness.historical import load_replay
     case = case_files(tmp_path)
@@ -156,6 +156,21 @@ async def test_missing_financial_observations_never_inherit_defaults(tmp_path, f
     with pytest.raises(ValueError):
         await comparison.compare_case(provider, 'fixture', case, 'ocr', pages, tmp_path, 5)
     assert provider._client.chat.call_count == 3
+
+
+async def test_historical_replay_keeps_an_unprinted_discount_null(tmp_path):
+    from scripts.ocr_harness.historical import load_replay
+
+    case = case_files(tmp_path)
+    pages, _ = load_replay(case, cpu_rows(case, tmp_path), 'pp-medium')
+    payload = multi_payload()
+    payload.pop('discount_total')
+    provider = formatter(False, payload)
+
+    result = await comparison.compare_case(provider, 'fixture', case, 'ocr', pages, tmp_path, 5)
+
+    assert result.receipt.discount_total is None
+    assert provider._client.chat.call_count == 1
 
 
 async def test_cpu_uses_shared_repair_and_rejects_nonboundary_duplicate(tmp_path):

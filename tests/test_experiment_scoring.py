@@ -78,6 +78,25 @@ def test_absent_optional_values_match():
     assert result["differences"] == []
 
 
+def test_exact_scoring_distinguishes_unprinted_values_from_numbers():
+    expected = receipt()
+    expected.discount_total = None
+    expected.line_items[0].quantity = None
+    expected.line_items[0].unit_price = None
+
+    perfect = detailed_score(expected, expected)
+    assert perfect["item_tp"] == 2
+    assert perfect["exact_amounts"] and perfect["full_receipt_correct"]
+    assert perfect["checks"]["schema_net_plus_tax_matches_total"]
+
+    inferred = detailed_score(expected, receipt())
+    assert inferred["item_tp"] == 1
+    assert not inferred["exact_amounts"] and not inferred["full_receipt_correct"]
+    assert {d["path"] for d in inferred["differences"]} == {
+        "discount_total", "line_items[0].quantity", "line_items[0].unit_price",
+    }
+
+
 def test_zero_seconds_time_representation_is_equivalent():
     expected = receipt().model_copy(update={"time": "12:30:00"})
     actual = receipt().model_copy(update={"time": "12:30"})

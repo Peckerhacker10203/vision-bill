@@ -61,8 +61,9 @@ const verifiedByBypass: ReceiptRow = {
 	verification_source: 'automatic_bypass'
 };
 const previewResponse: ReviewPreview = { operation_revision: 7, review_revision: 3, findings: [] };
-const detail = (receipt = row): ReceiptWithDetails => ({
+const detail = (receipt = row, canRereview = false): ReceiptWithDetails => ({
 	receipt,
+	can_rereview: canRereview,
 	line_items: [],
 	taxes: [],
 	collection_ids: [],
@@ -175,7 +176,7 @@ it('has no acknowledgement control for missing originals and disables verificati
 });
 it('displays server revocation after editing a verified receipt', async () => {
 	vi.mocked(api.getReceipt)
-		.mockResolvedValueOnce(detail({ ...row, status: 'verified', verified: true }))
+		.mockResolvedValueOnce(detail({ ...row, status: 'verified', verified: true }, true))
 		.mockResolvedValue(
 			detail({ ...row, merchant_name: 'Edited', operation_revision: 8, review_revision: 4 })
 		);
@@ -421,16 +422,23 @@ it.each([
 	}
 );
 
-it.each(['legacy', 'automatic_bypass'])(
-	'reviews a %s receipt explicitly with current findings and exact revisions',
+it.each(['legacy', 'automatic_bypass', 'human'])(
+	'reviews a %s receipt checked under version 2 when the server allows re-review',
 	async (verificationSource) => {
 		const verified: ReceiptRow = {
 			...row,
 			status: 'verified',
 			verified: true,
+			checks_version: '2',
 			verification_source: verificationSource
 		};
-		const human = { ...verified, operation_revision: 8, verification_source: 'human' };
+		const human = {
+			...verified,
+			operation_revision: 8,
+			review_revision: 4,
+			checks_version: '3',
+			verification_source: 'human'
+		};
 		const findings = [
 			{
 				id: 'current-finding',
@@ -442,7 +450,7 @@ it.each(['legacy', 'automatic_bypass'])(
 			}
 		];
 		vi.mocked(api.getReceipt)
-			.mockResolvedValueOnce(detail(verified))
+			.mockResolvedValueOnce(detail(verified, true))
 			.mockResolvedValue(detail(human));
 		const preview = vi
 			.fn()
@@ -507,7 +515,7 @@ it('abandons the verify continuation if the session changes while reloading the 
 });
 
 it('stops an accepted human-review preview after the originating account changes', async () => {
-	vi.mocked(api.getReceipt).mockResolvedValue(detail(verifiedByBypass));
+	vi.mocked(api.getReceipt).mockResolvedValue(detail(verifiedByBypass, true));
 	const body = deferred<ReviewPreview>();
 	const json = vi.fn(() => body.promise);
 	vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, status: 200, json }));
@@ -528,7 +536,7 @@ it('stops an accepted human-review preview after the originating account changes
 
 it('drops a human-review preview from a different receipt view', async () => {
 	vi.mocked(api.getReceipt).mockImplementation(async (id) =>
-		detail(id === second.id ? second : verifiedByBypass)
+		id === second.id ? detail(second) : detail(verifiedByBypass, true)
 	);
 	const pending = deferred<Response>();
 	const fetchMock = vi.fn().mockReturnValue(pending.promise);
@@ -556,7 +564,7 @@ it.each([row, verifiedByBypass])(
 			total: '10'
 		};
 		const refreshed = deferred<ReceiptWithDetails>();
-		queryClient.setQueryData(queryKeys.receipt(row.id), detail(cached), {
+		queryClient.setQueryData(queryKeys.receipt(row.id), detail(cached, cached.verified), {
 			updatedAt: Date.now() - 60_000
 		});
 		vi.mocked(api.getReceipt).mockReturnValue(refreshed.promise);
@@ -569,7 +577,7 @@ it.each([row, verifiedByBypass])(
 		expect(await screen.findByDisplayValue('Shop')).not.toBeNull();
 		await fireEvent.click(screen.getByRole('button', { name: label }));
 		expect(await screen.findByRole('dialog')).not.toBeNull();
-		refreshed.resolve(detail(next));
+		refreshed.resolve(detail(next, next.verified));
 		await screen.findByDisplayValue('A revised receipt');
 		expect(screen.queryByRole('dialog')).toBeNull();
 		expect(verify).not.toHaveBeenCalled();
@@ -615,9 +623,12 @@ it('preserves dirty values but blocks saving or verifying a stale editor until e
 it.each([row, verifiedByBypass])(
 	'never publishes new $status revisions with cached children after a failed refresh and remount',
 	async (previous) => {
-		const original = { ...detail(previous), line_items: [item] };
+		const original = { ...detail(previous, previous.verified), line_items: [item] };
 		const saved = { ...previous, operation_revision: 8, review_revision: 4 };
-		const latest = { ...detail(saved), line_items: [{ ...item, description: 'Corrected item' }] };
+		const latest = {
+			...detail(saved, saved.verified),
+			line_items: [{ ...item, description: 'Corrected item' }]
+		};
 		const next = deferred<ReceiptWithDetails>();
 		vi.mocked(api.getReceipt)
 			.mockResolvedValueOnce(original)

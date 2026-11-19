@@ -74,6 +74,13 @@ def test_mismatching_overlap_is_preserved():
     assert len(MultiImageReceipt.model_validate(data).reconciled(2).line_items) == 2
 
 
+@pytest.mark.parametrize("second_quantity", [None, 1])
+def test_overlap_without_observed_quantity_is_not_verified(second_quantity):
+    data = extraction([item(quantity=None), item(quantity=second_quantity, source=1)], [(0, 1)])
+    receipt = MultiImageReceipt.model_validate(data).reconciled(2)
+    assert [row.quantity for row in receipt.line_items] == [None, second_quantity]
+
+
 @pytest.mark.parametrize(
     "items,pairs",
     [

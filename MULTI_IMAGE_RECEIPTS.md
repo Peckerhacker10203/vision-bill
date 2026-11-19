@@ -137,14 +137,17 @@ Printed extraction observations can be null, including currency and amounts;
 classification/category/tags are downstream enrichment. A partial draft is saved
 for correction through `GET/PATCH /api/v1/images/<id>/draft` with
 `expected_revision`; finalization takes `expected_revision` and `request_key`.
-Required missing values block finalization, rather than acquiring made-up defaults.
+Missing required values block finalization. A receipt can be finalized with a
+blank discount, tip, quantity or unit price when the printed information is
+absent. Each line still needs a description and a total. Where both quantity
+and unit price are known, their product is checked against the line total.
 
-Receipt review uses checks version 2. See the
+Receipt review uses checks version 3. See the
 [amount policy and human acknowledgement contract](UPGRADE_AND_VERIFY.md#review-and-financial-contract).
 Verify uses current operation and review revisions with acknowledgements for the
 exact displayed finding IDs. Integrity failures block even with an acknowledgement.
-Previously bypassed or legacy verification can receive explicit human review of
-the current receipt. Use the current `GET /api/v1/receipts/<id>/verify` preview and
+Previously bypassed, legacy or older-version verification can receive explicit
+human review of the current receipt. Use the current `GET /api/v1/receipts/<id>/verify` preview and
 submit both expected revisions and acknowledgements to the matching POST.
 Automatic bypass requires complete observations, clean current checks and
 identified originals. Verification preserves original and working files. Benchmark

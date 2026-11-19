@@ -38,7 +38,9 @@ The worker waits for usable capabilities before claiming an attempt, extracts
 printed observations, retains partial drafts, checks source/amount/overlap evidence,
 and applies classification downstream. A complete saved observation can finish
 after interruption without repeating inference once ownership is settled. Missing
-printed observations stay null and unavailable categories or tags remain visible. Human corrections and original bytes survive review.
+printed observations stay null. A receipt without a discount, tip, quantity or
+unit price can be finalized if the required figures reconcile. Unavailable
+categories or tags remain visible. Human corrections and original bytes survive review.
 Verify changes database workflow state without moving files. See the
 [multi-photo/API workflow](MULTI_IMAGE_RECEIPTS.md).
 

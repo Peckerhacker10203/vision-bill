@@ -140,7 +140,7 @@ Run from a prepared checkout/environment on a network that reaches the intended
 DB. Clear conflicting process/dotenv settings and use a private
 `VISION_BILL_CONFIG_PATH` as appropriate: process env > dotenv > YAML precedence
 still applies. No DSN/password needs to appear in public commands or shell history.
-The resulting head is **0020**. Before starting uvicorn with runtime credentials,
+The resulting head is **0021**. Before starting uvicorn with runtime credentials,
 complete owner migration and grants. The current image still executes Alembic at
 startup using the runtime `PG__*` identity; it can only check an already-current
 schema, not apply pending owner DDL. Future upgrades must repeat the owner step.
@@ -148,9 +148,9 @@ Do not temporarily leave the app serving as the owner to simplify migration.
 
 ### Fresh and legacy mapping
 
-Fresh installations apply 0001 through 0020. Existing supported 0010 installations
-apply additive workflow, review, reference, claim, deletion and observation
-checkpoint migrations 0011–0020.
+Fresh installations apply 0001 through 0021. Existing supported 0010 installations
+apply migrations 0011–0021 for workflow, review, benchmark references,
+claim fencing, deletion, observation checkpoints and optional receipt values.
 Migration 0011 preserves linked receipts, verified flags, amounts and historical
 paths and marks their submissions analyzed; they are not re-OCRed. Receipt-free
 legacy failed/processing images become pending with attempt_count 0/max_attempts
@@ -159,6 +159,8 @@ benchmark attempt counts that cannot be known are not invented by migration 0017
 0014 retains exact Decimal/NUMERIC values; 0018 supplies durable owned deletion
 cleanup. Migration 0019 keeps retry policy choice for replay-safe explicit adoption.
 Migration 0020 adds durable observation checkpoints for completion-only recovery.
+Migration 0021 allows absent discounts, quantities and unit prices while preserving
+stored values. A downgrade to 0020 stops if those columns already contain nulls.
 
 After head/grants, start only the compatible new application. Verify login and
 owner/admin scope, polling of a new synthetic upload, a preserved old receipt and
@@ -224,12 +226,17 @@ storage for recovery. See [native ownership](paddleocr-service/README.md#interna
 
 ## Review and financial contract
 
-Checks version **2** separates `integrity` blockers from review exceptions.
+Checks version **3** separates `integrity` blockers from review exceptions.
 Required missing observations, unavailable/changed originals and invalid source
 references prevent finalization/verification. Unknown source mapping and unresolved
 overlaps require review. Observations remain nullable; human correction fills
-actual missing mandatory data before finalization. No automatic currency/amount
-substitution or arithmetic correction is performed.
+actual missing mandatory data before finalization. Drafts can save partial edits.
+Discount, tip, quantity and unit price can remain absent on the finalized receipt.
+Transaction and line totals remain required. Correct a present tax rate to its
+decimal fraction before finalizing, such as `0.07` for 7%.
+
+Migration 0021 permits these nulls without updating existing receipt amounts.
+Its downgrade refuses to erase their meaning after new nullable values are saved.
 
 `AmountPolicy` states tax basis (`gross/net/unknown`), subtotal origin
 (`printed/derived_net/unknown`), tax information (`present/explicit_zero/missing`),
@@ -242,7 +249,8 @@ only for `add`. Gross derived-net with separate discount/tip can be uncertain an
 is flagged rather than guessed. Explicit zero tax conflicts with a nonzero tax.
 
 Decimal comparisons flag differences **greater than** 0.01 for quantity×unit price
-versus line total, 0.05 for subtotal, 0.02 for tax sum and 0.05 for total. These are
+versus line total when both factors exist, 0.05 for subtotal, 0.02 for tax sum
+and 0.05 for total. These are
 review tolerances in recorded monetary units, not score tolerances or permission
 to round stored values. V4 exact amount metrics forgive no monetary discrepancy.
 Local receipt time accepts valid `HH:MM`, `HH:MM:SS` and up to six fractional second

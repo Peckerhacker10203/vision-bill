@@ -1,5 +1,6 @@
 import logging
 from datetime import date
+from decimal import Decimal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -48,6 +49,9 @@ class ReceiptUpdate(Receipt):
     field_sources: dict[str, list[SourceRef]] | None = None
     overlap_decisions: list[dict[str, object]] | None = None
     collection_ids: list[UUID] | None = None
+    discount_total: Decimal | None = Field(
+        default=None, ge=0, description="Total discounts applied if printed"
+    )
     line_items: list[LineItemUpdate]  # type: ignore[assignment]  # Pydantic parses PUT-only fields
 
 
@@ -141,7 +145,7 @@ async def preview_human_review(
     receipt_service: ReceiptService = Depends(get_receipt_service),  # noqa: B008
     current_user: User = Depends(get_current_user),  # noqa: B008
 ) -> ReviewPreview:
-    """Preview current findings for a verified receipt awaiting human review."""
+    """Preview current findings for a verified receipt eligible for human review."""
     if not receipt_service.db_ready:
         raise HTTPException(status_code=503, detail="Database not available")
     try:

@@ -131,9 +131,9 @@
 									{purchase.description}
 								</a>
 							</td>
-							<td class="p-3">{purchase.quantity}</td>
+							<td class="p-3">{purchase.quantity ?? '—'}</td>
 							<td class="whitespace-nowrap p-3">
-								{formatMoney(purchase.unit_price, purchase.currency)}
+								{formatMoney(purchase.unit_price, purchase.currency) || '—'}
 							</td>
 						</tr>
 					{/each}

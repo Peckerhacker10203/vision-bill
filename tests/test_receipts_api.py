@@ -1,6 +1,7 @@
 """Endpoint wiring tests: real FastAPI app + TestClient, mocked DB and provider."""
 
 import base64
+import json
 from collections.abc import Generator
 from datetime import UTC, datetime
 from datetime import date as Date
@@ -20,6 +21,7 @@ from vision_bill.api import images as images_api_module
 from vision_bill.api.system import main as system_api_module
 from vision_bill.config import Settings
 from vision_bill.model.receipt import LineItem, Receipt
+from vision_bill.model.review import CHECKS_VERSION, AmountPolicy
 from vision_bill.provider.db import image_db as image_db_module
 from vision_bill.provider.db import receipt_db as receipt_db_module
 from vision_bill.provider.db import user_db as user_db_module
@@ -719,6 +721,28 @@ def test_update_receipt_accepts_suggested_tags(api_context: ApiContext) -> None:
     assert insert_calls[0].args[6] == ["brunch"]
 
 
+@pytest.mark.parametrize("discount", [{}, {"discount_total": None}, {"discount_total": "0"}])
+def test_update_receipt_distinguishes_unobserved_discount_from_printed_zero(api_context, discount):
+    ctx = api_context
+    current = _receipt_row(discount_total=None)
+    expected = Decimal(0) if discount.get("discount_total") == "0" else None
+
+    def rows(query, *args):
+        if query.startswith(receipt_db_module.UPDATE_RECEIPT_SQL):
+            current["discount_total"] = args[9]
+        return current
+
+    ctx.conn.fetchrow = AsyncMock(side_effect=rows)
+    body = _make_receipt().model_dump(mode="json", exclude={"discount_total"})
+    body.update(discount, expected_operation_revision=1)
+
+    response = ctx.client.put(f"{RECEIPTS_URL}/{RECEIPT_ID}", json=body)
+
+    assert response.status_code == 200
+    assert current["discount_total"] == expected
+    assert response.json()["discount_total"] == discount.get("discount_total")
+
+
 @pytest.mark.parametrize("invalid", [["milk"], {"code": "milk"}, "fake_code"])
 def test_update_rejects_invalid_spending_category(api_context: ApiContext, invalid: object) -> None:
     body = {
@@ -919,6 +943,7 @@ def test_verify_receipt_already_verified_conflict(api_context: ApiContext) -> No
             status="verified",
             verified=True,
             verification_source="human",
+            checks_version=CHECKS_VERSION,
         )
     )
 
@@ -927,6 +952,54 @@ def test_verify_receipt_already_verified_conflict(api_context: ApiContext) -> No
     assert response.status_code == 409
     assert response.json()["detail"] == "Receipt already verified"
     ctx.conn.execute.assert_not_awaited()
+
+
+def test_human_review_under_old_checks_requires_current_findings_and_revisions(api_context, tmp_path):
+    ctx = api_context
+    original = tmp_path / "original.jpeg"
+    original.write_bytes(JPEG_BYTES)
+    policy = AmountPolicy(tax_basis="gross", subtotal_origin="printed", tax_information="explicit_zero")
+    old_ack = {"finding_id": "old-checks-finding", "comment": "Printed total checked"}
+    current = _receipt_row(
+        image_id=IMAGE_ID, status="verified", verified=True, verification_source="human",
+        checks_version="2", subtotal=Decimal(0), tax_total=Decimal(0), total=Decimal(1),
+        payment_method="cash", amount_policy=policy.model_dump(), acknowledgements=[old_ack],
+    )
+    image = _image_row(
+        image_path=str(original), source_manifest=[], requested_options={}, effective_options={},
+        request_fingerprint=None, idempotency_key=None, ocr_checkpoint=None, attempt_count=0,
+        generation=1,
+    )
+
+    def rows(query, *args):
+        if "FROM images" in query:
+            return image
+        if "UPDATE receipts SET status='verified'" in query:
+            current.update(findings=json.loads(args[1]), checks_version=args[2],
+                           acknowledgements=json.loads(args[3]), operation_revision=2)
+        return current
+
+    ctx.conn.fetchrow = AsyncMock(side_effect=rows)
+    ctx.conn.fetchval = AsyncMock(return_value=False)
+    receipt_url = f"{RECEIPTS_URL}/{RECEIPT_ID}"
+    verify_url = f"{receipt_url}/verify"
+
+    assert ctx.client.get(receipt_url).json()["can_rereview"] is True
+    assert ctx.client.post(verify_url).json()["detail"] == "review_revision_required"
+    response = ctx.client.get(verify_url)
+    assert response.status_code == 200, response.text
+    preview = response.json()
+    assert [finding["code"] for finding in preview["findings"]] == ["amount_discrepancy"]
+    revisions = {"expected_operation_revision": preview["operation_revision"],
+                 "expected_review_revision": preview["review_revision"]}
+    stale = ctx.client.post(verify_url, json={**revisions, "acknowledgements": [old_ack]})
+    assert stale.status_code == 422 and stale.json()["detail"] == "review_acknowledgements_invalid"
+    accepted = ctx.client.post(verify_url, json={**revisions, "acknowledgements": [
+        {**old_ack, "finding_id": preview["findings"][0]["id"]},
+    ]})
+    assert accepted.status_code == 200 and accepted.json()["checks_version"] == CHECKS_VERSION
+    assert ctx.client.get(receipt_url).json()["can_rereview"] is False
+    assert ctx.client.get(verify_url).status_code == 409
 
 
 def test_bypass_rereview_requires_explicit_revisions(api_context: ApiContext) -> None:

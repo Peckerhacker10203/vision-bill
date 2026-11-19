@@ -10,9 +10,9 @@ from uuid import UUID
 
 from pydantic import ValidationError
 
-from ..model.extraction import DraftLineItem, ExtractionDraft
+from ..model.extraction import DraftLineItem, DraftTaxLine, ExtractionDraft
 from ..model.ocr import SourceRef
-from ..model.receipt import LineItem, Receipt
+from ..model.receipt import LineItem, Receipt, TaxLine
 from ..model.review import (
     CHECKS_VERSION,
     AmountPolicy,
@@ -141,6 +141,10 @@ def evaluate_receipt(
             path = f"line_items.{index}.description"
             if not any(f.field_path == path for f in findings):
                 finding("missing_mandatory_field", path, "integrity")
+    observed_taxes: Sequence[TaxLine | DraftTaxLine] = receipt.taxes or []
+    for index, tax in enumerate(observed_taxes):
+        if tax.rate is not None and not 0 <= tax.rate <= 1:
+            finding("invalid_tax_rate", f"taxes.{index}.rate", "integrity")
     if not originals:
         finding("missing_original", "originals", "integrity")
     for original in originals:
@@ -171,18 +175,19 @@ def evaluate_receipt(
         finding("unknown_tip_treatment", "amount_policy.tip_treatment")
     if complete is not None:
         # Use enough precision for exact sums/products of the admitted monetary inputs.
+        discount = complete.discount_total or Decimal(0)
+        tip = complete.tip or Decimal(0)
         numbers = [
             complete.subtotal,
             complete.total,
-            complete.discount_total,
+            discount,
             complete.tax_total,
-            complete.tip or Decimal(0),
+            tip,
         ]
-        numbers += [
-            v
-            for item in complete.line_items
-            for v in (item.unit_price, item.total_price, Decimal(str(item.quantity)))
-        ]
+        for item in complete.line_items:
+            numbers.append(item.total_price)
+            if item.quantity is not None and item.unit_price is not None:
+                numbers.extend((Decimal(str(item.quantity)), item.unit_price))
         numbers += [tax.amount for tax in complete.taxes]
         with localcontext() as context:
             context.prec = max(
@@ -206,13 +211,14 @@ def evaluate_receipt(
                     )
 
             for index, item in enumerate(complete.line_items):
-                compare(
-                    "line_discrepancy",
-                    f"line_items.{index}.total_price",
-                    item.total_price,
-                    Decimal(str(item.quantity)) * item.unit_price,
-                    "0.01",
-                )
+                if item.quantity is not None and item.unit_price is not None:
+                    compare(
+                        "line_discrepancy",
+                        f"line_items.{index}.total_price",
+                        item.total_price,
+                        Decimal(str(item.quantity)) * item.unit_price,
+                        "0.01",
+                    )
             supported = (
                 amount_policy.tax_basis != "unknown"
                 and amount_policy.subtotal_origin != "unknown"
@@ -231,8 +237,8 @@ def evaluate_receipt(
                 and amount_policy.tax_basis == "gross"
             )
             if derived_gross and (
-                (complete.discount_total and amount_policy.discount_treatment == "subtract")
-                or (complete.tip and amount_policy.tip_treatment == "add")
+                (discount and amount_policy.discount_treatment == "subtract")
+                or (tip and amount_policy.tip_treatment == "add")
             ):
                 finding("uncertain_net_subtotal_basis", "subtotal")
                 supported = False
@@ -260,9 +266,9 @@ def evaluate_receipt(
                 if amount_policy.tax_basis == "net" or derived_gross:
                     expected += complete.tax_total
                 if amount_policy.discount_treatment == "subtract":
-                    expected -= complete.discount_total
+                    expected -= discount
                 if amount_policy.tip_treatment == "add":
-                    expected += complete.tip or Decimal(0)
+                    expected += tip
                 compare("amount_discrepancy", "total", complete.total, expected, "0.05")
     for retained in retained_findings:
         if not any(
@@ -287,6 +293,7 @@ def persistent_findings(findings: Sequence[ReviewFinding]) -> list[ReviewFinding
     """Retain provider observations while recalculating our own prior check results."""
     recalculated_codes = {
         "missing_mandatory_field",
+        "invalid_tax_rate",
         "missing_original",
         "original_integrity_failed",
         "source_integrity_failed",

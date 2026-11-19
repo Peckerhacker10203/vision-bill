@@ -204,7 +204,7 @@ export interface ReceiptRow {
 	currency: string;
 	category: Category;
 	subtotal: string;
-	discount_total: string;
+	discount_total: string | null;
 	tax_total: string;
 	tip: string | null;
 	total: string;
@@ -224,8 +224,8 @@ export interface LineItemRow {
 	receipt_id: string;
 	description: string;
 	original_description: string | null;
-	quantity: number;
-	unit_price: string;
+	quantity: number | null;
+	unit_price: string | null;
 	total_price: string;
 	spending_category: string;
 	category_source: 'llm' | 'history' | 'user' | 'unknown';
@@ -272,6 +272,7 @@ export interface TaxLineRow {
 
 export interface ReceiptWithDetails {
 	receipt: ReceiptRow;
+	can_rereview: boolean;
 	line_items: LineItemRow[];
 	taxes: TaxLineRow[];
 	image_path: string | null;
@@ -382,8 +383,8 @@ export interface DedicatedOcrStatus {
 export interface LineItemWrite {
 	id?: string;
 	description: string;
-	quantity: number;
-	unit_price: string;
+	quantity: number | null;
+	unit_price: string | null;
 	total_price: string;
 	spending_category: string;
 	remember_category?: boolean;
@@ -414,7 +415,7 @@ export interface ReceiptWrite {
 	line_items: LineItemWrite[];
 	taxes?: TaxLineWrite[];
 	subtotal: string;
-	discount_total?: string;
+	discount_total?: string | null;
 	tax_total?: string;
 	tip?: string | null;
 	total: string;
@@ -466,8 +467,8 @@ export interface ProductPurchase {
 	date: string;
 	/** Local HH:MM[:SS[.ffffff]], preserving sub-minute precision */
 	time: string | null;
-	quantity: number;
-	unit_price: string;
+	quantity: number | null;
+	unit_price: string | null;
 	currency: string;
 }
 

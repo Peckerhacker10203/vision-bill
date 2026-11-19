@@ -111,7 +111,7 @@ def detailed_score_v3(expected: Receipt, actual: Receipt, *, classification: boo
             "rows": {"missing": missing, "extra": extra, "matched": matched},
             "checks": {
                 "tax_lines_sum_matches_tax_total": sum((t.amount for t in actual.taxes), Decimal(0)) == actual.tax_total,
-                "schema_net_plus_tax_matches_total": actual.subtotal - actual.discount_total + actual.tax_total + (actual.tip or 0) == actual.total,
+                "schema_net_plus_tax_matches_total": actual.subtotal - (actual.discount_total or 0) + actual.tax_total + (actual.tip or 0) == actual.total,
                 "line_totals_sum": str(sum((item.total_price for item in actual.line_items), Decimal(0))),
                 "note": "Arithmetic checks are diagnostics; tax-inclusive receipt conventions may differ from the schema."
             }}
@@ -125,7 +125,11 @@ def _description(value: str) -> str:
 
 
 def _item_key(row: dict[str, Any]) -> tuple[Any, ...]:
-    return (_description(row['description']), *(Decimal(str(row[k])) for k in ITEM[1:]))
+    return (
+        _description(row['description']),
+        *(None if value is None else Decimal(str(value))
+          for value in (row.get('quantity'), row.get('unit_price'), row['total_price'])),
+    )
 
 
 def _lcs(left: list[tuple[Any, ...]], right: list[tuple[Any, ...]]) -> list[list[int]]:
@@ -186,7 +190,7 @@ def detailed_score(
                 pass
         equality[key] = equal
     for key in TOTALS:
-        e, a = left[key], right.get(key)
+        e, a = left.get(key, getattr(legacy_expected, key)), right.get(key)
         equality[key] = e == a if e is None or a is None else Decimal(str(e)) == Decimal(str(a))
     equality['line_items'] = litems == ritems
     def tax_key(row: dict[str, Any]) -> tuple[Any, ...]:

@@ -37,6 +37,7 @@ async def seed(w, scope, tmp_path, *, total="10", verified=False):
         "date": "2026-01-01",
         "currency": "EUR",
         "subtotal": total,
+        "discount_total": "0",
         "total": total,
         "line_items": [
             {"description": "Item", "quantity": 1, "unit_price": total, "total_price": total}

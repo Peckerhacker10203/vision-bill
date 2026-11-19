@@ -158,8 +158,7 @@
 		}
 		for (const [i, tax] of (document.taxes ?? []).entries()) {
 			if (tax.amount != null && !isPlainDecimal(tax.amount)) errors.push(`taxes.${i}.amount`);
-			if (tax.rate != null && (!Number.isFinite(tax.rate) || tax.rate < 0 || tax.rate > 1))
-				errors.push(`taxes.${i}.rate`);
+			if (tax.rate != null && !Number.isFinite(tax.rate)) errors.push(`taxes.${i}.rate`);
 		}
 		return errors;
 	}
@@ -203,7 +202,6 @@
 			'line_items',
 			'taxes',
 			'subtotal',
-			'discount_total',
 			'tax_total',
 			'total',
 			'payment_method'
@@ -212,14 +210,21 @@
 			(key) => document[key] == null || document[key] === ''
 		);
 		for (const [i, line] of (document.line_items ?? []).entries())
-			for (const key of ['description', 'quantity', 'unit_price', 'total_price'] as const)
-				if (line[key] == null || line[key] === '') missing.push(`line_items.${i}.${key}`);
+			for (const key of ['description', 'total_price'] as const)
+				if (!line[key]?.trim()) missing.push(`line_items.${i}.${key}`);
 		if (missing.length) {
 			error = translate('review.missingFields') + ': ' + missing.join(', ');
 			return;
 		}
 		if (dirty) {
 			error = translate('review.saveFirst');
+			return;
+		}
+		const invalidRates = (document.taxes ?? []).flatMap(({ rate }, i) =>
+			rate != null && (!Number.isFinite(rate) || rate < 0 || rate > 1) ? [`taxes.${i}.rate`] : []
+		);
+		if (invalidRates.length) {
+			error = `${translate('diagnostics.checks.invalid_tax_rate')} ${invalidRates.join(', ')}`;
 			return;
 		}
 		const view = active;

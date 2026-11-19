@@ -93,11 +93,7 @@
 		() => queryClient
 	);
 	let canVerify = $derived(data !== null && data.receipt.status === 'unverified');
-	let canReviewAsHuman = $derived(
-		data?.receipt.verified &&
-			data.receipt.status === 'verified' &&
-			data.receipt.verification_source !== 'human'
-	);
+	let canReviewAsHuman = $derived(data?.can_rereview ?? false);
 	let editorStale = $derived(
 		renderedVersion !== null &&
 			(renderedVersion.id !== id || !sameVersion(renderedVersion, data?.receipt))

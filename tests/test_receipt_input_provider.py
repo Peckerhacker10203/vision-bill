@@ -2,6 +2,7 @@
 
 import json
 import time
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -171,7 +172,7 @@ async def test_source_aware_overlap_keeps_original_draft_and_verified_decisions(
     assert [row.description for row in admit_observations(result).line_items] == ["Milk", "Milk", "Bread"]
 
 
-@pytest.mark.parametrize("field", ["taxes", "payment_method", "currency", "discount_total", "tax_total", "subtotal", "total"])
+@pytest.mark.parametrize("field", ["taxes", "payment_method", "currency", "tax_total", "subtotal", "total"])
 @pytest.mark.parametrize("explicit_null", [False, True])
 async def test_unobserved_mandatory_values_do_not_dispatch_classification(field, explicit_null):
     from test_experiment_scoring import receipt
@@ -192,6 +193,35 @@ async def test_unobserved_mandatory_values_do_not_dispatch_classification(field,
     assert provider.send_message.await_count == 1
     assert result.classification_enrichment.state == "skipped"
     assert result.classification_enrichment.reason_code == "incomplete_observations"
+
+
+@pytest.mark.parametrize("explicit_null", [False, True])
+async def test_unobserved_optional_values_survive_formatting(explicit_null):
+    from test_experiment_scoring import receipt
+
+    values = receipt(("Milk",)).model_dump(mode="json")
+    for obj, fields in (
+        (values, ("discount_total", "tip")),
+        (values["line_items"][0], ("quantity", "unit_price")),
+    ):
+        for field in fields:
+            if explicit_null:
+                obj[field] = None
+            else:
+                del obj[field]
+    provider = OllamaProvider("http://local")
+    provider.send_message = AsyncMock(return_value=json.dumps(values))
+
+    result = await provider.extract_observations(
+        "requested", ocr_input(), tags=[], deadline=time.monotonic() + 2
+    )
+
+    assert result.receipt is not None and result.draft is not None
+    for observed in [result.receipt, result.draft]:
+        assert observed.discount_total is None and observed.tip is None
+        assert observed.line_items[0].quantity is None
+        assert observed.line_items[0].unit_price is None
+        assert observed.line_items[0].total_price == Decimal("2.00")
 
 
 async def test_observation_stage_preserves_receipt_and_empty_tag_enrichment():

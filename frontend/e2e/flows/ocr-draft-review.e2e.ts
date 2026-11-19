@@ -8,7 +8,7 @@ import type { ReceiptWithDetails } from '../../src/lib/types';
 // Uses server-selected OCR/direct extraction and deterministic CPU stub evidence.
 test.describe('draft review and versioned receipt editing', () => {
 	stubGuard();
-	test('partial observations stay nullable until explicitly completed; finalize yields one unverified receipt', async ({
+	test('finalizing from a draft preserves absent optional observations', async ({
 		page,
 		context
 	}) => {
@@ -41,10 +41,11 @@ test.describe('draft review and versioned receipt editing', () => {
 		const partial = (await (await context.request.get(`/api/v1/images/${id}/draft`)).json())
 			.document;
 		expect(partial.discount_total).toBeNull();
+		expect(partial.tax_total).toBeNull();
 		expect(partial.total).toBe(draft.document.total);
 		await page.getByRole('button', { name: 'Finalize draft' }).click();
-		await expect(page.getByRole('alert')).toContainText('discount_total');
-		await page.getByLabel('Discount', { exact: true }).fill('0');
+		await expect(page.getByRole('alert')).toContainText('tax_total');
+		await page.getByLabel('Tax total', { exact: true }).fill(fixture.expected.tax_total);
 		const addTags = page.getByRole('button', { name: 'Add tags', exact: true });
 		const missingTags = await addTags.count();
 		for (let i = 0; i < missingTags; i++) await addTags.first().click();
@@ -59,10 +60,20 @@ test.describe('draft review and versioned receipt editing', () => {
 		await expect(page).toHaveURL(/\/receipts\/[a-f0-9-]+/);
 		const receiptId = page.url().split('/').pop()!;
 		const result = await context.request.get(`/api/v1/receipts/${receiptId}`);
-		expect((await result.json()).receipt).toMatchObject({
+		const detail = (await result.json()) as ReceiptWithDetails;
+		expect(detail.receipt).toMatchObject({
 			verified: false,
 			status: 'unverified',
-			merchant_name: 'Human correction'
+			merchant_name: 'Human correction',
+			discount_total: null,
+			tax_total: fixture.expected.tax_total,
+			tip: null
+		});
+		expect(detail.line_items[0]).toMatchObject({
+			description: fixture.expected.line_items[0].description,
+			quantity: null,
+			unit_price: null,
+			total_price: fixture.expected.line_items[0].total_price
 		});
 		const finalized = await context.request.get(`/api/v1/images/${id}/draft`);
 		expect((await finalized.json()).finalized_receipt_id).toBe(receiptId);
@@ -82,7 +93,7 @@ test.describe('draft review and versioned receipt editing', () => {
 		const draft = await (await context.request.get(`/api/v1/images/${id}/draft`)).json();
 		const document = {
 			...draft.document,
-			discount_total: '0',
+			tax_total: fixture.expected.tax_total,
 			line_items: draft.document.line_items.map((line: Record<string, unknown>) => ({
 				...line,
 				tags: line.tags ?? []

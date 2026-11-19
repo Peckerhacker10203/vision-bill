@@ -9,6 +9,7 @@ application's artifact cleanup, but never a partially committed receipt.
 
 import asyncio
 import json
+import re
 from collections.abc import Callable, Sequence
 from hashlib import sha256
 from typing import Any, Literal
@@ -1709,12 +1710,22 @@ class WorkflowDB:
         return payload
 
     async def _draft_view(self, conn: asyncpg.Connection, row: Any) -> DraftView:
+        findings = _decoded(row["findings"])
+        if row["finalized_receipt_id"] is None:
+            # Older drafts stored completeness findings for fields now optional.
+            findings = [
+                finding for finding in findings
+                if finding["code"] != "missing_mandatory_field" or not re.fullmatch(
+                    r"discount_total|line_items\.[0-9]+\.(quantity|unit_price)",
+                    finding["field_path"],
+                )
+            ]
         return DraftView(
             image_id=row["image_id"],
             revision=row["revision"],
             document=ExtractionDraft.model_validate(_decoded(row["document"])),
             amount_policy=_decoded(row["amount_policy"]),
-            findings=_decoded(row["findings"]),
+            findings=findings,
             field_sources=_decoded(row["field_sources"]),
             overlap_decisions=_decoded(row["overlap_decisions"]),
             finalized_receipt_id=row["finalized_receipt_id"],

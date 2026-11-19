@@ -498,6 +498,7 @@
 		"amount": "Amount",
 		"saveAndVerify": "Save & verify",
 		"merchantRequired": "Merchant is required.",
+		"descriptionRequired": "Each item needs a description.",
 		"dateRequired": "A valid date is required.",
 		"invalidCurrency": "Enter a three-letter currency code.",
 		"invalidAmount": "Amount must be a non-negative number.",
@@ -605,6 +606,7 @@
 			"uncertain_net_subtotal_basis": "A net subtotal cannot be compared reliably with gross lines when an extra discount or tip has an uncertain tax basis. Check the original and explain the basis.",
 			"amount_discrepancy": "The total differs from the subtotal with the selected tax, discount and tip treatment. Check the original; amounts are not changed automatically.",
 			"tax_discrepancy": "The tax total differs from the sum of the tax rows.",
+			"invalid_tax_rate": "Enter the tax rate as a decimal between 0 and 1. For example, enter 0.07 for 7%.",
 			"tax_information_conflict": "Tax is marked as explicitly zero, but the tax total is not zero."
 		},
 		"reasons": {

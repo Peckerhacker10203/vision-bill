@@ -315,7 +315,7 @@ class BenchmarkDB:
         items = await conn.fetch('SELECT quantity FROM line_items WHERE receipt_id=$1 ORDER BY position,id', receipt_id)
         taxes = await conn.fetch('SELECT rate FROM taxes WHERE receipt_id=$1 ORDER BY position,id', receipt_id)
         for item, raw in zip(expected['line_items'], items, strict=True):
-            item['quantity'] = str(raw['quantity'])
+            item['quantity'] = str(raw['quantity']) if raw['quantity'] is not None else None
         for tax, raw in zip(expected['taxes'], taxes, strict=True):
             tax['rate'] = str(raw['rate']) if raw['rate'] is not None else None
         material = material_document(document)
@@ -352,9 +352,11 @@ class BenchmarkDB:
         # confirmation cannot remove known observations, and its hash binds the mask.
         mandatory = {'merchant_name', 'date', 'line_items', 'subtotal', 'total'}
         defaults = {'currency': 'EUR', 'payment_method': 'unknown', 'discount_total': '0', 'tax_total': '0', 'taxes': []}
-        scored = [key for key in OBSERVABLE_FIELDS if key in mandatory or key in observed or
-                  (material.get(key) is not None and key not in defaults) or
-                  (key in defaults and material.get(key) != defaults[key])]
+        scored = [
+            key for key in OBSERVABLE_FIELDS
+            if key in mandatory or key in observed
+            or (material.get(key) is not None and (key not in defaults or material[key] != defaults[key]))
+        ]
         def digest(value: Any) -> str:
             return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
         # Bind scoring labels to Gold consent without changing the financial review revision.

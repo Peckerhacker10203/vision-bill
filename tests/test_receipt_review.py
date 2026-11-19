@@ -115,6 +115,67 @@ def test_nulls_are_integrity_and_do_not_gain_defaults():
     assert draft.currency is None
 
 
+@pytest.mark.parametrize("quantity,unit_price", [(None, None), (None, "5"), (2, None)])
+def test_unprinted_line_factors_and_adjustments_remain_null(quantity, unit_price):
+    draft = ExtractionDraft.model_validate(document().model_dump())
+    draft.line_items[0].quantity = quantity
+    draft.line_items[0].unit_price = None if unit_price is None else Decimal(unit_price)
+    draft.discount_total = None
+    policy = POLICY.model_copy(update={"discount_treatment": "subtract", "tip_treatment": "add"})
+    before = draft.model_dump()
+
+    result = evaluate(draft, policy)
+    finished = review.receipt_from_draft(draft)
+
+    assert result.can_finalize and result.can_auto_verify and result.findings == []
+    assert finished.line_items[0].quantity == quantity
+    assert finished.line_items[0].unit_price == draft.line_items[0].unit_price
+    assert finished.line_items[0].total_price == Decimal(10)
+    assert finished.discount_total is None and finished.tip is None
+    assert draft.model_dump() == before
+
+
+def test_line_total_still_drives_subtotal_and_total_checks_without_line_factors():
+    draft = ExtractionDraft.model_validate(document().model_dump())
+    draft.line_items[0].quantity = None
+    draft.line_items[0].unit_price = None
+    draft.line_items[0].total_price = Decimal("9.9499")
+    draft.subtotal = Decimal(10)
+    draft.total = Decimal("10.0501")
+
+    assert [f.code for f in evaluate(draft).findings] == [
+        "subtotal_discrepancy",
+        "amount_discrepancy",
+    ]
+
+
+@pytest.mark.parametrize("field", ["description", "total_price"])
+def test_line_description_and_total_remain_mandatory(field):
+    draft = ExtractionDraft.model_validate(document().model_dump())
+    setattr(draft.line_items[0], field, None)
+    result = evaluate(draft)
+    assert not result.can_finalize
+    assert [(f.field_path, f.severity) for f in result.findings] == [
+        (f"line_items.0.{field}", "integrity")
+    ]
+
+
+@pytest.mark.parametrize("rate", [-0.01, 7])
+def test_unscaled_tax_rate_stays_in_draft_with_nonwaivable_integrity_finding(rate):
+    draft = ExtractionDraft.model_validate(document().model_dump())
+    draft.taxes[0].rate = rate
+
+    result = evaluate(draft)
+
+    assert not result.can_finalize and not result.can_auto_verify
+    assert [(f.code, f.field_path, f.severity) for f in result.findings] == [
+        ("invalid_tax_rate", "taxes.0.rate", "integrity")
+    ]
+    assert draft.taxes[0].rate == rate
+    legacy = document(taxes=[{"name": "VAT", "amount": "1.60", "rate": rate}])
+    assert legacy.taxes[0].rate == rate
+
+
 @pytest.mark.parametrize(
     "originals",
     [
@@ -416,7 +477,7 @@ def test_changed_checks_reject_stale_ack_without_mutating_history(monkeypatch):
         historical=evaluate(doc)
     approvals=[FindingAcknowledgement(finding_id=f.id,comment='historical review') for f in historical.findings]
     current=evaluate(doc)
-    assert current.checks_version=='2' and historical.checks_version=='1'
+    assert current.checks_version=='3' and historical.checks_version=='1'
     with pytest.raises(ValueError,match='acknowledgements'):
         review.validate_acknowledgements(current,approvals)
     assert approvals[0].finding_id==historical.findings[0].id

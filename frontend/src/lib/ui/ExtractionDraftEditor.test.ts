@@ -3,6 +3,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import ExtractionDraftEditor from './ExtractionDraftEditor.svelte';
 import { api, ApiError } from '$lib/api/client';
 import { queryClient } from '$lib/query/client';
+import type { DraftView } from '$lib/types';
 const draft = {
 	image_id: 'job',
 	revision: 7,
@@ -27,6 +28,24 @@ const draft = {
 	findings: [],
 	source_views: [],
 	finalized_receipt_id: null
+};
+const completeDraft: DraftView = {
+	...draft,
+	document: {
+		confidence: 90,
+		merchant_name: 'Shop',
+		date: '2026-01-01',
+		currency: 'EUR',
+		category: 'grocery',
+		line_items: [{ description: 'Bread', quantity: null, unit_price: null, total_price: '3' }],
+		taxes: [],
+		subtotal: '3',
+		discount_total: null,
+		tax_total: '0',
+		tip: null,
+		total: '3',
+		payment_method: 'cash'
+	}
 };
 beforeEach(() => {
 	queryClient.clear();
@@ -129,6 +148,53 @@ it('shows required missing fields without attempting incomplete finalization', a
 	await screen.findByLabelText('Merchant');
 	await fireEvent.click(screen.getByRole('button', { name: 'Finalize draft' }));
 	expect(screen.getByRole('alert').textContent).toContain('merchant_name');
+	expect(finalize).not.toHaveBeenCalled();
+});
+
+it('finalizes a saved draft with absent discounts, tips, quantities and unit prices', async () => {
+	vi.mocked(api.getDraft).mockResolvedValue(completeDraft);
+	const finalize = vi.spyOn(api, 'finalizeDraft').mockResolvedValue({ id: 'receipt' } as never);
+	render(ExtractionDraftEditor, { id: 'job' });
+	await screen.findByDisplayValue('Bread');
+	await fireEvent.click(screen.getByRole('button', { name: 'Finalize draft' }));
+	expect(finalize).toHaveBeenCalledWith('job', {
+		expected_revision: 7,
+		request_key: expect.any(String)
+	});
+});
+
+it('saves partial corrections with an out-of-range tax observation', async () => {
+	const loaded = {
+		...completeDraft,
+		document: { ...completeDraft.document, taxes: [{ name: 'VAT', rate: 7, amount: '0' }] }
+	};
+	vi.mocked(api.getDraft).mockResolvedValue(loaded);
+	const patch = vi.spyOn(api, 'patchDraft').mockResolvedValue({
+		...loaded,
+		revision: 8,
+		document: { ...loaded.document, merchant_name: 'Shop corrected' }
+	});
+	render(ExtractionDraftEditor, { id: 'job' });
+	await screen.findByLabelText('Merchant');
+	await fireEvent.input(screen.getByLabelText('Merchant'), { target: { value: 'Shop corrected' } });
+	await fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+	expect(patch).toHaveBeenCalledWith('job', {
+		expected_revision: 7,
+		changes: { merchant_name: 'Shop corrected' }
+	});
+	expect((screen.getByLabelText('Rate (0–1)') as HTMLInputElement).value).toBe('7');
+});
+
+it('prompts for a decimal tax rate before finalizing a saved out-of-range observation', async () => {
+	vi.mocked(api.getDraft).mockResolvedValue({
+		...completeDraft,
+		document: { ...completeDraft.document, taxes: [{ name: 'VAT', rate: 7, amount: '0' }] }
+	});
+	const finalize = vi.spyOn(api, 'finalizeDraft');
+	render(ExtractionDraftEditor, { id: 'job' });
+	await screen.findByLabelText('Rate (0–1)');
+	await fireEvent.click(screen.getByRole('button', { name: 'Finalize draft' }));
+	expect(screen.getByRole('alert').textContent).toContain('between 0 and 1');
 	expect(finalize).not.toHaveBeenCalled();
 });
 

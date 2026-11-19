@@ -1,6 +1,7 @@
 """Public contract and artifact boundary tests (no database needed)."""
 
 import importlib.util
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -76,3 +77,23 @@ def test_retry_policy_is_explicit_and_strict():
     assert workflow.RetryRequest(expected_generation=1, request_key="r", policy="current").policy == "current"
     with pytest.raises(ValidationError):
         workflow.RetryRequest(expected_generation=1, request_key="r", policy="unknown")
+
+
+@pytest.mark.asyncio
+async def test_active_legacy_draft_hides_obsolete_optional_field_findings(monkeypatch):
+    from vision_bill.provider.db.workflow_db import WorkflowDB
+
+    db = object.__new__(WorkflowDB)
+    monkeypatch.setattr(db, "_source_views", AsyncMock(return_value=[]))
+    fields = ("discount_total", "line_items.0.quantity", "line_items.0.unit_price", "total")
+    row = {
+        "image_id": uuid4(), "revision": 2, "document": {}, "amount_policy": {},
+        "findings": [
+            {"id": path, "code": "missing_mandatory_field", "severity": "integrity", "field_path": path}
+            for path in fields
+        ],
+        "field_sources": {}, "overlap_decisions": [], "finalized_receipt_id": None,
+    }
+    view = await db._draft_view(None, row)
+    assert [finding.field_path for finding in view.findings] == ["total"]
+    assert len(row["findings"]) == 4

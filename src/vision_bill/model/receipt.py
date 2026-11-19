@@ -3,7 +3,7 @@ from datetime import time as Time
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BaseModel, Field, ValidationInfo, field_validator
+from pydantic import AfterValidator, BaseModel, Field, field_validator
 
 from .item_category import SpendingCategory, llm_category
 
@@ -46,9 +46,11 @@ class LineItem(BaseModel):
     spending_category: SpendingCategory = Field(
         default="unknown", description="One spending category code"
     )
-    quantity: float = Field(gt=0, description="Quantity purchased")
-    unit_price: Decimal = Field(description="Price per unit")
-    total_price: Decimal = Field(description="quantity * unit_price, line total")
+    quantity: float | None = Field(
+        default=None, gt=0, allow_inf_nan=False, description="Quantity purchased if printed"
+    )
+    unit_price: Decimal | None = Field(default=None, description="Price per unit if printed")
+    total_price: Decimal = Field(description="Total price of the purchased line")
     tags: list[str] = Field(
         default_factory=list,
         description=(
@@ -120,7 +122,9 @@ class Receipt(BaseModel):
     taxes: list[TaxLine] = Field(default_factory=list, description="Tax lines applied")
 
     subtotal: Decimal = Field(description="Sum of line items before tax/discounts")
-    discount_total: Decimal = Field(default=Decimal(0), ge=0, description="Total discounts applied")
+    discount_total: Decimal | None = Field(
+        default=Decimal(0), ge=0, description="Total discounts applied if printed"
+    )
     tax_total: Decimal = Field(default=Decimal(0), ge=0, description="Sum of all taxes")
     tip: Decimal | None = Field(default=None, ge=0, description="Tip/gratuity if applicable")
     total: Decimal = Field(description="Final amount charged")
@@ -128,17 +132,3 @@ class Receipt(BaseModel):
     payment_method: Literal[
         "cash", "credit_card", "debit_card", "mobile_payment", "check", "other", "unknown"
     ] = Field(default="unknown")
-
-    @field_validator("total")
-    @classmethod
-    def sanity_check_total(cls, v: Decimal, info: ValidationInfo) -> Decimal:
-        # Optional cross-field consistency check — catches LLM arithmetic drift
-        subtotal = info.data.get("subtotal")
-        tax_total = info.data.get("tax_total", Decimal(0))
-        discount_total = info.data.get("discount_total", Decimal(0))
-        if subtotal is not None:
-            expected = subtotal - discount_total + tax_total
-            if abs(v - expected) > Decimal("0.05"):
-                # Don't hard-fail — LLM extraction from OCR is fuzzy — but you could log/flag
-                pass
-        return v

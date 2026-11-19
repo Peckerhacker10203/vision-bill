@@ -510,6 +510,30 @@ async def test_list_receipts_delegates(delegation_context: DelegationContext) ->
 
 
 @pytest.mark.asyncio
+async def test_search_keeps_purchases_with_missing_prices_without_counting_them_in_summary(
+    delegation_context: DelegationContext,
+) -> None:
+    service, mock_db, _ = delegation_context
+    missing = ProductPurchase(
+        receipt_id=RECEIPT_ID, description="Eggs", merchant_name="Store A",
+        date=Date(2026, 3, 1), quantity=None, unit_price=None, currency="EUR",
+    )
+    known = missing.model_copy(update={
+        "receipt_id": OTHER_RECEIPT_ID, "quantity": 1, "unit_price": Decimal("2.49"),
+    })
+    mock_db.search_products.return_value = [missing, known]
+
+    result = await service.search_products("Eggs")
+    assert result.purchases == [missing, known]
+    assert result.latest_price == result.cheapest_price == result.average_price == Decimal("2.49")
+
+    mock_db.search_products.return_value = [missing]
+    result = await service.search_products("Eggs")
+    assert result.purchases == [missing]
+    assert result.latest_price is result.cheapest_price is result.average_price is None
+
+
+@pytest.mark.asyncio
 async def test_search_products_calculates_unit_price_summary(
     delegation_context: DelegationContext,
 ) -> None:

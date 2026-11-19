@@ -251,7 +251,7 @@ class ReceiptService:
         if not purchases:
             return ProductSearchResponse(query=query, purchases=[])
 
-        prices = [purchase.unit_price for purchase in purchases]
+        prices = [purchase.unit_price for purchase in purchases if purchase.unit_price is not None]
         # Currency conversion is intentionally out of scope: the current
         # application assumes a user pays in one currency.
         # cheapest_price is the lowest non-negative unit price: a negative Pfand
@@ -261,10 +261,13 @@ class ReceiptService:
         return ProductSearchResponse(
             query=query,
             purchases=purchases,
-            latest_price=purchases[0].unit_price,
+            latest_price=prices[0] if prices else None,
             cheapest_price=min(non_negative_prices) if non_negative_prices else None,
-            average_price=sum(prices, Decimal(0)) / len(prices),
-            currency=purchases[0].currency,
+            average_price=sum(prices, Decimal(0)) / len(prices) if prices else None,
+            currency=next(
+                (purchase.currency for purchase in purchases if purchase.unit_price is not None),
+                purchases[0].currency,
+            ),
         )
 
     async def get_statistics(

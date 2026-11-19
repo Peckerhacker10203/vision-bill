@@ -61,6 +61,33 @@ async def test_gold_requires_separate_current_human_confirmation(workflow_db, tm
         await b.current_reference(row.id, scope=scope)
 
 
+async def test_gold_preserves_unprinted_line_factors_and_adjustments(workflow_db, tmp_path):
+    from decimal import Decimal
+
+    from vision_bill.model.receipt import Receipt
+    from vision_bill.service.experiment_scoring import detailed_score
+
+    w, scope = workflow_db
+    row, body, _ = await reviews.seed(w, scope, tmp_path)
+    body.line_items[0].quantity = None
+    body.line_items[0].unit_price = None
+    body.discount_total = None
+    await w._receipts.update_receipt(row.id, body, user_id=scope.user_id)
+    await w._receipts.verify_receipt(row.id, ReviewRequest(), scope=scope)
+    b = bench(w)
+    preview = await b.reference_preview(row.id, scope=scope)
+    frozen = await b.qualify_reference(
+        row.id, preview.review_revision, preview.document_sha256, scope=scope,
+    )
+
+    assert frozen.expected['discount_total'] is None and frozen.expected['tip'] is None
+    assert frozen.expected['line_items'][0]['quantity'] is None
+    assert frozen.expected['line_items'][0]['unit_price'] is None
+    assert 'discount_total' not in frozen.scored_fields
+    actual = Receipt.model_validate(frozen.expected).model_copy(update={'discount_total': Decimal(0)})
+    assert detailed_score(frozen.expected, actual, scored_fields=frozen.scored_fields)['full_receipt_correct']
+
+
 @pytest.mark.parametrize('source', ['legacy', 'automatic_bypass', None])
 async def test_verified_flag_never_qualifies_gold(workflow_db, tmp_path, source):
     w, scope = workflow_db
@@ -151,7 +178,7 @@ async def test_two_tax_roundtrip_keeps_printed_positions_and_source_paths(workfl
     source_hash = hashlib.sha256(path.read_bytes()).hexdigest()
     async with w.pool.acquire() as conn:
         await conn.execute("INSERT INTO image_source_parts(part_id,image_id,photo_index,source_sha256,image_path,metadata) VALUES($1,$2,0,$3,$4,'{}')", part_id, row.image_id, source_hash, str(path))
-    body.taxes = [TaxLine(name='VAT seven', rate=7, amount='1'), TaxLine(name='VAT nineteen', rate=19, amount='2')]
+    body.taxes = [TaxLine(name='VAT seven', rate=0.07, amount='1'), TaxLine(name='VAT nineteen', rate=0.19, amount='2')]
     from decimal import Decimal
     body.tax_total = Decimal(3)
     body.amount_policy = reviews.POLICY.model_copy(update={'tax_information': 'present'})

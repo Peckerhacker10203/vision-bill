@@ -190,7 +190,7 @@ STATS_CURRENCY_SQL = """
         MIN(total) AS minimum,
         MAX(total) AS maximum,
         SUM(subtotal) AS subtotal,
-        SUM(discount_total) AS discounts,
+        COALESCE(SUM(discount_total), 0) AS discounts,
         SUM(tax_total) AS taxes,
         SUM(COALESCE(tip, 0)) AS tips
     FROM receipts
@@ -340,8 +340,8 @@ class ReceiptDB:
             original_description=d.get("original_description"),
             spending_category=d.get("spending_category", "unknown"),
             category_source=d.get("category_source", "unknown"),
-            quantity=float(d["quantity"]),
-            unit_price=Decimal(d["unit_price"]),
+            quantity=float(d["quantity"]) if d["quantity"] is not None else None,
+            unit_price=Decimal(d["unit_price"]) if d["unit_price"] is not None else None,
             total_price=Decimal(d["total_price"]),
             tags=list(d.get("tags") or []),
             position=d["position"],
@@ -357,8 +357,8 @@ class ReceiptDB:
             merchant_name=d["merchant_name"],
             date=d["date"],
             time=t.isoformat() if t is not None else None,
-            quantity=float(d["quantity"]),
-            unit_price=Decimal(d["unit_price"]),
+            quantity=float(d["quantity"]) if d["quantity"] is not None else None,
+            unit_price=Decimal(d["unit_price"]) if d["unit_price"] is not None else None,
             currency=d["currency"],
         )
 
@@ -384,7 +384,7 @@ class ReceiptDB:
                     INSERT_LINE_ITEM_SQL,
                     receipt_id,
                     item.description,
-                    Decimal(str(item.quantity)),
+                    Decimal(str(item.quantity)) if item.quantity is not None else None,
                     item.unit_price,
                     item.total_price,
                     list(item.tags),
@@ -1003,14 +1003,6 @@ class ReceiptDB:
 
         return self._receipt_row_from_record(row)
 
-    @staticmethod
-    def _can_rereview(receipt: ReceiptRow) -> bool:
-        return (
-            receipt.verified
-            and receipt.status == "verified"
-            and receipt.verification_source != "human"
-        )
-
     async def _evaluate_current_review(
         self,
         conn: asyncpg.Connection,
@@ -1047,7 +1039,7 @@ class ReceiptDB:
             if row is None:
                 return None
             current = self._receipt_row_from_record(row)
-            if not self._can_rereview(current):
+            if not current.can_rereview():
                 raise ValueError("human_rereview_not_available")
             evaluation = await self._evaluate_current_review(conn, row, current, lock=False)
             return ReviewPreview(
@@ -1089,7 +1081,7 @@ class ReceiptDB:
                 or request.expected_review_revision is None
             )
             if current.verified or current.status == "verified":
-                if not self._can_rereview(current) or user_id is None:
+                if not current.can_rereview() or user_id is None:
                     raise ValueError("receipt_already_verified")
                 if missing_revision:
                     raise ValueError("review_revision_required")
