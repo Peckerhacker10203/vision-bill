@@ -1,0 +1,51 @@
+{
+  "commit": "061f5da69e96a6d71a44535815a54b04fbf9b91c",
+  "original_ubuntu_ca_bundle": "missing",
+  "stages": {
+    "cuda-1": {
+      "detail": [
+        "#15 exporting layers",
+        "#15 exporting layers 29.2s done",
+        "#15 exporting manifest sha256:67f0fc0ec36b96bce1e725fc94ef635864915a3862f50f0be6af2049bc28686f done",
+        "#15 exporting config sha256:9579191f3219de69429ce74fa917892799f0387110d753312056438ad96fe4f6 done",
+        "#15 exporting attestation manifest sha256:584fd626c9b22e46d1a131081e3df7326ed1fe71c180bfaf2ae15e5d59ae61ce done",
+        "#15 exporting manifest list sha256:3c4a7e6d1d3f40b175b47481d525f9a5b98cb860db7fa4c4eac33103881bdf24 done",
+        "#15 naming to docker.io/library/vision-bill-apt-probe:cuda-1 done",
+        "#15 unpacking to docker.io/library/vision-bill-apt-probe:cuda-1",
+        "#15 unpacking to docker.io/library/vision-bill-apt-probe:cuda-1 4.7s done",
+        "#15 DONE 33.9s"
+      ],
+      "result": "passed"
+    },
+    "rocm-1": {
+      "detail": [
+        "",
+        "#12 exporting to image",
+        "#12 exporting layers done",
+        "#12 exporting manifest sha256:67f0fc0ec36b96bce1e725fc94ef635864915a3862f50f0be6af2049bc28686f done",
+        "#12 exporting config sha256:9579191f3219de69429ce74fa917892799f0387110d753312056438ad96fe4f6 done",
+        "#12 exporting attestation manifest sha256:6f22279d004b100bd3fc7647c624b95d6334ebdc6fdd3ca27b61d7b571760fae done",
+        "#12 exporting manifest list sha256:90a168be49d7b5f822fe9a053ddaad8cfd4ccc64864dea8fec0f4c9a3daa70f8 done",
+        "#12 naming to docker.io/library/vision-bill-apt-probe:rocm-1 done",
+        "#12 unpacking to docker.io/library/vision-bill-apt-probe:rocm-1 done",
+        "#12 DONE 0.0s"
+      ],
+      "result": "passed"
+    },
+    "rocm-2": {
+      "detail": [
+        "#12 exporting layers",
+        "#12 exporting layers 9.8s done",
+        "#12 exporting manifest sha256:d6ede327eee87e18f7d57ed6f1a47b49f7770cfb08400cdab111e109fff1fda7 done",
+        "#12 exporting config sha256:a1aa815764a89c84a746c81427a1ae2f16c499c2e1206097bf22aecba30ebb3d done",
+        "#12 exporting attestation manifest sha256:7ffaa86831dddd18f27f7151e2a8dfee68b298a5065e652e65ab60115a5d6eaa done",
+        "#12 exporting manifest list sha256:aa452963a2ef7e813a0fb6d6c60b779e65830a4b026f9944523de67b84f675dc done",
+        "#12 naming to docker.io/library/vision-bill-apt-probe:rocm-2 done",
+        "#12 unpacking to docker.io/library/vision-bill-apt-probe:rocm-2",
+        "#12 unpacking to docker.io/library/vision-bill-apt-probe:rocm-2 1.5s done",
+        "#12 DONE 11.3s"
+      ],
+      "result": "passed"
+    }
+  }
+}
