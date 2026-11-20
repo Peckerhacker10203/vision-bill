@@ -430,11 +430,35 @@
 		"temperature": "Temperatur",
 		"registration": "Registrierung",
 		"allowRegistration": "Neue Registrierungen erlauben",
-		"providerWarning": "Speichern übernimmt geänderte Einstellungen in die private Konfiguration und überschreibt Umgebungsvorgaben. Anbieter- oder Hoständerungen erfordern einen Backend-Neustart durch den Betreiber; Modell und Temperatur gelten sofort.",
-		"restartRequired": "Der laufende Anbieter verwendet noch den bisherigen Anbieter oder Host. Bitten Sie den Betreiber, das Backend neu zu starten, um die gespeicherte Verbindung anzuwenden.",
+		"providerWarning": "Beim Speichern werden geänderte Einstellungen in die private Konfiguration übernommen und Umgebungsvorgaben überschrieben. Änderungen am Anbieter, Host oder an der Authentifizierung erfordern einen Neustart des Backends. Modell und Temperatur gelten sofort.",
+		"restartRequired": "Bitten Sie den Betreiber, das Backend neu zu starten, damit die gespeicherten Verbindungseinstellungen wirksam werden.",
 		"sourceEnvironment": "Umgebungsvorgabe",
 		"sourceConfig": "Konfiguration",
 		"sourceDefault": "Standard",
+		"sourceSettings": "Einstellungen",
+		"authentication": {
+			"label": "Authentifizierung",
+			"keep": "Aktuelle Authentifizierung beibehalten",
+			"none": "Keine",
+			"bearer": "Bearer-API-Schlüssel",
+			"newKey": "Neuer API-Schlüssel oder Zugriffstoken",
+			"test": "Gespeicherte Verbindung testen",
+			"saveFirst": "Speichern Sie die geänderte Verbindung vor dem Test.",
+			"status": {
+				"none": "Kein API-Schlüssel konfiguriert",
+				"configured": "Bearer-Schlüssel konfiguriert",
+				"origin_mismatch": "Der gespeicherte Schlüssel gehört zu einem anderen Endpunkt. Geben Sie einen neuen Schlüssel ein oder wählen Sie Keine."
+			},
+			"result": {
+				"connected": "Verbunden. Der Endpunkt hat eine Modellliste zurückgegeben.",
+				"authentication_failed": "Der Endpunkt hat die konfigurierten Zugangsdaten abgelehnt.",
+				"unreachable": "Die Verbindung zum Endpunkt ist fehlgeschlagen. Prüfen Sie die URL und die Erreichbarkeit des Servers.",
+				"invalid_response": "Der Endpunkt hat keine gültige Modellliste zurückgegeben.",
+				"origin_mismatch": "Der gespeicherte Schlüssel gehört zu einem anderen Endpunkt. Geben Sie einen neuen Schlüssel ein oder wählen Sie Keine.",
+				"unsupported_provider": "Dieser Test erfordert einen OpenAI-kompatiblen Anbieter.",
+				"request_failed": "Der Verbindungstest konnte nicht ausgeführt werden."
+			}
+		},
 		"contextWindow": "Kontextfenster (Token)",
 		"formatterLimit": "Ausgabelimit des Formatierers (Token)",
 		"unknown": "Unbekannt",

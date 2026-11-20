@@ -35,7 +35,8 @@ def saved_settings(settings, tmp_path, monkeypatch):
     settings.pg.password = "environment-db-secret"
     settings.auth.secret_key = "environment-auth-secret"
     monkeypatch.setattr(system, "settings", settings)
-    monkeypatch.setattr(config, "_startup_llm_identity", (settings.llm.provider, settings.llm.host))
+    monkeypatch.setattr(config, "_startup_llm_identity", None)
+    config.mark_startup_settings(settings)
     app = FastAPI()
     app.include_router(system.router, prefix="/system")
     app.dependency_overrides[require_admin] = lambda: None
@@ -594,3 +595,120 @@ def test_legacy_full_put_keeps_environment_fields_locked(saved_settings, monkeyp
     response = client.put('/system/settings', json=body)
     assert response.status_code == 200
     assert response.json()['sources']['llm.provider'] == 'config'
+
+
+def test_explicit_none_overrides_legacy_key_without_copying_or_deleting_it(saved_settings, monkeypatch):
+    path, _, _, client = saved_settings
+    monkeypatch.setitem(config.Settings.model_config, "yaml_file", str(path))
+    monkeypatch.setenv("LLM__PROVIDER", "openai")
+    monkeypatch.setenv("LLM__API_KEY", "deployment-private-key")
+    active = config.Settings()
+    monkeypatch.setattr(system, "settings", active)
+    config.mark_startup_settings(active)
+
+    initial = client.get("/system/settings")
+    assert initial.json()["llm_authentication"] == {
+        "mode": "bearer", "source": "environment", "status": "configured",
+    }
+    body = {**explicit_payload(active), "llm_authentication": {"mode": "none"}}
+    response = client.put("/system/settings", json=body)
+    assert response.status_code == 200
+    assert response.json()["llm_authentication"] == {"mode": "none", "source": "settings", "status": "none"}
+    assert response.json()["restart_required"] is True
+    assert "deployment-private-key" not in response.text
+    saved = yaml.safe_load(path.read_text())
+    assert saved["llm"]["api_key"] == "persisted-api-secret"
+    assert saved["llm_authentication"] == {"mode": "none"}
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    restarted = config.Settings()
+    assert restarted.llm.request_api_key() is None
+    config.mark_startup_settings(restarted)
+    assert not config.runtime_restart_required(restarted)
+
+
+def test_bearer_replacement_cannot_follow_unrelated_origins(saved_settings, monkeypatch):
+    path, _, _, client = saved_settings
+    monkeypatch.setitem(config.Settings.model_config, "yaml_file", str(path))
+    monkeypatch.setenv("LLM__API_KEY", "legacy-deployment-key")
+    active = config.Settings()
+    monkeypatch.setattr(system, "settings", active)
+    body = {
+        **explicit_payload(active, provider="openai", host="https://one.example/v1"),
+        "llm_authentication": {"mode": "bearer", "api_key": "first-private-key"},
+    }
+    assert client.put("/system/settings", json=body).status_code == 200
+    blocked = client.put("/system/settings", json=explicit_payload(active, host="https://two.example/v1"))
+    assert blocked.status_code == 409
+    assert config.Settings().llm.request_api_key() == "first-private-key"
+
+    body = {
+        **explicit_payload(active, host="https://two.example/v1"),
+        "llm_authentication": {"mode": "bearer", "api_key": "second-private-key"},
+    }
+    replaced = client.put("/system/settings", json=body)
+    assert replaced.status_code == 200
+    assert replaced.json()["llm_authentication"]["status"] == "configured"
+    assert "private-key" not in replaced.text + client.get("/system/settings").text
+    assert config.Settings().llm.request_api_key() == "second-private-key"
+    private = yaml.safe_load(path.read_text())
+    private["llm"]["host"] = "https://three.example/v1"
+    path.write_text(yaml.safe_dump(private))
+    changed = config.Settings()
+    assert changed.llm.request_api_key() is None
+    monkeypatch.setattr(system, "settings", changed)
+    assert client.get("/system/settings").json()["llm_authentication"]["status"] == "origin_mismatch"
+
+
+@pytest.mark.parametrize("invalid", [123, "canary\ninvalid", {"canary": "private"}])
+def test_invalid_bearer_input_is_never_reflected(saved_settings, invalid, caplog):
+    path, _, active, client = saved_settings
+    previous = path.read_bytes()
+    body = {
+        **explicit_payload(active, provider="openai"),
+        "llm_authentication": {"mode": "bearer", "api_key": invalid},
+    }
+    response = client.put("/system/settings", json=body)
+    assert response.status_code == 422
+    assert "canary" not in response.text + caplog.text
+    assert response.json()["detail"] == "Invalid LLM authentication settings"
+    assert path.read_bytes() == previous
+
+
+@pytest.mark.parametrize(("status_code", "result"), [(200, "connected"), (401, "authentication_failed"), (503, "unreachable")])
+def test_saved_connection_probe_only_reads_model_discovery(saved_settings, status_code, result):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+
+    path, _, active, client = saved_settings
+    calls = []
+
+    class Stub(BaseHTTPRequestHandler):
+        def do_GET(self):
+            calls.append((self.command, self.path, self.headers.get_all("Authorization")))
+            self.send_response(status_code)
+            self.end_headers()
+            self.wfile.write(b'{"data": [], "private_message": "selected-secret"}')
+
+        def log_message(self, *_args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Stub) as server:
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            host = f"http://127.0.0.1:{server.server_port}/llama/v1"
+            body = {
+                **explicit_payload(active, provider="openai", host=host),
+                "llm_authentication": {"mode": "bearer", "api_key": "selected-secret"},
+            }
+            assert client.put("/system/settings", json=body).status_code == 200
+            previous = path.read_bytes()
+            response = client.post("/system/settings/llm/connection-test")
+            assert response.status_code == 200
+            assert response.json() == {"status": result}
+            assert "selected-secret" not in response.text
+            assert path.read_bytes() == previous
+        finally:
+            server.shutdown()
+            thread.join()
+    assert calls == [("GET", "/llama/v1/models", ["Bearer selected-secret"])]

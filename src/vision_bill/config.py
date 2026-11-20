@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from enum import Enum
+from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 from urllib.parse import quote, urlsplit
 
+import httpx
 import yaml
 from pydantic import (
     AnyHttpUrl,
     BaseModel,
+    ConfigDict,
     Field,
     PostgresDsn,
+    SecretStr,
     TypeAdapter,
     computed_field,
     field_validator,
@@ -41,7 +46,7 @@ EDITABLE_ENV_KEYS = {
     "auth.allow_registration": "AUTH__ALLOW_REGISTRATION",
 }
 
-_startup_llm_identity: tuple[LLMProviderEnum, str] | None = None
+_startup_llm_identity: tuple[LLMProviderEnum, str, str | None] | None = None
 
 
 def get_config_path() -> Path:
@@ -58,10 +63,39 @@ class OcrProviderEnum(str, Enum):
     PADDLEOCR = "paddleocr"
 
 
+def valid_bearer_key(value: str) -> bool:
+    return re.fullmatch(r"[\x21-\x7e]{1,8192}", value) is not None
+
+
+class LlmAuthentication(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    mode: Literal["none", "bearer"]
+    api_key: SecretStr | None = None
+    origin: str | None = None
+
+    @model_validator(mode="after")
+    def validate_mode(self) -> Self:
+        if self.mode == "none" and self.api_key is None and self.origin is None:
+            return self
+        if (
+            self.mode == "bearer" and self.origin and self.api_key is not None
+            and valid_bearer_key(self.api_key.get_secret_value())
+        ):
+            return self
+        raise ValueError("Invalid LLM authentication settings")
+
+    def private_record(self) -> dict[str, str]:
+        if self.mode == "bearer" and self.api_key is not None and self.origin is not None:
+            return {"mode": self.mode, "origin": self.origin, "api_key": self.api_key.get_secret_value()}
+        return {"mode": self.mode}
+
+
 class LLMSettings(BaseModel):
     provider: LLMProviderEnum = LLMProviderEnum.OLLAMA
     host: str  # Used for local LLMs
     api_key: str  # Used for external LLMs
+    authentication: LlmAuthentication | None = Field(default=None, exclude=True, repr=False)
     model_name: str
     temperature: float
     # Keep the complete extraction deadline below the 15-minute image claim lease.
@@ -86,6 +120,20 @@ class LLMSettings(BaseModel):
         if not value.strip():
             raise ValueError("LLM host and model_name must be explicitly selected and nonblank")
         return value
+
+    def request_api_key(self) -> str | None:
+        """Resolve the key for the selected endpoint, including an explicit omission."""
+        auth = self.authentication
+        if auth is None:
+            return self.api_key
+        if auth.api_key is None:
+            return None
+        try:
+            if auth.origin == llm_origin(self.host):
+                return auth.api_key.get_secret_value()
+        except ValueError:
+            pass
+        return None
 
 
 class ApiSettings(BaseModel):
@@ -303,12 +351,18 @@ def has_real_api_key(value: str) -> bool:
 
 
 def llm_origin(host: str) -> str:
-    parsed = urlsplit(host if "://" in host else "http://" + host)
-    port = parsed.port if parsed.port is not None else (443 if parsed.scheme.lower() == "https" else 80)
-    return f"{parsed.scheme.lower()}://{parsed.hostname}:{port}"
+    try:
+        url = httpx.URL(host if "://" in host else "http://" + host)
+    except httpx.InvalidURL:
+        raise ValueError("LLM endpoint origin is invalid") from None
+    if url.userinfo or not url.raw_host or url.scheme not in ("http", "https"):
+        raise ValueError("LLM endpoint origin is invalid")
+    port = url.port if url.port is not None else (443 if url.scheme == "https" else 80)
+    return f"{url.scheme}://{url.raw_host.decode()}:{port}"
 
 
 ADMIN_OVERRIDES_KEY = "admin_setting_overrides"
+LLM_AUTHENTICATION_KEY = "llm_authentication"
 
 
 def _admin_settings_overrides(data: dict[str, Any]) -> dict[str, Any]:
@@ -327,6 +381,10 @@ def _admin_settings_overrides(data: dict[str, Any]) -> dict[str, Any]:
 def _guarded_admin_overrides(data: dict[str, Any], sources: list[dict[str, Any]]) -> dict[str, Any]:
     """Use the actual instance sources to keep a credential with its operator endpoint."""
     adopted = _admin_settings_overrides(data)
+    authentication = data.get(LLM_AUTHENTICATION_KEY)
+    if authentication is not None:
+        adopted.setdefault("llm", {})["authentication"] = authentication
+        return adopted
     pinned_origin = data.get("llm_credential_origin")
     if pinned_origin is None:
         return adopted
@@ -385,9 +443,22 @@ def editable_setting_sources() -> dict[str, str]:
     return sources
 
 
-def write_config_file(config: Settings, *, changed_paths: frozenset[str] | None = None, credential_origin: str | None = None) -> None:
+def deployment_llm_credential_source() -> Literal["environment", "config"]:
+    for data in (EnvSettingsSource(Settings)(), DotEnvSettingsSource(Settings)()):
+        if isinstance(data.get("llm"), dict) and "api_key" in data["llm"]:
+            return "environment"
+    return "config"
+
+
+def write_config_file(
+    config: Settings, *, changed_paths: frozenset[str] | None = None,
+    credential_origin: str | None = None, save_llm_authentication: bool = False,
+) -> None:
     """Merge a save under the bootstrap lock without discarding private metadata."""
-    _publish_config_file(get_config_path(), config, changed_paths=changed_paths, credential_origin=credential_origin)
+    _publish_config_file(
+        get_config_path(), config, changed_paths=changed_paths, credential_origin=credential_origin,
+        save_llm_authentication=save_llm_authentication,
+    )
 
 
 def _publish_config_file(
@@ -397,6 +468,7 @@ def _publish_config_file(
     changed_paths: frozenset[str] | None = None,
     create_only: bool = False,
     credential_origin: str | None = None,
+    save_llm_authentication: bool = False,
 ) -> bool:
     from .distribution.bootstrap import (
         BootstrapError,
@@ -468,6 +540,8 @@ def _publish_config_file(
                 if not isinstance(section_data, dict):
                     raise BootstrapError("Persistent configuration has a conflicting section type")
                 section_data[key] = resolved[section][key]
+        if save_llm_authentication and config.llm.authentication is not None:
+            data[LLM_AUTHENTICATION_KEY] = config.llm.authentication.private_record()
         if credential_origin is not None:
             if has_real_api_key(config.llm.api_key):
                 data["llm_credential_origin"] = credential_origin
@@ -497,18 +571,22 @@ def initialize_config_file(config: Settings) -> None:
         logger.warning("Could not create YAML config at %s: %s", path, exc)
 
 
+def _llm_runtime_identity(config: Settings) -> tuple[LLMProviderEnum, str, str | None]:
+    llm = config.llm
+    key = llm.request_api_key() if llm.provider == LLMProviderEnum.OPENAI else None
+    fingerprint = sha256(key.encode()).hexdigest() if key is not None else None
+    return llm.provider, llm.host, fingerprint
+
+
 def mark_startup_settings(config: Settings) -> None:
-    """Record which provider/host the running process actually initialized."""
+    """Record the provider connection the running process initialized."""
     global _startup_llm_identity
-    _startup_llm_identity = (config.llm.provider, config.llm.host)
+    _startup_llm_identity = _llm_runtime_identity(config)
 
 
 def runtime_restart_required(config: Settings) -> bool:
-    """Whether the editable LLM provider/host differs from the live provider."""
-    return _startup_llm_identity is not None and _startup_llm_identity != (
-        config.llm.provider,
-        config.llm.host,
-    )
+    """Whether the saved LLM connection differs from the live provider."""
+    return _startup_llm_identity is not None and _startup_llm_identity != _llm_runtime_identity(config)
 
 
 # Required fields (llm, pg and auth) are populated from YAML, dotenv files, or

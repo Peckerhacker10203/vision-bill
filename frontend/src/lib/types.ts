@@ -356,17 +356,37 @@ export interface EditableLlmSettings {
 	temperature: number;
 }
 
+export type LlmAuthenticationUpdate = { mode: 'none' } | { mode: 'bearer'; api_key: string };
+
+export interface LlmAuthenticationView {
+	mode: 'none' | 'bearer';
+	source: SettingSource | 'settings';
+	status: 'none' | 'configured' | 'origin_mismatch';
+}
+
+export interface LlmConnectionResult {
+	status:
+		| 'connected'
+		| 'authentication_failed'
+		| 'unreachable'
+		| 'invalid_response'
+		| 'origin_mismatch'
+		| 'unsupported_provider';
+}
+
 export interface SettingsView {
 	llm: EditableLlmSettings;
 	allow_registration: boolean;
 	sources: Record<string, SettingSource>;
 	restart_required: boolean;
+	llm_authentication?: LlmAuthenticationView;
 }
 
 export interface SettingsUpdate {
 	changed_paths?: string[];
 	llm: EditableLlmSettings;
 	allow_registration: boolean;
+	llm_authentication?: LlmAuthenticationUpdate;
 }
 
 export interface DedicatedOcrStatus {

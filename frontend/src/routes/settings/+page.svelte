@@ -8,7 +8,7 @@
 	import { t } from '$lib/i18n';
 	import { queryClient } from '$lib/query/client';
 	import { queryKeys } from '$lib/query/keys';
-	import type { SettingsUpdate } from '$lib/types';
+	import type { LlmAuthenticationUpdate, LlmConnectionResult, SettingsUpdate } from '$lib/types';
 	import AppearanceSelect from '$lib/ui/AppearanceSelect.svelte';
 	import DedicatedOcr from './DedicatedOcr.svelte';
 
@@ -45,6 +45,15 @@
 	let saving = $state(false);
 	let saved = $state(false);
 	let error = $state('');
+	let authMode = $state<'keep' | LlmAuthenticationUpdate['mode']>('keep');
+	let bearerKey = $state('');
+	let testingConnection = $state(false);
+	let connectionResult = $state<LlmConnectionResult['status'] | 'request_failed' | null>(null);
+	const connectionEdited = $derived(
+		authMode !== 'keep' ||
+			form.llm.host !== baseline?.llm.host ||
+			form.llm.provider !== baseline?.llm.provider
+	);
 
 	$effect(() => {
 		if (!initialized && settings.data) {
@@ -63,16 +72,35 @@
 		}
 	});
 
+	$effect(() => {
+		if (form.llm.provider !== 'openai' || $session === null || !isCurrentView()) authMode = 'keep';
+		if (authMode !== 'bearer') bearerKey = '';
+	});
+
 	function source(field: string): string {
 		return settings.data?.sources[field] ?? 'default';
 	}
 
-	function sourceLabel(field: string): string {
-		return $t(`settings.source${source(field)[0].toUpperCase()}${source(field).slice(1)}`);
+	function sourceLabel(value: string): string {
+		return $t(`settings.source${value[0].toUpperCase()}${value.slice(1)}`);
+	}
+
+	async function testConnection() {
+		if (!isCurrentView() || connectionEdited || testingConnection || saving) return;
+		testingConnection = true;
+		connectionResult = null;
+		try {
+			const result = await api.testLlmConnection();
+			if (isCurrentView()) connectionResult = result.status;
+		} catch {
+			if (isCurrentView()) connectionResult = 'request_failed';
+		} finally {
+			if (isCurrentView()) testingConnection = false;
+		}
 	}
 
 	async function save() {
-		if (!isCurrentView() || saving) return;
+		if (!isCurrentView() || saving || testingConnection) return;
 		saving = true;
 		saved = false;
 		error = '';
@@ -85,8 +113,16 @@
 				.map((key) => `llm.${key}`);
 			if (form.allow_registration !== baseline?.allow_registration)
 				changed_paths.push('auth.allow_registration');
-			const result = await api.updateSettings({ ...form, changed_paths });
+			let llm_authentication: LlmAuthenticationUpdate | undefined;
+			if (form.llm.provider === 'openai') {
+				if (authMode === 'none') llm_authentication = { mode: 'none' };
+				if (authMode === 'bearer') llm_authentication = { mode: 'bearer', api_key: bearerKey };
+			}
+			const result = await api.updateSettings({ ...form, changed_paths, llm_authentication });
 			if (!isCurrentView()) return;
+			authMode = 'keep';
+			bearerKey = '';
+			connectionResult = null;
 			form = { llm: { ...result.llm }, allow_registration: result.allow_registration };
 			baseline = structuredClone($state.snapshot(form));
 			queryClient.setQueryData(queryKeys.settings(), result);
@@ -133,7 +169,7 @@
 					<label class="block text-sm">
 						<span class="flex items-center justify-between gap-2"
 							><span>{$t('settings.provider')}</span><span class="text-xs text-on-surface-variant"
-								>{sourceLabel('llm.provider')}</span
+								>{sourceLabel(source('llm.provider'))}</span
 							></span
 						>
 						<select
@@ -146,7 +182,7 @@
 					<label class="block text-sm">
 						<span class="flex items-center justify-between gap-2"
 							><span>{$t('settings.host')}</span><span class="text-xs text-on-surface-variant"
-								>{sourceLabel('llm.host')}</span
+								>{sourceLabel(source('llm.host'))}</span
 							></span
 						>
 						<input
@@ -154,10 +190,65 @@
 							bind:value={form.llm.host}
 						/>
 					</label>
+					{#if form.llm.provider === 'openai' && settings.data.llm_authentication}
+						<div class="space-y-2">
+							<label class="block text-sm">
+								{$t('settings.authentication.label')}
+								<select
+									class="mt-1 block w-full rounded-lg border border-outline-variant bg-surface p-2.5"
+									bind:value={authMode}
+									disabled={saving}
+								>
+									<option value="keep">{$t('settings.authentication.keep')}</option>
+									<option value="none">{$t('settings.authentication.none')}</option>
+									<option value="bearer">{$t('settings.authentication.bearer')}</option>
+								</select>
+							</label>
+							<p class="text-xs text-on-surface-variant">
+								{$t(`settings.authentication.status.${settings.data.llm_authentication.status}`)}
+								<span class="ml-1">· {sourceLabel(settings.data.llm_authentication.source)}</span>
+							</p>
+							{#if authMode === 'bearer'}
+								<label class="block text-sm">
+									{$t('settings.authentication.newKey')}
+									<input
+										class="mt-1 block w-full rounded-lg border border-outline-variant bg-surface p-2.5"
+										type="password"
+										autocomplete="new-password"
+										spellcheck="false"
+										maxlength="8192"
+										required
+										bind:value={bearerKey}
+										disabled={saving}
+									/>
+								</label>
+							{/if}
+							<button
+								type="button"
+								class="rounded-lg border border-outline px-3 py-2 text-sm disabled:opacity-50"
+								onclick={testConnection}
+								disabled={connectionEdited || testingConnection || saving}
+							>
+								{$t(testingConnection ? 'common.loading' : 'settings.authentication.test')}
+							</button>
+							{#if connectionEdited}
+								<p class="text-xs text-on-surface-variant">
+									{$t('settings.authentication.saveFirst')}
+								</p>
+							{:else if connectionResult}
+								<p
+									class="text-sm {connectionResult === 'connected' ? 'text-primary' : 'text-error'}"
+									role="status"
+								>
+									{$t(`settings.authentication.result.${connectionResult}`)}
+								</p>
+							{/if}
+						</div>
+					{/if}
 					<label class="block text-sm">
 						<span class="flex items-center justify-between gap-2"
 							><span>{$t('settings.model')}</span><span class="text-xs text-on-surface-variant"
-								>{sourceLabel('llm.model_name')}</span
+								>{sourceLabel(source('llm.model_name'))}</span
 							></span
 						>
 						<input
@@ -187,7 +278,8 @@
 					<label class="block text-sm">
 						<span class="flex items-center justify-between gap-2"
 							><span>{$t('settings.temperature')}</span><span
-								class="text-xs text-on-surface-variant">{sourceLabel('llm.temperature')}</span
+								class="text-xs text-on-surface-variant"
+								>{sourceLabel(source('llm.temperature'))}</span
 							></span
 						>
 						<input
@@ -210,7 +302,8 @@
 				<label class="mt-2 flex items-center justify-between gap-3 text-sm">
 					<span
 						><span class="block">{$t('settings.allowRegistration')}</span><span
-							class="text-xs text-on-surface-variant">{sourceLabel('auth.allow_registration')}</span
+							class="text-xs text-on-surface-variant"
+							>{sourceLabel(source('auth.allow_registration'))}</span
 						></span
 					>
 					<input
@@ -232,7 +325,7 @@
 			<button
 				type="submit"
 				class="rounded-lg bg-action px-4 py-2.5 text-sm font-medium text-on-primary disabled:opacity-50"
-				disabled={saving}
+				disabled={saving || testingConnection}
 			>
 				{saving ? $t('common.loading') : $t('common.save')}
 			</button>

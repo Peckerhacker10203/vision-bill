@@ -9,7 +9,7 @@ import httpx
 
 
 class LlamaCppLifecycle:
-    def __init__(self, host: str, api_key: str):
+    def __init__(self, host: str, api_key: str | None):
         parts = urlsplit(host)
         path = parts.path
         if (
@@ -48,7 +48,7 @@ class LlamaCppLifecycle:
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
             base_url=self._base_url,
-            headers={"Authorization": f"Bearer {self._api_key}"},
+            headers={"Authorization": f"Bearer {self._api_key}"} if self._api_key is not None else None,
             timeout=httpx.Timeout(30, connect=5), trust_env=False, follow_redirects=False,
         )
 

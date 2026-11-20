@@ -430,11 +430,35 @@
 		"temperature": "Temperature",
 		"registration": "Registration",
 		"allowRegistration": "Allow new registrations",
-		"providerWarning": "Save adopts changed settings into the private configuration, overriding environment defaults. Provider or host changes require a backend restart by your operator; model and temperature apply immediately.",
-		"restartRequired": "The running provider still uses its previous provider or host. Ask your operator to restart the backend to apply the saved connection.",
+		"providerWarning": "Save adopts changed settings into the private configuration, overriding environment defaults. Provider, host and authentication changes require a backend restart. Model and temperature apply immediately.",
+		"restartRequired": "Ask your operator to restart the backend to apply the saved connection settings.",
 		"sourceEnvironment": "Environment default",
 		"sourceConfig": "Config",
 		"sourceDefault": "Default",
+		"sourceSettings": "Settings",
+		"authentication": {
+			"label": "Authentication",
+			"keep": "Keep current authentication",
+			"none": "None",
+			"bearer": "Bearer API key",
+			"newKey": "New API key or access token",
+			"test": "Test saved connection",
+			"saveFirst": "Save your connection changes before testing.",
+			"status": {
+				"none": "No API key configured",
+				"configured": "Bearer key configured",
+				"origin_mismatch": "The saved key belongs to a different endpoint. Enter a new key or select None."
+			},
+			"result": {
+				"connected": "Connected. The endpoint returned a model list.",
+				"authentication_failed": "The endpoint rejected the configured credentials.",
+				"unreachable": "Could not connect to the endpoint. Check the URL and server availability.",
+				"invalid_response": "The endpoint did not return a valid model list.",
+				"origin_mismatch": "The saved key belongs to a different endpoint. Enter a new key or select None.",
+				"unsupported_provider": "This test requires an OpenAI-compatible provider.",
+				"request_failed": "Could not run the connection test."
+			}
+		},
 		"contextWindow": "Context window (tokens)",
 		"formatterLimit": "Formatter output limit (tokens)",
 		"unknown": "Unknown",

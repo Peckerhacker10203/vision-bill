@@ -31,6 +31,7 @@ import type {
 	ReviewPreview,
 	ReviewRequest,
 	ModelInfo,
+	LlmConnectionResult,
 	ImageListFilters,
 	ImageRow,
 	ItemSpendingStatistics,
@@ -353,9 +354,15 @@ export const api = {
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				llm: body.llm,
-				allow_registration: body.allow_registration
+				allow_registration: body.allow_registration,
+				changed_paths: body.changed_paths,
+				llm_authentication: body.llm_authentication
 			})
 		});
+	},
+
+	testLlmConnection(): Promise<LlmConnectionResult> {
+		return request<LlmConnectionResult>('/system/settings/llm/connection-test', { method: 'POST' });
 	},
 
 	/** GET /auth/me returns the current user (401 when the session is gone). */

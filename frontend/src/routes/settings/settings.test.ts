@@ -121,3 +121,55 @@ it('lets an admin explicitly save environment defaults and keeps restart guidanc
 	await waitFor(() => expect(api.getDedicatedOcr).toHaveBeenCalledTimes(2));
 	expect(screen.getByText(/Ask your operator to restart the backend/)).toBeTruthy();
 });
+
+it('adopts a write-only bearer key and shows the saved connection result', async () => {
+	session.set({ id: 'admin', username: 'admin', is_admin: true, can_see_all: true });
+	const initial = {
+		llm: {
+			provider: 'openai',
+			host: 'https://llm.example/v1',
+			model_name: 'formatter',
+			temperature: 0
+		},
+		allow_registration: true,
+		sources: {},
+		restart_required: false,
+		llm_authentication: { mode: 'bearer', source: 'environment', status: 'configured' }
+	} as const;
+	const saved = {
+		...initial,
+		llm_authentication: { ...initial.llm_authentication, source: 'settings' },
+		restart_required: true
+	};
+	vi.spyOn(api, 'getSettings').mockResolvedValue(initial);
+	vi.spyOn(api, 'getUiConfig').mockResolvedValue({
+		bypass_review_default: false,
+		registration_open: true
+	});
+	vi.spyOn(api, 'listModels').mockResolvedValue([]);
+	const fetch = vi.fn().mockImplementation((path: string) =>
+		Promise.resolve({
+			ok: true,
+			status: 200,
+			json: async () =>
+				path.endsWith('/connection-test') ? { status: 'authentication_failed' } : saved
+		})
+	);
+	vi.stubGlobal('fetch', fetch);
+	render(Settings);
+	const mode = await screen.findByLabelText('Authentication');
+	expect(screen.getByText(/Environment default/)).toBeTruthy();
+	await fireEvent.change(mode, { target: { value: 'bearer' } });
+	const key = screen.getByLabelText('New API key or access token');
+	expect(key.getAttribute('type')).toBe('password');
+	await fireEvent.input(key, { target: { value: 'new-private-token' } });
+	await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+	await screen.findByText(/Settings saved/);
+	const update = JSON.parse(fetch.mock.calls[0][1].body);
+	expect(update.llm_authentication).toEqual({ mode: 'bearer', api_key: 'new-private-token' });
+	expect(update.changed_paths).toEqual([]);
+	expect(screen.queryByLabelText('New API key or access token')).toBeNull();
+	await fireEvent.click(screen.getByRole('button', { name: 'Test saved connection' }));
+	expect(await screen.findByText('The endpoint rejected the configured credentials.')).toBeTruthy();
+	expect(fetch.mock.calls[1][1].body).toBeUndefined();
+});

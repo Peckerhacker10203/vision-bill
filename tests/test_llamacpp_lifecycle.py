@@ -339,3 +339,52 @@ async def test_managed_openai_client_does_not_follow_inference_redirect(monkeypa
         assert hosts == ["llama.local"]
     finally:
         await provider._client.close()
+
+
+@pytest.mark.parametrize("mode", ["none", "bearer"])
+async def test_explicit_authentication_applies_to_inference_and_router_controls(monkeypatch, mode):
+    import httpx2
+
+    from vision_bill.provider.llm import openai as provider_module
+
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-key")
+    monkeypatch.setenv("OPENAI_ADMIN_KEY", "ambient-admin-key")
+    monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", "aUtHoRiZaTiOn: Bearer ambient-header")
+    seen = []
+
+    def inference(request):
+        seen.append((request.method, request.url.path, request.headers.get_list("authorization")))
+        return httpx2.Response(200, json={
+            "id": "chat", "object": "chat.completion", "created": 0, "model": "own",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                         "finish_reason": "stop"}],
+        })
+
+    def control(request):
+        seen.append((request.method, request.url.path, request.headers.get_list("authorization")))
+        return httpx.Response(200, json=model_status("unloaded", "unloaded"))
+
+    sdk_client = provider_module.DefaultAsyncHttpxClient
+    monkeypatch.setattr(provider_module, "DefaultAsyncHttpxClient", lambda **kwargs: sdk_client(
+        transport=httpx2.MockTransport(inference), **kwargs,
+    ))
+    monkeypatch.setattr(lifecycle_module, "httpx", SimpleNamespace(
+        AsyncClient=lambda **kwargs: REAL_CLIENT(transport=httpx.MockTransport(control), **kwargs),
+        Timeout=httpx.Timeout,
+    ))
+    authentication = {"mode": "none"} if mode == "none" else {
+        "mode": "bearer", "origin": "http://llama.local:80", "api_key": "selected-key",
+    }
+    settings = LLMSettings.model_validate({
+        "provider": "openai", "host": "http://llama.local/llama/v1", "api_key": "deployment-key",
+        "model_name": "own", "temperature": 0, "model_lifecycle": "llamacpp",
+        "authentication": authentication,
+    })
+    provider = get_llm_provider(settings)
+    try:
+        assert await provider.send_message("own", [{"role": "user", "content": "hi"}]) == "ok"
+        assert await provider.resident_model_ids(deadline=monotonic() + 1) == frozenset()
+    finally:
+        await provider._client.close()
+    headers = [] if mode == "none" else ["Bearer selected-key"]
+    assert seen == [("POST", "/llama/v1/chat/completions", headers), ("GET", "/llama/models", headers)]

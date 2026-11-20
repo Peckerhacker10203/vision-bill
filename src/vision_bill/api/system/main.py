@@ -1,14 +1,32 @@
+from collections.abc import Callable, Coroutine
+from typing import Any, Literal, Self
+
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import AnyHttpUrl, BaseModel, Field, TypeAdapter, ValidationError
+from fastapi.exceptions import RequestValidationError
+from fastapi.routing import APIRoute
+from pydantic import (
+    AnyHttpUrl,
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    TypeAdapter,
+    ValidationError,
+    model_validator,
+)
+from starlette.responses import Response
 
 from ...config import (
     EDITABLE_ENV_KEYS,
+    LlmAuthentication,
     LLMProviderEnum,
+    deployment_llm_credential_source,
     editable_setting_sources,
     has_real_api_key,
     llm_origin,
     runtime_restart_required,
     settings,
+    valid_bearer_key,
     write_config_file,
 )
 from ...model.dedicated_ocr import (
@@ -17,9 +35,30 @@ from ...model.dedicated_ocr import (
     DedicatedOcrTopologyRequest,
 )
 from ...model.handoff import HandoffWait
+from ...provider.llm.connection import ConnectionStatus, check_saved_connection
 from ...security.dependencies import require_admin
 
 router = APIRouter(tags=["System"])
+
+
+class SettingsWriteRoute(APIRoute):
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        route = super().get_route_handler()
+
+        async def handle(request: Request) -> Response:
+            try:
+                return await route(request)
+            except RequestValidationError as exc:
+                errors = exc.errors()
+                if any("llm_authentication" in error["loc"] for error in errors):
+                    raise HTTPException(status_code=422, detail="Invalid LLM authentication settings") from None
+                detail = [{key: error[key] for key in ("loc", "msg", "type")} for error in errors]
+                raise HTTPException(status_code=422, detail=detail) from None
+
+        return handle
+
+
+settings_writes = APIRouter(route_class=SettingsWriteRoute)
 
 
 class LLMSettingsUpdate(BaseModel):
@@ -29,15 +68,45 @@ class LLMSettingsUpdate(BaseModel):
     temperature: float = Field(ge=0, le=2)
 
 
-class SettingsUpdate(BaseModel):
+class LlmAuthenticationUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    mode: Literal["none", "bearer"]
+    api_key: SecretStr | None = Field(default=None, exclude=True, repr=False)
+
+    @model_validator(mode="after")
+    def validate_key(self) -> Self:
+        if self.mode == "none" and self.api_key is None:
+            return self
+        if self.mode == "bearer" and self.api_key is not None and valid_bearer_key(self.api_key.get_secret_value()):
+            return self
+        raise ValueError("Invalid LLM authentication settings")
+
+
+class LlmAuthenticationView(BaseModel):
+    mode: Literal["none", "bearer"]
+    source: Literal["default", "environment", "config", "settings"]
+    status: Literal["none", "configured", "origin_mismatch"]
+
+
+class EditableSettings(BaseModel):
     llm: LLMSettingsUpdate
     allow_registration: bool
+
+
+class SettingsUpdate(EditableSettings):
     changed_paths: frozenset[str] | None = Field(default=None, exclude=True)
+    llm_authentication: LlmAuthenticationUpdate | None = Field(default=None, exclude=True, repr=False)
 
 
-class SettingsView(SettingsUpdate):
+class SettingsView(EditableSettings):
     sources: dict[str, str]
     restart_required: bool
+    llm_authentication: LlmAuthenticationView
+
+
+class LlmConnectionView(BaseModel):
+    status: ConnectionStatus
 
 
 @router.get(
@@ -101,6 +170,21 @@ async def get_ui_config() -> dict[str, bool | int]:
     }
 
 
+def _authentication_view() -> LlmAuthenticationView:
+    llm = settings.llm
+    auth = llm.authentication
+    if auth is None:
+        if has_real_api_key(llm.api_key):
+            return LlmAuthenticationView(mode="bearer", source=deployment_llm_credential_source(), status="configured")
+        return LlmAuthenticationView(mode="none", source="default", status="none")
+    if auth.mode == "none":
+        return LlmAuthenticationView(mode="none", source="settings", status="none")
+    status: Literal["configured", "origin_mismatch"] = (
+        "configured" if llm.request_api_key() is not None else "origin_mismatch"
+    )
+    return LlmAuthenticationView(mode="bearer", source="settings", status=status)
+
+
 def _settings_view() -> SettingsView:
     return SettingsView(
         llm=LLMSettingsUpdate(
@@ -112,6 +196,7 @@ def _settings_view() -> SettingsView:
         allow_registration=settings.auth.allow_registration,
         sources=editable_setting_sources(),
         restart_required=runtime_restart_required(settings),
+        llm_authentication=_authentication_view(),
     )
 
 
@@ -121,7 +206,27 @@ async def get_settings() -> SettingsView:
     return _settings_view()
 
 
-@router.put("/settings", response_model=SettingsView, dependencies=[Depends(require_admin)])
+@router.post(
+    "/settings/llm/connection-test", response_model=LlmConnectionView, dependencies=[Depends(require_admin)],
+)
+async def test_llm_connection() -> LlmConnectionView:
+    return LlmConnectionView(status=await check_saved_connection(settings.llm.model_copy()))
+
+
+def _validated_llm_origin(host: str) -> str:
+    try:
+        parsed = TypeAdapter(AnyHttpUrl).validate_python(host)
+    except ValidationError:
+        raise HTTPException(status_code=422, detail="Host must be an HTTP(S) URL") from None
+    if parsed.username is not None or parsed.password is not None:
+        raise HTTPException(status_code=422, detail="Host must not contain credentials")
+    try:
+        return llm_origin(host)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Host must be an HTTP(S) URL without credentials") from None
+
+
+@settings_writes.put("/settings", response_model=SettingsView, dependencies=[Depends(require_admin)])
 async def update_settings(request: Request, update: SettingsUpdate) -> SettingsView:
     """Persist admin-editable settings and apply safe changes immediately."""
     requested = {
@@ -152,33 +257,55 @@ async def update_settings(request: Request, update: SettingsUpdate) -> SettingsV
             )
     if "auth.allow_registration" in changed and sources["auth.allow_registration"] == "environment":
         raise HTTPException(status_code=409, detail="Registration is controlled by environment configuration")
-    credential_origin = None
-    if "llm.host" in changed:
-        try:
-            parsed = TypeAdapter(AnyHttpUrl).validate_python(update.llm.host)
-        except ValidationError:
-            raise HTTPException(status_code=422, detail="Host must be an HTTP(S) URL") from None
-        if parsed.username or parsed.password:
-            raise HTTPException(status_code=422, detail="Host must not contain credentials")
-        credential_origin = llm_origin(settings.llm.host)
-        if has_real_api_key(settings.llm.api_key) and llm_origin(update.llm.host) != credential_origin:
-            raise HTTPException(status_code=409, detail="Endpoint origin is bound to private credentials; ask your operator to approve the new endpoint")
-
     candidate = settings.model_copy(deep=True)
     for field in changed:
         section, key = field.split(".", 1)
         setattr(getattr(candidate, section), key, requested[field])
+
+    authentication = update.llm_authentication
+    credential_origin = None
+    candidate_origin = None
+    if "llm.host" in changed:
+        candidate_origin = _validated_llm_origin(candidate.llm.host)
+        if authentication is None:
+            existing = settings.llm.authentication
+            if existing is None:
+                try:
+                    credential_origin = llm_origin(settings.llm.host)
+                except ValueError:
+                    raise HTTPException(status_code=409, detail="Select authentication for the new endpoint") from None
+                protected_origin = credential_origin if has_real_api_key(settings.llm.api_key) else None
+            else:
+                protected_origin = existing.origin
+            if protected_origin is not None and candidate_origin != protected_origin:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Endpoint origin is bound to private credentials. Select a new key or None for the new endpoint.",
+                )
+    if authentication is not None:
+        if candidate.llm.provider != LLMProviderEnum.OPENAI:
+            raise HTTPException(status_code=422, detail="LLM authentication settings require the OpenAI provider")
+        origin = None
+        if authentication.mode == "bearer":
+            origin = candidate_origin or _validated_llm_origin(candidate.llm.host)
+            if origin != _validated_llm_origin(update.llm.host):
+                raise HTTPException(status_code=409, detail="The endpoint changed. Reload settings before replacing the key.")
+        candidate.llm.authentication = LlmAuthentication(
+            mode=authentication.mode, api_key=authentication.api_key, origin=origin,
+        )
     try:
         write_config_file(
             candidate,
             changed_paths=changed,
             credential_origin=credential_origin,
+            save_llm_authentication=authentication is not None,
         )
     except (OSError, ValueError) as exc:
         raise HTTPException(status_code=503, detail="Could not write application config") from exc
 
     settings.llm.provider = candidate.llm.provider
     settings.llm.host = candidate.llm.host
+    settings.llm.authentication = candidate.llm.authentication
     settings.llm.model_name = candidate.llm.model_name
     settings.llm.temperature = candidate.llm.temperature
     settings.auth.allow_registration = candidate.auth.allow_registration
@@ -186,6 +313,9 @@ async def update_settings(request: Request, update: SettingsUpdate) -> SettingsV
     if provider is not None:
         provider.update_runtime_settings(temperature=settings.llm.temperature)
     return _settings_view()
+
+
+router.include_router(settings_writes)
 
 
 # @router.post("/compare-models")

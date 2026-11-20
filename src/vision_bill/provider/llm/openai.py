@@ -7,6 +7,8 @@ from pathlib import Path
 from time import monotonic, perf_counter
 from typing import Any, Literal, cast
 
+import httpx2
+
 from ...helper.logging_config import setup_logging
 
 setup_logging()
@@ -77,7 +79,7 @@ class OpenAIProvider(LLMProvider):
     def __init__(
         self,
         host: str,
-        api_key: str,
+        api_key: str | None,
         temperature: float = 0.0,
         analysis_timeout_seconds: float = 600,
         max_output_tokens: int = 8192,
@@ -86,22 +88,33 @@ class OpenAIProvider(LLMProvider):
     ):
         if model_lifecycle not in ("none", "llamacpp"):
             raise ValueError("Unsupported OpenAI-compatible model lifecycle")
-        # The SDK needs a nonempty key even for a credentialless endpoint.
-        api_key = api_key or OPENAI_CREDENTIALLESS_API_KEY
-        self._lifecycle = LlamaCppLifecycle(host, api_key) if model_lifecycle == "llamacpp" else None
+        # The SDK requires a key internally even when the wire uses no Authorization.
+        sdk_api_key = api_key or OPENAI_CREDENTIALLESS_API_KEY
+        effective_api_key = sdk_api_key if api_key is not None else None
+        self._lifecycle = LlamaCppLifecycle(host, effective_api_key) if model_lifecycle == "llamacpp" else None
         self.supports_model_release = self._lifecycle is not None
         self.lifecycle_identity = self._lifecycle.identity if self._lifecycle else "unsupported"
         self.inference_identity = inference_endpoint_identity("openai", host)
         self._vision_model_ids = frozenset(vision_model_ids)
         self.analysis_timeout_seconds = analysis_timeout_seconds
         self.max_output_tokens = max_output_tokens
+        url = httpx2.URL(host)
+        origin = (url.scheme, url.raw_host, url.port)
+
+        async def enforce_authorization(request: httpx2.Request) -> None:
+            url = request.url
+            if effective_api_key is None or (url.scheme, url.raw_host, url.port) != origin:
+                request.headers.pop("Authorization", None)
+
         self._client = AsyncOpenAI(
             base_url=host,
-            api_key=api_key,
+            api_key=sdk_api_key,
+            default_headers={"Authorization": f"Bearer {sdk_api_key}"},
             timeout=analysis_timeout_seconds,
             max_retries=0,
             http_client=DefaultAsyncHttpxClient(
-                trust_env=False, follow_redirects=model_lifecycle == "none"
+                trust_env=False, follow_redirects=model_lifecycle == "none",
+                event_hooks={"request": [enforce_authorization]},
             ),
         )
         self._temperature = temperature
