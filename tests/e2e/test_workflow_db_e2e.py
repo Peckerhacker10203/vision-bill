@@ -169,8 +169,11 @@ def submission():
     )
 
 
-async def enqueue(w, scope):
-    return (await w.enqueue_submission(submission(), scope=scope, idempotency_key=None)).submission
+async def enqueue(w, scope, *, effective_options=None):
+    request = submission()
+    if effective_options is not None:
+        request.effective_options = effective_options
+    return (await w.enqueue_submission(request, scope=scope, idempotency_key=None)).submission
 
 
 def complete(*, total="90071992547.91"):

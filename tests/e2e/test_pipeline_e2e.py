@@ -61,7 +61,7 @@ def test_pipeline_per_fixture(http_factory, case: FixtureCase) -> None:
     got_items = {
         (
             item["description"],
-            item["quantity"],
+            Decimal(item["quantity"]) if item["quantity"] is not None else None,
             Decimal(item["unit_price"]),
             Decimal(item["total_price"]),
         )

@@ -62,9 +62,10 @@ async def test_scheduler_recovers_abandoned_work_while_provider_is_unavailable(
         settings, provider, service.receipts, None, submission_service=service
     )
 
-    remaining = await enqueue(workflow, owner)
-    exhausted = await enqueue(workflow, owner)
-    live = await enqueue(workflow, owner)
+    snapshot = service.current_snapshot()
+    remaining = await enqueue(workflow, owner, effective_options=snapshot)
+    exhausted = await enqueue(workflow, owner, effective_options=snapshot)
+    live = await enqueue(workflow, owner, effective_options=snapshot)
     await claim_attempt(workflow, remaining.id, 1)
     await claim_attempt(workflow, exhausted.id, 3)
     await claim_attempt(workflow, deletable.id, 3)
