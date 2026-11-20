@@ -8,13 +8,15 @@ import json
 import math
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from ocr_contract import OcrBlock, OcrResponse
+from ocr_contract import GpuMemorySnapshot, OcrBlock, OcrResponse
 
 from .fp32 import audit_dynamic_model, fp32_predictor_class, native_pipeline_class
+from .gpu_memory import probe_gpu_memory
 from .images import normalize_source, working_image
 from .precision import StaticArtifact, StaticAuditSession, begin_static_audit
 from .profile import (
@@ -216,7 +218,12 @@ class PipelineAdapter:
             )
 
 
-def construct_native(profile: OcrProfile, runtime: RuntimeSettings) -> tuple[Any, Any, type[Any]]:
+def construct_native(
+    profile: OcrProfile,
+    runtime: RuntimeSettings,
+    *,
+    record_preload: Callable[[GpuMemorySnapshot], None] | None = None,
+) -> tuple[Any, Any, type[Any]]:
     """Construct the pinned native profile; no coverage or serving permission is implied."""
     # PaddleX captures this flag at import time. Refuse a pre-imported process,
     # where setting the environment would create a false fallback guarantee.
@@ -285,11 +292,20 @@ def construct_native(profile: OcrProfile, runtime: RuntimeSettings) -> tuple[Any
     resolve(config)
     predictor = fp32_predictor_class(DocVLMLocalPredictor, runtime.gpu_index)
     pipeline_type = native_pipeline_class(_PaddleOCRVLPipeline, predictor, normalize_engine_config)
+    if record_preload is not None:
+        snapshot = probe_gpu_memory(runtime.accelerator, runtime.gpu_index)
+        if snapshot is not None:
+            record_preload(snapshot)
     native = pipeline_type(config, device=runtime.device, use_hpip=False)
     return native, paddle, PaddleStaticRunner
 
 
-def build_pipeline(profile: OcrProfile, runtime: RuntimeSettings) -> PipelineAdapter:
+def build_pipeline(
+    profile: OcrProfile,
+    runtime: RuntimeSettings,
+    *,
+    record_preload: Callable[[GpuMemorySnapshot], None] | None = None,
+) -> PipelineAdapter:
     if any(name == "paddlex" or name.startswith("paddlex.") for name in sys.modules):
         raise ValueError("Build native pipeline in a fresh worker before importing PaddleX")
     manifest = json.loads(runtime.qualification_manifest.read_text())
@@ -320,7 +336,9 @@ def build_pipeline(profile: OcrProfile, runtime: RuntimeSettings) -> PipelineAda
     actual_target = device_identity(paddle, runtime, compute=False)
     if not manifest.get("qualified_target") or actual_target != manifest["qualified_target"]:
         raise ValueError("Native qualified target identity mismatch; requalification required")
-    native, paddle, PaddleStaticRunner = construct_native(profile, runtime)
+    native, paddle, PaddleStaticRunner = construct_native(
+        profile, runtime, record_preload=record_preload
+    )
     preprocessor = native.doc_preprocessor_pipeline
     models = (
         native.layout_det_model,

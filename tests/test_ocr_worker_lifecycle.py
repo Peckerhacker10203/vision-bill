@@ -80,7 +80,13 @@ class FakeProcess:
             if self.dead.is_set():
                 return
         if self.context.init_fail:
-            out_q.put({"generation": generation, "kind": "init_failed"})
+            failure = {"generation": generation, "kind": "init_failed"}
+            if self.context.init_fail == "gpu_memory":
+                failure["code"] = "ocr_gpu_out_of_memory"
+                failure["preload_memory"] = {
+                    "accelerator": "rocm", "gpu_index": 2, "free_bytes": 100, "total_bytes": 200
+                }
+            out_q.put(failure)
             self.dead.set()
             return
         out_q.put(
@@ -103,6 +109,12 @@ class FakeProcess:
                 self.context.init_release.clear()
                 out_q.put({"generation":generation, "request_id":str(request.request_id), "kind":"qualification_invalidated"})
                 continue
+            if self.context.mode == "gpu_memory":
+                out_q.put({
+                    "generation": generation, "request_id": str(request.request_id),
+                    "kind": "qualification_invalidated", "code": "ocr_gpu_out_of_memory",
+                })
+                return
             if self.context.mode == "crash":
                 self.dead.set()
                 return
@@ -348,7 +360,7 @@ def test_native_entrypoint_qualifies_before_predict(tmp_path, monkeypatch):
         qualify=lambda image: calls.append("qualify"),
         predict=predict,
     )
-    monkeypatch.setattr(pipeline, "build_pipeline", lambda profile, runtime: adapter)
+    monkeypatch.setattr(pipeline, "build_pipeline", lambda profile, runtime, **kwargs: adapter)
     incoming, outgoing = queue.Queue(), queue.Queue()
     incoming.put(item)
     incoming.put(None)
@@ -648,6 +660,7 @@ def test_runtime_readiness_belongs_to_live_generation_only():
 
 def test_native_invalidated_qualification_exits_child_instead_of_serving_again(tmp_path, monkeypatch):
     from types import SimpleNamespace
+
     from ocr_service import pipeline
     from ocr_service.worker import _worker_main
 
@@ -659,7 +672,7 @@ def test_native_invalidated_qualification_exits_child_instead_of_serving_again(t
         adapter.qualified = False
         raise ValueError('private native failure')
     adapter.predict = predict
-    monkeypatch.setattr(pipeline, 'build_pipeline', lambda *a: adapter)
+    monkeypatch.setattr(pipeline, 'build_pipeline', lambda *a, **kw: adapter)
     incoming, outgoing = queue.Queue(), queue.Queue()
     incoming.put(item)
     incoming.put(item)
@@ -946,3 +959,137 @@ def test_worker_rejects_crc_correct_invalid_deflate_before_publication(tmp_path)
     with pytest.raises(ValueError, match="invalid_working_artifact_png"):
         publish_result(result, tmp_path)
     assert not list(tmp_path.glob("*.json"))
+
+
+def test_managed_load_reports_gpu_memory_failure_and_snapshot():
+    from ocr_service.worker import OcrWorkerError, OcrWorkerManager
+
+    context = FakeContext(init_fail="gpu_memory")
+    worker = OcrWorkerManager(mp_context=context, startup_timeout=1)
+    owner = f"1:{uuid4()}"
+    worker.claim(owner)
+    try:
+        with pytest.raises(OcrWorkerError, match="ocr_gpu_out_of_memory") as raised:
+            worker.load(owner)
+        assert raised.value.status_code == 503
+        ready = worker.readiness().model_dump()
+        assert ready["reason_code"] == "ocr_gpu_out_of_memory"
+        assert ready["preload_memory"] == {
+            "accelerator": "rocm", "gpu_index": 2, "free_bytes": 100, "total_bytes": 200
+        }
+        assert not context.processes[0].is_alive()
+        worker.park(owner)
+        assert worker.readiness().model_dump()["preload_memory"] is None
+    finally:
+        worker.stop()
+
+
+def test_inference_gpu_memory_failure_reaps_child_without_immediate_reload(tmp_path):
+    from ocr_service.worker import OcrWorkerError
+
+    context = FakeContext(mode="gpu_memory")
+    worker = manager(context)
+    source = request(tmp_path)
+    try:
+        with pytest.raises(OcrWorkerError, match="ocr_gpu_out_of_memory") as raised:
+            worker.infer(source, deadline_monotonic=time.monotonic() + 1)
+        assert raised.value.status_code == 503
+        assert raised.value.cleanup_safe
+        assert worker.readiness().reason_code == "ocr_gpu_out_of_memory"
+        assert worker._proc is None
+        assert len(context.processes) == 1
+        assert not context.processes[0].is_alive()
+    finally:
+        worker.stop()
+
+
+@pytest.mark.parametrize(
+    ("stage", "failure", "kind", "code"),
+    [
+        ("load", MemoryError("Out of memory error on GPU 2. private"),
+         "init_failed", "ocr_gpu_out_of_memory"),
+        ("smoke", OSError("(External) Hip error(2), out of memory. private"),
+         "init_failed", "ocr_gpu_out_of_memory"),
+        ("infer", RuntimeError("CUDA error: out of memory. private"),
+         "qualification_invalidated", "ocr_gpu_out_of_memory"),
+        ("load", MemoryError("private host memory exhausted"), "init_failed", "ocr_init_failed"),
+        ("infer", RuntimeError("private inference failed"), "error", "ocr_inference_failed"),
+    ],
+)
+def test_child_distinguishes_native_gpu_allocator_errors(
+    tmp_path, monkeypatch, stage, failure, kind, code
+):
+    from types import SimpleNamespace
+
+    from ocr_service import pipeline
+    from ocr_service.worker import _worker_main
+
+    def fail(at):
+        if stage == at:
+            raise failure
+
+    def build(_profile, _runtime, **kwargs):
+        fail("load")
+        return SimpleNamespace(
+            profile_id="p", runtime_fingerprint="r", qualified=True,
+            qualify=lambda _image: fail("smoke"), predict=lambda *_a, **_k: fail("infer"),
+        )
+
+    monkeypatch.setattr(pipeline, "build_pipeline", build)
+    incoming, outgoing = queue.Queue(), queue.Queue()
+    incoming.put(request(tmp_path))
+    incoming.put(None)
+    _worker_main(
+        incoming, outgoing, 2, Path(__file__).parents[1] / "paddleocr-service/profile.json",
+        object(), tmp_path, tmp_path,
+    )
+    if stage == "infer":
+        assert outgoing.get_nowait()["kind"] == "ready"
+    message = outgoing.get_nowait()
+    assert message["kind"] == kind
+    assert message.get("code", "ocr_init_failed") == code
+    assert "private" not in str(message)
+
+
+def test_ready_poll_cannot_restart_a_generation_retired_for_gpu_memory(tmp_path, monkeypatch):
+    from ocr_service.worker import OcrWorkerError
+
+    context = FakeContext(mode="gpu_memory")
+    worker = manager(context)
+    release_reply = threading.Event()
+    recovery_started = threading.Event()
+    recovery_finished = threading.Event()
+    original_get = worker._out_q.get
+    original_recovery = worker._recover_idle
+
+    def get_after_poll(*, timeout):
+        assert release_reply.wait(2)
+        return original_get(timeout=timeout)
+
+    def track_recovery(generation):
+        recovery_started.set()
+        try:
+            original_recovery(generation)
+        finally:
+            recovery_finished.set()
+
+    monkeypatch.setattr(worker._out_q, "get", get_after_poll)
+    monkeypatch.setattr(worker, "_recover_idle", track_recovery)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            job = pool.submit(
+                worker.infer, request(tmp_path), deadline_monotonic=time.monotonic() + 3
+            )
+            assert context.entered.wait(1)
+            context.processes[0].thread.join(1)
+            assert not worker.readiness().ready
+            assert recovery_started.wait(1)
+            release_reply.set()
+            with pytest.raises(OcrWorkerError, match="ocr_gpu_out_of_memory"):
+                job.result(3)
+        assert recovery_finished.wait(1)
+        assert len(context.processes) == 1
+        assert worker.readiness().reason_code == "ocr_gpu_out_of_memory"
+    finally:
+        release_reply.set()
+        worker.stop()

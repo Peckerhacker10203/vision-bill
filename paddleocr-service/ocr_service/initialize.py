@@ -17,6 +17,7 @@ from uuid import uuid4
 from ocr_contract.activation import MaintenanceIntent
 
 from .device_inventory import inspect_device_identity
+from .gpu_memory import GPU_OOM_CODE, GPU_OOM_EXIT
 from .initialization_lock import lock_path, maintenance_handoff
 from .provision import (
     KINDS,
@@ -44,6 +45,10 @@ class InitializationFailed(RuntimeError):
     """Native qualification did not commit a complete release gate result."""
 
     reason_code = "native_initialization_required"
+
+
+class InitializationGpuOutOfMemory(InitializationFailed):
+    reason_code = GPU_OOM_CODE
 
 
 def owned_qualification_process(command: list[str]) -> int:
@@ -275,7 +280,10 @@ def initialize(
                 "--output",
                 str(output),
             ]
-            if owned_qualification_process(command):
+            exit_code = owned_qualification_process(command)
+            if exit_code == GPU_OOM_EXIT:
+                raise InitializationGpuOutOfMemory(GPU_OOM_CODE)
+            if exit_code:
                 raise InitializationFailed(
                     "Full native qualification failed; selected settings were not published"
                 )

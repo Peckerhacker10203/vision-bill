@@ -642,3 +642,73 @@ def test_cli_exits_nonzero_when_serving_runtime_publication_fails(
     assert stopped.value.code == 1
     assert json.loads(output.read_text())["qualified"] is False
     assert not output.with_suffix(".runtime.json").exists()
+
+
+@pytest.mark.parametrize("status", [42, -9])
+def test_qualification_only_recognizes_reserved_gpu_allocation_exit(tmp_path, monkeypatch, status):
+    import subprocess
+
+    module = qualification()
+    process = SimpleNamespace(args=["stage"], wait=lambda timeout: status)
+    monkeypatch.setattr(module.subprocess, "Popen", lambda *a, **k: process)
+    if status == 42:
+        with pytest.raises(RuntimeError, match="ocr_gpu_out_of_memory"):
+            module.run_stage("collect", {}, tmp_path)
+    else:
+        with pytest.raises(subprocess.CalledProcessError):
+            module.run_stage("collect", {}, tmp_path)
+
+
+def test_collection_stage_converts_explicit_gpu_allocation_failure_to_exit(tmp_path, monkeypatch):
+    import sys
+
+    module = qualification()
+    stage_input = tmp_path / "input.json"
+    stage_input.write_text("{}")
+    output = tmp_path / "result.json"
+
+    def collect(_payload):
+        raise MemoryError("Out of memory error on GPU 2. private native text")
+
+    monkeypatch.setattr(module, "collect", collect)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["qualify", "--stage", "collect", "--stage-input", str(stage_input), "--output", str(output)],
+    )
+    with pytest.raises(SystemExit) as raised:
+        module.main()
+    assert raised.value.code == 42
+    assert not output.exists()
+
+
+def test_full_qualification_preserves_gpu_allocation_exit(tmp_path, monkeypatch):
+    import sys
+
+    module = qualification()
+    runtime = module.RuntimeSettings(
+        accelerator="rocm",
+        gpu_index=2,
+        model_dirs={},
+        cache_dir=tmp_path,
+        qualification_manifest=tmp_path / "manifest.json",
+        expected_packages={},
+        expected_paddle_commit="1234567",
+        image_identity="candidate",
+    )
+    settings = tmp_path / "runtime.json"
+    settings.write_text(runtime.model_dump_json())
+    monkeypatch.setattr(module, "qualification_is_supervised", lambda _fd: True)
+    report = module.QualificationReport(
+        accelerator="rocm", image_identity="candidate", failure="ocr_gpu_out_of_memory"
+    )
+    monkeypatch.setattr(module, "qualify_runtime", lambda *_args: report)
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "qualify", "--accelerator", "rocm", "--runtime", str(settings),
+            "--cases", str(tmp_path / "cases"), "--output", str(tmp_path / "report"),
+        ],
+    )
+    with pytest.raises(SystemExit) as raised:
+        module.main()
+    assert raised.value.code == 42

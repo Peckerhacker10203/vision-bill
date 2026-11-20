@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID
 
-from ocr_contract import OcrResponse
+from ocr_contract import GpuMemorySnapshot, OcrResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .bootstrap import (
@@ -32,6 +32,7 @@ from .bootstrap import (
 )
 from .device_inventory import inspect_device_identity
 from .fp32 import audit_dynamic_model, floating_dtype, require_gpu
+from .gpu_memory import GPU_OOM_CODE, GPU_OOM_EXIT, GpuOutOfMemory, is_gpu_out_of_memory
 from .images import normalize_source
 from .pipeline import PipelineAdapter, build_pipeline, construct_native, tree_identity
 from .precision import ParameterRecord, StaticArtifact
@@ -65,6 +66,7 @@ class QualificationReport(BaseModel):
     accelerator: str
     image_identity: str
     device: dict[str, Any] = Field(default_factory=dict)
+    preload_memory: GpuMemorySnapshot | None = None
     profile: dict[str, Any] = Field(default_factory=dict)
     model_content: dict[str, str] = Field(default_factory=dict)
     profile_id: str | None = None
@@ -140,6 +142,8 @@ def run_stage(stage: str, payload: dict[str, Any], directory: Path) -> dict[str,
         if isinstance(exc, subprocess.TimeoutExpired):
             raise TimeoutError("Native qualification stage exceeded 600 seconds") from None
         raise
+    if code == GPU_OOM_EXIT and stage in ("collect", "replay"):
+        raise GpuOutOfMemory
     if code:
         raise subprocess.CalledProcessError(code, process.args)
     if outgoing.stat().st_size > 64 * 1024 * 1024:
@@ -211,7 +215,8 @@ def collect(payload: dict[str, Any]) -> dict[str, Any]:
         runtime.expected_packages, payload["dependencies"], accelerator=runtime.accelerator
     )
     profile = load_profile(PROFILE)
-    native, paddle, runner_type = construct_native(profile, runtime)
+    preload: list[GpuMemorySnapshot] = []
+    native, paddle, runner_type = construct_native(profile, runtime, record_preload=preload.append)
     device = device_identity(paddle, runtime)
     preprocessor = native.doc_preprocessor_pipeline
     models = [
@@ -289,7 +294,11 @@ def collect(payload: dict[str, Any]) -> dict[str, Any]:
                 "parameter_bindings": bindings,
             }
         ).model_dump()
-    return {"static_artifacts": artifacts, "device": device}
+    return {
+        "static_artifacts": artifacts,
+        "device": device,
+        "preload_memory": preload[0].model_dump() if preload else None,
+    }
 
 
 def replay(payload: dict[str, Any]) -> dict[str, Any]:
@@ -385,6 +394,8 @@ def qualify_runtime(runtime: RuntimeSettings, cases: Path, output: Path) -> Qual
             report.stage = "native_collection"
             collected = run_stage("collect", {**base, "inventory": inventory}, directory)
             report.device = collected["device"]
+            if collected.get("preload_memory") is not None:
+                report.preload_memory = GpuMemorySnapshot.model_validate(collected["preload_memory"])
             manifest = {
                 "qualified_target": {key: value for key, value in report.device.items() if key != "compute_probe"},
                 "dependencies": dependencies,
@@ -436,7 +447,7 @@ def qualify_runtime(runtime: RuntimeSettings, cases: Path, output: Path) -> Qual
     except Exception as exc:  # noqa: BLE001 -- unknown native/build errors fail closed
         report.qualified = False
         report.qualified_targets = []
-        report.failure = type(exc).__name__
+        report.failure = GPU_OOM_CODE if isinstance(exc, GpuOutOfMemory) else type(exc).__name__
         # A writer can fail after replacing its destination. Revoke both stale and
         # partially published artifacts before attempting a sanitized failure report.
         serving.unlink(missing_ok=True)
@@ -474,10 +485,13 @@ def main() -> None:
             result = inspect_artifact(
                 runtime.model_dirs[name], name, paddle, "paddle:" + runtime.expected_paddle_commit
             )
-        elif args.stage == "collect":
-            result = collect(payload)
         else:
-            result = replay(payload)
+            try:
+                result = (collect if args.stage == "collect" else replay)(payload)
+            except Exception as exc:
+                if is_gpu_out_of_memory(exc):
+                    raise SystemExit(GPU_OOM_EXIT) from None
+                raise
         write_json(args.output, result)
         return
     if not qualification_is_supervised(args.supervisor_fd):
@@ -491,6 +505,8 @@ def main() -> None:
     if runtime.accelerator != args.accelerator:
         parser.error("--accelerator differs from explicit runtime settings")
     report = qualify_runtime(runtime, args.cases, args.output)
+    if not report.qualified and report.failure == GPU_OOM_CODE:
+        raise SystemExit(GPU_OOM_EXIT)
     raise SystemExit(0 if report.qualified else 1)
 
 

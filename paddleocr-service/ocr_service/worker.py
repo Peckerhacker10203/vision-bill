@@ -15,10 +15,12 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from ocr_contract import OcrResponse, WorkerReadiness
+from ocr_contract import GpuMemorySnapshot, OcrResponse, WorkerReadiness
 from ocr_contract.document_image import decode_working_png, validate_working_png
 from ocr_contract.limits import MAX_OCR_RESPONSE_BYTES
+from pydantic import ValidationError
 
+from .gpu_memory import GPU_OOM_CODE, is_gpu_out_of_memory
 from .profile import RuntimeSettings, load_profile
 
 MAX_CONTROL_BYTES = 4096
@@ -117,23 +119,29 @@ def _worker_main(
     reply_directory: Path,
 ) -> None:
     # No exception text or receipt content crosses the general error/log boundary.
+    startup: dict[str, Any] = {"generation": generation}
+
+    def record_preload(snapshot: GpuMemorySnapshot) -> None:
+        startup["preload_memory"] = snapshot.model_dump()
+
     try:
         from .pipeline import build_pipeline
 
         if runtime is None or smoke_path is None:
             raise ValueError("Explicit runtime and sealed smoke image are required")
-        adapter = build_pipeline(load_profile(profile_path), runtime)
+        adapter = build_pipeline(load_profile(profile_path), runtime, record_preload=record_preload)
         adapter.qualify(smoke_path)
         output_channel.put(
             {
                 "kind": "ready",
-                "generation": generation,
+                **startup,
                 "profile_id": adapter.profile_id,
                 "runtime_fingerprint": adapter.runtime_fingerprint,
             }
         )
-    except Exception:  # noqa: BLE001 - native boundary must hide exception details
-        output_channel.put({"kind": "init_failed", "generation": generation})
+    except Exception as exc:  # noqa: BLE001 - native boundary must hide exception details
+        code = GPU_OOM_CODE if is_gpu_out_of_memory(exc) else "ocr_init_failed"
+        output_channel.put({"kind": "init_failed", "code": code, **startup})
         return
     while True:
         request = input_channel.get()
@@ -151,7 +159,11 @@ def _worker_main(
                 source_sha256=request.source_sha256,
             )
             message.update(kind="result", artifact=publish_result(result, reply_directory))
-        except Exception:  # noqa: BLE001 - native boundary must hide exception details
+        except Exception as exc:  # noqa: BLE001 - native boundary must hide exception details
+            if is_gpu_out_of_memory(exc):
+                message.update(kind="qualification_invalidated", code=GPU_OOM_CODE)
+                output_channel.put(message)
+                return
             if not adapter.qualified:
                 message.update(
                     kind="qualification_invalidated", code="ocr_qualification_invalidated"
@@ -197,6 +209,7 @@ class OcrWorkerManager:
         self.last_identity: dict[str, str | None] = {}
         self._profile_id: str | None = None
         self._runtime_fingerprint: str | None = None
+        self._preload_memory: GpuMemorySnapshot | None = None
         self._ready = False
         self._admitted = 0
         self._proc: Any = None
@@ -236,6 +249,7 @@ class OcrWorkerManager:
                 profile_id=self._profile_id,
                 reason_code=reason,
                 runtime_fingerprint=self._runtime_fingerprint if ready else None,
+                preload_memory=self._preload_memory,
             )
 
         if recover_generation is not None:
@@ -273,10 +287,12 @@ class OcrWorkerManager:
                 # Unconfirmed death preserves ownership and remains unready.
                 pass
 
-    def _set_unready(self, reason: str) -> None:
+    def _set_unready(self, reason: str, *, keep_preload: bool = False) -> None:
         with self._state:
             self._ready, self._reason, self._profile_id = False, reason, None
             self._runtime_fingerprint = None
+            if not keep_preload:
+                self._preload_memory = None
 
     def start(
         self,
@@ -338,6 +354,16 @@ class OcrWorkerManager:
                         continue
                     if message.get("generation") != self._generation:
                         continue
+                    if message.get("kind") in ("ready", "init_failed"):
+                        snapshot = message.get("preload_memory")
+                        if snapshot is not None:
+                            try:
+                                memory = GpuMemorySnapshot.model_validate(snapshot)
+                            except ValidationError:
+                                pass  # Diagnostics never decide worker readiness.
+                            else:
+                                with self._state:
+                                    self._preload_memory = memory
                     if message.get("kind") == "ready":
                         with self._state:
                             self._ready = not self._stopped.is_set()
@@ -350,7 +376,13 @@ class OcrWorkerManager:
                             }
                         if self._ready:
                             return
-                    self._set_unready("ocr_init_failed")
+                    code = (
+                        GPU_OOM_CODE
+                        if message.get("kind") == "init_failed"
+                        and message.get("code") == GPU_OOM_CODE
+                        else "ocr_init_failed"
+                    )
+                    self._set_unready(code, keep_preload=True)
                     break
             except Exception:  # noqa: BLE001 - native boundary must hide exception details
                 self._set_unready("ocr_init_failed")
@@ -390,7 +422,10 @@ class OcrWorkerManager:
     def _recover(self, reason: str, *, restart: bool = True) -> None:
         with self._control:
             generation = self._generation
-            self._set_unready(reason)
+            if not restart:
+                # A readiness poll may already have queued recovery for this child.
+                self._recovery_attempted_generation = generation
+            self._set_unready(reason, keep_preload=reason == GPU_OOM_CODE)
             self._teardown()
         if not restart:
             return
@@ -594,6 +629,9 @@ class OcrWorkerManager:
                 ):
                     continue
                 if message.get("kind") == "qualification_invalidated":
+                    if message.get("code") == GPU_OOM_CODE:
+                        self._recover(GPU_OOM_CODE, restart=False)
+                        raise OcrWorkerError(GPU_OOM_CODE, 503)
                     self._recover("ocr_qualification_invalidated", restart=recover)
                     raise OcrWorkerError("ocr_qualification_invalidated", 503)
                 if message.get("kind") != "result":

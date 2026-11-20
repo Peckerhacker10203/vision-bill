@@ -168,7 +168,7 @@ def test_native_waits_for_app_admissions_and_publishes_only_after_park(
     assert store.read_status(request) == ActivationStatus(request.generation, ActivationPhase.READY)
 
 
-@pytest.mark.parametrize("failure", ["archive", "qualification"])
+@pytest.mark.parametrize("failure", ["archive", "qualification", "gpu_memory"])
 def test_activation_failure_requires_an_explicit_new_generation(
     store, inputs, idle_health, release, monkeypatch, failure
 ):
@@ -200,10 +200,10 @@ def test_activation_failure_requires_an_explicit_new_generation(
         yield
 
     def qualification(command):
-        assert failure == "qualification"
+        assert failure in {"qualification", "gpu_memory"}
         assert command[1:3] == ["-m", "ocr_service.qualify"]
         qualification_attempts.append(command)
-        return 1
+        return 42 if failure == "gpu_memory" else 1
 
     def must_not_serve(*args, **kwargs):
         pytest.fail("Failed initialization reached native serving")
@@ -216,11 +216,11 @@ def test_activation_failure_requires_an_explicit_new_generation(
 
     request = store.submit_request(MaintenanceIntent.SEPARATE_OCR_DEVICE)
     assert activation.process_request(store, request, inputs, idle_health) is True
-    reason = (
-        "native_activation_inputs_invalid"
-        if failure == "archive"
-        else "native_qualification_failed"
-    )
+    reason = {
+        "archive": "native_activation_inputs_invalid",
+        "qualification": "native_qualification_failed",
+        "gpu_memory": "ocr_gpu_out_of_memory",
+    }[failure]
     assert store.read_status(request) == ActivationStatus(
         request.generation, ActivationPhase.FAILED, reason
     )

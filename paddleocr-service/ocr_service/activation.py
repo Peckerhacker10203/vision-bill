@@ -27,7 +27,12 @@ from ocr_contract.activation import (
     ActivationStore,
 )
 
-from .initialize import InitializationFailed, check_installation, initialize
+from .initialize import (
+    InitializationFailed,
+    InitializationGpuOutOfMemory,
+    check_installation,
+    initialize,
+)
 from .supervision import (
     InstallationBusy,
     ManagedInterrupted,
@@ -216,6 +221,8 @@ def process_request(
             if restarting:
                 return False
             reason = "native_installation_busy"
+        except InitializationGpuOutOfMemory as exc:
+            reason = exc.reason_code
         except InitializationFailed:
             reason = (
                 "native_activation_recovery_required"

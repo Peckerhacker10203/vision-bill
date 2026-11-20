@@ -1,9 +1,9 @@
 """Versioned OCR wire types, portable to the sidecar without application imports."""
 
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from . import limits
 from .wire_json import check_encoded_metadata, preflight_wire_metadata
@@ -14,6 +14,7 @@ __all__ = [
     "CONTRACT_VERSION",
     "BoundingBox",
     "CoordinateSpace",
+    "GpuMemorySnapshot",
     "OcrBlock",
     "OcrCapabilities",
     "OcrPageMetadata",
@@ -142,9 +143,24 @@ class OcrCapabilities(BaseModel):
     ocr_max_new_tokens: int | None = Field(default=None, gt=0)
 
 
+class GpuMemorySnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    accelerator: Literal["cuda", "rocm"]
+    gpu_index: int = Field(ge=0, le=1024)
+    free_bytes: int = Field(ge=0)
+    total_bytes: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def validate_free(self) -> Self:
+        if self.free_bytes > self.total_bytes:
+            raise ValueError("Reported free GPU memory exceeds total GPU memory")
+        return self
+
+
 class WorkerReadiness(BaseModel):
     runtime_fingerprint: str | None = None
     ready: bool
     generation: int = Field(ge=1)
     profile_id: str | None = None
     reason_code: str | None = None
+    preload_memory: GpuMemorySnapshot | None = None
