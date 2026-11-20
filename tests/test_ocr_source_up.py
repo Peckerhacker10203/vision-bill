@@ -24,13 +24,15 @@ def test_source_command_prepares_default_inputs(
 
     calls = []
 
-    def bootstrap(chosen: str, inputs: Path | None, *, restart: bool) -> None:
-        calls.append((chosen, inputs, restart))
+    def bootstrap(
+        chosen: str, inputs: Path | None, *, restart: bool, reuse_native_image: str | None
+    ) -> None:
+        calls.append((chosen, inputs, restart, reuse_native_image))
 
     monkeypatch.setattr(sys, "argv", [str(SCRIPT), accelerator])
     monkeypatch.setattr(ocr_source_up, "bootstrap", bootstrap)
     assert ocr_source_up.main() == 0
-    assert calls == [(accelerator, None, False)]
+    assert calls == [(accelerator, None, False, None)]
 
 
 def test_source_command_rejects_supplied_inputs_with_restart() -> None:
@@ -43,6 +45,98 @@ def test_source_command_rejects_supplied_inputs_with_restart() -> None:
     assert result.returncode == 2
     assert "APPROVED_DIRECTORY" in result.stderr
     assert "--restart" in result.stderr
+
+
+def docker_metadata() -> tuple[str, str, str, dict[str, bytes]]:
+    blobs: dict[str, bytes] = {}
+
+    def add(record: dict[str, Any]) -> str:
+        raw = json.dumps(record, indent=2).encode()
+        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        blobs[digest] = raw
+        return digest
+
+    config = add(
+        {"architecture": "amd64", "os": "linux", "rootfs": {"type": "layers", "diff_ids": []}}
+    )
+    manifest = add({"schemaVersion": 2, "config": {"digest": config}, "layers": []})
+    platform = {"os": "linux", "architecture": "amd64"}
+    descriptor = {
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "platform": platform,
+    }
+    index = add(
+        {
+            "schemaVersion": 2,
+            "manifests": [
+                {
+                    **descriptor,
+                    "digest": "sha256:" + "0" * 64,
+                    "annotations": {
+                        "vnd.docker.reference.type": "attestation-manifest",
+                    },
+                },
+                {**descriptor, "digest": manifest},
+            ],
+        }
+    )
+    return config, manifest, index, blobs
+
+
+@pytest.mark.parametrize("target", [0, 1, 2])
+def test_export_verifies_exact_config_for_each_engine_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: int
+) -> None:
+    from scripts import ocr_source_up
+
+    config, manifest, index, blobs = docker_metadata()
+    monkeypatch.setattr(ocr_source_up, "build_history_blob", blobs.__getitem__, raising=False)
+    assert ocr_source_up.export_config(tmp_path, (config, manifest, index)[target]) == config
+    assert (tmp_path / "image-config.json").read_bytes() == blobs[config]
+
+
+@pytest.mark.parametrize("target", [0, 1, 2])
+def test_export_refuses_a_changed_blob(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: int
+) -> None:
+    from scripts import ocr_source_up
+
+    config, manifest, index, blobs = docker_metadata()
+    digest = (config, manifest, index)[target]
+    blobs[digest] += b" "
+    monkeypatch.setattr(ocr_source_up, "build_history_blob", blobs.__getitem__, raising=False)
+    with pytest.raises(ValueError, match="Docker image metadata digest"):
+        ocr_source_up.export_config(tmp_path, index)
+    assert not (tmp_path / "image-config.json").exists()
+
+
+def test_export_falls_back_to_an_archive_that_preserves_containerd_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts import ocr_source_up
+
+    config, _, index, blobs = docker_metadata()
+
+    def unavailable(digest: str) -> bytes:
+        raise subprocess.CalledProcessError(1, ["docker", "buildx"])
+
+    def save(*args: str, capture: bool = False) -> str:
+        assert args[:4] == ("docker", "image", "save", "--output")
+        assert args[-1] == index
+        with tarfile.open(args[4], "w") as archive:
+            for digest, raw in blobs.items():
+                entry = tarfile.TarInfo(f"blobs/sha256/{digest[7:]}")
+                entry.size = len(raw)
+                archive.addfile(entry, io.BytesIO(raw))
+        return ""
+
+    monkeypatch.setattr(ocr_source_up, "build_history_blob", unavailable, raising=False)
+    monkeypatch.setattr(ocr_source_up, "command", save)
+    release = tmp_path / "release"
+    release.mkdir()
+    assert ocr_source_up.export_config(release, index) == config
+    assert (release / "image-config.json").read_bytes() == blobs[config]
+    assert sorted(tmp_path.iterdir()) == [release]
 
 
 def test_staging_keeps_approved_metadata_and_checks_fixture_bytes(tmp_path: Path) -> None:
@@ -79,9 +173,17 @@ def test_managed_overlay_pins_native_image_and_disables_startup_enable(tmp_path:
     from scripts.ocr_source_up import managed_overlay
 
     image_id = "sha256:" + "d" * 64
+    config_id = "sha256:" + "c" * 64
     app_id = "sha256:" + "e" * 64
     result = managed_overlay(
-        "cuda", tmp_path, image_id, app_id, "test", {"OCR_CUDA_DEVICE_ID": "0"}, "a" * 64
+        "cuda",
+        tmp_path,
+        image_id,
+        app_id,
+        "test",
+        {"OCR_CUDA_DEVICE_ID": "0"},
+        "a" * 64,
+        config_id=config_id,
     )
     app = result["services"]["vision_bill"]
     native = result["services"]["paddleocr-service"]
@@ -90,7 +192,8 @@ def test_managed_overlay_pins_native_image_and_disables_startup_enable(tmp_path:
     assert app["environment"] == {"OCR_ACTIVATION_ON_STARTUP": "false"}
     assert native["image"] == "vision-bill-ocr-cuda:source-" + "d" * 64
     assert native["pull_policy"] == "never"
-    assert native["environment"]["OCR_IMAGE_ID"] == image_id
+    assert native["environment"]["OCR_IMAGE_ID"] == config_id
+    assert result["x-vision-bill-source"]["image_config_sha256"] == config_id[7:]
     assert native["volumes"] == [
         {
             "type": "bind",
@@ -103,8 +206,8 @@ def test_managed_overlay_pins_native_image_and_disables_startup_enable(tmp_path:
 
 
 @pytest.mark.parametrize(
-    ("automatic", "requested_channel", "selected_channel"),
-    [(False, None, "cu126"), (True, None, "cu129"), (True, "cu126", "cu126")],
+    ("automatic", "requested_channel", "selected_channel", "reuse"),
+    [(False, None, "cu126", False), (True, None, "cu129", True), (True, "cu126", "cu126", False)],
 )
 def test_failed_candidate_cannot_create_restart_record(
     tmp_path: Path,
@@ -112,6 +215,7 @@ def test_failed_candidate_cannot_create_restart_record(
     automatic: bool,
     requested_channel: str | None,
     selected_channel: str,
+    reuse: bool,
 ) -> None:
     from scripts import ocr_source_up
 
@@ -139,8 +243,9 @@ def test_failed_candidate_cannot_create_restart_record(
             }
         },
     }
-    image_config = b'{"architecture":"amd64"}'
-    image_id = "sha256:" + hashlib.sha256(image_config).hexdigest()
+    config_id, _, image_id, blobs = docker_metadata()
+    image_config = blobs[config_id]
+    candidate = "vision-bill-ocr-cuda:source-build-" + "a" * 32
     prepare_paths: list[Path] = []
 
     def docker_boundary(*args: str, capture: bool = False) -> str:
@@ -169,26 +274,32 @@ def test_failed_candidate_cannot_create_restart_record(
         if "--check" in args:
             assert args[-2:] == ("--channel", selected_channel)
             return ""
-        if args[0] == "make" or args[1:3] == ("image", "tag"):
+        if args[:2] == ("make", "ocr-build-cuda"):
+            assert not reuse
             return ""
         if args[1:3] == ("image", "inspect"):
+            if reuse:
+                assert args[-1] == candidate
             return image_id
-        if args[1:3] == ("image", "save"):
-            with tarfile.open(args[4], "w") as output:
-                records = {
-                    "manifest.json": b'[{"Config":"config.json"}]',
-                    "config.json": image_config,
-                }
-                for name, content in records.items():
-                    entry = tarfile.TarInfo(name)
-                    entry.size = len(content)
-                    output.addfile(entry, io.BytesIO(content))
-            return ""
         if args[1] == "run":
-            assert args[2:7] == ("--rm", "--pull", "never", "--network", "none")
-            assert args[7:9] == ("--gpus", "device=2")
+            assert args[2:11] == (
+                "--rm",
+                "--pull",
+                "never",
+                "--platform",
+                "linux/amd64",
+                "--network",
+                "none",
+                "--gpus",
+                "device=2",
+            )
+            binder = args.index("-c")
+            assert args[binder - 1] == image_id
+            assert args[binder + 2 : binder + 5] == (image_id, config_id, "/release")
+            assert bool(args[binder + 5]) is reuse
+            release = Path(args[args.index("--volume") + 1].removesuffix(":/release:ro"))
+            assert (release / "image-config.json").read_bytes() == image_config
             if automatic:
-                release = Path(args[args.index("--volume") + 1].removesuffix(":/release:ro"))
                 assert {path.name for path in release.iterdir()} == {
                     "bundle.json",
                     "fixtures.tar",
@@ -212,31 +323,42 @@ def test_failed_candidate_cannot_create_restart_record(
     if requested_channel is not None:
         monkeypatch.setenv("OCR_CUDA_CHANNEL", requested_channel)
     monkeypatch.setattr(ocr_source_up, "command", docker_boundary)
+    monkeypatch.setattr(ocr_source_up, "build_history_blob", blobs.__getitem__)
     with pytest.raises(subprocess.CalledProcessError):
-        ocr_source_up.deploy(("docker", "compose"), state, "cuda", None if automatic else approved)
+        ocr_source_up.deploy(
+            ("docker", "compose"),
+            state,
+            "cuda",
+            None if automatic else approved,
+            reuse_native_image=candidate if reuse else None,
+        )
     assert len(prepare_paths) == int(automatic)
     assert not managed.exists()
     assert not list(state.iterdir())
 
 
-@pytest.mark.parametrize("altered_lock", [False, True])
+@pytest.mark.parametrize("altered", [None, "lock", "sources"])
 def test_native_binding_uses_full_exact_package_closure(
     ocr_release: tuple[Path, dict[str, Any], Path],  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    altered_lock: bool,
+    altered: str | None,
 ) -> None:
     from importlib import metadata
     from types import SimpleNamespace
 
-    from ocr_service import bootstrap, device_inventory
+    from ocr_service import bootstrap, device_inventory, provision
 
     from scripts.ocr_source_up import BIND_BUNDLE
 
     path, manifest, image_config = ocr_release
     approved = manifest["expected_packages"]
     closure = {**approved, "numpy": "2.4.0", "pydantic": "2.12.0"}
-    image_id = "sha256:" + hashlib.sha256(image_config.read_bytes()).hexdigest()
+    config_id = "sha256:" + hashlib.sha256(image_config.read_bytes()).hexdigest()
+    image_id = "sha256:" + "d" * 64
+    sources = provision.source_identities()
+    if altered == "sources":
+        sources["runtime-lock.json"] = "f" * 64
     lock = path.parent / "requirements.cuda.lock"
     lock.write_text("expected CUDA lock")
     resolver = path.parent / "resolve_cuda.py"
@@ -244,10 +366,22 @@ def test_native_binding_uses_full_exact_package_closure(
         "import sys; assert sys.argv[1:] == " + repr(["--check", str(lock), "--channel", "cu129"])
     )
     digest = hashlib.sha256(lock.read_bytes()).hexdigest()
-    if altered_lock:
+    if altered == "lock":
         lock.write_text("wrong CUDA lock")
     monkeypatch.setattr(
-        sys, "argv", ["-c", image_id, str(path.parent), "cu129", digest, str(lock), str(resolver)]
+        sys,
+        "argv",
+        [
+            "-c",
+            image_id,
+            config_id,
+            str(path.parent),
+            json.dumps(sources),
+            "cu129",
+            digest,
+            str(lock),
+            str(resolver),
+        ],
     )
     monkeypatch.setattr(
         metadata, "distributions", lambda: [SimpleNamespace(metadata={"Name": "paddlepaddle-gpu"})]
@@ -256,14 +390,19 @@ def test_native_binding_uses_full_exact_package_closure(
     monkeypatch.setattr(device_inventory, "inspect_device_identity", lambda *args: {})
     binder = path.parent / "bind.py"
     binder.write_text(BIND_BUNDLE)
-    if altered_lock:
+    if altered == "lock":
         with pytest.raises(ValueError, match="Built CUDA lock differs"):
+            runpy.run_path(str(binder))
+        return
+    if altered == "sources":
+        with pytest.raises(ValueError, match="Reused OCR image sources"):
             runpy.run_path(str(binder))
         return
     runpy.run_path(str(binder))
     bound = json.loads(capsys.readouterr().out)
     assert bound["expected_packages"] == closure
     assert bound["image_identity"] == image_id
+    assert bound["image_config_sha256"] == config_id[7:]
     assert bound["models"] == manifest["models"]
 
 
@@ -289,20 +428,33 @@ def managed_release(tmp_path: Path) -> tuple[Path, str, str]:
     )
 
 
-@pytest.mark.parametrize("bundle_altered", [False, True])
+@pytest.mark.parametrize(
+    ("bundle_altered", "legacy"), [(False, False), (False, True), (True, False)]
+)
 def test_restart_checks_pinned_images_and_waits_on_original_project(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     managed_release: tuple[Path, str, str],
     bundle_altered: bool,
+    legacy: bool,
 ) -> None:
     from scripts import ocr_source_up
 
-    release, native_id, bundle_digest = managed_release
+    release, config_id, bundle_digest = managed_release
+    native_id = config_id if legacy else "sha256:" + "d" * 64
     app_id = "sha256:" + "e" * 64
     overlay = ocr_source_up.managed_overlay(
-        "cuda", release, native_id, app_id, "original", {"OCR_CUDA_DEVICE_ID": "2"}, bundle_digest
+        "cuda",
+        release,
+        native_id,
+        app_id,
+        "original",
+        {"OCR_CUDA_DEVICE_ID": "2"},
+        bundle_digest,
+        config_id=config_id,
     )
+    if legacy:
+        del overlay["x-vision-bill-source"]["image_config_sha256"]
     (tmp_path / "compose.local.json").write_text(json.dumps(overlay))
     calls = []
 
@@ -363,7 +515,14 @@ def test_restart_rejects_a_different_container_image_in_its_project(
     release, native_id, bundle_digest = managed_release
     app_id = "sha256:" + "e" * 64
     overlay = ocr_source_up.managed_overlay(
-        "cuda", release, native_id, app_id, "original", {"OCR_CUDA_DEVICE_ID": "2"}, bundle_digest
+        "cuda",
+        release,
+        native_id,
+        app_id,
+        "original",
+        {"OCR_CUDA_DEVICE_ID": "2"},
+        bundle_digest,
+        config_id=native_id,
     )
     (tmp_path / "compose.local.json").write_text(json.dumps(overlay))
 
@@ -572,7 +731,14 @@ def test_reserved_claim_cannot_adopt_database_before_admission(
     release, native_id, bundle_digest = managed_release
     app_id = "sha256:" + "e" * 64
     overlay = ocr_source_up.managed_overlay(
-        "cuda", release, native_id, app_id, "original", {"OCR_CUDA_DEVICE_ID": "2"}, bundle_digest
+        "cuda",
+        release,
+        native_id,
+        app_id,
+        "original",
+        {"OCR_CUDA_DEVICE_ID": "2"},
+        bundle_digest,
+        config_id=native_id,
     )
     (tmp_path / "compose.local.json").write_text(json.dumps(overlay))
 

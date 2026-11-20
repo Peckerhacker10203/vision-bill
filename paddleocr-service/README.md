@@ -132,6 +132,10 @@ activation and handoff state. [Stop, cut over and recover](../distribution/READM
 python3 scripts/ocr_source_up.py cuda --restart
 ```
 
+If the native image finished building before initial preparation was interrupted,
+use `--reuse-native-image` with the local `source-build-…` tag printed by the launcher.
+It checks the selected image against this checkout and continues preparing the app.
+
 ## Consumer GPU release targets
 
 Prepare a binary bundle for the accelerator and host platform before an end
