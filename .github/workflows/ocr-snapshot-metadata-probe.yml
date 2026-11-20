@@ -1,4 +1,4 @@
-name: Verify CUDA and ROCm snapshot bootstrap
+name: Test containerd source image verification
 
 on:
   push:
@@ -8,78 +8,83 @@ permissions:
   contents: write
 
 jobs:
-  snapshot:
+  image-identity:
     if: github.repository == 'Peckerhacker10203/vision-bill'
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-      - name: Check the real signed package archives in Docker
+      - name: Enable the containerd image store in the disposable runner
+        run: |
+          sudo python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          target = Path("/etc/docker/daemon.json")
+          config = json.loads(target.read_text()) if target.exists() else {}
+          config.setdefault("features", {})["containerd-snapshotter"] = True
+          config.pop("storage-driver", None)
+          target.write_text(json.dumps(config))
+          PY
+          sudo systemctl restart docker
+          docker info --format '{{json .DriverStatus}}' | grep -q io.containerd.snapshotter.v1
+          docker buildx version
+      - name: Verify the actual config without a second image export
         shell: bash
         run: |
           set -euo pipefail
           scratch=$(mktemp -d)
           export scratch
+          mkdir -p "$scratch/context" "$scratch/bin" "$scratch/release"
+          echo source-identity-probe > "$scratch/context/marker"
+          printf 'FROM scratch\nCOPY marker /marker\nCMD ["/marker"]\n' > "$scratch/context/Dockerfile"
+          docker buildx build --platform linux/amd64 --load --provenance=mode=min \
+            --tag vision-bill-identity-probe:local "$scratch/context"
+          export docker_id=$(docker image inspect vision-bill-identity-probe:local --format '{{.Id}}')
+          export docker_container=$(docker create vision-bill-identity-probe:local)
+          test "$(docker inspect --format '{{.Image}}' "$docker_container")" = "$docker_id"
+          docker image save -o "$scratch/reference.tar" "$docker_id"
+          export real_docker=$(command -v docker)
+          cat > "$scratch/bin/docker" <<'SH'
+          #!/bin/sh
+          if [ "$1" = image ] && [ "$2" = save ]; then
+            echo 'Unexpected full image export' >&2
+            exit 97
+          fi
+          exec "$real_docker" "$@"
+          SH
+          chmod +x "$scratch/bin/docker"
+          export PATH="$scratch/bin:$PATH"
           python3 - <<'PY'
-          import os
-          from pathlib import Path
-          import re
-          import sys
-
-          scratch = Path(os.environ["scratch"])
-          for accelerator, expected in [("cuda", 1), ("rocm", 2)]:
-              path = Path(f"paddleocr-service/Dockerfile.{accelerator}")
-              syntax, *stages = re.split(r"(?m)(?=^FROM )", path.read_text())
-              donor = stages[0]
-              snapshots = [stage for stage in stages[1:] if "snapshot.ubuntu.com" in stage]
-              if len(snapshots) != expected:
-                  sys.exit(f"Expected {expected} APT stages for {accelerator}")
-              for number, stage in enumerate(snapshots, 1):
-                  end = stage.index(" && rm -rf /var/lib/apt/lists/*") + len(" && rm -rf /var/lib/apt/lists/*")
-                  (scratch / f"{accelerator}-{number}.Dockerfile").write_text(
-                      syntax + donor + stage[:end] +
-                      "\nRUN test -s /etc/ssl/certs/ca-certificates.crt && "
-                      "dpkg-query -W ca-certificates python3.12\n"
-                  )
-          PY
-          docker run --rm --platform linux/amd64 \
-            ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5 \
-            sh -c 'if test -s /etc/ssl/certs/ca-certificates.crt; then echo present; else echo missing; fi' > "$scratch/base.log"
-          for stage in cuda-1 rocm-1 rocm-2; do
-            if docker build --progress=plain -f "$scratch/$stage.Dockerfile" \
-              -t "vision-bill-apt-probe:$stage" "$scratch" > "$scratch/$stage.log" 2>&1; then
-              echo "$stage passed"
-              echo passed > "$scratch/$stage.result"
-            else
-              echo "$stage failed"
-              echo failed > "$scratch/$stage.result"
-            fi
-            tail -20 "$scratch/$stage.log"
-          done
-          python3 - <<'PY'
+          import hashlib
           import json
           import os
           from pathlib import Path
+          import tarfile
+
+          from scripts.ocr_source_up import export_config
 
           scratch = Path(os.environ["scratch"])
-          results = {
-              stage: {
-                  "result": (scratch / f"{stage}.result").read_text().strip(),
-                  "detail": (scratch / f"{stage}.log").read_text().splitlines()[-10:],
-              }
-              for stage in ("cuda-1", "rocm-1", "rocm-2")
-          }
-          Path("snapshot-bootstrap-verification.json").write_text(json.dumps({
+          with tarfile.open(scratch / "reference.tar") as archive:
+              manifest = json.loads(archive.extractfile("manifest.json").read())
+              assert len(manifest) == 1
+              config = archive.extractfile(manifest[0]["Config"]).read()
+          config_id = "sha256:" + hashlib.sha256(config).hexdigest()
+          image_id = os.environ["docker_id"]
+          assert image_id != config_id
+          export_config(scratch / "release", image_id)
+          assert (scratch / "release/image-config.json").read_bytes() == config
+          Path("containerd-image-verification.json").write_text(json.dumps({
               "commit": os.environ["GITHUB_SHA"],
-              "original_ubuntu_ca_bundle": (scratch / "base.log").read_text().strip(),
-              "stages": results,
+              "engine_image_id": image_id,
+              "image_config_id": config_id,
+              "container_image_id_matches_engine": True,
+              "raw_config_matches_reference_tar": True,
+              "full_export_disabled_in_launcher": True,
           }, indent=2, sort_keys=True) + "\n")
           PY
-          git add -- snapshot-bootstrap-verification.json
+          git add -- containerd-image-verification.json
           git -c user.name='github-actions[bot]' \
             -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
-            commit -m 'Record native OCR snapshot bootstrap checks'
+            commit -m 'Record actual containerd source image verification'
           git push origin HEAD:refs/heads/codex/vision-bill-ocr-model-metadata
-          for stage in cuda-1 rocm-1 rocm-2; do
-            grep -qx passed "$scratch/$stage.result"
-          done
