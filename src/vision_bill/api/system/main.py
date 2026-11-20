@@ -23,12 +23,13 @@ from ...config import (
     SavedLlmEndpointChanged,
     deployment_llm_credential_source,
     editable_setting_sources,
-    has_ambient_openai_authorization,
+    has_ambient_openai_credentials,
+    has_ambient_openai_headers,
     has_legacy_llm_credentials,
     has_real_api_key,
     llm_origin,
     runtime_restart_required,
-    saved_llm_host,
+    saved_llm_settings,
     settings,
     valid_bearer_key,
     write_config_file,
@@ -182,6 +183,8 @@ def _authentication_view() -> LlmAuthenticationView:
     llm = settings.llm
     auth = llm.authentication
     if auth is None:
+        if has_ambient_openai_credentials():
+            return LlmAuthenticationView(mode="bearer", source="environment", status="configured")
         if has_real_api_key(llm.api_key):
             return LlmAuthenticationView(mode="bearer", source=deployment_llm_credential_source(), status="configured")
         return LlmAuthenticationView(mode="none", source="default", status="none")
@@ -218,9 +221,11 @@ async def get_settings() -> SettingsView:
     "/settings/llm/connection-test", response_model=LlmConnectionView, dependencies=[Depends(require_admin)],
 )
 async def test_llm_connection(request: LlmConnectionRequest) -> LlmConnectionView:
-    llm = settings.llm.model_copy()
-    persisted_host = saved_llm_host()
-    if request.host != llm.host or (persisted_host is not None and request.host != persisted_host):
+    try:
+        llm = saved_llm_settings()
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail="Could not read saved LLM settings") from None
+    if request.host != llm.host:
         raise HTTPException(status_code=409, detail="The saved connection changed. Reload settings before testing.")
     return LlmConnectionView(status=await check_saved_connection(llm))
 
@@ -281,13 +286,13 @@ async def update_settings(request: Request, update: SettingsUpdate) -> SettingsV
     if "llm.host" in changed:
         candidate_origin = _validated_llm_origin(candidate.llm.host)
         if (
-            has_ambient_openai_authorization() and not has_real_api_key(settings.llm.api_key)
+            has_ambient_openai_headers() and not has_real_api_key(settings.llm.api_key)
             and llm_origin(settings.llm.host) != candidate_origin
         ):
-            # Previous releases cannot bind an ambient Authorization header to the old origin.
+            # Previous releases cannot bind custom header credentials on their own.
             raise HTTPException(
                 status_code=409,
-                detail="Remove the deployment Authorization header before changing the endpoint origin.",
+                detail="Remove the deployment's custom OpenAI headers before changing the endpoint origin.",
             )
         if authentication is None:
             existing = settings.llm.authentication

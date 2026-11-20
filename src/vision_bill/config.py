@@ -360,12 +360,20 @@ def ambient_openai_headers() -> dict[str, str]:
     }
 
 
-def has_ambient_openai_authorization() -> bool:
-    return any(name.lower() == "authorization" and bool(value) for name, value in ambient_openai_headers().items())
+def has_ambient_openai_headers() -> bool:
+    # A deployment-defined header can carry credentials under any name.
+    return any(ambient_openai_headers().values())
+
+
+def has_ambient_openai_credentials() -> bool:
+    return any(
+        name.lower() in {"authorization", "api-key", "x-api-key"} and bool(value)
+        for name, value in ambient_openai_headers().items()
+    )
 
 
 def has_legacy_llm_credentials(api_key: str) -> bool:
-    return has_real_api_key(api_key) or has_ambient_openai_authorization()
+    return has_real_api_key(api_key) or has_ambient_openai_headers()
 
 
 def llm_origin(host: str) -> str:
@@ -483,8 +491,15 @@ def _saved_llm_host(data: dict[str, Any]) -> str | None:
     return None
 
 
-def saved_llm_host() -> str | None:
-    return _saved_llm_host(_read_yaml_config(get_config_path()))
+def saved_llm_settings() -> LLMSettings:
+    """Read a fresh configuration under the same lock used to publish admin settings."""
+    from .distribution.bootstrap import config_lock
+
+    try:
+        with config_lock(get_config_path().parent):
+            return Settings().llm  # type: ignore[call-arg]
+    except (OSError, ValueError, SettingsError, yaml.YAMLError):
+        raise RuntimeError("Could not read saved LLM settings") from None
 
 
 def write_config_file(

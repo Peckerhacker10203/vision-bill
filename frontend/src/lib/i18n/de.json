@@ -446,7 +446,7 @@
 			"saveFirst": "Speichern Sie die geänderte Verbindung vor dem Test.",
 			"status": {
 				"none": "Kein API-Schlüssel konfiguriert",
-				"configured": "Bearer-Schlüssel konfiguriert",
+				"configured": "Zugangsdaten konfiguriert",
 				"origin_mismatch": "Der gespeicherte Schlüssel gehört zu einem anderen Endpunkt. Geben Sie einen neuen Schlüssel ein oder wählen Sie Keine."
 			},
 			"result": {

@@ -446,7 +446,7 @@
 			"saveFirst": "Save your connection changes before testing.",
 			"status": {
 				"none": "No API key configured",
-				"configured": "Bearer key configured",
+				"configured": "Credential configured",
 				"origin_mismatch": "The saved key belongs to a different endpoint. Enter a new key or select None."
 			},
 			"result": {

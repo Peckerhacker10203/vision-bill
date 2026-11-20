@@ -29,6 +29,7 @@ def saved_settings(settings, tmp_path, monkeypatch):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv(config.CONFIG_PATH_ENV, str(path))
+    monkeypatch.setitem(config.Settings.model_config, "yaml_file", str(path))
     settings.llm.host = data["llm"]["host"]
     # Effective private overrides must never overwrite unrelated persisted keys.
     settings.llm.api_key = "environment-api-secret"
@@ -677,7 +678,8 @@ def test_invalid_bearer_input_is_never_reflected(saved_settings, invalid, caplog
 @pytest.mark.parametrize(
     ("status_code", "encoding", "result"),
     [(200, None, "connected"), (401, None, "authentication_failed"), (503, None, "unreachable"),
-     (200, "gzip", "invalid_response"), (200, "long_integer", "invalid_response")],
+     (200, "gzip", "invalid_response"), (200, "long_integer", "invalid_response"),
+     (200, "rotated_key", "connected")],
 )
 def test_saved_connection_probe_only_reads_bounded_model_discovery(saved_settings, status_code, encoding, result):
     import gzip
@@ -713,16 +715,22 @@ def test_saved_connection_probe_only_reads_bounded_model_discovery(saved_setting
                 "llm_authentication": {"mode": "bearer", "api_key": "selected-secret"},
             }
             assert client.put("/system/settings", json=body).status_code == 200
+            if encoding == "rotated_key":
+                other_replica = yaml.safe_load(path.read_text())
+                other_replica["llm_authentication"]["api_key"] = "rotated-secret"
+                path.write_text(yaml.safe_dump(other_replica))
             previous = path.read_bytes()
             response = client.post("/system/settings/llm/connection-test", json={"host": host})
             assert response.status_code == 200
             assert response.json() == {"status": result}
             assert "selected-secret" not in response.text
+            assert "rotated-secret" not in response.text
             assert path.read_bytes() == previous
         finally:
             server.shutdown()
             thread.join()
-    assert calls == [("GET", "/llama/v1/models", ["Bearer selected-secret"], "identity")]
+    key = "rotated-secret" if encoding == "rotated_key" else "selected-secret"
+    assert calls == [("GET", "/llama/v1/models", [f"Bearer {key}"], "identity")]
 
 
 @pytest.mark.parametrize("stale_replica", [False, True])
@@ -792,11 +800,12 @@ def test_legacy_ambient_authorization_prevents_cross_origin_host_edit(saved_sett
     assert path.read_bytes() == before
 
 
-def test_explicit_none_does_not_expose_retained_ambient_credentials_on_rollback(saved_settings, monkeypatch):
+@pytest.mark.parametrize("header", ["Authorization", "X-API-Key", "X-Private-Credential"])
+def test_explicit_none_does_not_expose_retained_ambient_credentials_on_rollback(saved_settings, monkeypatch, header):
     path, _, active, client = saved_settings
     active.llm.provider = config.LLMProviderEnum.OPENAI
     active.llm.api_key = "none"
-    monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", "Authorization: Bearer legacy-ambient-key")
+    monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", f"{header}: legacy-ambient-key")
     monkeypatch.setenv("LLM__API_KEY", "none")
     new_origin = "https://other.example/v1"
     choice = {"mode": "none"}
@@ -807,6 +816,20 @@ def test_explicit_none_does_not_expose_retained_ambient_credentials_on_rollback(
     same_origin = {**explicit_payload(active), "llm_authentication": choice}
     assert client.put("/system/settings", json=same_origin).status_code == 200
     assert client.put("/system/settings", json=explicit_payload(active, host=new_origin)).status_code == 409
+
+
+@pytest.mark.parametrize("header", ["Authorization", "API-Key", "X-API-Key"])
+def test_inherited_ambient_credentials_report_environment_without_values(saved_settings, monkeypatch, header):
+    _, _, active, client = saved_settings
+    active.llm.provider = config.LLMProviderEnum.OPENAI
+    active.llm.api_key = "none"
+    monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", f"{header}: private-ambient-credential")
+    response = client.get("/system/settings")
+    assert response.status_code == 200
+    assert response.json()["llm_authentication"] == {
+        "mode": "bearer", "source": "environment", "status": "configured",
+    }
+    assert "private-ambient-credential" not in response.text
 
 
 def test_explicit_bearer_with_the_same_key_still_requires_restart(saved_settings, monkeypatch):
