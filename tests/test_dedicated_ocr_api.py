@@ -1,5 +1,6 @@
 """Dedicated OCR can be requested only by an administrator."""
 import asyncio
+import json
 from types import SimpleNamespace
 
 from fastapi import FastAPI
@@ -55,15 +56,16 @@ def test_admin_can_persist_separate_gpu_before_installation(tmp_path, monkeypatc
 
     monkeypatch.setenv("OCR_ACTIVATION_ENDPOINT", "http://prepared-ocr.test")
     store = ActivationStore(tmp_path / "request", tmp_path / "status", tmp_path / "lock")
+    path = tmp_path / "gpu.lock"
 
     def app_with_activation():
         config = settings.model_copy(deep=True)
         config.ocr.enabled = False
-        config.ocr.coordination_path = tmp_path / "legacy.lock"
+        config.ocr.coordination_path = path
         provider = SimpleNamespace(supports_model_release=False)
         activation = DedicatedOcrActivation(
             config, provider, lambda *_args: None, lambda: None,
-            store=store, handoff_path=tmp_path / "gpu.lock",
+            store=store, handoff_path=path,
         )
 
         async def live():
@@ -83,6 +85,16 @@ def test_admin_can_persist_separate_gpu_before_installation(tmp_path, monkeypatc
     assert store.read_request() is None
     client = app_with_activation()
     assert client.get("/system/dedicated-ocr").json()["shared_gpu"] is False
+    legacy = path.with_suffix(".json")
+    legacy.write_text(json.dumps({
+        "version": 2, "coordinator": "vision-bill-model-handoff-v2",
+        "resources": {"llm": "openai:legacy", "ocr": "ocr:legacy"},
+        "generation": 11, "unsettled": True, "ocr_pending": False, "models": ["old-model"],
+    }))
+    blocked = client.post("/system/dedicated-ocr", json={})
+    assert blocked.status_code == 409 and blocked.json()["detail"] == "model_request_unsettled"
+    assert store.read_request() is None
+    legacy.unlink()
     requested = client.post("/system/dedicated-ocr", json={})
     assert requested.status_code == 202
     assert requested.json()["state"] == "requested"

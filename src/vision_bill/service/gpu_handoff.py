@@ -447,6 +447,18 @@ class ModelHandoff:
         if status.reason_code == "ocr_mode_mismatch":
             raise HandoffWait(HandoffStatus(state="configuration_required", reason_code="ocr_mode_mismatch"))
 
+    async def require_clean_for_maintenance(self, deadline: float) -> None:
+        """Qualification cannot reclaim a worker without its serving controller."""
+        async with self.exclusion(deadline, wait=False):
+            peer = self._read_peer_journal()
+            saved = self.read_journal()
+            if saved is not None and saved.unsettled:
+                raise HandoffWait(HandoffStatus(state="recovery_required", reason_code="model_request_unsettled"))
+            if (saved is not None and (saved.ocr_pending or saved.models)) or (peer is not None and peer.ocr_pending):
+                raise HandoffWait(HandoffStatus(
+                    state="recovery_required", reason_code="model_handoff_journal_not_clean",
+                ))
+
     @asynccontextmanager
     async def recover_checkpoint(
         self, deadline: float, *, model_id: str, expected_binding_sha256: str | None,

@@ -313,10 +313,18 @@ class DedicatedOcrActivation:
                     if self.prior_handoff != self.handoff.path and (
                         self.prior_handoff.with_suffix(".json").exists()
                         or self.prior_handoff.with_suffix(".binding.json").exists()
+                        or self.prior_handoff.with_suffix(".ocr-only.json").exists()
                     ):
                         self._blocker = "ocr_existing_handoff"
                         return DedicatedOcrStatus(state="action_required", reason=self._blocker)
                     intent = MaintenanceIntent.SEPARATE_OCR_DEVICE
+                    deadline = monotonic() + 3
+                    handoff = self.handoff if shared_gpu else self.ocr_only_handoff
+                    try:
+                        await handoff.require_clean_for_maintenance(deadline)
+                    except HandoffWait as exc:
+                        self._blocker = "llm_quiescence_required" if shared_gpu else exc.status.reason_code
+                        return DedicatedOcrStatus(state="action_required", reason=self._blocker)
                     if shared_gpu:
                         intent = MaintenanceIntent(os.environ.get(
                             "OCR_ACTIVATION_MAINTENANCE_INTENT",
@@ -326,7 +334,7 @@ class DedicatedOcrActivation:
                             self.handoff, [self.settings.llm.model_name],
                             dedicated_coordinated_requests=True,
                             external_eager_loading_disabled=True,
-                            deadline=monotonic() + 3,
+                            deadline=deadline,
                         )
                     self.store.submit_request(
                         intent, retry_generation=current.generation if current else None,
