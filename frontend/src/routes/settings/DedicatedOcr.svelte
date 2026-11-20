@@ -36,11 +36,13 @@
 		'llm_request_recovery_required',
 		'ocr_handoff_confirmation_required',
 		'ocr_runtime_unavailable',
+		'ocr_gpu_out_of_memory',
 		'ocr_download_failed'
 	]);
 	const installed = $derived(status.data?.installed ?? false);
 	const activationState = $derived(status.data?.state);
 	const selected = $derived(status.data?.selected ?? activationState === 'active');
+	const sharedGpu = $derived(status.data?.shared_gpu ?? true);
 	const reason = $derived(status.data?.reason);
 	const runtimeUnavailable = $derived(reason === 'ocr_runtime_unavailable');
 	const message = $derived(
@@ -60,8 +62,27 @@
 	let submitting = $state(false);
 	let requestFailed = $state(false);
 	let requestReason = $state<string | null>(null);
+	let topologyDraft = $state<boolean | null>(null);
 	const busy = $derived(
 		submitting || activationState === 'requested' || activationState === 'installing'
+	);
+	const topologyShared = $derived(topologyDraft ?? sharedGpu);
+	const topologyChanged = $derived(topologyShared !== sharedGpu);
+	const canChooseTopology = $derived(
+		!!activationState && activationState !== 'unavailable' && !status.isError && !busy
+	);
+	const needsTopologyHandoff = $derived(topologyChanged && topologyShared && installed);
+	const needsSetupHandoff = $derived(
+		!topologyChanged && sharedGpu && canRequest && !selected && !installed
+	);
+	const canSaveTopology = $derived(
+		canChooseTopology && topologyChanged && (!needsTopologyHandoff || confirmHandoff)
+	);
+	const canToggle = $derived(
+		!busy &&
+			!status.isError &&
+			!topologyChanged &&
+			(selected || (canRequest && (!needsSetupHandoff || confirmHandoff)))
 	);
 
 	$effect(() => {
@@ -71,18 +92,20 @@
 		}
 	});
 
-	async function requestSetup() {
+	async function changeDedicatedOcr(targetSharedGpu: boolean | null = null) {
 		const previous = status.data;
-		const enabled = !selected;
-		if (!previous || busy || status.isError || !isCurrentView()) return;
-		if (enabled && (!canRequest || (!installed && !confirmHandoff))) return;
+		if (!previous || !isCurrentView() || !(targetSharedGpu === null ? canToggle : canSaveTopology))
+			return;
 		submitting = true;
 		requestFailed = false;
 		requestReason = null;
+		const confirmed = confirmHandoff;
+		confirmHandoff = false;
 		try {
-			const request = api.requestDedicatedOcr(actor, confirmHandoff, enabled);
-			confirmHandoff = false;
-			const result = await request;
+			const result =
+				targetSharedGpu === null
+					? await api.requestDedicatedOcr(actor, confirmed, !selected)
+					: await api.setDedicatedOcrGpuTopology(actor, targetSharedGpu, confirmed);
 			if (!isCurrentView()) return;
 			await queryClient.cancelQueries({ queryKey });
 			if (isCurrentView()) queryClient.setQueryData(queryKey, result);
@@ -100,14 +123,31 @@
 				requestFailed =
 					!requestReason &&
 					(refreshed.isError ||
-						(refreshed.data?.state === previous.state &&
-							refreshed.data.reason === previous.reason));
+						(targetSharedGpu === null
+							? refreshed.data?.state === previous.state &&
+								refreshed.data.reason === previous.reason
+							: (refreshed.data?.shared_gpu ?? true) !== targetSharedGpu));
 			}
 		} finally {
-			if (isCurrentView()) submitting = false;
+			if (isCurrentView()) {
+				if (targetSharedGpu !== null) topologyDraft = null;
+				submitting = false;
+			}
 		}
 	}
 </script>
+
+{#snippet handoffConfirmation()}
+	<label class="flex items-start gap-2 text-sm">
+		<input
+			type="checkbox"
+			class="mt-0.5 size-4 shrink-0"
+			bind:checked={confirmHandoff}
+			disabled={busy}
+		/>
+		<span>{$t('settings.dedicatedOcr.confirmHandoff')}</span>
+	</label>
+{/snippet}
 
 <section
 	class="mt-6 max-w-2xl space-y-3 rounded-xl border border-outline-variant bg-surface-container-low p-5"
@@ -139,6 +179,39 @@
 	{:else if requestFailed}
 		<p class="text-sm text-error" role="alert">{$t('settings.dedicatedOcr.requestError')}</p>
 	{/if}
+	{#if activationState && activationState !== 'unavailable'}
+		<div class="space-y-2 border-b border-outline-variant pb-3">
+			<label class="flex items-start gap-2 text-sm font-medium">
+				<input
+					type="checkbox"
+					class="mt-0.5 size-4 shrink-0"
+					checked={topologyShared}
+					disabled={!canChooseTopology}
+					aria-describedby="dedicated-ocr-gpu-description"
+					onchange={(event) => {
+						const checked = event.currentTarget.checked;
+						topologyDraft = checked === sharedGpu ? null : checked;
+						confirmHandoff = false;
+					}}
+				/>
+				<span>{$t('settings.dedicatedOcr.sharedGpu')}</span>
+			</label>
+			<p id="dedicated-ocr-gpu-description" class="text-sm text-on-surface-variant">
+				{$t('settings.dedicatedOcr.sharedGpuHelp')}
+			</p>
+			{#if needsTopologyHandoff}
+				{@render handoffConfirmation()}
+			{/if}
+			<button
+				type="button"
+				class="rounded-lg border border-outline-variant px-4 py-2.5 text-sm font-medium disabled:opacity-50"
+				disabled={!canSaveTopology}
+				onclick={() => changeDedicatedOcr(topologyShared)}
+			>
+				{$t('settings.dedicatedOcr.saveGpuTopology')}
+			</button>
+		</div>
+	{/if}
 	<button
 		type="button"
 		role="switch"
@@ -146,10 +219,8 @@
 		aria-checked={selected}
 		aria-busy={busy}
 		class="inline-flex items-center gap-3 rounded-full border border-outline-variant px-4 py-2.5 text-sm font-medium disabled:opacity-50"
-		disabled={busy ||
-			status.isError ||
-			(!selected && (!canRequest || (!installed && !confirmHandoff)))}
-		onclick={requestSetup}
+		disabled={!canToggle}
+		onclick={() => changeDedicatedOcr()}
 	>
 		<span
 			aria-hidden="true"
@@ -163,16 +234,8 @@
 		</span>
 		{$t('settings.dedicatedOcr.title')}
 	</button>
-	{#if canRequest && !installed && !status.isError}
-		<label class="flex items-start gap-2 text-sm">
-			<input
-				type="checkbox"
-				class="mt-0.5 size-4 shrink-0"
-				bind:checked={confirmHandoff}
-				disabled={busy}
-			/>
-			<span>{$t('settings.dedicatedOcr.confirmHandoff')}</span>
-		</label>
+	{#if needsSetupHandoff && !status.isError}
+		{@render handoffConfirmation()}
 	{/if}
 	<p class="text-sm text-on-surface-variant">{$t('settings.dedicatedOcr.prerequisites')}</p>
 	<a

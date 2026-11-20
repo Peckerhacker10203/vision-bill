@@ -315,6 +315,22 @@ export const api = {
 		return request<DedicatedOcrStatus>('/system/dedicated-ocr', undefined, actor);
 	},
 
+	setDedicatedOcrGpuTopology(
+		actor: SessionActor | null,
+		sharedGpu: boolean,
+		confirmHandoff: boolean
+	): Promise<DedicatedOcrStatus> {
+		return request<DedicatedOcrStatus>(
+			'/system/dedicated-ocr/gpu-topology',
+			{
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ shared_gpu: sharedGpu, confirm_handoff: confirmHandoff })
+			},
+			actor
+		);
+	},
+
 	requestDedicatedOcr(
 		actor: SessionActor | null,
 		confirmHandoff: boolean,

@@ -62,6 +62,29 @@ it.each(['pending', 'processing'])(
 );
 
 describe('SubmissionStatus', () => {
+	it.each([
+		['en', 'The local OCR GPU ran out of video memory.'],
+		['de', 'Die lokale OCR-GPU hat nicht genug Grafikspeicher.']
+	] as const)('reports local OCR GPU memory exhaustion in %s', async (language, message) => {
+		setLocale(language);
+		try {
+			vi.spyOn(api, 'getImage').mockResolvedValue(
+				status({
+					terminal: true,
+					retry_at: null,
+					wait_reason: null,
+					error: 'ocr_gpu_out_of_memory',
+					result_code: 'ocr_gpu_out_of_memory'
+				}) as never
+			);
+
+			render(SubmissionStatus, { id: 'job' });
+			await screen.findByText(new RegExp(`${message} \\(ocr_gpu_out_of_memory\\)`));
+		} finally {
+			setLocale('en');
+		}
+	});
+
 	it.each(['en', 'de'] as const)(
 		'explains model unreadability despite a valid working image in %s',
 		async (language) => {

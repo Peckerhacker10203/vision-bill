@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/sv
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { api } from '$lib/api/client';
 import { session } from '$lib/auth';
+import { setLocale } from '$lib/i18n';
 import { queryClient } from '$lib/query/client';
 import Settings from './+page.svelte';
 
@@ -17,6 +18,7 @@ const directVision = {
 };
 
 beforeEach(() => {
+	setLocale('en');
 	session.set(admin);
 	vi.spyOn(api, 'getSettings').mockResolvedValue({
 		llm: { provider: 'ollama', host: 'local', model_name: 'configured', temperature: 0 },
@@ -35,8 +37,14 @@ afterEach(() => {
 	vi.unstubAllGlobals();
 });
 
-function status(state: string, reason: string | null = null, httpStatus = 200, installed = false) {
-	return Response.json({ state, reason, installed }, { status: httpStatus });
+function status(
+	state: string,
+	reason: string | null = null,
+	httpStatus = 200,
+	installed = false,
+	shared_gpu = true
+) {
+	return Response.json({ state, reason, installed, shared_gpu }, { status: httpStatus });
 }
 
 function handoffConfirmation() {
@@ -44,6 +52,109 @@ function handoffConfirmation() {
 		name: 'I confirm the LLM endpoint is dedicated to Vision Bill and idle, with eager model loading turned off.'
 	});
 }
+
+it('can save separate GPUs before activating OCR without confirming LLM handoff', async () => {
+	const fetchStatus = vi
+		.fn()
+		.mockResolvedValueOnce(status('action_required', 'llm_lifecycle_required'))
+		.mockResolvedValueOnce(status('disabled', null, 200, false, false))
+		.mockResolvedValueOnce(status('requested', null, 202, false, false));
+	vi.stubGlobal('fetch', fetchStatus);
+
+	render(Settings);
+	const shared = await screen.findByRole('checkbox', { name: 'LLM and OCR share a GPU' });
+	expect(shared).toHaveProperty('checked', true);
+	const enable = screen.getByRole('switch', { name: 'Dedicated OCR' });
+	await fireEvent.click(shared);
+	expect(enable).toHaveProperty('disabled', true);
+	expect(screen.queryByRole('checkbox', { name: /I confirm the LLM endpoint/ })).toBeNull();
+	await fireEvent.click(screen.getByRole('button', { name: 'Save GPU configuration' }));
+
+	await waitFor(() => expect(enable).toHaveProperty('disabled', false));
+	expect(shared).toHaveProperty('checked', false);
+	const [url, options] = fetchStatus.mock.calls[1];
+	expect(url).toBe('/api/v1/system/dedicated-ocr/gpu-topology');
+	expect(options.method).toBe('PUT');
+	expect(new Headers(options.headers).get('X-Vision-Bill-Expected-User')).toBe('admin');
+	expect(JSON.parse(options.body)).toEqual({ shared_gpu: false, confirm_handoff: false });
+	await fireEvent.click(enable);
+	await screen.findByText('Dedicated OCR setup is queued.');
+	expect(fetchStatus.mock.calls[2][1].body).toBe('{"enabled":true,"confirm_handoff":false}');
+});
+
+it('requires a fresh handoff confirmation before using a shared GPU with installed models', async () => {
+	const fetchStatus = vi
+		.fn()
+		.mockResolvedValueOnce(status('disabled', null, 200, true, false))
+		.mockResolvedValueOnce(status('disabled', null, 200, true));
+	vi.stubGlobal('fetch', fetchStatus);
+
+	render(Settings);
+	const shared = await screen.findByRole('checkbox', { name: 'LLM and OCR share a GPU' });
+	expect(shared).toHaveProperty('checked', false);
+	await fireEvent.click(shared);
+	const save = screen.getByRole('button', { name: 'Save GPU configuration' });
+	expect(save).toHaveProperty('disabled', true);
+	await fireEvent.click(await handoffConfirmation());
+	await fireEvent.click(shared);
+	await fireEvent.click(shared);
+	expect(save).toHaveProperty('disabled', true);
+	await fireEvent.click(save);
+	expect(fetchStatus).toHaveBeenCalledOnce();
+	await fireEvent.click(await handoffConfirmation());
+	await fireEvent.click(save);
+
+	await waitFor(() =>
+		expect(screen.getByRole('switch', { name: 'Dedicated OCR' })).toHaveProperty('disabled', false)
+	);
+	expect(JSON.parse(fetchStatus.mock.calls[1][1].body)).toEqual({
+		shared_gpu: true,
+		confirm_handoff: true
+	});
+	expect(screen.queryByRole('checkbox', { name: /I confirm the LLM endpoint/ })).toBeNull();
+});
+
+it('explains a rejected topology change without applying the unsaved choice', async () => {
+	const fetchStatus = vi
+		.fn()
+		.mockResolvedValueOnce(status('active', null, 200, true))
+		.mockResolvedValueOnce(
+			Response.json({ detail: 'llm_request_recovery_required' }, { status: 409 })
+		)
+		.mockResolvedValueOnce(status('active', null, 200, true));
+	vi.stubGlobal('fetch', fetchStatus);
+
+	render(Settings);
+	const shared = await screen.findByRole('checkbox', { name: 'LLM and OCR share a GPU' });
+	await fireEvent.click(shared);
+	await fireEvent.click(screen.getByRole('button', { name: 'Save GPU configuration' }));
+	await screen.findByText(
+		'Confirm the previous LLM request has ended and follow the Dedicated OCR recovery guide.'
+	);
+	expect(shared).toHaveProperty('checked', true);
+	expect(screen.getByRole('switch', { name: 'Dedicated OCR' }).getAttribute('aria-checked')).toBe(
+		'true'
+	);
+	expect(fetchStatus).toHaveBeenCalledTimes(3);
+});
+
+it('reports local OCR memory exhaustion during setup with the German GPU choice', async () => {
+	setLocale('de');
+	vi.stubGlobal(
+		'fetch',
+		vi.fn().mockResolvedValue(status('failed', 'ocr_gpu_out_of_memory', 200, false, false))
+	);
+
+	try {
+		render(Settings);
+		await screen.findByText('Die lokale OCR-GPU hat nicht genug Grafikspeicher.');
+		expect(
+			screen.getByRole('checkbox', { name: 'LLM und OCR teilen sich eine GPU' })
+		).toHaveProperty('checked', false);
+	} finally {
+		setLocale('en');
+	}
+});
 
 it('does not load Dedicated OCR setup for a non-admin who visits Settings', async () => {
 	session.set({ ...admin, is_admin: false, can_see_all: false });

@@ -372,6 +372,7 @@ export interface SettingsUpdate {
 export interface DedicatedOcrStatus {
 	selected?: boolean;
 	installed?: boolean;
+	shared_gpu?: boolean;
 	state:
 		| 'unavailable'
 		| 'disabled'
