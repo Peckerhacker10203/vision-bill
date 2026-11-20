@@ -1,8 +1,9 @@
 {
-  "commit": "0b06f73c5d7bbf70c3c2ed57330b7f225298e1e1",
+  "archive_fallback_matches_reference": true,
+  "commit": "8065fa5f05d7f487feef4f6245680381833a1aa7",
   "container_image_id_matches_engine": true,
-  "engine_image_id": "sha256:656c71751b6e83cb5627f2e0ead151b2f087a83546219291d2b80287c8fbb9f3",
-  "full_export_disabled_in_launcher": true,
-  "image_config_id": "sha256:b4deb2a1c00bc7b8435d54c7fc73bd4aeeb7a3dca0a809f843af8e865838303e",
+  "engine_image_id": "sha256:d268d3263a8e67a7e47b05e965ba6c59026dd4961e404ec380e81bfe7f317a66",
+  "full_export_disabled_in_fast_path": true,
+  "image_config_id": "sha256:9a4df2e784713f4f2ab14974c33756f1ea6f935a8aac8a5661b08d51521b52c9",
   "raw_config_matches_reference_tar": true
 }
