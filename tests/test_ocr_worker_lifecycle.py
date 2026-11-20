@@ -109,7 +109,11 @@ class FakeProcess:
                 self.context.init_release.clear()
                 out_q.put({"generation":generation, "request_id":str(request.request_id), "kind":"qualification_invalidated"})
                 continue
-            if self.context.mode == "gpu_memory":
+            if self.context.mode in ("gpu_memory", "gpu_memory_after_timeout"):
+                if self.context.mode == "gpu_memory_after_timeout":
+                    while not self.context.release.wait(0.005):
+                        if self.dead.is_set():
+                            return
                 out_q.put({
                     "generation": generation, "request_id": str(request.request_id),
                     "kind": "qualification_invalidated", "code": "ocr_gpu_out_of_memory",
@@ -1008,11 +1012,19 @@ def test_inference_gpu_memory_failure_reaps_child_without_immediate_reload(tmp_p
     [
         ("load", MemoryError("Out of memory error on GPU 2. private"),
          "init_failed", "ocr_gpu_out_of_memory"),
-        ("smoke", OSError("(External) Hip error(2), out of memory. private"),
+        ("smoke", MemoryError("(ResourceExhausted)\nOut of memory error on GPU 2. private"),
          "init_failed", "ocr_gpu_out_of_memory"),
-        ("infer", RuntimeError("CUDA error: out of memory. private"),
+        ("infer", MemoryError("Out of memory error on GPU 2. private"),
          "qualification_invalidated", "ocr_gpu_out_of_memory"),
         ("load", MemoryError("private host memory exhausted"), "init_failed", "ocr_init_failed"),
+        ("load", OSError("(External) Hip error(2), out of memory in hipHostMalloc. private"),
+         "init_failed", "ocr_init_failed"),
+        ("smoke", OSError("(External) CUDA error(2), out of memory. private"),
+         "init_failed", "ocr_init_failed"),
+        ("infer", RuntimeError("CUDA error: out of memory in cudaMallocHost. private"),
+         "error", "ocr_inference_failed"),
+        ("infer", OSError("(External) CU error(2) in cuMemHostAlloc. private"),
+         "error", "ocr_inference_failed"),
         ("infer", RuntimeError("private inference failed"), "error", "ocr_inference_failed"),
     ],
 )
@@ -1092,4 +1104,56 @@ def test_ready_poll_cannot_restart_a_generation_retired_for_gpu_memory(tmp_path,
         assert worker.readiness().reason_code == "ocr_gpu_out_of_memory"
     finally:
         release_reply.set()
+        worker.stop()
+
+
+@pytest.mark.parametrize("phase", ["load", "infer"])
+def test_final_gpu_memory_reply_survives_receive_timeout_before_child_exit(
+    tmp_path, monkeypatch, phase
+):
+    from ocr_service.worker import ControlChannel, OcrWorkerError, OcrWorkerManager
+
+    context = FakeContext(
+        mode="gpu_memory_after_timeout" if phase == "infer" else "ok",
+        init_fail="gpu_memory" if phase == "load" else False,
+        init_blocked=phase == "load",
+    )
+    worker = OcrWorkerManager(mp_context=context, startup_timeout=1)
+    owner = f"1:{uuid4()}"
+    worker.claim(owner)
+    if phase == "infer":
+        worker.load(owner)
+    original_get = ControlChannel.get
+    simulated_timeout = False
+
+    def get_after_child_exit(channel, *, timeout):
+        nonlocal simulated_timeout
+        if not simulated_timeout and channel is worker._out_q:
+            assert timeout > 0
+            simulated_timeout = True
+            try:
+                return original_get(channel, timeout=0.001)
+            except queue.Empty:
+                # Post the awaited reply and exit the child before the
+                # manager can check liveness after the receive timeout.
+                context.init_release.set()
+                context.release.set()
+                context.processes[0].thread.join(1)
+                assert not context.processes[0].is_alive()
+                raise
+        return original_get(channel, timeout=timeout)
+
+    monkeypatch.setattr(ControlChannel, "get", get_after_child_exit)
+    try:
+        with pytest.raises(OcrWorkerError, match="ocr_gpu_out_of_memory"):
+            if phase == "load":
+                worker.load(owner)
+            else:
+                worker.infer(
+                    request(tmp_path), owner=owner, deadline_monotonic=time.monotonic() + 1
+                )
+        assert simulated_timeout
+        assert worker.readiness().reason_code == "ocr_gpu_out_of_memory"
+        assert worker._proc is None
+    finally:
         worker.stop()

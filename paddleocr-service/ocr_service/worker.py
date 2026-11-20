@@ -47,7 +47,7 @@ class ControlChannel:
         self.socket.settimeout(timeout)
         try:
             payload, _, flags, _ = self.socket.recvmsg(MAX_CONTROL_BYTES)
-        except TimeoutError:
+        except (TimeoutError, BlockingIOError):
             raise queue.Empty from None
         if flags & socket.MSG_TRUNC:
             raise ValueError("Truncated control datagram")
@@ -345,13 +345,16 @@ class OcrWorkerManager:
                             else "ocr_startup_timeout"
                         )
                         break
+                    child_exited = False
                     try:
                         message = self._out_q.get(timeout=min(0.05, remaining))
                     except queue.Empty:
-                        if not self._proc.is_alive():
-                            self._set_unready("ocr_init_failed")
-                            break
-                        continue
+                        if self._proc.is_alive():
+                            continue
+                        # The child may have posted its final datagram between
+                        # the timed receive and the liveness observation.
+                        child_exited = True
+                        message = self._out_q.get(timeout=0)
                     if message.get("generation") != self._generation:
                         continue
                     if message.get("kind") in ("ready", "init_failed"):
@@ -364,7 +367,7 @@ class OcrWorkerManager:
                             else:
                                 with self._state:
                                     self._preload_memory = memory
-                    if message.get("kind") == "ready":
+                    if message.get("kind") == "ready" and not child_exited:
                         with self._state:
                             self._ready = not self._stopped.is_set()
                             self._reason = None if self._ready else "ocr_stopped"
@@ -607,17 +610,16 @@ class OcrWorkerManager:
                     self._recover("ocr_deadline_exceeded", restart=recover)
                     raise OcrWorkerError("ocr_deadline_exceeded", 504)
                 try:
-                    message = out_q.get(timeout=min(0.05, remaining))
-                except queue.Empty:
-                    with self._control:
-                        if self._stopped.is_set():
-                            self._teardown()
-                            raise OcrWorkerError("ocr_stopped", 503) from None
-                        if proc is not self._proc or not proc.is_alive():
-                            self._recover("ocr_worker_crashed", restart=recover)
-                            raise OcrWorkerError("ocr_worker_crashed", 503) from None
-                    continue
-                except (OSError, ValueError, TypeError, RecursionError):
+                    try:
+                        message = out_q.get(timeout=min(0.05, remaining))
+                    except queue.Empty:
+                        with self._control:
+                            if self._stopped.is_set() or proc is not self._proc:
+                                raise
+                            if proc.is_alive():
+                                continue
+                            message = out_q.get(timeout=0)
+                except (queue.Empty, OSError, ValueError, TypeError, RecursionError):
                     if self._stopped.is_set():
                         with self._control:
                             self._teardown()

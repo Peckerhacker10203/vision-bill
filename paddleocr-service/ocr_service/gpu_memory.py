@@ -10,15 +10,11 @@ from pydantic import ValidationError
 GPU_OOM_CODE = "ocr_gpu_out_of_memory"
 GPU_OOM_EXIT = 42  # Reserved between the supervised qualification processes.
 
-# Paddle's CUDA/HIP allocator reports a GPU-specific ResourceExhausted.
-# The CUDA and HIP device APIs use allocation failure status 2.
+# Paddle's shared CUDA/HIP allocator explicitly names device memory exhaustion.
+# Bare runtime allocation errors also occur for page-locked host memory.
 _GPU_ALLOCATION_ERROR = re.compile(
-    r"^\s*(?:\((?:ResourceExhausted|External)\)\s*)?"
-    r"(?:out of memory error on GPU \d+\b"
-    r"|(?:CUDA|HIP|CU) error\((?:2|cudaErrorMemoryAllocation|hipErrorOutOfMemory|"
-    r"CUDA_ERROR_OUT_OF_MEMORY)\)"
-    r"|CUDA error:\s*out of memory\b)",
-    re.IGNORECASE | re.MULTILINE,
+    r"^\s*(?:\(ResourceExhausted\)\s*)?Out of memory error on GPU \d+\b",
+    re.MULTILINE,
 )
 
 
