@@ -122,6 +122,13 @@ class PaddleOcrProvider(OcrProvider):
                 ready = await asyncio.to_thread(
                     WorkerReadiness.model_validate_json, response.content
                 )
+                if ready.reason_code == OCR_GPU_OUT_OF_MEMORY:
+                    if response.status_code != 503 or ready.ready:
+                        raise ValueError("ocr_invalid_oom_readiness")
+                    # The native OOM signal requires a JSON boolean, not a coerced value.
+                    await asyncio.to_thread(
+                        WorkerReadiness.model_validate_json, response.content, strict=True,
+                    )
                 info_profile = info.get("worker", {}).get("profile_id")
                 if ready.ready and (
                     response.status_code != 200

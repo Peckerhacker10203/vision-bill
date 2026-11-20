@@ -91,6 +91,24 @@ async def test_readiness_requires_info_and_ready(monkeypatch):
     assert all(call["trust_env"] is False for call in calls)
 
 
+@pytest.mark.parametrize("status,ready", [(200, False), (200, True), (503, True), (503, "false")])
+async def test_readiness_ignores_oom_with_bad_status_or_ready_value(monkeypatch, status, ready):
+    def handler(request):
+        if request.url.path == "/info":
+            return httpx.Response(200, json={"contract_version": 2, "profile": {}})
+        return httpx.Response(status, json={
+            "ready": ready,
+            "generation": 1,
+            "profile_id": "fixed-profile",
+            "reason_code": "ocr_gpu_out_of_memory",
+        })
+
+    http_client(monkeypatch, handler)
+    capabilities = await PaddleOcrProvider("http://local").get_capabilities()
+    assert not capabilities.ready and not capabilities.can_load and capabilities.reachable
+    assert capabilities.reason_code == "ocr_unavailable"
+
+
 async def test_original_png_bytes_mime_hash_and_remaining_deadline(monkeypatch, tmp_path):
     path = image_file(tmp_path)
     raw = path.read_bytes()
