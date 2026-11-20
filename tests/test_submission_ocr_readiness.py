@@ -160,3 +160,29 @@ async def test_ready_unmanaged_service_including_legacy_missing_mode_is_eligible
     assert await service.ready_for(image)
     assert waits == [None] and claims == [] and image.attempt_count == 0
     llm.get_available_models.assert_awaited_once_with(capability="text")
+
+
+async def test_readiness_exposes_exact_oom_without_claiming_receipt(settings, monkeypatch, tmp_path):
+    from vision_bill.provider.db.workflow_db import READINESS_WAIT_REASONS
+
+    service, _receipts, llm, image, waits, claims = await submission_context(
+        settings, monkeypatch, tmp_path, managed=False
+    )
+    original_client = httpx.AsyncClient
+
+    def server(request):
+        if request.url.path == "/info":
+            return httpx.Response(200, json={"contract_version": 2, "profile": {}})
+        assert request.url.path == "/ready"
+        return httpx.Response(503, json={
+            "ready": False, "generation": 1, "reason_code": "ocr_gpu_out_of_memory",
+        })
+
+    monkeypatch.setattr(
+        httpx, "AsyncClient",
+        lambda **kwargs: original_client(**kwargs, transport=httpx.MockTransport(server)),
+    )
+    assert not await service.ready_for(image)
+    assert waits == ["ocr_gpu_out_of_memory"] and waits[0] in READINESS_WAIT_REASONS
+    assert claims == [] and image.attempt_count == 0
+    llm.get_available_models.assert_not_awaited()

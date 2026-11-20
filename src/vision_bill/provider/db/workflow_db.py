@@ -30,6 +30,7 @@ from ...model.extraction import (
 )
 from ...model.handoff import HANDOFF_WAIT_REASONS
 from ...model.ocr import OcrPageMetadata, Sha256, SourceRef, WorkingImageMetadata
+from ...model.ocr_errors import OCR_GPU_OUT_OF_MEMORY
 from ...model.review import AmountPolicy, OriginalAvailability, ReviewEvaluation, SourceView
 from ...model.workflow import (
     AccessScope,
@@ -66,7 +67,10 @@ COMPLETION_WAIT_REASONS = HANDOFF_WAIT_REASONS | {
     OBSERVATION_RECOVERY_WAIT, "observation_checkpoint_invalid", "source_integrity_failed",
 }
 READINESS_WAIT_REASONS = HANDOFF_WAIT_REASONS | {
-    "provider_unavailable", "vision_model_unavailable", "formatter_model_unavailable",
+    OCR_GPU_OUT_OF_MEMORY,
+    "provider_unavailable",
+    "vision_model_unavailable",
+    "formatter_model_unavailable",
 }
 
 _UNMANAGED_CLASSIFICATION_UNSETTLED = """CASE

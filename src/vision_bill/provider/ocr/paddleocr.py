@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import json
 from io import BytesIO
 from pathlib import Path
 from time import monotonic
@@ -16,7 +17,30 @@ from pydantic import ValidationError
 
 from ...helper.deadline import check_deadline, run_sync_before
 from ...model.ocr import OcrCapabilities, OcrResponse, WorkerReadiness
+from ...model.ocr_errors import OCR_GPU_OUT_OF_MEMORY, OcrGpuOutOfMemoryError
 from .base import OcrProvider
+
+MAX_ERROR_BODY_BYTES = 4096
+
+
+async def _reports_gpu_oom(response: httpx.Response) -> bool:
+    """Only recognize the native detail within a short, bounded identity response."""
+    if response.status_code != 503:
+        return False
+    if response.headers.get("Content-Encoding", "identity").lower() != "identity":
+        return False
+    body = bytearray()
+    try:
+        async with asyncio.timeout(1):
+            async for chunk in response.aiter_bytes():
+                if len(body) + len(chunk) > MAX_ERROR_BODY_BYTES:
+                    return False
+                body.extend(chunk)
+        # Keep object pairs to reject duplicate keys and any additional members.
+        detail: object = json.loads(body, object_pairs_hook=list)
+        return detail == [("detail", OCR_GPU_OUT_OF_MEMORY)]
+    except (httpx.HTTPError, TimeoutError, ValueError, RecursionError):
+        return False
 
 
 class PaddleOcrProvider(OcrProvider):
@@ -29,16 +53,23 @@ class PaddleOcrProvider(OcrProvider):
         self.managed_lifecycle = managed_lifecycle
 
     async def _lifecycle(self, action: str, token: str, deadline: float) -> None:
-        async with httpx.AsyncClient(timeout=max(.001, deadline - monotonic()), trust_env=False) as client:
-            response = await client.post(f"{self.service_url}/lifecycle/{action}",
-                                         json={"owner_token": token})
+        async with (
+            httpx.AsyncClient(timeout=max(.001, deadline - monotonic()), trust_env=False) as client,
+            client.stream(
+                "POST", f"{self.service_url}/lifecycle/{action}",
+                headers={"Accept-Encoding": "identity"}, json={"owner_token": token},
+            ) as response,
+        ):
+            if action == "load" and await _reports_gpu_oom(response):
+                raise OcrGpuOutOfMemoryError
             response.raise_for_status()
+            body = await response.aread()
 
         error = f"ocr_invalid_lifecycle_acknowledgement:{action}"
         if response.status_code != 200:
             raise httpx.RemoteProtocolError(error, request=response.request)
         try:
-            ready = WorkerReadiness.model_validate_json(response.content, strict=True)
+            ready = WorkerReadiness.model_validate_json(body, strict=True)
         except ValidationError:
             raise httpx.RemoteProtocolError(error, request=response.request) from None
 
@@ -165,6 +196,8 @@ class PaddleOcrProvider(OcrProvider):
                         "owner_token": owner.token if owner is not None else "",
                     },
                 ) as response:
+                    if await _reports_gpu_oom(response):
+                        raise OcrGpuOutOfMemoryError
                     response.raise_for_status()
                     limits.check_ocr_response_headers(
                         response.headers.get("Content-Length"),

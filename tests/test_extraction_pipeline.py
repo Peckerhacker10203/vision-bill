@@ -118,6 +118,67 @@ async def test_second_photo_failure_is_not_a_complete_prefix(photos, blank):
     assert not result.provenance.fallback_used
 
 
+@pytest.mark.parametrize("failure_phase", ["load", "inference"])
+async def test_managed_gpu_oom_parks_worker_and_records_receipt_retry(
+    photos, monkeypatch, failure_phase,
+):
+    import re
+
+    import httpx
+    from test_handoff_binding import adopt
+    from test_ocr_provider import http_client
+
+    from vision_bill import config
+    from vision_bill.provider.ocr.paddleocr import PaddleOcrProvider
+    from vision_bill.service.submission_service import SubmissionService
+
+    requests = []
+    ready = {"ready": True, "generation": 1, "profile_id": "fixed-profile"}
+    parked = {"ready": False, "generation": 1, "reason_code": "ocr_parked"}
+
+    def native(request):
+        path = request.url.path
+        requests.append(path)
+        if path == "/info":
+            return httpx.Response(200, json={"contract_version": 2, "profile": {}, "worker": ready})
+        if path in ("/lifecycle/claim", "/lifecycle/park"):
+            return httpx.Response(200, json=parked)
+        if path == "/ready" or (path == "/lifecycle/load" and failure_phase == "inference"):
+            return httpx.Response(200, json=ready)
+        if path == "/ocr" and requests.count("/ocr") == 1:
+            request_id = re.search(rb'name="request_id"\r\n\r\n([^\r]+)', request.content)
+            assert request_id is not None
+            return httpx.Response(200, json=wire_page(
+                0, hashlib.sha256(photos[0].read_bytes()).hexdigest(), request_id[1].decode(),
+            ))
+        assert path in ("/ocr", "/lifecycle/load")
+        return httpx.Response(503, json={"detail": "ocr_gpu_out_of_memory"})
+
+    llm = formatter()
+    http_client(monkeypatch, native)
+    ocr = PaddleOcrProvider("http://native")
+    extraction = pipeline(
+        llm, ocr, manage_model_lifecycle=True, coordination_path=photos[0].parent / "gpu.lock",
+    )
+    monkeypatch.setattr(config.settings, "ocr", extraction.settings)
+    handoff = extraction.coordinator()
+    assert handoff is not None
+    await adopt(handoff, ("fixture",))
+    checkpoint = AsyncMock()
+    result = await extraction.extract(
+        "fixture", photos, options=ExperimentOptions(pipeline="ocr"),
+        deadline=time.monotonic() + 2, tags=[], checkpoint=checkpoint,
+    )
+
+    outcome = SubmissionService._outcome(result, [], [])
+    assert outcome.kind == "retry" and outcome.result_code == "ocr_gpu_out_of_memory"
+    assert result.findings[-1].code == "ocr_gpu_out_of_memory"
+    assert requests[-1] == "/lifecycle/park" and not handoff.read_journal().ocr_pending
+    assert len(result.ocr_pages) == checkpoint.await_count == (1 if failure_phase == "inference" else 0)
+    assert requests.count("/ocr") == (2 if failure_phase == "inference" else 0)
+    llm._client.chat.assert_not_awaited()
+
+
 @pytest.mark.parametrize("failure", ["blank", "transport", "timeout"])
 async def test_optional_failure_stops_without_images_despite_legacy_grants(photos, failure):
     import httpx

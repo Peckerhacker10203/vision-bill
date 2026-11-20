@@ -28,6 +28,7 @@ from ..model.extraction import (
 )
 from ..model.handoff import HandoffStatus, HandoffWait
 from ..model.ocr import OcrPageMetadata, OcrResponse, SourceRef, WorkingImage, WorkingImageMetadata
+from ..model.ocr_errors import OCR_GPU_OUT_OF_MEMORY
 from ..model.receipt import Receipt
 from ..model.review import OriginalAvailability
 from ..model.workflow import (
@@ -208,6 +209,8 @@ class SubmissionService:
                 if not (
                     capabilities.ready or (ocr.manage_model_lifecycle and capabilities.can_load)
                 ):
+                    if capabilities.reason_code == OCR_GPU_OUT_OF_MEMORY:
+                        return OCR_GPU_OUT_OF_MEMORY
                     return "ocr_unavailable"
                 capability = "text"
             models = await self.receipts.get_available_models(capability=capability)
@@ -687,6 +690,7 @@ class SubmissionService:
         if document is None:
             code = envelope.findings[-1].code if envelope.findings else "analysis_incomplete"
             if code not in {
+                OCR_GPU_OUT_OF_MEMORY,
                 "ocr_unavailable",
                 "ocr_page_failed",
                 "ocr_disabled",

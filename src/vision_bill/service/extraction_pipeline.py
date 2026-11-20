@@ -21,6 +21,7 @@ from ..model.extraction import (
 )
 from ..model.handoff import HandoffStatus, HandoffWait
 from ..model.ocr import OcrPageMetadata, OcrResponse, SourceRef
+from ..model.ocr_errors import OCR_GPU_OUT_OF_MEMORY, OcrGpuOutOfMemoryError
 from ..model.review import ReviewFinding
 from ..provider.llm.base import LLMProvider, ModelInfo
 from ..provider.ocr.base import OcrProvider, compact_ocr_text
@@ -211,7 +212,11 @@ class ExtractionPipeline:
                     reason = "ocr_unavailable"
                 else:
                     if owner is not None:
-                        await owner.ocr_phase()
+                        try:
+                            await owner.ocr_phase()
+                        except OcrGpuOutOfMemoryError:
+                            result.provenance.fallback_reason = OCR_GPU_OUT_OF_MEMORY
+                            return self._failed(result, OCR_GPU_OUT_OF_MEMORY, started)
                     capabilities = await self.ocr.get_capabilities()
                     if not capabilities.ready or not capabilities.profile_id:
                         reason = capabilities.reason_code or "ocr_unavailable"
@@ -255,6 +260,9 @@ class ExtractionPipeline:
                                     raise ValueError("ocr_identity_mismatch")
                             except OcrRuntimeChangedError:
                                 raise
+                            except OcrGpuOutOfMemoryError:
+                                reason = OCR_GPU_OUT_OF_MEMORY
+                                break
                             except (httpx.HTTPError, OSError, ValueError) as exc:
                                 # Transport failures share the same whole-receipt policy as blank text.
                                 if isinstance(exc, TimeoutError):

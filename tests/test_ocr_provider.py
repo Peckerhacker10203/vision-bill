@@ -11,6 +11,7 @@ import pytest
 from PIL import Image
 
 from vision_bill.config import OcrSettings
+from vision_bill.model.ocr_errors import OcrGpuOutOfMemoryError
 from vision_bill.provider.factory import get_ocr_provider
 from vision_bill.provider.ocr.paddleocr import PaddleOcrProvider
 
@@ -162,6 +163,43 @@ async def test_paddleocr_extract_text_http_failure(monkeypatch, tmp_path):
     http_client(monkeypatch, lambda request: httpx.Response(500))
     with pytest.raises(httpx.HTTPStatusError):
         await PaddleOcrProvider("http://local", managed_lifecycle=False).extract_text(path)
+
+
+@pytest.mark.parametrize("action", ["load", "inference", "claim", "park"])
+@pytest.mark.parametrize(
+    "status,detail,is_oom",
+    [
+        (503, b'{"detail":"ocr_gpu_out_of_memory"}', True),
+        (500, b'{"detail":"ocr_gpu_out_of_memory"}', False),
+        (503, b'{"detail":"ocr_gpu_out_of_memory: private backend message"}', False),
+        (503, b'{"detail":{"code":"ocr_gpu_out_of_memory"}}', False),
+        (503, b'{"detail":"ocr_gpu_out_of_memory","extra":true}', False),
+        (503, b'{"detail":"ocr_gpu_out_of_memory"', False),
+        (503, b'{"detail":"ocr_generic","detail":"ocr_gpu_out_of_memory"}', False),
+        (503, b'{"detail":"ocr_gpu_out_of_memory"}' + b' ' * 4096, False),
+    ],
+)
+async def test_ocr_http_failure_recognizes_only_bounded_native_oom(
+    monkeypatch, tmp_path, action, status, detail, is_oom
+):
+    class ErrorBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield detail[:20]
+            yield detail[20:]
+
+    http_client(monkeypatch, lambda request: httpx.Response(status, stream=ErrorBody()))
+    provider = PaddleOcrProvider("http://local", managed_lifecycle=False)
+    if is_oom and action in {"load", "inference"}:
+        error_type = OcrGpuOutOfMemoryError
+    else:
+        error_type = httpx.HTTPStatusError
+    with pytest.raises(error_type) as error:
+        if action == "inference":
+            await provider.extract_text(image_file(tmp_path))
+        else:
+            await getattr(provider, action)("1:test-owner", time.monotonic() + 2)
+    if is_oom and action in {"load", "inference"}:
+        assert str(error.value) == "ocr_gpu_out_of_memory"
 
 
 @pytest.mark.parametrize("body", [[], {"contract_version": 2, "profile": {}, "worker": "bad"}])
