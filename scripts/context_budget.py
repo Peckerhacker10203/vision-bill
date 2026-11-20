@@ -286,7 +286,7 @@ class Budget:
         if image_b64:
             payload["images"] = [image_b64]
         from vision_bill.config import settings
-        if settings.ocr.enabled and settings.ocr.manage_model_lifecycle:
+        if settings.ocr.enabled and settings.ocr.manage_model_lifecycle and settings.ocr.shared_gpu:
             data = asyncio.run(self._managed_generate(payload))
         else:
             with inference_admission(), direct_inference_call():

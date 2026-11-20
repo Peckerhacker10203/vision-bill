@@ -409,7 +409,7 @@ async def test_ready_install_can_disable_restart_and_reenable_without_new_genera
         "models": [config.llm.model_name], "unsettled": False,
     }).model_dump_json())
     async def refuse_release(_model):
-        raise RuntimeError("model_release_unconfirmed")
+        raise RuntimeError("model_release_unconfirmed: private provider status")
     provider.release_model = refuse_release
     blocked = await activation.submit(enabled=False, confirm_handoff=False)
     assert blocked.reason == "model_release_unconfirmed"

@@ -279,22 +279,24 @@ class PaddleOcrProvider(OcrProvider):
 
     async def extract_text(self, image: Path) -> dict[str, Any]:
         """Compatibility API; live sidecars still require a validated v2 response."""
+        from ...service.activation_admission import inference_admission
+
         deadline = monotonic() + self.timeout
         digest = await run_sync_before(
             deadline, lambda: hashlib.sha256(self._read_original(image)).hexdigest()
         )
         if not self.managed_lifecycle:
-            page = await self.extract_page(image, photo_index=0, source_sha256=digest, deadline=deadline)
+            with inference_admission(uses_ocr=True):
+                page = await self.extract_page(image, photo_index=0, source_sha256=digest, deadline=deadline)
             return await run_sync_before(deadline, page.model_dump, mode="json")
         from ...config import settings
-        from ...service.activation_admission import inference_admission
-        from ...service.gpu_handoff import ModelHandoff
+        from ...service.gpu_handoff import ModelHandoff, admission_deadline
         from ..factory import get_llm_provider
         provider = get_llm_provider(settings.llm)
         model_id = settings.llm.model_name
         handoff = ModelHandoff(settings.ocr.coordination_path, provider, self, shared_gpu=settings.ocr.shared_gpu)
-        with inference_admission(provider):
-            async with handoff.session(deadline, model_id=model_id) as owner:
+        with inference_admission(provider, handoff=handoff, uses_ocr=True):
+            async with handoff.session(deadline, model_id=model_id, lock_deadline=admission_deadline(deadline)) as owner:
                 if handoff.shared_gpu:
                     owner.track(model_id)
                 await owner.ocr_phase()

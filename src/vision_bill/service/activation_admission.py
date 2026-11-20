@@ -16,6 +16,7 @@ from uuid import uuid4
 from ocr_contract.activation import (
     ActivationBusy,
     ActivationPhase,
+    ActivationRequest,
     ActivationStateError,
     ActivationStore,
 )
@@ -24,6 +25,7 @@ from ..model.handoff import HandoffStatus, HandoffWait
 from .gpu_handoff import ModelHandoff, current_owner
 
 if TYPE_CHECKING:
+    from ..config import OcrSettings
     from ..provider.llm.base import LLMProvider
 
 _MARKERS = "direct-calls"
@@ -63,25 +65,69 @@ def _current_admission() -> _Admission | None:
     return None
 
 
-def _require_provider(provider: LLMProvider | None, shared_gpu: bool | None) -> None:
-    if provider is None or shared_gpu is None:
+def _require_current_route(store: ActivationStore, request: ActivationRequest, ocr: OcrSettings) -> bool:
+    shared_gpu = store.shared_gpu()
+    if store.runtime_enabled(request) != ocr.enabled or shared_gpu != ocr.shared_gpu:
+        raise HandoffWait(HandoffStatus(state="configuration_required", reason_code="execution_policy_changed"))
+    return shared_gpu
+
+
+@contextmanager
+def policy_capture(ocr: OcrSettings) -> Iterator[None]:
+    """Capture a live policy without waiting for initial native qualification."""
+    if not activation_enabled():
+        yield
+        return
+    store = ActivationStore()
+    with ExitStack() as lock:
+        try:
+            locked = True
+            try:
+                lock.enter_context(store.admission(exclusive=False))
+            except ActivationBusy:
+                locked = False
+            request = store.read_request()
+            status = store.read_status(request) if request is not None else None
+            if request is not None and status is not None and status.phase == ActivationPhase.READY:
+                if not locked:
+                    raise HandoffWait(HandoffStatus(state="busy", reason_code="dedicated_ocr_activation_pending"))
+                _require_current_route(store, request, ocr)
+        except (ActivationStateError, OSError):
+            raise HandoffWait(HandoffStatus(
+                state="configuration_required", reason_code="dedicated_ocr_activation_state_invalid",
+            )) from None
+        yield
+
+
+def _require_provider(
+    provider: LLMProvider | None, shared_gpu: bool | None, *,
+    candidate: ModelHandoff | None, uses_ocr: bool,
+) -> None:
+    from ..config import settings
+
+    if uses_ocr and not settings.ocr.enabled:
+        raise HandoffWait(HandoffStatus(state="configuration_required", reason_code="dedicated_ocr_disabled"))
+    if shared_gpu is None or (provider is None and not uses_ocr and candidate is None):
         return
     owner = current_owner() if _task() is not None else None
-    handoff = owner.coordinator if owner is not None else provider.handoff
-    endpoint = os.environ.get("OCR_ACTIVATION_ENDPOINT")
-    if not shared_gpu and provider.handoff is None and owner is None:
+    attached = provider.handoff if provider is not None else None
+    handoff = candidate if candidate is not None else (owner.coordinator if owner is not None else attached)
+    endpoint = os.environ.get("OCR_ACTIVATION_ENDPOINT", settings.ocr.service_url).rstrip("/")
+    if not shared_gpu and handoff is None and not uses_ocr:
         return
     if (
         isinstance(handoff, ModelHandoff)
+        and (not uses_ocr or candidate is not None)
         and handoff.shared_gpu == shared_gpu
         and getattr(handoff.ocr, "managed_lifecycle", False)
         and handoff.path.resolve() == activation_handoff_path().resolve()
-        and (endpoint is None or getattr(handoff.ocr, "service_url", None) == endpoint.rstrip("/"))
+        and getattr(handoff.ocr, "service_url", None) == endpoint
+        and (owner is None or handoff.matches(owner.coordinator))
         and (
-            not shared_gpu and provider.handoff is None
-            or shared_gpu and provider.supports_model_release and handoff.resources.llm == provider.lifecycle_identity
-            and (owner is None or provider.handoff is None
-                 or isinstance(provider.handoff, ModelHandoff) and handoff.matches(provider.handoff))
+            not shared_gpu and attached is None
+            or shared_gpu and provider is not None and provider.supports_model_release
+            and handoff.resources.llm == provider.lifecycle_identity
+            and (attached is None or isinstance(attached, ModelHandoff) and handoff.matches(attached))
         )
     ):
         return
@@ -91,6 +137,7 @@ def _require_provider(provider: LLMProvider | None, shared_gpu: bool | None) -> 
 @contextmanager
 def inference_admission(
     provider: LLMProvider | None = None, *, store: ActivationStore | None = None,
+    handoff: ModelHandoff | None = None, uses_ocr: bool = False,
 ) -> Iterator[None]:
     """Hold a shared lock for an attempt, reusing it for that task's nested calls."""
     if not activation_enabled():
@@ -98,7 +145,7 @@ def inference_admission(
         return
     admitted = _current_admission()
     if admitted is not None and (store is None or store == admitted.store):
-        _require_provider(provider, admitted.shared_gpu)
+        _require_provider(provider, admitted.shared_gpu, candidate=handoff, uses_ocr=uses_ocr)
         yield
         return
 
@@ -111,12 +158,7 @@ def inference_admission(
             status = selected.read_status(request) if request is not None else None
             if request is not None and status is not None and status.phase == ActivationPhase.READY:
                 from ..config import settings
-                shared_gpu = selected.shared_gpu()
-                if (selected.runtime_enabled(request) != settings.ocr.enabled
-                        or shared_gpu != settings.ocr.shared_gpu):
-                    raise HandoffWait(HandoffStatus(
-                        state="configuration_required", reason_code="execution_policy_changed",
-                    ))
+                shared_gpu = _require_current_route(selected, request, settings.ocr)
         except ActivationBusy:
             raise HandoffWait(HandoffStatus(state="busy", reason_code="dedicated_ocr_activation_pending")) from None
         except (ActivationStateError, OSError):
@@ -126,7 +168,7 @@ def inference_admission(
         if request is not None and (status is None or status.phase != ActivationPhase.READY):
             raise HandoffWait(HandoffStatus(state="busy", reason_code="dedicated_ocr_activation_pending"))
 
-        _require_provider(provider, shared_gpu)
+        _require_provider(provider, shared_gpu, candidate=handoff, uses_ocr=uses_ocr)
         token = _current.set(_Admission(selected, shared_gpu, _task(), get_ident()))
         try:
             yield

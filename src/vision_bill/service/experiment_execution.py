@@ -207,23 +207,24 @@ async def pipeline_identity(
     handoff = ReceiptExtractionPipeline(provider, ocr, settings).coordinator(
         direct=options.pipeline == ExtractionPipeline.DIRECT,
     )
-    binding_sha256 = None
-    if handoff is not None and handoff.shared_gpu:
-        binding = handoff.require_binding(expected_binding_sha256)
-        if qualify and any(model not in binding.model_ids for model in managed_model_ids):
-            raise HandoffWait(HandoffStatus(
-                state="configuration_required", reason_code="model_handoff_model_not_adopted",
-            ))
-        binding_sha256 = handoff.binding_sha256(binding)
-    elif expected_binding_sha256 is not None:
-        raise HandoffWait(HandoffStatus(
-            state="configuration_required", reason_code="execution_policy_changed",
-        ))
     capabilities = None
-    if ocr is not None and options.pipeline != ExtractionPipeline.DIRECT:
-        if qualify and handoff is not None:
-            deadline = monotonic() + provider.analysis_timeout_seconds
-            with inference_admission(provider):
+    binding_sha256 = None
+    uses_ocr = ocr is not None and options.pipeline != ExtractionPipeline.DIRECT
+    with inference_admission(provider, handoff=handoff, uses_ocr=uses_ocr):
+        if handoff is not None and handoff.shared_gpu:
+            binding = handoff.require_binding(expected_binding_sha256)
+            if qualify and any(model not in binding.model_ids for model in managed_model_ids):
+                raise HandoffWait(HandoffStatus(
+                    state="configuration_required", reason_code="model_handoff_model_not_adopted",
+                ))
+            binding_sha256 = handoff.binding_sha256(binding)
+        elif expected_binding_sha256 is not None:
+            raise HandoffWait(HandoffStatus(
+                state="configuration_required", reason_code="execution_policy_changed",
+            ))
+        if ocr is not None and uses_ocr:
+            if qualify and handoff is not None:
+                deadline = monotonic() + provider.analysis_timeout_seconds
                 async with handoff.session(
                     deadline, model_ids=managed_model_ids, expected_binding_sha256=binding_sha256,
                     lock_deadline=admission_deadline(deadline),
@@ -233,13 +234,13 @@ async def pipeline_identity(
                     if not qualified.ready or not qualified.runtime_fingerprint:
                         raise ValueError("ocr_qualification_required")
                     capabilities = qualified.model_dump(mode="json")
-        else:
-            capabilities = (await ocr.get_capabilities()).model_dump(mode="json")
-        if getattr(ocr, "managed_lifecycle", False):
-            # Residency and availability are observations, not frozen identity.
-            capabilities = {key: capabilities[key] for key in (
-                "profile_id", "runtime_fingerprint", "ocr_max_new_tokens"
-            )}
+            else:
+                capabilities = (await ocr.get_capabilities()).model_dump(mode="json")
+            if getattr(ocr, "managed_lifecycle", False):
+                # Residency and availability are observations, not frozen identity.
+                capabilities = {key: capabilities[key] for key in (
+                    "profile_id", "runtime_fingerprint", "ocr_max_new_tokens"
+                )}
     return {
         "execution_policy_version": EXECUTION_POLICY_VERSION,
         "managed_binding_sha256": binding_sha256,

@@ -150,11 +150,12 @@ class BenchmarkService:
             if current is None or (digest and digest != current.digest):
                 raise ValueError("Selected model is unavailable or its digest changed; create a new run")
             budget = await self._timeout(run)
-            async with asyncio.timeout(budget):
-                expected, result = await self._run_experiment(
-                    manifest, receipt_id, model_id, managed_model_ids=run.model_ids,
-                    inference_deadline=monotonic() + budget,
-                )
+            with inference_admission(self._provider):
+                async with asyncio.timeout(budget):
+                    expected, result = await self._run_experiment(
+                        manifest, receipt_id, model_id, managed_model_ids=run.model_ids,
+                        inference_deadline=monotonic() + budget,
+                    )
             detail = self._score(manifest, receipt_id, expected, result.receipt)
             item = next(item for item in manifest["inputs"] if item["receipt_id"] == str(receipt_id))
             return {"receipt_id": receipt_id, "model_id": model_id, **detail,

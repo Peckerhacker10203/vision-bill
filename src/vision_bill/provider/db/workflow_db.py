@@ -140,7 +140,8 @@ def _is_unmanaged_checkpoint_policy(row: Any) -> bool:
     try:
         snapshot = _decoded(row["effective_options"])
         identity = _decoded(row["observation_checkpoint"])["execution_identity"]
-        return not managed_ocr(snapshot_ocr(snapshot)) and (
+        ocr = snapshot_ocr(snapshot)
+        return (not managed_ocr(ocr) or not ocr.shared_gpu) and (
             semantic_policy_sha256(snapshot) == identity["semantic_policy_sha256"]
         )
     except (KeyError, TypeError, ValueError):

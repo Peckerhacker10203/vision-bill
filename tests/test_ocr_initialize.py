@@ -493,17 +493,18 @@ def test_metadata_unavailable_is_specific_safe_failure(monkeypatch, accelerator)
         {"extra": False},
     ],
 )
-def test_maintenance_handoff_journal_strict_clean_v2_only(tmp_path, release, monkeypatch, change):
+@pytest.mark.parametrize("shared_gpu", [True, False])
+def test_maintenance_handoff_journal_strict_clean_v2_only(tmp_path, release, monkeypatch, change, shared_gpu):
     from contextlib import contextmanager
 
     from ocr_service import initialize as module
 
     handoff = tmp_path / "gpu-handoff.lock"
-    journal = handoff.with_suffix(".json")
+    journal = handoff.with_suffix(".json" if shared_gpu else ".ocr-only.json")
     state = {
         "version": 2,
         "coordinator": "vision-bill-model-handoff-v2",
-        "resources": {"llm": "explicit-test-llm", "ocr": "explicit-test-ocr"},
+        "resources": {"llm": "explicit-test-llm" if shared_gpu else "external-unmanaged", "ocr": "explicit-test-ocr"},
         "generation": 1,
         "models": [],
         "unsettled": False,

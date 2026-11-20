@@ -99,6 +99,7 @@ async def test_separate_gpu_upload_uses_only_remote_inference_after_confirmed_pa
     )
     ocr = sidecar()
     ocr.managed_lifecycle = True
+    ocr.service_url = selected.service_url
 
     async def claim(_token, _deadline):
         events.append("claim")
@@ -446,3 +447,111 @@ def test_ready_runtime_toggle_holds_stale_worker_route(activation_store, monkeyp
     monkeypatch.setattr(settings.ocr, "enabled", True)
     with pytest.raises(HandoffWait, match="execution_policy_changed"), inference_admission():
         pytest.fail("An OCR-enabled worker entered after the durable OFF intent")
+
+
+def select_ready_separate_ocr(store, monkeypatch, path):
+    from vision_bill.config import OcrSettings, settings
+
+    store.set_shared_gpu(False)
+    request = store.submit_request(MaintenanceIntent.SEPARATE_OCR_DEVICE)
+    assert store.publish_status(ActivationStatus(request.generation, ActivationPhase.READY))
+    monkeypatch.setenv("OCR_ACTIVATION_HANDOFF_LOCK_PATH", str(path))
+    selected = OcrSettings(enabled=True, shared_gpu=False, coordination_path=path,
+                           service_url="http://installed-ocr.test")
+    monkeypatch.setattr(settings, "ocr", selected)
+    return selected
+
+
+@pytest.mark.parametrize("mismatch", ["endpoint", "lock", "native-mode"])
+async def test_standalone_qualification_rejects_unadmitted_ocr_before_io(
+    activation_store, tmp_path, monkeypatch, mismatch,
+):
+    from types import SimpleNamespace
+
+    from vision_bill.model.experiment import ExperimentOptions
+    from vision_bill.service.experiment_execution import pipeline_identity
+
+    settings = select_ready_separate_ocr(activation_store, monkeypatch, tmp_path / "installed.lock")
+    ocr = PaddleOcrProvider(
+        "http://other-ocr.test" if mismatch == "endpoint" else settings.service_url,
+        managed_lifecycle=mismatch != "native-mode",
+    )
+    if mismatch == "lock":
+        settings = settings.model_copy(update={"coordination_path": tmp_path / "other.lock"})
+
+    async def unexpected_ocr(*_args):
+        pytest.fail("An unadmitted sidecar received a resource operation")
+
+    monkeypatch.setattr(ocr, "get_capabilities", unexpected_ocr)
+    monkeypatch.setattr(ocr, "claim", unexpected_ocr)
+    provider = OpenAIProvider("http://remote.test/v1", "none")
+    service = SimpleNamespace(_provider=provider, _ocr_provider=ocr, _ocr_settings=settings)
+    try:
+        with pytest.raises(HandoffWait, match="execution_policy_changed"):
+            await pipeline_identity(service, ExperimentOptions(pipeline="ocr"), qualify=True)
+    finally:
+        await provider._client.close()
+
+
+async def test_legacy_ocr_compatibility_rejects_unadmitted_sidecar_before_claim(
+    activation_store, tmp_path, monkeypatch,
+):
+    from PIL import Image
+
+    select_ready_separate_ocr(activation_store, monkeypatch, tmp_path / "installed.lock")
+    photo = tmp_path / "receipt.png"
+    Image.new("RGB", (4, 5)).save(photo)
+    ocr = PaddleOcrProvider("http://other-ocr.test")
+
+    async def claim(*_args):
+        pytest.fail("The legacy OCR entry point claimed the wrong sidecar")
+
+    monkeypatch.setattr(ocr, "claim", claim)
+    with pytest.raises(HandoffWait, match="execution_policy_changed"):
+        await ocr.extract_text(photo)
+
+
+async def test_benchmark_reevaluation_holds_a_stale_topology_before_experiment(
+    activation_store, tmp_path, monkeypatch,
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from uuid import uuid4
+
+    from vision_bill.config import settings
+    from vision_bill.model.workflow import AccessScope
+    from vision_bill.service.benchmark_service import BenchmarkService
+
+    select_ready_separate_ocr(activation_store, monkeypatch, tmp_path / "installed.lock")
+    monkeypatch.setattr(settings.ocr, "shared_gpu", True)
+    receipt_id, run_id = uuid4(), uuid4()
+    service = BenchmarkService.__new__(BenchmarkService)
+    service._provider = SimpleNamespace(get_available_models=AsyncMock(return_value=[SimpleNamespace(id="fixture")]))
+    service._db = SimpleNamespace(
+        run=AsyncMock(return_value=SimpleNamespace(receipt_ids=[receipt_id], model_ids=["fixture"])),
+        manifest=AsyncMock(return_value={"manifest": True}),
+    )
+    monkeypatch.setattr(service, "_run_digests", AsyncMock(return_value={}))
+    monkeypatch.setattr(service, "_timeout", AsyncMock(return_value=3))
+
+    async def unexpected_experiment(*_args, **_kwargs):
+        pytest.fail("Stale reevaluation entered readiness or native ownership")
+
+    monkeypatch.setattr(service, "_run_experiment", unexpected_experiment)
+    with pytest.raises(HandoffWait, match="execution_policy_changed"):
+        await service.reevaluate(run_id, receipt_id, "fixture", scope=AccessScope(user_id=uuid4()))
+
+
+def test_separate_gpu_diagnostic_keeps_direct_inference_marker(activation_store, tmp_path, monkeypatch):
+    select_ready_separate_ocr(activation_store, monkeypatch, tmp_path / "installed.lock")
+    budget = Budget("http://remote.test", "fixture", 1024, 10)
+    budget.ctx = 1024
+
+    def post(path, payload):
+        assert path == "/api/generate"
+        assert len(unsettled_direct_calls(activation_store)) == 1
+        return {"prompt_eval_count": 17}
+
+    monkeypatch.setattr(budget, "_post", post)
+    assert budget.count("fixture") == 17
+    assert unsettled_direct_calls(activation_store) == ()

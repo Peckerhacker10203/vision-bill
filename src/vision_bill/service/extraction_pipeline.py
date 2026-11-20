@@ -106,8 +106,9 @@ class ExtractionPipeline:
         if owner is not None:
             deadline = min(deadline, owner.deadline)
         started = perf_counter()
-        handoff = self.coordinator(direct=options.pipeline.value == "direct_vision")
-        with inference_admission(self.provider):
+        direct = options.pipeline.value == "direct_vision"
+        handoff = self.coordinator(direct=direct)
+        with inference_admission(self.provider, handoff=handoff, uses_ocr=self.settings.enabled and not direct):
             async with asyncio.timeout(max(0, deadline - monotonic())), (
                 handoff.session(
                     deadline, model_id=model_id,

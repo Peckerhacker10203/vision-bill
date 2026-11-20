@@ -10,9 +10,11 @@ from ocr_contract.limits import APP_SOURCE_MAX_BYTES
 
 from ..config import settings
 from ..model.db.image import ImagePart, ImageRow
+from ..model.handoff import HandoffWait
 from ..model.workflow import AccessScope, SubmissionCreate, SubmissionStatus
 from ..security.dependencies import get_current_user
 from ..security.models import User
+from ..service.activation_admission import policy_capture
 from ..service.analysis_scheduler import AnalysisScheduler
 from ..service.image_service import ImageService, UnsupportedImageTypeError
 from ..service.receipt_service import ReceiptService
@@ -74,6 +76,11 @@ async def upload_image(
             part.original_filename = upload.filename
             thumb = image_service.generate_thumbnail(Path(part.image_path))
             part.thumbnail_path = str(thumb) if thumb else None
+        with policy_capture(settings.ocr):
+            effective_options = receipt_service.current_execution_snapshot(settings)
+    except HandoffWait as exc:
+        _discard_unreferenced(parts, image_service)
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     except BaseException:
         _discard_unreferenced(parts, image_service)
         raise
@@ -103,7 +110,7 @@ async def upload_image(
         source_manifest=manifest,
         requested_options=requested,
         request_fingerprint=fingerprint,
-        effective_options=receipt_service.current_execution_snapshot(settings),
+        effective_options=effective_options,
         model_id=model_id if model_id is not None else settings.llm.model_name,
         bypass_review=(
             settings.images.bypass_review_default if bypass_review is None else bypass_review

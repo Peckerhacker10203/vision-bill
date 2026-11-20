@@ -10,9 +10,11 @@ from pydantic import ValidationError
 from ..helper.deadline import run_sync_before
 from ..model.db.receipt import ReceiptRow
 from ..model.extraction import DraftView
+from ..model.handoff import HandoffWait
 from ..model.workflow import AccessScope, DraftFinalize, DraftPatch, RetryRequest, SubmissionStatus
 from ..security.dependencies import get_current_user
 from ..security.models import User
+from ..service.activation_admission import policy_capture
 from ..service.analysis_scheduler import AnalysisScheduler
 from ..service.submission_service import SubmissionService
 from .helper.helper import get_analysis_scheduler
@@ -97,10 +99,16 @@ async def retry(
     scheduler: AnalysisScheduler = Depends(get_analysis_scheduler),  # noqa: B008
 ) -> SubmissionStatus:
     try:
+        replacement_snapshot = None
+        if request.policy == "current":
+            with policy_capture(service.settings.ocr):
+                replacement_snapshot = service.current_snapshot()
         status = await service.db.retry_submission(
             image_id, request, scope=scope,
-            replacement_snapshot=service.current_snapshot() if request.policy == "current" else None,
+            replacement_snapshot=replacement_snapshot,
         )
+    except HandoffWait as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     except ValueError:
         raise HTTPException(status_code=409, detail="Retry conflict") from None
     if status is None:

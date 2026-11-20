@@ -130,3 +130,50 @@ async def test_benchmark_classification_uses_no_upload_markers(settings, tmp_pat
     assert result.metadata["classification_enrichment"]["state"] == "unavailable"
     assert llm._client.chat.await_count == 2
     record.assert_not_awaited()
+
+
+@pytest.mark.parametrize("shared_gpu", [False, True])
+async def test_managed_ocr_checkpoint_records_unmanaged_formatter_settlement(settings, tmp_path, monkeypatch, shared_gpu):
+    import json
+    from contextlib import asynccontextmanager
+    from uuid import uuid4
+
+    from vision_bill.provider.db import workflow_db
+    from vision_bill.service.execution_policy import current_snapshot, semantic_policy_sha256
+
+    _, _, _, claim, _ = context(settings, tmp_path)
+    settings.ocr.enabled = True
+    settings.ocr.shared_gpu = shared_gpu
+    snapshot = current_snapshot(settings)
+    checkpoint_id = uuid4()
+    row = {
+        "id": claim.image.id, "generation": claim.image.generation, "attempt_count": claim.image.attempt_count,
+        "receipt_id": None, "effective_options": snapshot, "legacy_events": [],
+        "observation_checkpoint": {
+            "checkpoint_id": str(checkpoint_id), "eligible_generation": claim.image.generation,
+            "producer_generation": claim.image.generation, "producer_attempt_number": claim.image.attempt_count,
+            "execution_identity": {"inference_identity": "openai:fixture",
+                                   "semantic_policy_sha256": semantic_policy_sha256(snapshot)},
+            "envelope": {"classification_enrichment": {"state": "pending"}},
+        },
+    }
+
+    async def fetchval(_sql, image_id, events):
+        assert image_id == row["id"]
+        row["legacy_events"].extend(json.loads(events))
+        return image_id
+
+    @asynccontextmanager
+    async def connection(*_args, **_kwargs):
+        from types import SimpleNamespace
+
+        yield SimpleNamespace(fetchval=fetchval)
+
+    db = workflow_db.WorkflowDB(settings.pg)
+    monkeypatch.setattr(db, "_pool", object())
+    monkeypatch.setattr(db, "_lock_claim", AsyncMock(return_value=row))
+    monkeypatch.setattr(workflow_db, "connection", connection)
+    assert await db.record_unmanaged_classification_event(claim, checkpoint_id, state="started") is not shared_gpu
+    assert await db.record_unmanaged_classification_event(claim, checkpoint_id, state="settled") is not shared_gpu
+    events = [item["event"] for item in row["legacy_events"]]
+    assert events == ([] if shared_gpu else ["unmanaged_classification_started", "unmanaged_classification_settled"])

@@ -163,7 +163,7 @@ class DedicatedOcrActivation:
         except HandoffWait:
             raise
         except RuntimeError as exc:
-            if str(exc) == "model_release_unconfirmed":
+            if str(exc).partition(":")[0] == "model_release_unconfirmed":
                 raise _topology_wait("model_release_unconfirmed") from None
             raise _topology_wait("ocr_runtime_unavailable") from None
         return await self.status()
@@ -268,7 +268,7 @@ class DedicatedOcrActivation:
         try:
             result = await self._submit(confirm_handoff=confirm_handoff, enabled=enabled)
         except RuntimeError as exc:
-            if str(exc) != "model_release_unconfirmed":
+            if str(exc).partition(":")[0] != "model_release_unconfirmed":
                 raise
             result = DedicatedOcrStatus(
                 state="action_required", reason="model_release_unconfirmed", installed=True,

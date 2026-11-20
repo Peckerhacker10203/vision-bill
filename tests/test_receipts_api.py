@@ -325,6 +325,31 @@ def test_upload_image_returns_202_when_provider_unreachable(api_context: ApiCont
     ctx.provider.analyse_receipt_from_model.assert_not_awaited()
 
 
+def test_upload_cannot_freeze_a_stale_dedicated_ocr_topology(api_context, monkeypatch, tmp_path):
+    from ocr_contract.activation import (
+        ActivationPhase,
+        ActivationStatus,
+        ActivationStore,
+        MaintenanceIntent,
+    )
+
+    from vision_bill.config import settings
+    from vision_bill.service import activation_admission
+
+    store = ActivationStore(tmp_path / "request", tmp_path / "status", tmp_path / "lock")
+    monkeypatch.setattr(activation_admission, "ActivationStore", lambda: store)
+    monkeypatch.setenv("VISION_BILL_OCR_ACTIVATION", "true")
+    monkeypatch.setattr(settings.ocr, "enabled", True)
+    request = store.submit_request(MaintenanceIntent.SEPARATE_OCR_DEVICE)
+    store.set_shared_gpu(False)
+    assert store.publish_status(ActivationStatus(request.generation, ActivationPhase.READY))
+    ctx = api_context
+    ctx.conn.fetchrow = AsyncMock(return_value=_image_row(id=IMAGE_ID))
+    response = ctx.client.post(IMAGES_URL, files={"receipt": _upload_jpeg()})
+    assert response.status_code == 409 and response.json()["detail"] == "execution_policy_changed"
+    ctx.conn.fetchrow.assert_not_called()
+
+
 # ── Image collection (GET /images) ─────────────────────────────────────
 
 
