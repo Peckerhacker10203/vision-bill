@@ -674,8 +674,13 @@ def test_invalid_bearer_input_is_never_reflected(saved_settings, invalid, caplog
     assert path.read_bytes() == previous
 
 
-@pytest.mark.parametrize(("status_code", "result"), [(200, "connected"), (401, "authentication_failed"), (503, "unreachable")])
-def test_saved_connection_probe_only_reads_model_discovery(saved_settings, status_code, result):
+@pytest.mark.parametrize(
+    ("status_code", "encoding", "result"),
+    [(200, None, "connected"), (401, None, "authentication_failed"), (503, None, "unreachable"),
+     (200, "gzip", "invalid_response"), (200, "long_integer", "invalid_response")],
+)
+def test_saved_connection_probe_only_reads_bounded_model_discovery(saved_settings, status_code, encoding, result):
+    import gzip
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from threading import Thread
 
@@ -684,10 +689,16 @@ def test_saved_connection_probe_only_reads_model_discovery(saved_settings, statu
 
     class Stub(BaseHTTPRequestHandler):
         def do_GET(self):
-            calls.append((self.command, self.path, self.headers.get_all("Authorization")))
+            calls.append((self.command, self.path, self.headers.get_all("Authorization"), self.headers.get("Accept-Encoding")))
+            response_body = b'{"data": [], "private_message": "selected-secret"}'
             self.send_response(status_code)
+            if encoding == "gzip":
+                self.send_header("Content-Encoding", "gzip")
+                response_body = gzip.compress(response_body)
+            elif encoding == "long_integer":
+                response_body = b'{"data": [' + b"9" * 6000 + b"]}"
             self.end_headers()
-            self.wfile.write(b'{"data": [], "private_message": "selected-secret"}')
+            self.wfile.write(response_body)
 
         def log_message(self, *_args):
             pass
@@ -703,7 +714,7 @@ def test_saved_connection_probe_only_reads_model_discovery(saved_settings, statu
             }
             assert client.put("/system/settings", json=body).status_code == 200
             previous = path.read_bytes()
-            response = client.post("/system/settings/llm/connection-test")
+            response = client.post("/system/settings/llm/connection-test", json={"host": host})
             assert response.status_code == 200
             assert response.json() == {"status": result}
             assert "selected-secret" not in response.text
@@ -711,4 +722,127 @@ def test_saved_connection_probe_only_reads_model_discovery(saved_settings, statu
         finally:
             server.shutdown()
             thread.join()
-    assert calls == [("GET", "/llama/v1/models", ["Bearer selected-secret"])]
+    assert calls == [("GET", "/llama/v1/models", ["Bearer selected-secret"], "identity")]
+
+
+@pytest.mark.parametrize("stale_replica", [False, True])
+def test_stale_none_cannot_disable_credentials_for_a_changed_origin(saved_settings, monkeypatch, stale_replica):
+    path, _, active, client = saved_settings
+    active.llm.provider = config.LLMProviderEnum.OPENAI
+    replica = active.model_copy(deep=True)
+    stale_body = {**explicit_payload(active), "llm_authentication": {"mode": "none"}}
+    new_body = {
+        **explicit_payload(active, host="https://new.example/v1"),
+        "llm_authentication": {"mode": "bearer", "api_key": "new-endpoint-key"},
+    }
+    assert client.put("/system/settings", json=new_body).status_code == 200
+    previous = path.read_bytes()
+    if stale_replica:
+        monkeypatch.setattr(system, "settings", replica)
+    assert client.put("/system/settings", json=stale_body).status_code == 409
+    assert path.read_bytes() == previous
+
+
+@pytest.mark.parametrize("selection", [{"mode": "none"}, {"mode": "bearer", "api_key": "new-key"}])
+@pytest.mark.parametrize("key_source", ["config", "environment"])
+def test_moving_origin_with_explicit_authentication_fences_legacy_key_on_rollback(
+    saved_settings, monkeypatch, selection, key_source,
+):
+    path, _, active, client = saved_settings
+    monkeypatch.delenv("LLM__API_KEY", raising=False)
+    if key_source == "environment":
+        monkeypatch.setenv("LLM__API_KEY", "deployment-key")
+    old_host = active.llm.host
+    body = {**explicit_payload(active, provider="openai", host="https://new.example/v1"), "llm_authentication": selection}
+    assert client.put("/system/settings", json=body).status_code == 200
+    document = yaml.safe_load(path.read_text())
+    assert document["llm"]["api_key"] == "persisted-api-secret"
+    assert document.get("llm_credential_origin") == old_host
+    monkeypatch.setitem(config.Settings.model_config, "yaml_file", str(path))
+    document.pop("llm_authentication")
+    path.write_text(yaml.safe_dump(document))
+    with pytest.raises(ValueError, match="operator approval"):
+        config.Settings()
+
+
+def test_connection_probe_rejects_a_different_saved_endpoint(saved_settings):
+    _, _, active, client = saved_settings
+    active.llm.provider = config.LLMProviderEnum.OPENAI
+    active.llm.host = "http://127.0.0.1:1/v1"
+    assert client.post("/system/settings/llm/connection-test", json={"host": "http://127.0.0.1:2/v1"}).status_code == 409
+
+
+def test_connection_probe_rejects_a_new_endpoint_saved_by_another_replica(saved_settings):
+    path, document, active, client = saved_settings
+    active.llm.provider = config.LLMProviderEnum.OPENAI
+    active.llm.host = "http://127.0.0.1:1/v1"
+    document["llm"]["host"] = "http://127.0.0.1:2/v1"
+    path.write_text(yaml.safe_dump(document))
+    assert client.post("/system/settings/llm/connection-test", json={"host": active.llm.host}).status_code == 409
+
+
+def test_legacy_ambient_authorization_prevents_cross_origin_host_edit(saved_settings, monkeypatch):
+    path, _, active, client = saved_settings
+    active.llm.provider = config.LLMProviderEnum.OPENAI
+    active.llm.api_key = "none"
+    monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", "aUtHoRiZaTiOn: Bearer legacy-ambient-key")
+    before = path.read_bytes()
+    response = client.put("/system/settings", json=explicit_payload(active, host="https://other.example/v1"))
+    assert response.status_code == 409
+    assert path.read_bytes() == before
+
+
+def test_explicit_none_does_not_expose_retained_ambient_credentials_on_rollback(saved_settings, monkeypatch):
+    path, _, active, client = saved_settings
+    active.llm.provider = config.LLMProviderEnum.OPENAI
+    active.llm.api_key = "none"
+    monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", "Authorization: Bearer legacy-ambient-key")
+    monkeypatch.setenv("LLM__API_KEY", "none")
+    new_origin = "https://other.example/v1"
+    choice = {"mode": "none"}
+    before = path.read_bytes()
+    move = {**explicit_payload(active, host=new_origin), "llm_authentication": choice}
+    assert client.put("/system/settings", json=move).status_code == 409
+    assert path.read_bytes() == before
+    same_origin = {**explicit_payload(active), "llm_authentication": choice}
+    assert client.put("/system/settings", json=same_origin).status_code == 200
+    assert client.put("/system/settings", json=explicit_payload(active, host=new_origin)).status_code == 409
+
+
+def test_explicit_bearer_with_the_same_key_still_requires_restart(saved_settings, monkeypatch):
+    _, _, active, client = saved_settings
+    active.llm.provider = config.LLMProviderEnum.OPENAI
+    monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", "Host: legacy-route.example")
+    config.mark_startup_settings(active)
+    body = {
+        **explicit_payload(active),
+        "llm_authentication": {"mode": "bearer", "api_key": active.llm.api_key},
+    }
+    response = client.put("/system/settings", json=body)
+    assert response.status_code == 200
+    assert response.json()["restart_required"] is True
+
+
+def test_ordinary_model_discovery_uses_the_running_provider(monkeypatch):
+    from types import SimpleNamespace
+
+    from vision_bill.api.system import llm
+    from vision_bill.provider.llm.base import ModelInfo
+    from vision_bill.security.dependencies import get_current_user
+
+    async def running_models(*, capability):
+        assert capability == "text"
+        return [ModelInfo("live-model")]
+
+    async def pending_models(*, capability):
+        return [ModelInfo("pending-model")]
+
+    monkeypatch.setattr(llm, "get_llm_provider", lambda _settings: SimpleNamespace(
+        get_available_models=pending_models,
+    ), raising=False)
+    app = FastAPI()
+    app.state.llm_provider = SimpleNamespace(get_available_models=running_models)
+    app.include_router(llm.router)
+    app.dependency_overrides[get_current_user] = lambda: None
+    with TestClient(app) as client:
+        assert [model["id"] for model in client.get("/models?capability=text").json()] == ["live-model"]

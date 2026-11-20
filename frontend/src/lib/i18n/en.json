@@ -456,7 +456,8 @@
 				"invalid_response": "The endpoint did not return a valid model list.",
 				"origin_mismatch": "The saved key belongs to a different endpoint. Enter a new key or select None.",
 				"unsupported_provider": "This test requires an OpenAI-compatible provider.",
-				"request_failed": "Could not run the connection test."
+				"request_failed": "Could not run the connection test.",
+				"settings_changed": "The saved connection changed. Reload the page before testing."
 			}
 		},
 		"contextWindow": "Context window (tokens)",

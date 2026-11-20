@@ -361,8 +361,12 @@ export const api = {
 		});
 	},
 
-	testLlmConnection(): Promise<LlmConnectionResult> {
-		return request<LlmConnectionResult>('/system/settings/llm/connection-test', { method: 'POST' });
+	testLlmConnection(host: string): Promise<LlmConnectionResult> {
+		return request<LlmConnectionResult>('/system/settings/llm/connection-test', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ host })
+		});
 	},
 
 	/** GET /auth/me returns the current user (401 when the session is gone). */

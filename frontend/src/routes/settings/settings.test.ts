@@ -171,5 +171,5 @@ it('adopts a write-only bearer key and shows the saved connection result', async
 	expect(screen.queryByLabelText('New API key or access token')).toBeNull();
 	await fireEvent.click(screen.getByRole('button', { name: 'Test saved connection' }));
 	expect(await screen.findByText('The endpoint rejected the configured credentials.')).toBeTruthy();
-	expect(fetch.mock.calls[1][1].body).toBeUndefined();
+	expect(JSON.parse(fetch.mock.calls[1][1].body)).toEqual({ host: initial.llm.host });
 });

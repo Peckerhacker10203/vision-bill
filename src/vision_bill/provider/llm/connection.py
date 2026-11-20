@@ -6,7 +6,7 @@ from typing import Literal
 
 import httpx
 
-from ...config import LLMProviderEnum, LLMSettings
+from ...config import LLMProviderEnum, LLMSettings, ambient_openai_headers
 from . import OPENAI_CREDENTIALLESS_API_KEY
 
 ConnectionStatus = Literal[
@@ -23,7 +23,13 @@ async def check_saved_connection(settings: LLMSettings) -> ConnectionStatus:
     key = settings.request_api_key()
     if settings.authentication is not None and settings.authentication.mode == "bearer" and key is None:
         return "origin_mismatch"
-    headers = {"Authorization": f"Bearer {key or OPENAI_CREDENTIALLESS_API_KEY}"} if key is not None else None
+    headers = {"Accept-Encoding": "identity"}
+    if key is not None:
+        headers["Authorization"] = f"Bearer {key or OPENAI_CREDENTIALLESS_API_KEY}"
+    if settings.authentication is None:
+        headers.update({
+            name: value for name, value in ambient_openai_headers().items() if name.lower() != "accept-encoding"
+        })
     try:
         url = httpx.URL(settings.host)
         if url.scheme not in ("http", "https") or not url.host or url.userinfo:
@@ -35,14 +41,17 @@ async def check_saved_connection(settings: LLMSettings) -> ConnectionStatus:
                 return "authentication_failed"
             if not response.is_success:
                 return "unreachable"
+            if response.headers.get("content-encoding", "identity").strip().lower() != "identity":
+                return "invalid_response"
             body = bytearray()
-            async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
-                body.extend(chunk)
-                if len(body) > MAX_DISCOVERY_BYTES:
+            async for chunk in response.aiter_raw():
+                if len(body) + len(chunk) > MAX_DISCOVERY_BYTES:
                     return "invalid_response"
-        payload = json.loads(body)
+                body.extend(chunk)
     except (httpx.HTTPError, httpx.InvalidURL, TimeoutError, UnicodeEncodeError):
         return "unreachable"
-    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+    try:
+        payload = json.loads(body)
+    except (ValueError, RecursionError):
         return "invalid_response"
     return "connected" if isinstance(payload, dict) and isinstance(payload.get("data"), list) else "invalid_response"

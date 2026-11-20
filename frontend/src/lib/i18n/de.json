@@ -456,7 +456,8 @@
 				"invalid_response": "Der Endpunkt hat keine gültige Modellliste zurückgegeben.",
 				"origin_mismatch": "Der gespeicherte Schlüssel gehört zu einem anderen Endpunkt. Geben Sie einen neuen Schlüssel ein oder wählen Sie Keine.",
 				"unsupported_provider": "Dieser Test erfordert einen OpenAI-kompatiblen Anbieter.",
-				"request_failed": "Der Verbindungstest konnte nicht ausgeführt werden."
+				"request_failed": "Der Verbindungstest konnte nicht ausgeführt werden.",
+				"settings_changed": "Die gespeicherte Verbindung wurde geändert. Laden Sie die Seite vor dem Test neu."
 			}
 		},
 		"contextWindow": "Kontextfenster (Token)",

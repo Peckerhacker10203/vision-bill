@@ -48,7 +48,9 @@
 	let authMode = $state<'keep' | LlmAuthenticationUpdate['mode']>('keep');
 	let bearerKey = $state('');
 	let testingConnection = $state(false);
-	let connectionResult = $state<LlmConnectionResult['status'] | 'request_failed' | null>(null);
+	let connectionResult = $state<
+		LlmConnectionResult['status'] | 'request_failed' | 'settings_changed' | null
+	>(null);
 	const connectionEdited = $derived(
 		authMode !== 'keep' ||
 			form.llm.host !== baseline?.llm.host ||
@@ -90,10 +92,12 @@
 		testingConnection = true;
 		connectionResult = null;
 		try {
-			const result = await api.testLlmConnection();
+			const result = await api.testLlmConnection(form.llm.host);
 			if (isCurrentView()) connectionResult = result.status;
-		} catch {
-			if (isCurrentView()) connectionResult = 'request_failed';
+		} catch (cause) {
+			if (isCurrentView())
+				connectionResult =
+					cause instanceof ApiError && cause.status === 409 ? 'settings_changed' : 'request_failed';
 		} finally {
 			if (isCurrentView()) testingConnection = false;
 		}

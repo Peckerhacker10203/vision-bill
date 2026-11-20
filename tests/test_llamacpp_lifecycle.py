@@ -341,18 +341,19 @@ async def test_managed_openai_client_does_not_follow_inference_redirect(monkeypa
         await provider._client.close()
 
 
-@pytest.mark.parametrize("mode", ["none", "bearer"])
-async def test_explicit_authentication_applies_to_inference_and_router_controls(monkeypatch, mode):
+@pytest.mark.parametrize("mode", ["legacy", "none", "bearer"])
+async def test_authentication_applies_to_inference_and_router_controls(monkeypatch, mode):
     import httpx2
 
     from vision_bill.provider.llm import openai as provider_module
 
     monkeypatch.setenv("OPENAI_API_KEY", "ambient-key")
     monkeypatch.setenv("OPENAI_ADMIN_KEY", "ambient-admin-key")
-    monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", "aUtHoRiZaTiOn: Bearer ambient-header")
+    monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", "aUtHoRiZaTiOn: Bearer ambient-header\nHost: other.local")
     seen = []
 
     def inference(request):
+        assert request.headers["Host"] == ("other.local" if mode == "legacy" else "llama.local")
         seen.append((request.method, request.url.path, request.headers.get_list("authorization")))
         return httpx2.Response(200, json={
             "id": "chat", "object": "chat.completion", "created": 0, "model": "own",
@@ -378,7 +379,7 @@ async def test_explicit_authentication_applies_to_inference_and_router_controls(
     settings = LLMSettings.model_validate({
         "provider": "openai", "host": "http://llama.local/llama/v1", "api_key": "deployment-key",
         "model_name": "own", "temperature": 0, "model_lifecycle": "llamacpp",
-        "authentication": authentication,
+        "authentication": authentication if mode != "legacy" else None,
     })
     provider = get_llm_provider(settings)
     try:
@@ -386,5 +387,10 @@ async def test_explicit_authentication_applies_to_inference_and_router_controls(
         assert await provider.resident_model_ids(deadline=monotonic() + 1) == frozenset()
     finally:
         await provider._client.close()
-    headers = [] if mode == "none" else ["Bearer selected-key"]
-    assert seen == [("POST", "/llama/v1/chat/completions", headers), ("GET", "/llama/models", headers)]
+    wire_headers = {
+        "legacy": (["Bearer deployment-key", "Bearer ambient-header"], ["Bearer deployment-key"]),
+        "none": ([], []),
+        "bearer": (["Bearer selected-key"], ["Bearer selected-key"]),
+    }
+    inference_headers, control_headers = wire_headers[mode]
+    assert seen == [("POST", "/llama/v1/chat/completions", inference_headers), ("GET", "/llama/models", control_headers)]

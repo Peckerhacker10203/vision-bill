@@ -85,6 +85,8 @@ class OpenAIProvider(LLMProvider):
         max_output_tokens: int = 8192,
         vision_model_ids: Sequence[str] = (),
         model_lifecycle: Literal["none", "llamacpp"] = "none",
+        *,
+        explicit_authentication: bool = False,
     ):
         if model_lifecycle not in ("none", "llamacpp"):
             raise ValueError("Unsupported OpenAI-compatible model lifecycle")
@@ -98,6 +100,7 @@ class OpenAIProvider(LLMProvider):
         self._vision_model_ids = frozenset(vision_model_ids)
         self.analysis_timeout_seconds = analysis_timeout_seconds
         self.max_output_tokens = max_output_tokens
+        enforce_authentication = explicit_authentication or api_key is None
         url = httpx2.URL(host)
         origin = (url.scheme, url.raw_host, url.port)
 
@@ -105,18 +108,24 @@ class OpenAIProvider(LLMProvider):
             url = request.url
             if effective_api_key is None or (url.scheme, url.raw_host, url.port) != origin:
                 request.headers.pop("Authorization", None)
+            else:
+                request.headers["Authorization"] = f"Bearer {effective_api_key}"
 
         self._client = AsyncOpenAI(
             base_url=host,
             api_key=sdk_api_key,
-            default_headers={"Authorization": f"Bearer {sdk_api_key}"},
             timeout=analysis_timeout_seconds,
             max_retries=0,
             http_client=DefaultAsyncHttpxClient(
                 trust_env=False, follow_redirects=model_lifecycle == "none",
-                event_hooks={"request": [enforce_authorization]},
+                event_hooks={"request": [enforce_authorization]} if enforce_authentication else None,
             ),
         )
+        if enforce_authentication:
+            # The SDK merges OPENAI_CUSTOM_HEADERS even with an explicit constructor mapping.
+            self._client._custom_headers = {}
+            self._client.organization = None
+            self._client.project = None
         self._temperature = temperature
         from ...service.gpu_handoff import configure_handoff
         configure_handoff(self)

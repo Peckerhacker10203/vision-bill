@@ -350,6 +350,24 @@ def has_real_api_key(value: str) -> bool:
     return value.strip().lower() not in {"", "none"}
 
 
+def ambient_openai_headers() -> dict[str, str]:
+    """Read the custom header mapping used by the SDK's legacy connection."""
+    return {
+        name.strip(): value.strip()
+        for line in os.environ.get("OPENAI_CUSTOM_HEADERS", "").splitlines()
+        for name, separator, value in [line.partition(":")]
+        if separator
+    }
+
+
+def has_ambient_openai_authorization() -> bool:
+    return any(name.lower() == "authorization" and bool(value) for name, value in ambient_openai_headers().items())
+
+
+def has_legacy_llm_credentials(api_key: str) -> bool:
+    return has_real_api_key(api_key) or has_ambient_openai_authorization()
+
+
 def llm_origin(host: str) -> str:
     try:
         url = httpx.URL(host if "://" in host else "http://" + host)
@@ -403,7 +421,7 @@ def _guarded_admin_overrides(data: dict[str, Any], sources: list[dict[str, Any]]
     for source in reversed(sources[:-1]):
         deployment.update(llm_values(source))
     effective.update(deployment)
-    if not has_real_api_key(effective.get("api_key", "")):
+    if not has_legacy_llm_credentials(effective.get("api_key", "")):
         return adopted
     deployment_host = deployment.get("host")
     if deployment_host is not None and llm_origin(deployment_host) != pinned_origin:
@@ -450,14 +468,33 @@ def deployment_llm_credential_source() -> Literal["environment", "config"]:
     return "config"
 
 
+class SavedLlmEndpointChanged(ValueError):
+    """The shared settings document changed to a different LLM origin."""
+
+
+def _saved_llm_host(data: dict[str, Any]) -> str | None:
+    env = EnvSettingsSource(Settings)()
+    dotenv = DotEnvSettingsSource(Settings)()
+    adopted = _guarded_admin_overrides(data, [{}, env, dotenv, {}])
+    for source in (adopted, env, dotenv, data):
+        llm = source.get("llm")
+        if isinstance(llm, dict) and isinstance(llm.get("host"), str):
+            return str(llm["host"])
+    return None
+
+
+def saved_llm_host() -> str | None:
+    return _saved_llm_host(_read_yaml_config(get_config_path()))
+
+
 def write_config_file(
     config: Settings, *, changed_paths: frozenset[str] | None = None,
-    credential_origin: str | None = None, save_llm_authentication: bool = False,
+    credential_origin: str | None = None, llm_authentication_expected_origin: str | None = None,
 ) -> None:
     """Merge a save under the bootstrap lock without discarding private metadata."""
     _publish_config_file(
         get_config_path(), config, changed_paths=changed_paths, credential_origin=credential_origin,
-        save_llm_authentication=save_llm_authentication,
+        llm_authentication_expected_origin=llm_authentication_expected_origin,
     )
 
 
@@ -468,7 +505,7 @@ def _publish_config_file(
     changed_paths: frozenset[str] | None = None,
     create_only: bool = False,
     credential_origin: str | None = None,
-    save_llm_authentication: bool = False,
+    llm_authentication_expected_origin: str | None = None,
 ) -> bool:
     from .distribution.bootstrap import (
         BootstrapError,
@@ -510,6 +547,10 @@ def _publish_config_file(
             raise BootstrapError("Incomplete installation requires explicit recovery")
         resolved = config.model_dump(mode="json", exclude={"pg": {"database_url", "pg_dsn"}})
         data = read_mapping(path) if existing else (resolved if changed_paths is None else {})
+        if llm_authentication_expected_origin is not None:
+            saved_host = _saved_llm_host(data)
+            if saved_host is not None and llm_origin(saved_host) != llm_authentication_expected_origin:
+                raise SavedLlmEndpointChanged
         if existing:
             # Source deployments can keep credentials and other required fields in
             # the environment. Fill missing validation inputs only, without copying
@@ -540,10 +581,14 @@ def _publish_config_file(
                 if not isinstance(section_data, dict):
                     raise BootstrapError("Persistent configuration has a conflicting section type")
                 section_data[key] = resolved[section][key]
-        if save_llm_authentication and config.llm.authentication is not None:
+        if llm_authentication_expected_origin is not None and config.llm.authentication is not None:
             data[LLM_AUTHENTICATION_KEY] = config.llm.authentication.private_record()
+            if data.get("llm_credential_origin") is None:
+                # Older loaders ignore the explicit mode. Keep the retained deployment key bound
+                # to its original origin even when the same save changes the host.
+                data["llm_credential_origin"] = llm_authentication_expected_origin
         if credential_origin is not None:
-            if has_real_api_key(config.llm.api_key):
+            if has_legacy_llm_credentials(config.llm.api_key):
                 data["llm_credential_origin"] = credential_origin
             else:
                 data.setdefault("llm_credential_origin", credential_origin)
@@ -574,7 +619,8 @@ def initialize_config_file(config: Settings) -> None:
 def _llm_runtime_identity(config: Settings) -> tuple[LLMProviderEnum, str, str | None]:
     llm = config.llm
     key = llm.request_api_key() if llm.provider == LLMProviderEnum.OPENAI else None
-    fingerprint = sha256(key.encode()).hexdigest() if key is not None else None
+    policy = "settings" if llm.authentication is not None else "deployment"
+    fingerprint = sha256(f"{policy}\0{key}".encode()).hexdigest() if key is not None else None
     return llm.provider, llm.host, fingerprint
 
 

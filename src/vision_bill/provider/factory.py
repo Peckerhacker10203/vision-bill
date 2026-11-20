@@ -23,6 +23,7 @@ def get_llm_provider(llm_settings: LLMSettings) -> LLMProvider:
         return OpenAIProvider(
             host=llm_settings.host,
             api_key=llm_settings.request_api_key(),
+            explicit_authentication=llm_settings.authentication is not None,
             vision_model_ids=llm_settings.vision_model_ids,
             model_lifecycle=llm_settings.model_lifecycle,
             temperature=llm_settings.temperature,
