@@ -89,10 +89,12 @@ verify it on the actual board. [CUDA build inputs](#build-inputs)
 ### AMD ROCm on native Linux
 
 Use the host's `/dev/kfd` and the selected `/dev/dri/renderD*` node. The source
-command derives the two container group IDs from those device nodes. Set
-`OCR_RENDER_NODE` to the actual render node and `OCR_AMDGPU_TARGETS` to the
-device's actual GFX target when it differs from the default RDNA2 candidate
-list. [ROCm build inputs](#build-inputs)
+command derives the two container group IDs from those device nodes and reads
+the selected node's GFX architecture from the Linux KFD topology. Set
+`OCR_RENDER_NODE` when choosing a different GPU from the default render node.
+Set `OCR_AMDGPU_TARGETS` explicitly for a multi-target build or when the host
+cannot report the selected architecture. The candidate checks the actual HIP
+target before starting the service. [ROCm build inputs](#build-inputs)
 
 ```bash
 python3 scripts/ocr_source_up.py rocm
@@ -100,7 +102,7 @@ python3 scripts/ocr_source_up.py rocm
 
 To test different approved inputs, pass their directory as a second argument
 after the accelerator. It must contain `bundle.json` and its declared local
-fixture tar. The CUDA custom-input path defaults to `cu126`.
+fixture tar. CUDA uses the same `cu129` default with custom inputs.
 [Prepare custom inputs](../distribution/README.md#prepare-approved-native-inputs)
 
 ### Enable and restart
@@ -117,7 +119,9 @@ Sign in as an administrator and open **Settings → Dedicated OCR**. For an LLM
 on another GPU or server, clear **LLM and OCR share a GPU**, save the GPU
 configuration and leave the LLM running. Turn **Dedicated OCR** On.
 The controller waits for this first explicit request before downloading the
-model archives and running native qualification.
+model archives and running native qualification. If collection reaches its
+time limit during automatic activation, the controller logs the timeout and
+retries the full qualification once after reaping the previous processes.
 Turning it Off routes new work to direct vision and keeps the verified cache for
 reuse. On a shared GPU, Vision Bill confirms that the paired formatter model is
 unloaded before loading OCR. In both GPU modes, it waits for the OCR worker
@@ -155,7 +159,8 @@ included architecture and qualification evidence.
 
 These are qualification targets. Release evidence records the architecture,
 driver and host environment for actual runs of the configured OCR pipeline.
-The current source defaults for ROCm build the listed RDNA2 candidates.
+The automatic source launcher builds the selected ROCm device's architecture.
+The standalone ROCm build defaults to the listed RDNA2 candidates.
 [NVIDIA GPU architectures](https://developer.nvidia.com/cuda/gpus) ·
 [TheRock targets at the pinned revision](https://github.com/ROCm/TheRock/blob/b324869fb3116353ac7eec5e6926aa3d452ac987/cmake/therock_amdgpu_targets.cmake) ·
 [Docker Desktop GPU support](https://docs.docker.com/desktop/features/gpu/)
@@ -167,6 +172,17 @@ Verify the wheel and linked libraries, then run device allocation and the
 full OCR pipeline on representative hardware.
 [Official Paddle CUDA 12.9 wheel index](https://www.paddlepaddle.org.cn/packages/stable/cu129/paddlepaddle-gpu/) ·
 [CUDA 12.8 release notes](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-toolkit-release-notes/index.html#new-features)
+
+Run the full native qualification per architecture and host environment you
+intend to support. For CUDA, include representative RTX 20-, 30-, 40- and
+50-series devices, including lower-VRAM configurations, and test native Linux
+and Docker Desktop with WSL 2 independently. For ROCm, qualify the recorded GFX
+target on native Linux. Record the image and model identities, installed driver,
+available VRAM, host OS and Docker version with each report. The CUDA
+`driver_version` value in the report is the driver API version. Record the
+installed NVIDIA driver release separately. Then activate
+Dedicated OCR in the app and verify a multi-photo receipt through OCR, confirmed
+worker shutdown, and LLM formatting. [Native qualification](#what-qualifies)
 
 ## Build inputs
 
@@ -184,8 +200,8 @@ versions through `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_*`.
 
 The checked-in `requirements.cuda.lock` is unresolved. The source setup command
 resolves the selected channel on a connected host when a matching lock is
-unavailable. To resolve it manually, run `make ocr-lock-cuda` for `cu126` or
-`OCR_CUDA_CHANNEL=cu129 make ocr-lock-cuda` for `cu129`. The resolver selects the
+unavailable. To resolve it manually, run `make ocr-lock-cuda` for `cu129` or
+`OCR_CUDA_CHANNEL=cu126 make ocr-lock-cuda` for `cu126`. The resolver selects the
 exact official Paddle GPU 3.3.1 cp312 x86_64 wheel for that channel, inspects its
 METADATA, freezes the full closure, hashes the bytes, and emits the lock plus
 `requirements.cuda.attestation.json`. Review both outputs and use the same

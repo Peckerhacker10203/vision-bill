@@ -4,16 +4,76 @@ import json
 import os
 import platform
 import runpy
+import stat
 import subprocess
 import sys
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from test_ocr_provision import release as ocr_release  # type: ignore[import-not-found] # noqa: F401
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/ocr_source_up.py"
+
+
+def test_rocm_qualification_preserves_selected_render_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import ocr_source_up
+
+    render = "/dev/dri/renderD129"
+    original_stat = Path.stat
+
+    def device_stat(path: Path, **kwargs: Any) -> Any:
+        gids = {"/dev/kfd": 21, render: 22}
+        if str(path) in gids:
+            return SimpleNamespace(st_mode=stat.S_IFCHR, st_gid=gids[str(path)])
+        return original_stat(path, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", device_stat)
+    devices = [{"source": "/dev/kfd", "target": "/dev/kfd"}, {"source": render, "target": render}]
+    arguments, environment = ocr_source_up.gpu_args("rocm", {"devices": devices})
+    assert arguments == [
+        "--device",
+        "/dev/kfd:/dev/kfd",
+        "--group-add",
+        "21",
+        "--device",
+        "/dev/dri/renderD129:/dev/dri/renderD129",
+        "--group-add",
+        "22",
+    ]
+    assert environment == {
+        "OCR_RENDER_NODE": render,
+        "OCR_VIDEO_GID": "21",
+        "OCR_RENDER_GID": "22",
+    }
+
+
+@pytest.mark.parametrize(
+    "renders",
+    [
+        [{"source": "/dev/dri/renderD129", "target": "/dev/dri/renderD128"}],
+        [
+            {"source": "/dev/dri/renderD128", "target": "/dev/dri/renderD128"},
+            {"source": "/dev/dri/renderD129", "target": "/dev/dri/renderD129"},
+        ],
+        [
+            {"source": "/dev/dri/renderD129", "target": "/dev/dri/renderD129"},
+            {"source": "/dev/dri/renderD129", "target": "/dev/dri/renderD129"},
+        ],
+    ],
+)
+def test_rocm_qualification_rejects_remapped_or_extra_render_devices(
+    renders: list[dict[str, str]],
+) -> None:
+    from scripts import ocr_source_up
+
+    devices = [{"source": "/dev/kfd", "target": "/dev/kfd"}, *renders]
+    with pytest.raises(ValueError, match="one selected DRI render node"):
+        ocr_source_up.gpu_args("rocm", {"devices": devices})
 
 
 @pytest.mark.parametrize("accelerator", ["cuda", "rocm"])
@@ -206,14 +266,20 @@ def test_managed_overlay_pins_native_image_and_disables_startup_enable(tmp_path:
 
 
 @pytest.mark.parametrize(
-    ("automatic", "requested_channel", "selected_channel", "reuse"),
-    [(False, None, "cu126", False), (True, None, "cu129", True), (True, "cu126", "cu126", False)],
+    ("automatic", "requested_channel", "compose_channel", "selected_channel", "reuse"),
+    [
+        (False, None, None, "cu129", False),
+        (True, None, "cu129", "cu129", True),
+        (True, "cu126", "cu126", "cu126", False),
+        (False, None, "cu126", "cu126", False),
+    ],
 )
 def test_failed_candidate_cannot_create_restart_record(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     automatic: bool,
     requested_channel: str | None,
+    compose_channel: str | None,
     selected_channel: str,
     reuse: bool,
 ) -> None:
@@ -239,6 +305,7 @@ def test_failed_candidate_cannot_create_restart_record(
         "services": {
             "paddleocr-service": {
                 "image": "vision-bill-ocr-cuda:candidate",
+                "build": {"args": {"OCR_CUDA_CHANNEL": compose_channel}},
                 "deploy": {"resources": {"reservations": {"devices": [{"device_ids": ["2"]}]}}},
             }
         },
@@ -566,6 +633,103 @@ def test_prepare_rejects_the_other_accelerator_record_in_its_project(
     monkeypatch.setattr(ocr_source_up, "command", docker_boundary)
     with pytest.raises(ValueError, match="another accelerator"):
         ocr_source_up.deploy(("docker", "compose"), state, "rocm", tmp_path / "approved")
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [(100304, "gfx1034"), (110001, "gfx1101"), (120001, "gfx1201"), (90010, "gfx90a")],
+)
+def test_rocm_target_matches_the_selected_render_minor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: int, expected: str
+) -> None:
+    from scripts import ocr_source_up
+
+    for node, minor, target in ((0, 0, 0), (1, 128, 100300), (2, 129, version)):
+        directory = tmp_path / str(node)
+        directory.mkdir()
+        (directory / "properties").write_text(
+            f"drm_render_minor {minor}\nvendor_id 4098\ngfx_target_version {target}\n"
+        )
+    original_stat = Path.stat
+
+    def device_stat(path: Path, *args, **kwargs):
+        if path == Path("/dev/dri/renderD129"):
+            return SimpleNamespace(st_rdev=os.makedev(226, 129))
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", device_stat)
+    assert ocr_source_up.rocm_render_target(Path("/dev/dri/renderD129"), tmp_path) == expected
+
+
+@pytest.mark.parametrize("nodes", [(), (100300, 110000), (0,), (110099,)])
+def test_rocm_target_refuses_missing_ambiguous_or_invalid_kfd_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, nodes: tuple[int, ...]
+) -> None:
+    from scripts import ocr_source_up
+
+    for node, version in enumerate(nodes):
+        directory = tmp_path / str(node)
+        directory.mkdir()
+        (directory / "properties").write_text(
+            f"drm_render_minor 129\nvendor_id 4098\ngfx_target_version {version}\n"
+        )
+    original_stat = Path.stat
+    render = Path("/dev/dri/renderD129")
+
+    def device_stat(path: Path, *args, **kwargs):
+        if path == render:
+            return SimpleNamespace(st_rdev=os.makedev(226, 129))
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", device_stat)
+    with pytest.raises(ValueError, match="set OCR_AMDGPU_TARGETS"):
+        ocr_source_up.rocm_render_target(render, tmp_path)
+
+
+def test_automatic_rocm_build_uses_the_selected_target_and_keeps_explicit_build_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts import ocr_source_up
+
+    class BuildReached(Exception):
+        pass
+
+    target = ""
+    selected_builds = []
+    detected = []
+
+    def command(*args: str, capture: bool = False) -> str:
+        if "config" in args:
+            return json.dumps({
+                "name": "test",
+                "services": {"paddleocr-service": {
+                    "image": "vision-bill-ocr-rocm:candidate",
+                    "build": {"args": {"AMDGPU_TARGETS": target}},
+                }},
+            })
+        if args[-2:] == ("build", "paddleocr-service"):
+            selected_builds.append(os.environ["OCR_AMDGPU_TARGETS"])
+            raise BuildReached
+        pytest.fail(f"Unexpected subprocess command: {args}")
+
+    def detect(render: Path) -> str:
+        detected.append(render)
+        return "gfx1201"
+
+    monkeypatch.setattr(ocr_source_up, "command", command)
+    monkeypatch.setattr(ocr_source_up, "gpu_args", lambda *_: ([], {"OCR_RENDER_NODE": "/dev/dri/renderD129"}))
+    monkeypatch.setattr(ocr_source_up, "rocm_render_target", detect, raising=False)
+    for name in ("reject_other_profile", "reject_existing_ocr", "verify_existing_app", "stage_first_run_inputs"):
+        monkeypatch.setattr(ocr_source_up, name, lambda *_: None)
+    for key in ("VB_IMAGE_TAG", "OCR_IMAGE_TAG", "OCR_AMDGPU_TARGETS", "OCR_RENDER_NODE"):
+        monkeypatch.setenv(key, "")
+
+    for selected_targets in ("", "gfx1100;gfx1201"):
+        target = selected_targets
+        with pytest.raises(BuildReached):
+            ocr_source_up.deploy(("docker", "compose"), tmp_path, "rocm", None)
+    assert selected_builds == ["gfx1201", "gfx1100;gfx1201"]
+    assert detected == [Path("/dev/dri/renderD129")]
 
 
 def test_project_claim_cannot_be_relabelled_by_another_checkout(

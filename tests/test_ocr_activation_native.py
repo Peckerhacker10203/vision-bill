@@ -118,6 +118,7 @@ def test_native_waits_for_app_admissions_and_publishes_only_after_park(
             "maintenance_intent": "external-llm-quiesced",
             "handoff_lock": inputs.handoff_lock,
             "require_remote_models": True,
+            "retry_collection_timeout": True,
         }
         assert store.read_status(request).phase is ActivationPhase.QUALIFYING
         with pytest.raises(ActivationBusy), store.admission(exclusive=False):

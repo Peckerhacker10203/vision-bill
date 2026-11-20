@@ -20,6 +20,7 @@ import {
   cudaChannels,
   cudaLockDigestLabel,
   defaultCudaChannel,
+  legacyCudaChannel,
   validateCudaLock,
   renderBundle,
   writeBundle,
@@ -370,6 +371,7 @@ function build(request, inputs, output) {
     app = request.variant === "app" || appOcr;
   const accelerator =
     request.variant === "app" ? null : request.variant.split("-").at(-1);
+  if (accelerator === "cuda") plan.cuda_channel ??= defaultCudaChannel;
   const ownedTags = [];
   function candidate(name, dockerfile, context, args = []) {
     const archive = join(output, `${name}.oci.tar`);
@@ -463,7 +465,7 @@ function build(request, inputs, output) {
       const args = [];
       let cudaLockDigest;
       if (accelerator === "cuda") {
-        const channel = plan.cuda_channel ?? defaultCudaChannel;
+        const channel = plan.cuda_channel;
         run(
           "uv",
           [
@@ -497,7 +499,12 @@ function build(request, inputs, output) {
           join(nativeDirectory, "lock-attestation.json"),
           attestation,
         );
-        args.push("--label", cudaLockDigestLabel + "=" + cudaLockDigest);
+        args.push(
+          "--build-arg",
+          `OCR_CUDA_CHANNEL=${channel}`,
+          "--label",
+          cudaLockDigestLabel + "=" + cudaLockDigest,
+        );
       } else
         args.push(
           "--build-arg",
@@ -576,9 +583,7 @@ function build(request, inputs, output) {
           ...(accelerator === "cuda"
             ? {
                 cuda_lock: `${accelerator}/lock-attestation.json`,
-                ...(plan.cuda_channel
-                  ? { cuda_channel: plan.cuda_channel }
-                  : {}),
+                cuda_channel: plan.cuda_channel,
               }
             : {}),
         },
@@ -605,8 +610,8 @@ function lstatExists(path) {
 function verifyCandidateCudaChannel(plan, manifest, accelerator) {
   if (accelerator === "cuda")
     check(
-      (manifest.native?.cuda?.cuda_channel ?? defaultCudaChannel) ===
-        (plan.cuda_channel ?? defaultCudaChannel),
+      (manifest.native?.cuda?.cuda_channel ?? legacyCudaChannel) ===
+        (plan.cuda_channel ?? legacyCudaChannel),
       "Candidate CUDA channel differs from approved producer plan",
     );
 }
@@ -648,7 +653,7 @@ function qualify(request, output, env) {
             "--device",
             "/dev/kfd:/dev/kfd",
             "--device",
-            `${plan.rocm.render_node}:/dev/dri/renderD128`,
+            plan.rocm.render_node,
             ...(plan.rocm.render_gid === undefined
               ? []
               : ["--group-add", String(plan.rocm.render_gid)]),

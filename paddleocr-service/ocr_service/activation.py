@@ -198,6 +198,7 @@ def process_request(
                     maintenance_intent=request.maintenance_intent,
                     handoff_lock=inputs.handoff_lock,
                     require_remote_models=True,
+                    retry_collection_timeout=True,
                 )
 
             reason = "native_serving_startup_failed"

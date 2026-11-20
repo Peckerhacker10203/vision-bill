@@ -680,3 +680,112 @@ def test_failed_collection_logs_only_a_bounded_static_hook_diagnostic(
     assert private_text not in caplog.text
     assert not (tmp_path / "state" / "selected").exists()
     assert not list((tmp_path / "state" / "installations").iterdir())
+
+
+@pytest.mark.parametrize(
+    ("first", "expected_attempts"),
+    [
+        ("collection_timeout", 2),
+        ("recovered", 2),
+        ("generic_exit", 1),
+        ("unmarked", 1),
+        ("other_stage", 1),
+        ("other_image", 1),
+        ("oom", 1),
+        ("static_hooks", 1),
+        ("malformed", 1),
+        ("symlink", 1),
+        ("hardlink", 1),
+        ("manual", 1),
+    ],
+)
+def test_managed_initializer_retries_only_verified_collection_wait_timeout(
+    tmp_path, release, monkeypatch, caplog, first, expected_attempts
+):
+    from contextlib import nullcontext
+
+    from ocr_service import initialize as module
+
+    monkeypatch.setenv("OCR_INSTALLATION_LOCK_PATH", str(tmp_path / "installation.lock"))
+    monkeypatch.setattr(module, "managed_installation", lambda *_args: nullcontext())
+    state = tmp_path / "state"
+    old = state / "installations" / "previous"
+    old.mkdir(parents=True)
+    (old / "preserve").write_bytes(b"previous installation")
+    selected = state / "selected"
+    selected.symlink_to(old.relative_to(state))
+    outside = tmp_path / "outside.json"
+    attempts = []
+
+    def qualify(command):
+        runtime = json.loads(Path(command[command.index("--runtime") + 1]).read_bytes())
+        report = Path(command[command.index("--output") + 1])
+        cache = Path(runtime["cache_dir"])
+        artifacts = (report, report.with_suffix(".runtime.json"), Path(runtime["qualification_manifest"]))
+        assert not cache.exists()
+        assert all(not path.exists() for path in artifacts)
+        assert selected.resolve() == old
+        if first == "recovered" and attempts:
+            attempts.append(report.parent)
+            artifacts[1].write_text(json.dumps(runtime))
+            artifacts[2].write_text("{}")
+            report.write_text(json.dumps({
+                "qualified": True,
+                "stage": "complete",
+                "accelerator": runtime["accelerator"],
+                "image_identity": runtime["image_identity"],
+                "profile_id": "test-profile",
+                "runtime_fingerprint": "test-runtime",
+                "manifest_sha256": sha(artifacts[2].read_bytes()),
+                "device": DEVICE,
+                "cases": [
+                    {"kind": kind, "fresh_worker": repetition}
+                    for kind in module.KINDS
+                    for repetition in range(2)
+                ],
+            }))
+            return 0
+        cache.mkdir()
+        (cache / "stale").write_bytes(b"candidate only")
+        for path in artifacts[1:]:
+            path.write_bytes(b"candidate only")
+        attempt = first if not attempts else "collection_timeout"
+        expected = {
+            "qualified": False,
+            "accelerator": runtime["accelerator"],
+            "image_identity": runtime["image_identity"] if attempt != "other_image" else "other",
+            "stage": "native_collection" if attempt != "other_stage" else "fresh_replay",
+            "failure": "static_hook_collection_failed" if attempt == "static_hooks" else "TimeoutError",
+            "collection_wait_timed_out": attempt != "unmarked",
+        }
+        if attempt in ("symlink", "hardlink"):
+            outside.write_text(json.dumps(expected))
+            if attempt == "symlink":
+                report.symlink_to(outside)
+            else:
+                report.hardlink_to(outside)
+        elif attempt == "malformed":
+            report.write_text("{")
+        else:
+            report.write_text(json.dumps(expected))
+        attempts.append(report.parent)
+        return {"generic_exit": 1, "oom": 42, "static_hooks": 1}.get(attempt, 44)
+
+    monkeypatch.setattr(module, "owned_qualification_process", qualify)
+    kwargs = {"retry_collection_timeout": True} if first != "manual" else {}
+    if first == "recovered":
+        install = initialize_release(tmp_path, release, force=True, **kwargs)
+        assert selected.resolve() == install
+        assert (install / "complete.json").is_file()
+    else:
+        with pytest.raises(module.InitializationFailed):
+            initialize_release(tmp_path, release, force=True, **kwargs)
+        assert not any(candidate.exists() for candidate in attempts)
+        assert selected.resolve() == old
+    assert len(attempts) == expected_attempts
+    assert (old / "preserve").read_bytes() == b"previous installation"
+    if first in ("symlink", "hardlink"):
+        assert outside.is_file()
+    assert sum(r.getMessage() == "native_qualification_retry_collection_timeout" for r in caplog.records) == (
+        expected_attempts - 1
+    )

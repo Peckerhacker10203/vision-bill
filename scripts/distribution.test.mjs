@@ -707,7 +707,7 @@ test("CUDA Make targets pass an expected channel by default and on explicit sele
     mode: 0o755,
   });
   for (const target of ["ocr-build-cuda", "ocr-lock-cuda"]) {
-    for (const channel of [undefined, "", "cu129"]) {
+    for (const channel of [undefined, "", "cu126"]) {
       const env = { ...process.env, PATH: directory + ":" + process.env.PATH };
       if (channel === undefined) delete env.OCR_CUDA_CHANNEL;
       else env.OCR_CUDA_CHANNEL = channel;
@@ -717,7 +717,7 @@ test("CUDA Make targets pass an expected channel by default and on explicit sele
       });
       assert.equal(result.status, 0, result.stderr);
       assert.ok(
-        result.stdout.split("\n").includes("--channel=" + (channel || "cu126")),
+        result.stdout.split("\n").includes("--channel=" + (channel || "cu129")),
       );
     }
   }
@@ -891,6 +891,7 @@ test("CLI generates every variant and Docker Compose validates effective config 
   const env = {
     ...process.env,
     COMPOSE_PROJECT_NAME: "vb-distribution-test",
+    OCR_RENDER_NODE: "/dev/dri/renderD129",
   };
   delete env.OCR_RENDER_GID;
   delete env.OCR_VIDEO_GID;
@@ -916,6 +917,8 @@ test("CLI generates every variant and Docker Compose validates effective config 
       "docker",
       [
         "compose",
+        "--profile",
+        "ocr-maintenance",
         "-f",
         join(output, "compose.yaml"),
         "config",
@@ -926,6 +929,20 @@ test("CLI generates every variant and Docker Compose validates effective config 
     );
     assert.equal(composed.status, 0, composed.stderr);
     const effective = JSON.parse(composed.stdout);
+    if (variant.endsWith("-rocm")) {
+      for (const name of ["ocr", "ocr-init", "ocr-maintenance"]) {
+        const service = effective.services[name];
+        if (!service) continue;
+        assert.deepEqual(
+          service.devices.map(({ source, target }) => [source, target]),
+          [
+            ["/dev/kfd", "/dev/kfd"],
+            ["/dev/dri/renderD129", "/dev/dri/renderD129"],
+          ],
+          name,
+        );
+      }
+    }
     if (variant.startsWith("app-ocr")) {
       assert.equal(effective.services.app.environment.OCR__ENDPOINT, undefined);
       assert.match(

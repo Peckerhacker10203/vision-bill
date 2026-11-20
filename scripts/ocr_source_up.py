@@ -25,6 +25,7 @@ NATIVE = "paddleocr-service"
 RECORD_LIMIT = 32 * 1024**2
 IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 NATIVE_PLATFORM = "linux/amd64"
+KFD_TOPOLOGY = Path("/sys/class/kfd/kfd/topology/nodes")
 MANIFEST_TYPES = {
     "application/vnd.oci.image.manifest.v1+json",
     "application/vnd.docker.distribution.manifest.v2+json",
@@ -475,21 +476,30 @@ def gpu_args(accelerator: str, native: dict[str, Any]) -> tuple[list[str], dict[
             raise ValueError("Select one CUDA device by numeric index or GPU UUID")
         return ["--gpus", f"device={ids[0]}"], {"OCR_CUDA_DEVICE_ID": ids[0]}
 
-    devices = {entry["target"]: entry["source"] for entry in native["devices"]}
-    render = Path(devices["/dev/dri/renderD128"])
-    kfd = Path(devices["/dev/kfd"])
-    if not re.fullmatch(r"/dev/dri/renderD[0-9]+", str(render)) or kfd != Path("/dev/kfd"):
+    entries = native.get("devices", [])
+    devices = {entry["target"]: entry["source"] for entry in entries}
+    kfd = "/dev/kfd"
+    render = next((target for target in devices if target != kfd), "")
+    if (
+        len(entries) != 2
+        or devices.get(kfd) != kfd
+        or devices.get(render) != render
+        or not re.fullmatch(r"/dev/dri/renderD[0-9]+", render)
+    ):
         raise ValueError("ROCm requires /dev/kfd and one selected DRI render node")
     arguments: list[str] = []
-    for target, device in (("/dev/kfd", kfd), ("/dev/dri/renderD128", render)):
-        details = device.stat()
+    groups: list[str] = []
+    for device in (kfd, render):
+        details = Path(device).stat()
         if not stat.S_ISCHR(details.st_mode):
             raise ValueError(f"ROCm device is not a character device: {device}")
-        arguments.extend(("--device", f"{device}:{target}", "--group-add", str(details.st_gid)))
+        group = str(details.st_gid)
+        groups.append(group)
+        arguments.extend(("--device", f"{device}:{device}", "--group-add", group))
     return arguments, {
-        "OCR_RENDER_NODE": str(render),
-        "OCR_VIDEO_GID": str(kfd.stat().st_gid),
-        "OCR_RENDER_GID": str(render.stat().st_gid),
+        "OCR_RENDER_NODE": render,
+        "OCR_VIDEO_GID": groups[0],
+        "OCR_RENDER_GID": groups[1],
     }
 
 
@@ -501,6 +511,29 @@ def reject_other_profile(state: Path, accelerator: str, project: str) -> None:
         identity = json.loads(record.read_bytes())["x-vision-bill-source"]
         if identity["project"] == project:
             raise ValueError("This Compose project is already prepared for another accelerator")
+
+
+def rocm_render_target(render: Path, topology: Path = KFD_TOPOLOGY) -> str:
+    """Read the native Linux KFD architecture for the selected DRM minor."""
+    try:
+        minor = os.minor(render.stat().st_rdev)
+        versions = []
+        for properties in sorted(topology.glob("[0-9]*/properties")):
+            values = dict(line.split(maxsplit=1) for line in properties.read_text().splitlines())
+            if values.get("drm_render_minor") == str(minor) and values.get("vendor_id") == "4098":
+                versions.append(int(values["gfx_target_version"]))
+        if len(versions) != 1 or versions[0] <= 0:
+            raise ValueError("Missing or ambiguous KFD GPU topology")
+        major, remainder = divmod(versions[0], 10_000)
+        minor_version, stepping = divmod(remainder, 100)
+        if not 1 <= major <= 99 or minor_version > 15 or stepping > 15:
+            raise ValueError("Invalid KFD GPU architecture")
+        return f"gfx{major}{minor_version:x}{stepping:x}"
+    except (OSError, ValueError, KeyError) as exc:
+        raise ValueError(
+            f"Cannot determine the GFX target for {render}. Select the render node "
+            "and set OCR_AMDGPU_TARGETS to its actual native architecture."
+        ) from exc
 
 
 def existing_controllers(compose: tuple[str, ...]) -> list[str]:
@@ -791,6 +824,11 @@ def deploy(
     candidate = config["services"][NATIVE]
     devices, device_environment = gpu_args(accelerator, candidate)
     os.environ.update(device_environment)
+    if accelerator == "rocm" and reuse_native_image is None:
+        configured_targets = candidate["build"]["args"]["AMDGPU_TARGETS"]
+        if not configured_targets:
+            configured_targets = rocm_render_target(Path(device_environment["OCR_RENDER_NODE"]))
+        os.environ["OCR_AMDGPU_TARGETS"] = configured_targets
     native_image = reuse_native_image or candidate["image"]
     image_id = ""
     expected_sources: dict[str, str] = {}
@@ -818,7 +856,11 @@ def deploy(
                 "--check",
                 "paddleocr-service/requirements.cuda.lock",
             ]
-            channel = os.environ.get("OCR_CUDA_CHANNEL") or ("cu129" if inputs is None else "cu126")
+            channel = (
+                os.environ.get("OCR_CUDA_CHANNEL")
+                or candidate.get("build", {}).get("args", {}).get("OCR_CUDA_CHANNEL")
+                or "cu129"
+            )
             if channel not in {"cu126", "cu129"}:
                 raise ValueError("OCR_CUDA_CHANNEL must be cu126 or cu129")
             os.environ["OCR_CUDA_CHANNEL"] = channel

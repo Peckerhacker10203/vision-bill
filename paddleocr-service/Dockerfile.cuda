@@ -24,7 +24,8 @@ RUN python -m pip install --require-hashes --no-deps --only-binary=:all: -r /opt
  && python -m pip install --require-hashes --no-deps --no-build-isolation -r /opt/locks/requirements.build.lock
 COPY requirements.cuda.* requirements.runtime.lock /opt/locks/
 COPY build/resolve_cuda.py /opt/ocr/build/resolve_cuda.py
-RUN python /opt/ocr/build/resolve_cuda.py --check /opt/locks/requirements.cuda.lock \
+ARG OCR_CUDA_CHANNEL=cu129
+RUN python /opt/ocr/build/resolve_cuda.py --check /opt/locks/requirements.cuda.lock --channel "$OCR_CUDA_CHANNEL" \
  && python -m pip install --require-hashes --no-deps --no-build-isolation -r /opt/locks/requirements.cuda.lock \
  && python -m pip check
 WORKDIR /app

@@ -213,6 +213,7 @@ def initialize(
     handoff_lock: Path | None = None,
     force: bool = False,
     require_remote_models: bool = False,
+    retry_collection_timeout: bool = False,
 ) -> Path:
     if maintenance_intent not in {"external-llm-quiesced", "separate-ocr-device"}:
         raise ValueError("Explicit maintenance intent is required for this invocation")
@@ -284,6 +285,22 @@ def initialize(
                 str(output),
             ]
             exit_code = owned_qualification_process(command)
+            if exit_code and retry_collection_timeout:
+                from .qualify import COLLECTION_WAIT_TIMEOUT_EXIT, is_collection_wait_timeout
+
+                if exit_code == COLLECTION_WAIT_TIMEOUT_EXIT and is_collection_wait_timeout(
+                    output, accelerator=bundle.accelerator, image_identity=bundle.image_identity
+                ):
+                    # The supervisor has drained the failed invocation. Reset
+                    # only this unpublished candidate's cache and evidence.
+                    cache = root / "cache"
+                    if os.path.lexists(cache):
+                        shutil.rmtree(cache)
+                    output.unlink(missing_ok=True)
+                    output.with_suffix(".runtime.json").unlink(missing_ok=True)
+                    (root / "manifest.json").unlink(missing_ok=True)
+                    logger.warning("native_qualification_retry_collection_timeout")
+                    exit_code = owned_qualification_process(command)
             if exit_code == GPU_OOM_EXIT:
                 raise InitializationGpuOutOfMemory(GPU_OOM_CODE)
             if exit_code:

@@ -54,7 +54,8 @@ PROFILE = Path(__file__).resolve().parents[1] / "profile.json"
 KINDS = {"upright", "rotated", "warped", "table", "formula"}
 STATIC_HOOK_FAILURE_CODE = "static_hook_collection_failed"
 _STATIC_HOOK_FAILURE_EXIT = 43
-_STATIC_HOOK_REPORT_BYTES = 16 * 1024
+COLLECTION_WAIT_TIMEOUT_EXIT = 44
+_FAILURE_REPORT_BYTES = 16 * 1024
 
 
 class QualificationCase(BaseModel):
@@ -80,28 +81,57 @@ class StaticHookCollectionFailed(ValueError):
         self.diagnostic = diagnostic
 
 
-def read_static_hook_failure(path: Path) -> StaticHookFailure | None:
-    """Read only a small failure envelope, never raw native diagnostics."""
+class NativeStageWaitTimeout(TimeoutError):
+    def __init__(self, stage: str):
+        super().__init__("Native qualification stage exceeded 600 seconds")
+        self.stage = stage
+
+
+def _read_failure_report(path: Path) -> dict[str, Any] | None:
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
         with os.fdopen(descriptor, "rb") as stream:
             info = os.fstat(stream.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_size > _STATIC_HOOK_REPORT_BYTES:
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or info.st_size > _FAILURE_REPORT_BYTES
+            ):
                 return None
             payload = stream.read(info.st_size + 1)
         if len(payload) != info.st_size:
             return None
         data = json.loads(payload)
-        if (
-            not isinstance(data, dict)
-            or data.get("qualified") is not False
-            or data.get("stage") != "native_collection"
-            or data.get("failure") != STATIC_HOOK_FAILURE_CODE
-        ):
-            return None
-        return StaticHookFailure.model_validate(data.get("static_hook_failure"))
+        return data if isinstance(data, dict) and data.get("qualified") is False else None
     except (OSError, ValueError, RecursionError):
         return None
+
+
+def read_static_hook_failure(path: Path) -> StaticHookFailure | None:
+    """Read only a small failure envelope, never raw native diagnostics."""
+    report = _read_failure_report(path)
+    if (
+        report is None
+        or report.get("stage") != "native_collection"
+        or report.get("failure") != STATIC_HOOK_FAILURE_CODE
+    ):
+        return None
+    try:
+        return StaticHookFailure.model_validate(report.get("static_hook_failure"))
+    except ValueError:
+        return None
+
+
+def is_collection_wait_timeout(path: Path, *, accelerator: str, image_identity: str) -> bool:
+    report = _read_failure_report(path)
+    return (
+        report is not None
+        and report.get("stage") == "native_collection"
+        and report.get("failure") == "TimeoutError"
+        and report.get("collection_wait_timed_out") is True
+        and report.get("accelerator") == accelerator
+        and report.get("image_identity") == image_identity
+    )
 
 
 class QualificationReport(BaseModel):
@@ -120,6 +150,7 @@ class QualificationReport(BaseModel):
     qualified_targets: list[str] = Field(default_factory=list)
     failure: str | None = None
     static_hook_failure: StaticHookFailure | None = None
+    collection_wait_timed_out: bool = False
     stage: str = "inputs"
 
 
@@ -185,7 +216,7 @@ def run_stage(stage: str, payload: dict[str, Any], directory: Path) -> dict[str,
             pass  # The child can exit between the deadline and group signal.
         process.wait(timeout=30)
         if isinstance(exc, subprocess.TimeoutExpired):
-            raise TimeoutError("Native qualification stage exceeded 600 seconds") from None
+            raise NativeStageWaitTimeout(stage) from None
         raise
     if code == GPU_OOM_EXIT and stage in ("collect", "replay"):
         raise GpuOutOfMemory
@@ -509,6 +540,11 @@ def qualify_runtime(runtime: RuntimeSettings, cases: Path, output: Path) -> Qual
         if isinstance(exc, StaticHookCollectionFailed):
             report.failure = STATIC_HOOK_FAILURE_CODE
             report.static_hook_failure = exc.diagnostic
+        elif isinstance(exc, NativeStageWaitTimeout):
+            report.failure = "TimeoutError"
+            report.collection_wait_timed_out = (
+                exc.stage == "collect" and report.stage == "native_collection"
+            )
         else:
             report.failure = GPU_OOM_CODE if isinstance(exc, GpuOutOfMemory) else type(exc).__name__
         # A writer can fail after replacing its destination. Revoke both stale and
@@ -578,6 +614,8 @@ def main() -> None:
     report = qualify_runtime(runtime, args.cases, args.output)
     if not report.qualified and report.failure == GPU_OOM_CODE:
         raise SystemExit(GPU_OOM_EXIT)
+    if not report.qualified and report.collection_wait_timed_out:
+        raise SystemExit(COLLECTION_WAIT_TIMEOUT_EXIT)
     raise SystemExit(0 if report.qualified else 1)
 
 

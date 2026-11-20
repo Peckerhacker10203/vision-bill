@@ -37,7 +37,7 @@ services:
       - ${OCR_RELEASE_DIR:-./server_data/ocr-release}:/release:ro
     devices:
       - /dev/kfd:/dev/kfd
-      - ${OCR_RENDER_NODE:-/dev/dri/renderD128}:/dev/dri/renderD128
+      - ${OCR_RENDER_NODE:-/dev/dri/renderD128}:${OCR_RENDER_NODE:-/dev/dri/renderD128}
     group_add:
       - ${OCR_RENDER_GID:-109}
       - ${OCR_VIDEO_GID:-44}

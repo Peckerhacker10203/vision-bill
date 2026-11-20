@@ -32,7 +32,8 @@ const variants = [
   "app-ocr-rocm",
 ];
 export const cudaChannels = ["cu126", "cu129"];
-export const defaultCudaChannel = "cu126";
+export const defaultCudaChannel = "cu129";
+export const legacyCudaChannel = "cu126";
 export const cudaLockDigestLabel = "io.vision-bill.cuda.lock-sha256";
 const cudaWheelUrl =
   /^https:\/\/(?:www\.paddlepaddle\.org\.cn|paddle-whl\.(?:bj|cdn)\.bcebos\.com)\/(packages\/)?stable\/(cu126|cu129)\/(paddlepaddle-gpu\/)?paddlepaddle_gpu-3\.3\.1-cp312-cp312-(?:linux_x86_64|manylinux[\w.]*x86_64)\.whl$/;
@@ -225,7 +226,7 @@ const device = (accelerator) =>
     : {
         devices: [
           "/dev/kfd:/dev/kfd",
-          "${OCR_RENDER_NODE:-/dev/dri/renderD128}:/dev/dri/renderD128",
+          "${OCR_RENDER_NODE:-/dev/dri/renderD128}:${OCR_RENDER_NODE:-/dev/dri/renderD128}",
         ],
       };
 
@@ -569,7 +570,7 @@ export function validateCudaLock(lock, channel) {
     typeof lock?.wheel_url === "string" && cudaWheelUrl.exec(lock.wheel_url);
   const attestedChannel = Object.hasOwn(lock ?? {}, "cuda_channel")
     ? lock.cuda_channel
-    : defaultCudaChannel;
+    : legacyCudaChannel;
   check(
     cudaChannels.includes(channel) &&
       attestedChannel === channel &&
@@ -864,7 +865,7 @@ function verifyEvidence(manifest, variant, contents) {
     const lockPath = "cuda/requirements.cuda.lock";
     allowedAssets.add(lockPath);
     const lock = read(native.cuda_lock);
-    validateCudaLock(lock, native.cuda_channel ?? defaultCudaChannel);
+    validateCudaLock(lock, native.cuda_channel ?? legacyCudaChannel);
     check(
       contents[lockPath] &&
         manifest.assets[lockPath].size_bytes <= 32 * 1024 * 1024 &&

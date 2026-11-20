@@ -799,3 +799,69 @@ def test_full_qualification_preserves_gpu_allocation_exit(tmp_path, monkeypatch)
     with pytest.raises(SystemExit) as raised:
         module.main()
     assert raised.value.code == 42
+
+
+@pytest.mark.parametrize(
+    ("stage", "source", "retryable"),
+    [
+        ("collect", "process_wait", True),
+        ("inspect", "process_wait", False),
+        ("replay", "process_wait", False),
+        ("collect", "other_timeout", False),
+    ],
+)
+def test_collection_retry_marker_requires_an_actual_collect_child_wait_timeout(
+    tmp_path, monkeypatch, stage, source, retryable
+):
+    import sys
+
+    from ocr_service.profile import MODEL_NAMES, RuntimeSettings
+
+    module = qualification()
+    real_run = module.run_stage
+    runtime = RuntimeSettings(
+        accelerator="cuda", gpu_index=0, model_dirs={name: tmp_path / name for name in MODEL_NAMES},
+        cache_dir=tmp_path, qualification_manifest=tmp_path / "manifest.json", expected_packages={},
+        expected_paddle_commit="1234567", image_identity="sha256:" + "a" * 64,
+    )
+
+    class Process:
+        args = ("native-child",)
+        pid = 63001
+        waited = False
+
+        def wait(self, timeout):
+            if not self.waited:
+                self.waited = True
+                raise module.subprocess.TimeoutExpired(self.args, timeout)
+            return -9
+
+    def run(name, payload, directory):
+        if name != stage:
+            return {"static_artifacts": {}, "device": {}}
+        if source == "other_timeout":
+            raise TimeoutError("Coordinator timeout rather than a child wait")
+        monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: Process())
+        monkeypatch.setattr(module.os, "killpg", lambda *_args: None)
+        return real_run(name, payload, directory)
+
+    case = module.QualificationCase(kind="upright", path=tmp_path / "upright", sha256="a" * 64)
+    monkeypatch.setattr(module, "load_cases", lambda _path: [case])
+    monkeypatch.setattr(module, "seal_dependencies", lambda **kwargs: ({}, {}))
+    monkeypatch.setattr(module, "verify_dependencies", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "tree_identity", lambda _path: "model-hash")
+    monkeypatch.setattr(module, "run_stage", run)
+    monkeypatch.setattr(module, "qualification_is_supervised", lambda _fd: True)
+    settings = tmp_path / "runtime.json"
+    settings.write_text(runtime.model_dump_json())
+    output = tmp_path / "report.json"
+    monkeypatch.setattr(sys, "argv", [
+        "qualify", "--accelerator", "cuda", "--runtime", str(settings),
+        "--cases", str(tmp_path / "cases"), "--output", str(output),
+    ])
+    with pytest.raises(SystemExit) as failed:
+        module.main()
+    assert failed.value.code == (44 if retryable else 1)
+    report = json.loads(output.read_bytes())
+    assert report["failure"] == "TimeoutError"
+    assert report["collection_wait_timed_out"] is retryable

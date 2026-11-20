@@ -138,12 +138,12 @@ fe: ## Run an npm script in frontend/ (make fe CMD=<script> [ARGS="..."])
 	$(NODE) (cd $(FE) && npm run $(CMD) $(ARGS))
 
 .PHONY: ocr-lock-cuda ocr-build-cuda ocr-build-rocm ocr-qualify-cuda ocr-qualify-rocm
-ocr-lock-cuda ocr-build-cuda: export OCR_CUDA_CHANNEL ?= cu126
-ocr-lock-cuda: ## Resolve official CUDA lock (default cu126, optional OCR_CUDA_CHANNEL=cu129)
-	SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEX=3.7.2 SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEOCR=3.7.0 uv run --no-project --with packaging==26.2 python paddleocr-service/build/resolve_cuda.py --channel="$${OCR_CUDA_CHANNEL:-cu126}"
+ocr-lock-cuda ocr-build-cuda: export OCR_CUDA_CHANNEL ?= cu129
+ocr-lock-cuda: ## Resolve official CUDA lock (default cu129, optional OCR_CUDA_CHANNEL=cu126)
+	SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEX=3.7.2 SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEOCR=3.7.0 uv run --no-project --with packaging==26.2 python paddleocr-service/build/resolve_cuda.py --channel="$${OCR_CUDA_CHANNEL:-cu129}"
 
 ocr-build-cuda: ## Build candidate CUDA image after official lock resolution
-	uv run --no-project --with packaging==26.2 python paddleocr-service/build/resolve_cuda.py --check paddleocr-service/requirements.cuda.lock --channel="$${OCR_CUDA_CHANNEL:-cu126}"
+	uv run --no-project --with packaging==26.2 python paddleocr-service/build/resolve_cuda.py --check paddleocr-service/requirements.cuda.lock --channel="$${OCR_CUDA_CHANNEL:-cu129}"
 	docker compose --profile ocr -f docker-compose.yml -f docker-compose.cuda.yml build paddleocr-service
 
 ocr-build-rocm: ## Build native full-SDK RDNA2 candidate (large build; no support claim)

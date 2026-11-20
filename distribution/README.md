@@ -111,9 +111,11 @@ use text and evidence. Direct vision needs an image-capable selected model.
 App port defaults to `127.0.0.1:8080`, with `APP_BIND_ADDRESS` and `APP_PORT`
 available for Compose interpolation. Independent OCR defaults to
 `127.0.0.1:8082`, with `OCR_BIND_ADDRESS` and `OCR_PORT`. Set
-`OCR_CUDA_DEVICE_ID` for NVIDIA or `OCR_RENDER_NODE`, `OCR_RENDER_GID` and
-`OCR_VIDEO_GID` for Radeon as needed. Linux AMD target selection starts with
-RX 6000/RDNA2 candidates. Qualify the exact device before relying on it.
+`OCR_CUDA_DEVICE_ID` for NVIDIA or `OCR_RENDER_NODE` for Radeon as needed.
+Generated ROCm bundles run the native service as container root. The source
+launcher derives device group IDs from the host. Linux AMD
+target selection starts with RX 6000/RDNA2 candidates. Qualify the exact device
+before relying on it. [ROCm source setup](../paddleocr-service/README.md#amd-rocm-on-native-linux)
 
 ```bash
 sh ./check-compose.sh
@@ -426,9 +428,11 @@ uv and adequate build/archive capacity. Labels are `vision-bill-cuda` and
 `DISTRIBUTION_MAINTENANCE_INTENT` for the runner's actual LLM quiescence or separate
 OCR device. ROCm selected targets must agree with compile inputs, kernel
 inventory and the actual qualified AMD device. For CUDA, `release-inputs.json`
-accepts `"cuda_channel": "cu129"` when qualifying the CUDA 12.9 candidate and
-defaults to `cu126`. The producer resolves and attests the official GPU wheel
-for that channel.
+defaults to `cu129` for new candidates. Set `"cuda_channel": "cu126"` to select
+CUDA 12.6 explicitly. The producer records the selected channel in the candidate
+plan and manifest, and resolves and attests the official GPU wheel for that
+channel. Existing candidate plans and manifests without a channel describe
+CUDA 12.6.
 
 OCI registry **manifest** digest identifies transport/pull bytes; local Docker image
 `.Id` identifies the config blob. Neither substitutes for the other. The producer

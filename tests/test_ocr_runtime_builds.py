@@ -26,7 +26,7 @@ def test_separate_digest_pinned_native_images_and_cuda_lock():
         assert "/health" in text
     cuda = (SERVICE / "requirements.cuda.lock").read_text()
     if "UNRESOLVED" in cuda:
-        assert "paddlepaddle_gpu-3.3.1" in cuda and "cu126" in cuda
+        assert "paddlepaddle_gpu-3.3.1" in cuda and "cu129" in cuda
         with pytest.raises(ValueError, match="unresolved"):
             load_build_module("resolve_cuda").validate_lock(SERVICE / "requirements.cuda.lock")
     else:
@@ -199,7 +199,7 @@ def load_build_module(name):
 
 def test_cuda_resolver_selects_only_exact_official_cp312_artifact():
     module = load_build_module("resolve_cuda")
-    official = "https://paddle-whl.bj.bcebos.com/stable/cu126/paddlepaddle_gpu-3.3.1-cp312-cp312-linux_x86_64.whl"
+    official = "https://paddle-whl.bj.bcebos.com/stable/cu129/paddlepaddle_gpu-3.3.1-cp312-cp312-linux_x86_64.whl"
     html = f'<a href="{official}">wheel</a><a href="https://evil.invalid/paddlepaddle_gpu-3.3.1-cp312-cp312-linux_x86_64.whl">other</a>'
     assert module.select_wheel(html) == official
     import pytest
@@ -215,8 +215,8 @@ def test_cuda_resolver_selects_only_requested_channel():
     legacy = f"https://paddle-whl.bj.bcebos.com/stable/cu126/{wheel}"
     blackwell = f"https://paddle-whl.cdn.bcebos.com/stable/cu129/paddlepaddle-gpu/{wheel}"
     html = f'<a href="{legacy}">legacy</a><a href="{blackwell}#sha256=abc">candidate</a>'
-    assert module.select_wheel(html) == legacy
-    assert module.select_wheel(html, "cu129") == blackwell
+    assert module.select_wheel(html) == blackwell
+    assert module.select_wheel(html, "cu126") == legacy
     with pytest.raises(ValueError, match="cu129"):
         module.select_wheel(f'<a href="{legacy}">legacy</a>', "cu129")
     with pytest.raises(ValueError, match="channel"):
@@ -369,7 +369,7 @@ def cuda_lock_fixture(tmp_path):
     native = f"paddlepaddle-gpu @ {url} \\\n    --hash=sha256:{digest}\n"
     text = (SERVICE / "requirements.runtime.lock").read_text() + "\n" + native
     data = {
-        "index": module.INDEX,
+        "index": module.INDEXES["cu126"],
         "index_sha256": hashlib.sha256(b"test index").hexdigest(),
         "wheel_url": url,
         "wheel_sha256": digest,
@@ -414,7 +414,7 @@ def test_cuda_validator_binds_channel_to_index_and_lock(tmp_path):
     for field, value in [
         ("cuda_channel", "cu126"),
         ("cuda_channel", "cu128"),
-        ("index", module.INDEX),
+        ("index", module.INDEXES["cu126"]),
     ]:
         with pytest.raises(ValueError, match="attestation mismatch"):
             module.validate_lock(

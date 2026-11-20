@@ -29,8 +29,8 @@ INDEXES = {
     channel: f"https://www.paddlepaddle.org.cn/packages/stable/{channel}/paddlepaddle-gpu/"
     for channel in ("cu126", "cu129")
 }
-DEFAULT_CHANNEL = "cu126"
-INDEX = INDEXES[DEFAULT_CHANNEL]
+DEFAULT_CHANNEL = "cu129"
+LEGACY_CHANNEL = "cu126"
 HOSTS = {"www.paddlepaddle.org.cn", "paddle-whl.bj.bcebos.com", "paddle-whl.cdn.bcebos.com"}
 WHEEL = re.compile(
     r"paddlepaddle_gpu-3\.3\.1-cp312-cp312-(?:linux_x86_64|manylinux[\w.]*x86_64)\.whl$",
@@ -169,7 +169,7 @@ def validate_lock(
         or not isinstance(data["wheel_url"], str)
     ):
         raise ValueError("CUDA attestation metadata is invalid")
-    attested_channel = data.get("cuda_channel", DEFAULT_CHANNEL)
+    attested_channel = data.get("cuda_channel", LEGACY_CHANNEL)
     if (
         not isinstance(attested_channel, str)
         or attested_channel not in INDEXES
@@ -310,7 +310,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", type=Path)
     parser.add_argument(
-        "--channel", choices=INDEXES, help="CUDA channel (resolution defaults to cu126)"
+        "--channel", choices=INDEXES, help=f"CUDA channel (resolution defaults to {DEFAULT_CHANNEL})"
     )
     parser.add_argument("--service", type=Path, default=Path(__file__).resolve().parents[1])
     args = parser.parse_args()

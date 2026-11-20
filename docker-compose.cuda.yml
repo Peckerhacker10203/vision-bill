@@ -16,6 +16,8 @@ services:
     build:
       context: ./paddleocr-service
       dockerfile: Dockerfile.cuda
+      args:
+        OCR_CUDA_CHANNEL: "${OCR_CUDA_CHANNEL:-cu129}"
     image: vision-bill-ocr-cuda:${OCR_IMAGE_TAG:-candidate}
     command: ["python", "-m", "ocr_service.activation"]
     environment:

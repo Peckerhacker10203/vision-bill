@@ -119,10 +119,17 @@ def main() -> None:
                 device = ocr["deploy"]["resources"]["reservations"]["devices"][0]
                 assert device["driver"] == "nvidia" and device["device_ids"] == ["0"]
             else:
-                assert {device["source"] for device in ocr["devices"]} == {
-                    "/dev/kfd",
-                    "/dev/dri/renderD128",
+                assert {(device["source"], device["target"]) for device in ocr["devices"]} == {
+                    ("/dev/kfd", "/dev/kfd"),
+                    ("/dev/dri/renderD128", "/dev/dri/renderD128"),
                 }
+                selected = resolve_compose(
+                    command, private, {**environment, "OCR_RENDER_NODE": "/dev/dri/renderD129"}
+                )["services"]["paddleocr-service"]["devices"]
+                assert [(device["source"], device["target"]) for device in selected] == [
+                    ("/dev/kfd", "/dev/kfd"),
+                    ("/dev/dri/renderD129", "/dev/dri/renderD129"),
+                ]
             manual = resolve_compose(
                 [*command, "-f", str(ROOT / "docker-compose.ocr-qualification.yml")],
                 private,
