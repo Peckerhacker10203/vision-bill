@@ -185,7 +185,7 @@ def stage_approved_inputs(
 
 def image_tag(accelerator: str, image_id: str) -> str:
     if not IMAGE_ID.fullmatch(image_id):
-        raise ValueError("Invalid Docker image configuration ID")
+        raise ValueError("Invalid native Docker engine image ID")
     return f"vision-bill-ocr-{accelerator}:source-{image_id[7:]}"
 
 
@@ -201,7 +201,7 @@ def managed_overlay(
     config_id: str,
 ) -> dict[str, Any]:
     if not IMAGE_ID.fullmatch(app_id):
-        raise ValueError("Invalid application Docker image configuration ID")
+        raise ValueError("Invalid application Docker engine image ID")
     if not IMAGE_ID.fullmatch(config_id):
         raise ValueError("Invalid native Docker image configuration ID")
     return {
@@ -289,10 +289,10 @@ def build_history_blob(digest: str) -> bytes:
     # digest addresses a blob on that node independently of the selected record.
     args = ("docker", "buildx", "history", "inspect", "attachment", "", digest)
     with subprocess.Popen(
-        args, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        args, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=False
     ) as process:
         assert process.stdout is not None
-        record = process.stdout.read(RECORD_LIMIT + 1)
+        record: bytes = process.stdout.read(RECORD_LIMIT + 1)
         if len(record) > RECORD_LIMIT:
             process.kill()
             raise ValueError("Docker image metadata exceeds its size limit")
@@ -310,21 +310,25 @@ def resolve_image_config(image_id: str, read_blob: Callable[[str], bytes]) -> tu
             raise ValueError("Docker image metadata digest does not match the exact bytes")
         record = json.loads(raw)
         if not isinstance(record, dict):
-            raise ValueError("Invalid Docker image metadata record")
+            raise TypeError("Invalid Docker image metadata record")
         return record, raw
 
     digest = image_id
     record, raw = read_verified(digest)
     if "manifests" in record:
+        if record.get("schemaVersion") != 2 or not isinstance(record["manifests"], list):
+            raise ValueError("Invalid Docker image index")
         native = [
             entry["digest"]
             for entry in record["manifests"]
-            if entry.get("mediaType") in MANIFEST_TYPES
-            and entry.get("platform", {}).get("os") == "linux"
-            and entry.get("platform", {}).get("architecture") == "amd64"
-            and entry.get("annotations", {}).get("vnd.docker.reference.type") != "attestation-manifest"
+            if isinstance(entry, dict)
+            and entry.get("mediaType") in MANIFEST_TYPES
+            and (entry.get("platform") or {}).get("os") == "linux"
+            and (entry.get("platform") or {}).get("architecture") == "amd64"
+            and (entry.get("annotations") or {}).get("vnd.docker.reference.type")
+            != "attestation-manifest"
         ]
-        if record.get("schemaVersion") != 2 or len(native) != 1:
+        if len(native) != 1:
             raise ValueError("Docker image index must include one runnable linux/amd64 manifest")
         digest = native[0]
         record, raw = read_verified(digest)
@@ -336,7 +340,8 @@ def resolve_image_config(image_id: str, read_blob: Callable[[str], bytes]) -> tu
     if (
         record.get("os") != "linux"
         or record.get("architecture") != "amd64"
-        or record.get("rootfs", {}).get("type") != "layers"
+        or not isinstance(record.get("rootfs"), dict)
+        or record["rootfs"].get("type") != "layers"
         or not isinstance(record["rootfs"].get("diff_ids"), list)
     ):
         raise ValueError("Docker image configuration must describe a linux/amd64 root filesystem")
@@ -349,8 +354,8 @@ def export_config(release: Path, image_id: str) -> str:
         config_id, config = resolve_image_config(image_id, build_history_blob)
     except subprocess.CalledProcessError:
         print(
-            "Buildx metadata is unavailable. Exporting the Docker image for verification; "
-            "large images may take several minutes and require temporary disk space.",
+            "Buildx metadata is unavailable. Exporting the Docker image for verification. "
+            "Large images may take several minutes and require temporary disk space.",
             flush=True,
         )
         with tempfile.TemporaryDirectory(dir=release.parent) as temporary:
@@ -420,7 +425,13 @@ def need_host(accelerator: str, *, build: bool, automatic_inputs: bool) -> None:
         raise ValueError("Use a local Docker engine with host bind mounts and GPU access")
 
 
-def bootstrap(accelerator: str, inputs: Path | None, *, restart: bool = False) -> None:
+def bootstrap(
+    accelerator: str,
+    inputs: Path | None,
+    *,
+    restart: bool = False,
+    reuse_native_image: str | None = None,
+) -> None:
     need_host(accelerator, build=not restart, automatic_inputs=not restart and inputs is None)
     deployment = ROOT / "server_data" / "ocr-source"
     state = deployment / accelerator
@@ -446,7 +457,14 @@ def bootstrap(accelerator: str, inputs: Path | None, *, restart: bool = False) -
     lock = deployment / "deploy.lock"
     with lock.open("a") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        deploy(compose, state, accelerator, inputs, restart=restart)
+        deploy(
+            compose,
+            state,
+            accelerator,
+            inputs,
+            restart=restart,
+            reuse_native_image=reuse_native_image,
+        )
 
 
 def gpu_args(accelerator: str, native: dict[str, Any]) -> tuple[list[str], dict[str, str]]:
@@ -674,9 +692,16 @@ def verify_prepared_release(overlay: dict[str, Any], state: Path, accelerator: s
     if not stat.S_ISDIR(details.st_mode) or release.parent != state or details.st_mode & 0o077:
         raise ValueError("Prepared release must be a private directory inside its deployment")
     identity = overlay["x-vision-bill-source"]
+    config_digest = identity.get("image_config_sha256", identity["image_ids"][NATIVE][7:])
+    config_id = f"sha256:{config_digest}"
+    if (
+        not IMAGE_ID.fullmatch(config_id)
+        or overlay["services"][NATIVE]["environment"]["OCR_IMAGE_ID"] != config_id
+    ):
+        raise ValueError("Prepared release has an inconsistent native image configuration ID")
     for filename, digest in (
         ("bundle.json", identity["bundle_sha256"]),
-        ("image-config.json", identity["image_ids"][NATIVE][7:]),
+        ("image-config.json", config_digest),
     ):
         path = release / filename
         if trusted_file(path).st_size > RECORD_LIMIT or path_digest(path) != digest:
@@ -705,7 +730,15 @@ def deploy(
     inputs: Path | None,
     *,
     restart: bool = False,
+    reuse_native_image: str | None = None,
 ) -> None:
+    if reuse_native_image is not None and (
+        restart
+        or not re.fullmatch(
+            rf"vision-bill-ocr-{accelerator}:source-build-[0-9a-f]{{32}}", reuse_native_image
+        )
+    ):
+        raise ValueError("Reuse requires a local source-build tag for the selected accelerator")
     managed = state / "compose.local.json"
     if restart:
         trusted_file(managed)
@@ -758,6 +791,13 @@ def deploy(
     candidate = config["services"][NATIVE]
     devices, device_environment = gpu_args(accelerator, candidate)
     os.environ.update(device_environment)
+    native_image = reuse_native_image or candidate["image"]
+    image_id = ""
+    expected_sources: dict[str, str] = {}
+    if reuse_native_image is not None:
+        image_id = inspect_image(native_image)
+        expected_sources = checkout_sources()
+        print(f"Checking the local {accelerator.upper()} OCR candidate {native_image}…", flush=True)
     release = Path(tempfile.mkdtemp(prefix="release-", dir=state))
     pending = release / "compose.local.json"
     try:
@@ -795,11 +835,14 @@ def deploy(
                 "/opt/locks/requirements.cuda.lock",
                 "/opt/ocr/build/resolve_cuda.py",
             ]
-            command("make", "ocr-build-cuda")
-        else:
-            command(*compose, "build", NATIVE)
-        image_id = inspect_image(candidate["image"])
-        export_config(release, image_id)
+        if reuse_native_image is None:
+            if accelerator == "cuda":
+                command("make", "ocr-build-cuda")
+            else:
+                command(*compose, "build", NATIVE)
+            image_id = inspect_image(native_image)
+        config_id = export_config(release, image_id)
+        print("Validating the native OCR packages and GPU selection…", flush=True)
         # The metadata probe has neither model cache/state mounts nor a network.
         bound = command(
             "docker",
@@ -807,6 +850,8 @@ def deploy(
             "--rm",
             "--pull",
             "never",
+            "--platform",
+            NATIVE_PLATFORM,
             "--network",
             "none",
             *devices,
@@ -818,11 +863,18 @@ def deploy(
             "-c",
             BIND_BUNDLE,
             image_id,
+            config_id,
             "/release",
+            json.dumps(expected_sources) if expected_sources else "",
             *cuda_verification,
             capture=True,
         )
-        (release / "bundle.json").write_text(json.dumps(json.loads(bound), indent=2) + "\n")
+        manifest = json.loads(bound)
+        if reuse_native_image is not None and (
+            inspect_image(native_image) != image_id or manifest["source_files"] != expected_sources
+        ):
+            raise ValueError("Reused OCR image or its sources changed during verification")
+        (release / "bundle.json").write_text(json.dumps(manifest, indent=2) + "\n")
         command("docker", "image", "tag", image_id, image_tag(accelerator, image_id))
         command(*compose, "build", "vision_bill")
         app_id = inspect_image(config["services"]["vision_bill"]["image"])
@@ -834,6 +886,7 @@ def deploy(
             project,
             device_environment,
             path_digest(release / "bundle.json"),
+            config_id=config_id,
         )
         command("docker", "image", "tag", app_id, overlay["services"]["vision_bill"]["image"])
         pending.write_text(json.dumps(overlay))
@@ -870,8 +923,14 @@ def main() -> int:
         metavar="APPROVED_DIRECTORY",
         help="use a custom approved directory in place of the repository snapshots and fixtures",
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--restart", action="store_true", help="start the last prepared source deployment"
+    )
+    mode.add_argument(
+        "--reuse-native-image",
+        metavar="SOURCE_BUILD_TAG",
+        help="verify and use a local OCR candidate from an earlier source build",
     )
     args = parser.parse_args()
     if args.approved_inputs is not None and args.restart:
@@ -881,6 +940,7 @@ def main() -> int:
             args.accelerator,
             Path(os.path.abspath(args.approved_inputs)) if args.approved_inputs else None,
             restart=args.restart,
+            reuse_native_image=args.reuse_native_image,
         )
     except subprocess.CalledProcessError as exc:
         print(

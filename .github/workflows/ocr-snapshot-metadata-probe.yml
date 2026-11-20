@@ -61,6 +61,8 @@ jobs:
           import os
           from pathlib import Path
           import tarfile
+          import subprocess
+          from unittest.mock import patch
 
           from scripts.ocr_source_up import export_config
 
@@ -74,13 +76,20 @@ jobs:
           assert image_id != config_id
           export_config(scratch / "release", image_id)
           assert (scratch / "release/image-config.json").read_bytes() == config
+          fallback = scratch / "fallback"
+          fallback.mkdir()
+          with patch.dict(os.environ, {"PATH": os.environ["PATH"].split(":", 1)[1]}):
+              with patch("scripts.ocr_source_up.build_history_blob", side_effect=subprocess.CalledProcessError(1, ["buildx"])):
+                  assert export_config(fallback, image_id) == config_id
+          assert (fallback / "image-config.json").read_bytes() == config
           Path("containerd-image-verification.json").write_text(json.dumps({
               "commit": os.environ["GITHUB_SHA"],
               "engine_image_id": image_id,
               "image_config_id": config_id,
               "container_image_id_matches_engine": True,
               "raw_config_matches_reference_tar": True,
-              "full_export_disabled_in_launcher": True,
+              "full_export_disabled_in_fast_path": True,
+              "archive_fallback_matches_reference": True,
           }, indent=2, sort_keys=True) + "\n")
           PY
           git add -- containerd-image-verification.json
