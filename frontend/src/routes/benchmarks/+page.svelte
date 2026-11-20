@@ -3,7 +3,7 @@
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import { onDestroy, onMount } from 'svelte';
-	import { api } from '$lib/api/client';
+	import { api, ApiError } from '$lib/api/client';
 	import { session } from '$lib/auth';
 	import { captureSessionActor, isCurrentSessionActor } from '$lib/session-lifetime';
 	import type { BenchmarkCreate, BenchmarkReferencePreview, ModelInfo } from '$lib/types';
@@ -158,7 +158,17 @@
 			await api.createBenchmark(body, actor);
 			if (current()) await goto(resolve('/benchmarks/results'));
 		} catch (cause) {
-			if (current()) error = cause instanceof Error ? cause.message : $t('benchmarkUi.createError');
+			if (current()) {
+				if (
+					cause instanceof ApiError &&
+					cause.status === 503 &&
+					cause.detail === 'ocr_gpu_out_of_memory'
+				) {
+					error = $t('settings.dedicatedOcr.reasons.ocr_gpu_out_of_memory');
+				} else {
+					error = cause instanceof Error ? cause.message : $t('benchmarkUi.createError');
+				}
+			}
 		} finally {
 			if (current()) {
 				creating = false;

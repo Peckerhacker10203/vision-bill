@@ -24,6 +24,7 @@ from ..model.extraction import (
     pack_inference_metadata,
 )
 from ..model.handoff import HandoffStatus, HandoffWait
+from ..model.ocr_errors import OCR_GPU_OUT_OF_MEMORY, OcrGpuOutOfMemoryError
 from ..model.receipt import Receipt
 from .activation_admission import inference_admission
 from .execution_policy import EXECUTION_POLICY_VERSION
@@ -231,6 +232,8 @@ async def pipeline_identity(
                 ) as owner:
                     await owner.ocr_phase()
                     qualified = await ocr.get_capabilities()
+                    if not qualified.ready and qualified.reason_code == OCR_GPU_OUT_OF_MEMORY:
+                        raise OcrGpuOutOfMemoryError
                     if not qualified.ready or not qualified.runtime_fingerprint:
                         raise ValueError("ocr_qualification_required")
                     capabilities = qualified.model_dump(mode="json")

@@ -783,6 +783,119 @@ def test_benchmark_create_requires_explicit_unique_models(body):
         BenchmarkCreate.model_validate(body)
 
 
+@pytest.mark.parametrize("phase", ["create", "replay_readiness", "replay_load", "replay_inference"])
+async def test_benchmark_http_reports_gpu_oom_and_parks_worker(settings, tmp_path, monkeypatch, phase):
+    from types import SimpleNamespace
+
+    import httpx
+    from fastapi import FastAPI
+    from PIL import Image
+    from test_experiment_scoring import receipt
+    from test_extraction_pipeline import formatter
+    from test_handoff_binding import adopt
+    from test_ocr_provider import http_client
+
+    from vision_bill import config
+    from vision_bill.api.benchmarks import router
+    from vision_bill.api.helper.helper import get_benchmark_service
+    from vision_bill.model.benchmark import BenchmarkCreate
+    from vision_bill.provider.ocr.paddleocr import PaddleOcrProvider
+    from vision_bill.security.dependencies import get_current_user
+    from vision_bill.security.models import User
+    from vision_bill.service.benchmark_service import BenchmarkService
+    from vision_bill.service.experiment_execution import image_digest
+    from vision_bill.service.gpu_handoff import ModelHandoff
+    from vision_bill.service.receipt_service import ReceiptService
+
+    settings.ocr = config.OcrSettings(
+        enabled=True, service_url="http://native.test", coordination_path=tmp_path / "gpu.lock",
+    )
+    monkeypatch.setattr(config, "settings", settings)
+    requests = []
+    loaded = False
+    fail = phase == "create"
+    ready = {
+        "ready": True, "generation": 1, "profile_id": "fixed", "runtime_fingerprint": "runtime",
+    }
+    parked = {"ready": False, "generation": 1, "reason_code": "ocr_parked"}
+
+    def native(request):
+        nonlocal loaded
+        path = request.url.path
+        requests.append(path)
+        if path == "/info":
+            return httpx.Response(200, json={"contract_version": 2, "profile": {}, "worker": ready})
+        if path == "/ready":
+            if fail and phase == "replay_readiness":
+                return httpx.Response(503, json={**parked, "reason_code": "ocr_gpu_out_of_memory"})
+            return httpx.Response(200 if loaded else 503, json=ready if loaded else parked)
+        if path in ("/lifecycle/claim", "/lifecycle/park"):
+            loaded = False
+            return httpx.Response(200, json=parked)
+        if path == "/lifecycle/load" and (not fail or phase == "replay_inference"):
+            loaded = True
+            return httpx.Response(200, json=ready)
+        assert path in ("/ocr", "/lifecycle/load")
+        return httpx.Response(503, json={"detail": "ocr_gpu_out_of_memory"})
+
+    client_type = httpx.AsyncClient
+    llm = formatter()
+    http_client(monkeypatch, native)
+    ocr = PaddleOcrProvider(settings.ocr.service_url)
+    llm.handoff = ModelHandoff(settings.ocr.coordination_path, llm, ocr)
+    await adopt(llm.handoff, ("fixture",))
+    receipt_id, run_id = uuid4(), uuid4()
+    user = User(id=uuid4(), username="admin", is_admin=True)
+    photo = tmp_path / "photo.png"
+    Image.new("RGB", (3, 4)).save(photo)
+    benchmark = object.__new__(BenchmarkService)
+    benchmark._provider = llm
+    benchmark._receipts = ReceiptService(settings.images, settings.pg, llm, ocr, settings.ocr)
+    benchmark._receipts.list_tags = AsyncMock(return_value=[])
+    benchmark._select_receipts = AsyncMock(return_value=[receipt_id])
+    benchmark._capture_input = AsyncMock(return_value={
+        "receipt_id": str(receipt_id), "expected": receipt().model_dump(mode="json"),
+        "images": [{"path": str(photo), "sha256": image_digest(photo)}],
+    })
+    benchmark._db = SimpleNamespace(
+        create_run=AsyncMock(),
+        run=AsyncMock(return_value=SimpleNamespace(id=run_id, model_ids=["fixture"], receipt_ids=[receipt_id])),
+        manifest=AsyncMock(),
+    )
+    benchmark._run_digests = AsyncMock(return_value={})
+    benchmark._timeout = AsyncMock(return_value=2)
+    create = {"model_ids": ["fixture"], "experiment": {"pipeline": "ocr", "include_classification": False}}
+    if phase != "create":
+        await benchmark.create_run(BenchmarkCreate.model_validate(create), scope=AccessScope(user_id=user.id))
+        benchmark._db.manifest.return_value = benchmark._db.create_run.call_args.kwargs["manifest"]
+        benchmark._db.create_run.reset_mock()
+        requests.clear()
+        fail = True
+
+    app = FastAPI()
+    app.include_router(router, prefix="/benchmarks")
+    app.dependency_overrides[get_current_user] = lambda: user
+    app.dependency_overrides[get_benchmark_service] = lambda: benchmark
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with client_type(transport=transport, base_url="http://app.test") as client:
+        if phase == "create":
+            response = await client.post("/benchmarks", json=create)
+        else:
+            response = await client.post(f"/benchmarks/{run_id}/reevaluate", json={
+                "receipt_id": str(receipt_id), "model_id": "fixture",
+            })
+
+    if phase == "replay_readiness":
+        assert not any(request.startswith("/lifecycle/") for request in requests)
+    else:
+        assert requests[-1] == "/lifecycle/park"
+    assert not llm.handoff.read_journal().ocr_pending
+    assert requests.count("/ocr") == (1 if phase == "replay_inference" else 0)
+    llm._client.chat.assert_not_awaited()
+    benchmark._db.create_run.assert_not_awaited()
+    assert response.status_code == 503 and response.json() == {"detail": "ocr_gpu_out_of_memory"}
+
+
 @pytest.mark.parametrize("body", [{}, {"model_ids": []}, {"model_ids": ["a", "a"]}])
 async def test_benchmark_service_rejects_invalid_model_selection_before_discovery(body):
     from types import SimpleNamespace

@@ -116,6 +116,29 @@ it('labels the default upload policy as a text formatter when OCR is enabled', a
 	expect(calls).toContain('/api/v1/llm/models?capability=text');
 });
 
+it('shows the localized GPU memory error when benchmark OCR qualification fails', async () => {
+	setLocale('de');
+	session.set({ id: 'owner', username: 'admin', is_admin: true, can_see_all: false });
+	vi.stubGlobal(
+		'fetch',
+		vi.fn(async (url: string) => {
+			if (url.endsWith('/capabilities'))
+				return Response.json({ ocr_available: true, ocr_enabled: true, thinking_control: false });
+			if (url === '/api/v1/benchmarks')
+				return Response.json({ detail: 'ocr_gpu_out_of_memory' }, { status: 503 });
+			return Response.json([{ id: 'ocr-formatter' }]);
+		})
+	);
+	render(Page);
+	await screen.findByText('ocr-formatter');
+	await fireEvent.click(screen.getByRole('button', { name: 'Benchmark anlegen' }));
+	await fireEvent.click(screen.getByRole('button', { name: 'Bestätigen und starten' }));
+	expect((await screen.findByRole('alert')).textContent).toBe(
+		'Die lokale OCR-GPU hat nicht genug Grafikspeicher.'
+	);
+	expect(goto).not.toHaveBeenCalled();
+});
+
 it.each(['account change', 'view destruction'])(
 	'stops after the first outstanding qualification on %s',
 	async (boundary) => {

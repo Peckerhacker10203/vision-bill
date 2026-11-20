@@ -137,6 +137,22 @@ it('shows historical v4 fields as unavailable and keeps the old average', async 
 	expect(column('Average score (successful cases only)').textContent).toContain('100.00%');
 });
 
+it('shows a readable message for a benchmark result with a native GPU memory failure', async () => {
+	showResults({
+		details: [
+			{
+				model_id: 'model',
+				receipt_id: 'ocr-failure',
+				success: false,
+				error: 'ocr_gpu_out_of_memory'
+			}
+		]
+	});
+	await fireEvent.click(await screen.findByRole('button', { name: 'Load individual results' }));
+	await fireEvent.click(await screen.findByText(/ocr-failure/));
+	await screen.findByText('The local OCR GPU ran out of video memory.');
+});
+
 it('distinguishes a successful extraction with incorrect amounts from a fully correct receipt', async () => {
 	showResults({
 		details: [

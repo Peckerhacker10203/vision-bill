@@ -15,10 +15,12 @@ from ..model.benchmark import (
     ReferencePreview,
 )
 from ..model.handoff import HandoffWait
+from ..model.ocr_errors import OCR_GPU_OUT_OF_MEMORY, OcrGpuOutOfMemoryError
 from ..model.workflow import AccessScope
 from ..security.dependencies import require_admin
 from ..security.models import User
 from ..service.benchmark_service import BenchmarkService
+from ..service.experiment_execution import ExperimentFailure
 from .helper.helper import get_benchmark_service
 
 router = APIRouter(dependencies=[Depends(require_admin)])
@@ -47,6 +49,8 @@ async def create_benchmark_run(
         run = await benchmark_service.create_run(request, scope=AccessScope(user_id=user.id, can_see_all=user.can_see_all))
     except HandoffWait as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
+    except OcrGpuOutOfMemoryError as error:
+        raise HTTPException(status_code=503, detail=OCR_GPU_OUT_OF_MEMORY) from error
     except (ValueError, FileNotFoundError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     response.headers["Location"] = _location(run.id)
@@ -144,7 +148,11 @@ async def reevaluate_receipt(
         )
     except HandoffWait as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
+    except OcrGpuOutOfMemoryError as error:
+        raise HTTPException(status_code=503, detail=OCR_GPU_OUT_OF_MEMORY) from error
     except ValueError as error:
+        if isinstance(error, ExperimentFailure) and str(error) == OCR_GPU_OUT_OF_MEMORY:
+            raise HTTPException(status_code=503, detail=OCR_GPU_OUT_OF_MEMORY) from error
         raise HTTPException(status_code=404, detail=str(error)) from error
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error

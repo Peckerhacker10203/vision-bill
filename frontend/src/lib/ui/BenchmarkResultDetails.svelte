@@ -18,7 +18,11 @@
 						})
 					: $t('benchmarkResults.failed')}
 			</summary>
-			{#if result.error}<p class="mt-3 text-sm text-error">{result.error}</p>{/if}
+			{#if result.error}<p class="mt-3 text-sm text-error">
+					{result.error === 'ocr_gpu_out_of_memory'
+						? $t('settings.dedicatedOcr.reasons.ocr_gpu_out_of_memory')
+						: result.error}
+				</p>{/if}
 			{#if result.version === '4'}
 				<dl class="mt-3 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-3">
 					{@render diagnostic('fullyCorrectReceipt', result.full_receipt_correct)}

@@ -25,6 +25,7 @@ from ..model.benchmark import (
 )
 from ..model.experiment import ExperimentOptions, ExtractionPipeline
 from ..model.handoff import HandoffStatus, HandoffWait
+from ..model.ocr_errors import OCR_GPU_OUT_OF_MEMORY, OcrGpuOutOfMemoryError
 from ..model.receipt import LineItem, Receipt, TaxLine
 from ..model.workflow import AccessScope
 from ..provider.db.benchmark_db import BenchmarkDB
@@ -295,8 +296,10 @@ class BenchmarkService:
             return exc.status_code == 429 or bool(exc.status_code and exc.status_code >= 500)
         if isinstance(exc, httpx.HTTPStatusError):
             return exc.response.status_code == 429 or exc.response.status_code >= 500
+        if isinstance(exc, OcrGpuOutOfMemoryError):
+            return True
         return isinstance(exc, ValueError) and str(exc) in {
-            "ocr_unavailable", "ocr_page_failed", "formatter_model_unavailable",
+            OCR_GPU_OUT_OF_MEMORY, "ocr_unavailable", "ocr_page_failed", "formatter_model_unavailable",
             "vision_model_unavailable", "vision_fallback_unavailable",
         }
 
@@ -451,14 +454,16 @@ class BenchmarkService:
                 state="configuration_required", reason_code="execution_policy_changed",
             ))
         runtime = current_identity.get("ocr_runtime") or {}
-        if uses_ocr and runtime.get("reason_code") == "ocr_mode_mismatch":
+        runtime_reason = runtime.get("reason_code")
+        if uses_ocr and runtime_reason == "ocr_mode_mismatch":
             raise HandoffWait(HandoffStatus(
                 state="configuration_required", reason_code="ocr_mode_mismatch",
             ))
         qualify_runtime = False
         if uses_ocr and handoff is not None and ocr is not None:
             available = await ocr.get_capabilities()
-            if available.reason_code == "ocr_mode_mismatch":
+            runtime_reason = available.reason_code
+            if runtime_reason == "ocr_mode_mismatch":
                 raise HandoffWait(HandoffStatus(
                     state="configuration_required", reason_code="ocr_mode_mismatch",
                 ))
@@ -467,6 +472,8 @@ class BenchmarkService:
         if uses_ocr and not runtime.get("ready"):
             # Check readiness BEFORE frozen identity: an outage is a wait, not
             # evidence that a different runtime permanently replaced this one.
+            if runtime_reason == OCR_GPU_OUT_OF_MEMORY:
+                raise OcrGpuOutOfMemoryError
             raise _ReadinessWait("ocr_unavailable")
         if frozen_identity is not None:
             if not uses_ocr:
@@ -526,6 +533,8 @@ class BenchmarkService:
                         await owner.ocr_phase()
                         live = await ocr.get_capabilities()
                         frozen_runtime = (frozen_identity or {}).get("ocr_runtime") or {}
+                        if not live.ready and live.reason_code == OCR_GPU_OUT_OF_MEMORY:
+                            raise OcrGpuOutOfMemoryError
                         if not live.ready or not live.runtime_fingerprint:
                             raise ValueError("ocr_unavailable")
                         if any(frozen_runtime.get(key) != getattr(live, key) for key in (
