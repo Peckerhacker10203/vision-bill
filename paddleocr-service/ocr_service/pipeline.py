@@ -303,8 +303,6 @@ def construct_native(
 def build_pipeline(
     profile: OcrProfile,
     runtime: RuntimeSettings,
-    *,
-    record_preload: Callable[[GpuMemorySnapshot], None] | None = None,
 ) -> PipelineAdapter:
     if any(name == "paddlex" or name.startswith("paddlex.") for name in sys.modules):
         raise ValueError("Build native pipeline in a fresh worker before importing PaddleX")
@@ -336,9 +334,7 @@ def build_pipeline(
     actual_target = device_identity(paddle, runtime, compute=False)
     if not manifest.get("qualified_target") or actual_target != manifest["qualified_target"]:
         raise ValueError("Native qualified target identity mismatch; requalification required")
-    native, paddle, PaddleStaticRunner = construct_native(
-        profile, runtime, record_preload=record_preload
-    )
+    native, paddle, PaddleStaticRunner = construct_native(profile, runtime)
     preprocessor = native.doc_preprocessor_pipeline
     models = (
         native.layout_det_model,

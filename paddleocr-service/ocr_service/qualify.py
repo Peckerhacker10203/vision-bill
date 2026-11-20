@@ -11,6 +11,7 @@ import math
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -24,7 +25,9 @@ from ocr_contract import GpuMemorySnapshot, OcrResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .bootstrap import (
+    HookCollectionError,
     HookCollector,
+    HookFailureReason,
     common_coverage,
     inspect_artifact,
     parameter_bindings,
@@ -49,6 +52,9 @@ from .targets import validate_profile
 
 PROFILE = Path(__file__).resolve().parents[1] / "profile.json"
 KINDS = {"upright", "rotated", "warped", "table", "formula"}
+STATIC_HOOK_FAILURE_CODE = "static_hook_collection_failed"
+_STATIC_HOOK_FAILURE_EXIT = 43
+_STATIC_HOOK_REPORT_BYTES = 16 * 1024
 
 
 class QualificationCase(BaseModel):
@@ -58,6 +64,44 @@ class QualificationCase(BaseModel):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     # Require recognized structure for table/formula cases, without logging text.
     required_labels: list[str] = Field(default_factory=list)
+
+
+class StaticHookFailure(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    model_name: Literal["PP-DocLayoutV3", "PP-LCNet_x1_0_doc_ori", "UVDoc"]
+    reason_code: HookFailureReason
+    input_count: int = Field(ge=0, le=2**63 - 1)
+    output_count: int = Field(ge=0, le=2**63 - 1)
+
+
+class StaticHookCollectionFailed(ValueError):
+    def __init__(self, diagnostic: StaticHookFailure):
+        super().__init__(STATIC_HOOK_FAILURE_CODE)
+        self.diagnostic = diagnostic
+
+
+def read_static_hook_failure(path: Path) -> StaticHookFailure | None:
+    """Read only a small failure envelope, never raw native diagnostics."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > _STATIC_HOOK_REPORT_BYTES:
+                return None
+            payload = stream.read(info.st_size + 1)
+        if len(payload) != info.st_size:
+            return None
+        data = json.loads(payload)
+        if (
+            not isinstance(data, dict)
+            or data.get("qualified") is not False
+            or data.get("stage") != "native_collection"
+            or data.get("failure") != STATIC_HOOK_FAILURE_CODE
+        ):
+            return None
+        return StaticHookFailure.model_validate(data.get("static_hook_failure"))
+    except (OSError, ValueError, RecursionError):
+        return None
 
 
 class QualificationReport(BaseModel):
@@ -75,6 +119,7 @@ class QualificationReport(BaseModel):
     cases: list[dict[str, Any]] = Field(default_factory=list)
     qualified_targets: list[str] = Field(default_factory=list)
     failure: str | None = None
+    static_hook_failure: StaticHookFailure | None = None
     stage: str = "inputs"
 
 
@@ -144,6 +189,10 @@ def run_stage(stage: str, payload: dict[str, Any], directory: Path) -> dict[str,
         raise
     if code == GPU_OOM_EXIT and stage in ("collect", "replay"):
         raise GpuOutOfMemory
+    if code == _STATIC_HOOK_FAILURE_EXIT and stage == "collect":
+        diagnostic = read_static_hook_failure(outgoing)
+        if diagnostic is not None:
+            raise StaticHookCollectionFailed(diagnostic)
     if code:
         raise subprocess.CalledProcessError(code, process.args)
     if outgoing.stat().st_size > 64 * 1024 * 1024:
@@ -245,7 +294,9 @@ def collect(payload: dict[str, Any]) -> dict[str, Any]:
             or artifact["graph_file"].rsplit(".", 1)[0] != runner.model_file_prefix
         ):
             raise ValueError("Inspector and native runner artifacts differ")
-        collector = HookCollector(runtime.gpu_index)
+        collector = HookCollector(
+            runtime.gpu_index, parameter_names={entry["name"] for entry in artifact["parameters"]}
+        )
         runner.predictor.register_input_hook(collector.observe_input)
         runner.predictor.register_output_hook(collector.observe_output)
         collectors.append(collector)
@@ -277,7 +328,15 @@ def collect(payload: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("Required recognized structure absent")
             audit_dynamic_model(native.vl_rec_model.infer, runtime.gpu_index)
             for index, collector in enumerate(collectors):
-                forwards[index].append(collector.finish())
+                try:
+                    forwards[index].append(collector.finish())
+                except HookCollectionError as exc:
+                    raise StaticHookCollectionFailed(StaticHookFailure.model_validate({
+                        "model_name": MODEL_NAMES[index],
+                        "reason_code": exc.reason_code,
+                        "input_count": exc.input_count,
+                        "output_count": exc.output_count,
+                    })) from None
     artifacts = {}
     for index, name in enumerate(MODEL_NAMES[:3]):
         coverage = common_coverage(forwards[index])
@@ -447,7 +506,11 @@ def qualify_runtime(runtime: RuntimeSettings, cases: Path, output: Path) -> Qual
     except Exception as exc:  # noqa: BLE001 -- unknown native/build errors fail closed
         report.qualified = False
         report.qualified_targets = []
-        report.failure = GPU_OOM_CODE if isinstance(exc, GpuOutOfMemory) else type(exc).__name__
+        if isinstance(exc, StaticHookCollectionFailed):
+            report.failure = STATIC_HOOK_FAILURE_CODE
+            report.static_hook_failure = exc.diagnostic
+        else:
+            report.failure = GPU_OOM_CODE if isinstance(exc, GpuOutOfMemory) else type(exc).__name__
         # A writer can fail after replacing its destination. Revoke both stale and
         # partially published artifacts before attempting a sanitized failure report.
         serving.unlink(missing_ok=True)
@@ -488,6 +551,14 @@ def main() -> None:
         else:
             try:
                 result = (collect if args.stage == "collect" else replay)(payload)
+            except StaticHookCollectionFailed as exc:
+                write_json(args.output, {
+                    "qualified": False,
+                    "stage": "native_collection",
+                    "failure": STATIC_HOOK_FAILURE_CODE,
+                    "static_hook_failure": exc.diagnostic.model_dump(),
+                })
+                raise SystemExit(_STATIC_HOOK_FAILURE_EXIT) from None
             except Exception as exc:
                 if is_gpu_out_of_memory(exc):
                     raise SystemExit(GPU_OOM_EXIT) from None

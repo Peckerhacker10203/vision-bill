@@ -4,16 +4,17 @@ This module cannot authorize serving. Its output is replayed by a fresh ordinary
 factory/adapter. Unknown CPU float transfers conservatively fail collection.
 """
 
+from collections.abc import Collection
 from importlib import metadata
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
 from .fp32 import floating_dtype
 from .paddle_distribution import installed_native_paddle, native_paddle_distribution
-from .precision import HookRecord, ParameterRecord
+from .precision import HookRecord, HookVariableNames, ParameterRecord
 from .profile import dependency_identity, file_digest
 
 INSPECTOR_VERSION = "pinned-export-inventory-v1"
@@ -84,20 +85,43 @@ def bind_approved_dependencies(
     return versions
 
 
+HookFailureReason = Literal[
+    "hook_cpu_float",
+    "hook_wrong_gpu",
+    "hook_non_fp32",
+    "hook_metadata_invalid",
+    "hook_metadata_limit",
+    "hook_input_missing",
+    "hook_output_missing",
+    "hook_float_coverage_missing",
+]
+
+
+class HookCollectionError(ValueError):
+    def __init__(self, reason_code: HookFailureReason, input_count: int, output_count: int):
+        super().__init__(f"Incomplete or invalid native hook coverage ({reason_code})")
+        self.reason_code = reason_code
+        self.input_count = input_count
+        self.output_count = output_count
+
+
 class HookCollector:
     """A bounded observation collector, never a synthetic StaticAuditSession."""
 
-    def __init__(self, gpu_index: int, max_records: int = 100_000):
+    def __init__(
+        self, gpu_index: int, max_records: int = 100_000, *, parameter_names: Collection[str] = ()
+    ):
         self.gpu_index = gpu_index
         self.max_records = max_records
         self.observed: set[tuple[str, str, str, str, str]] = set()
-        self.violations: set[str] = set()
+        self.names = HookVariableNames(parameter_names)
+        self.failure: HookFailureReason | None = None
         self.counts = {"input": 0, "output": 0}
         self.enabled = False
 
     def start(self) -> None:
         self.observed.clear()
-        self.violations.clear()
+        self.failure = None
         self.counts = {"input": 0, "output": 0}
         self.enabled = True
 
@@ -105,27 +129,35 @@ class HookCollector:
         if not self.enabled:
             return
         self.counts[hook] += 1
+        if self.failure is not None:
+            return
         try:
             dtype = floating_dtype(tensor.dtype)
             if dtype is None:
                 return
             place = tensor.place
-            if (
-                dtype != "float32"
-                or not place.is_gpu_place()
-                or place.gpu_device_id() != self.gpu_index
-            ):
-                self.violations.add("Unproven floating precision or device")
+            if dtype != "float32":
+                self.failure = "hook_non_fp32"
                 return
-            record = (hook, str(op), str(name), dtype, f"gpu:{self.gpu_index}")
+            if place.is_cpu_place():
+                self.failure = "hook_cpu_float"
+                return
+            if not place.is_gpu_place():
+                self.failure = "hook_metadata_invalid"
+                return
+            if place.gpu_device_id() != self.gpu_index:
+                self.failure = "hook_wrong_gpu"
+                return
             if len(op) > 1024 or len(name) > 4096:
-                self.violations.add("Hook metadata exceeds bounds")
-            elif record not in self.observed and len(self.observed) >= self.max_records:
-                self.violations.add("Hook inventory exceeds bounds")
+                self.failure = "hook_metadata_limit"
+                return
+            record = (hook, str(op), self.names.canonical(str(name)), dtype, f"gpu:{self.gpu_index}")
+            if record not in self.observed and len(self.observed) >= self.max_records:
+                self.failure = "hook_metadata_limit"
             else:
                 self.observed.add(record)
         except Exception:  # noqa: BLE001 -- native callbacks must retain failures
-            self.violations.add("Unable to inspect hook metadata")
+            self.failure = "hook_metadata_invalid"
 
     def observe_input(self, op: str, name: str, tensor: Any) -> None:
         self.observe("input", op, name, tensor)
@@ -135,12 +167,16 @@ class HookCollector:
 
     def finish(self) -> list[HookRecord]:
         self.enabled = False
-        if (
-            self.violations
-            or not all(self.counts.values())
-            or {row[0] for row in self.observed} != {"input", "output"}
-        ):
-            raise ValueError("Incomplete or invalid native hook coverage")
+        reason = self.failure
+        if reason is None:
+            if not self.counts["input"]:
+                reason = "hook_input_missing"
+            elif not self.counts["output"]:
+                reason = "hook_output_missing"
+            elif {row[0] for row in self.observed} != {"input", "output"}:
+                reason = "hook_float_coverage_missing"
+        if reason is not None:
+            raise HookCollectionError(reason, self.counts["input"], self.counts["output"])
         return [
             HookRecord.model_validate(
                 dict(zip(("hook", "op", "name", "dtype", "place"), row, strict=True))

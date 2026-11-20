@@ -18,9 +18,8 @@ from uuid import UUID, uuid4
 from ocr_contract import GpuMemorySnapshot, OcrResponse, WorkerReadiness
 from ocr_contract.document_image import decode_working_png, validate_working_png
 from ocr_contract.limits import MAX_OCR_RESPONSE_BYTES
-from pydantic import ValidationError
 
-from .gpu_memory import GPU_OOM_CODE, is_gpu_out_of_memory
+from .gpu_memory import GPU_OOM_CODE, is_gpu_out_of_memory, probe_gpu_memory
 from .profile import RuntimeSettings, load_profile
 
 MAX_CONTROL_BYTES = 4096
@@ -119,29 +118,24 @@ def _worker_main(
     reply_directory: Path,
 ) -> None:
     # No exception text or receipt content crosses the general error/log boundary.
-    startup: dict[str, Any] = {"generation": generation}
-
-    def record_preload(snapshot: GpuMemorySnapshot) -> None:
-        startup["preload_memory"] = snapshot.model_dump()
-
     try:
         from .pipeline import build_pipeline
 
         if runtime is None or smoke_path is None:
             raise ValueError("Explicit runtime and sealed smoke image are required")
-        adapter = build_pipeline(load_profile(profile_path), runtime, record_preload=record_preload)
+        adapter = build_pipeline(load_profile(profile_path), runtime)
         adapter.qualify(smoke_path)
         output_channel.put(
             {
                 "kind": "ready",
-                **startup,
+                "generation": generation,
                 "profile_id": adapter.profile_id,
                 "runtime_fingerprint": adapter.runtime_fingerprint,
             }
         )
     except Exception as exc:  # noqa: BLE001 - native boundary must hide exception details
         code = GPU_OOM_CODE if is_gpu_out_of_memory(exc) else "ocr_init_failed"
-        output_channel.put({"kind": "init_failed", "code": code, **startup})
+        output_channel.put({"kind": "init_failed", "code": code, "generation": generation})
         return
     while True:
         request = input_channel.get()
@@ -309,7 +303,37 @@ class OcrWorkerManager:
             if self._proc is not None:
                 self._teardown()
             self._generation += 1
+            deadline = time.monotonic() + self._startup_timeout
+            if deadline_monotonic is not None:
+                deadline = min(deadline, deadline_monotonic)
+
+            def interruption(now: float) -> str | None:
+                if self._stopped.is_set():
+                    return "ocr_stopped"
+                if cancel_event is not None and cancel_event.is_set():
+                    return "ocr_cancelled"
+                if now < deadline:
+                    return None
+                if deadline_monotonic is not None and now >= deadline_monotonic:
+                    return "ocr_deadline_exceeded"
+                return "ocr_startup_timeout"
+
             try:
+                now = time.monotonic()
+                if reason := interruption(now):
+                    self._set_unready(reason)
+                    return
+                if self._runtime is not None:
+                    # Keep ownership while the helper runs and is reaped. Park
+                    # must not release the GPU while this startup owns a context.
+                    snapshot = probe_gpu_memory(
+                        self._runtime.accelerator, self._runtime.gpu_index, timeout=deadline - now
+                    )
+                    if reason := interruption(time.monotonic()):
+                        self._set_unready(reason)
+                        return
+                    with self._state:
+                        self._preload_memory = snapshot
                 self._in_q = self._ctx.Queue(maxsize=1)
                 receiver, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
                 self._out_q = ControlChannel(receiver)
@@ -329,22 +353,12 @@ class OcrWorkerManager:
                     daemon=True,
                 )
                 self._proc.start()
-                deadline = time.monotonic() + self._startup_timeout
-                if deadline_monotonic is not None:
-                    deadline = min(deadline, deadline_monotonic)
-                while not self._stopped.is_set():
-                    if cancel_event is not None and cancel_event.is_set():
-                        self._set_unready("ocr_cancelled")
+                while True:
+                    now = time.monotonic()
+                    if reason := interruption(now):
+                        self._set_unready(reason)
                         break
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        self._set_unready(
-                            "ocr_deadline_exceeded"
-                            if deadline_monotonic is not None
-                            and time.monotonic() >= deadline_monotonic
-                            else "ocr_startup_timeout"
-                        )
-                        break
+                    remaining = deadline - now
                     child_exited = False
                     try:
                         message = self._out_q.get(timeout=min(0.05, remaining))
@@ -357,16 +371,6 @@ class OcrWorkerManager:
                         message = self._out_q.get(timeout=0)
                     if message.get("generation") != self._generation:
                         continue
-                    if message.get("kind") in ("ready", "init_failed"):
-                        snapshot = message.get("preload_memory")
-                        if snapshot is not None:
-                            try:
-                                memory = GpuMemorySnapshot.model_validate(snapshot)
-                            except ValidationError:
-                                pass  # Diagnostics never decide worker readiness.
-                            else:
-                                with self._state:
-                                    self._preload_memory = memory
                     if message.get("kind") == "ready" and not child_exited:
                         with self._state:
                             self._ready = not self._stopped.is_set()

@@ -640,3 +640,43 @@ def test_paired_maintenance_requires_explicit_original_handoff_path(
     assert error.value.code == 2
     assert "original app --handoff-lock" in capsys.readouterr().err
     native.assert_not_called()
+
+
+@pytest.mark.parametrize("invalid", [None, "unknown_model", "oversized"])
+def test_failed_collection_logs_only_a_bounded_static_hook_diagnostic(
+    tmp_path, release, monkeypatch, caplog, invalid
+):
+    from contextlib import nullcontext
+
+    from ocr_service import initialize as module
+
+    monkeypatch.setenv("OCR_INSTALLATION_LOCK_PATH", str(tmp_path / "installation.lock"))
+    monkeypatch.setattr(module, "managed_installation", lambda *_args: nullcontext())
+    private_text = "private tensor name and path"
+
+    def fail(command):
+        output = Path(command[command.index("--output") + 1])
+        output.write_text(json.dumps({
+            "stage": "native_collection",
+            "failure": "static_hook_collection_failed",
+            "qualified": False,
+            "static_hook_failure": {
+                "model_name": private_text if invalid == "unknown_model" else "UVDoc",
+                "reason_code": "hook_cpu_float",
+                "input_count": 7,
+                "output_count": 5,
+            },
+            "private_fixture_output": private_text * (100_000 if invalid == "oversized" else 1),
+        }))
+        return 1
+
+    monkeypatch.setattr(module, "owned_qualification_process", fail)
+    with pytest.raises(module.InitializationFailed):
+        initialize_release(tmp_path, release)
+
+    messages = [r.getMessage() for r in caplog.records]
+    expected = "static_hook_collection_failed model=UVDoc reason=hook_cpu_float input=7 output=5"
+    assert (expected in messages) == (invalid is None)
+    assert private_text not in caplog.text
+    assert not (tmp_path / "state" / "selected").exists()
+    assert not list((tmp_path / "state" / "installations").iterdir())

@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from test_ocr_pipeline import tensor
+from test_ocr_pipeline import artifact, tensor
 
 
 def qualification():
@@ -35,6 +35,79 @@ def test_collector_requires_each_forward_complete_not_corpus_union():
     assert module.common_coverage([first, first]) == first
 
 
+def test_fresh_static_runner_replays_pir_temporaries_without_changing_weight_names(tmp_path):
+    from ocr_service.precision import StaticAuditSession
+
+    source = artifact(tmp_path)
+    collector = bootstrap().HookCollector(0, parameter_names={"w"})
+    collector.start()
+    collector.observe_input("pd_op.conv2d:9", "w", tensor())
+    collector.observe_output("pd_op.conv2d:9", "0x7f642a1301732000000000000000_inner_var_16", tensor())
+    coverage = collector.finish()
+    assert bootstrap().parameter_bindings(source.parameters, coverage, 0) == {"w": "w"}
+    session = StaticAuditSession(
+        source.model_copy(update={"coverage": coverage, "parameter_bindings": {"w": "w"}}), 0
+    )
+    session.start()
+    session.observe_input("pd_op.conv2d:9", "w", tensor())
+    session.observe_output("pd_op.conv2d:9", "0x7fb6416801732000000000000001_inner_var_16", tensor())
+    assert session.finish()["floating_parameters"] == 1
+
+    session.start()
+    session.observe_input("pd_op.conv2d:9", "w", tensor())
+    session.observe_output("pd_op.conv2d:9", "0x7fb6416801732000000000000001_inner_var_17", tensor())
+    with pytest.raises(ValueError, match="coverage"):
+        session.finish()
+
+
+def test_collector_rejects_ambiguous_pir_scope_instead_of_collapsing_variables():
+    collector = bootstrap().HookCollector(0)
+    collector.start()
+    collector.observe_input("pd_op.add:9", "0x7f642a1301732000000000000000_inner_var_16", tensor())
+    collector.observe_output("pd_op.add:9", "0x7fb6416801732000000000000001_inner_var_16", tensor())
+    with pytest.raises(ValueError, match="coverage"):
+        collector.finish()
+
+
+def test_same_static_predictor_rejects_anonymous_scope_changes_between_forwards(tmp_path):
+    from ocr_service.precision import StaticAuditSession
+
+    source = artifact(tmp_path)
+    collector = bootstrap().HookCollector(0)
+    initial = "0x7f642a1301732000000000000000_inner_var_16"
+    changed = "0x7fb6416801732000000000000001_inner_var_16"
+    collector.start()
+    collector.observe_input("pd_op.conv2d:9", "w", tensor())
+    collector.observe_output("pd_op.conv2d:9", initial, tensor())
+    session = StaticAuditSession(
+        source.model_copy(update={"coverage": collector.finish(), "parameter_bindings": {"w": "w"}}),
+        0,
+    )
+    session.start()
+    session.observe_input("pd_op.conv2d:9", "w", tensor())
+    session.observe_output("pd_op.conv2d:9", initial, tensor())
+    session.finish()
+    for audit in (collector, session):
+        audit.start()
+        audit.observe_input("pd_op.conv2d:9", "w", tensor())
+        audit.observe_output("pd_op.conv2d:9", changed, tensor())
+        with pytest.raises(ValueError, match="coverage"):
+            audit.finish()
+
+
+def test_exported_weight_cannot_use_a_reserved_pir_temporary_identity():
+    with pytest.raises(ValueError, match="reserved PIR identity prefix"):
+        bootstrap().HookCollector(0, parameter_names={"pir-temporary:16"})
+
+
+def test_hook_collection_preserves_a_named_tensor_that_only_resembles_a_pir_temporary():
+    collector = bootstrap().HookCollector(0)
+    collector.start()
+    collector.observe_input("pd_op.relu:5", "0xdeadbeef_inner_var_1", tensor())
+    collector.observe_output("pd_op.relu:5", "out", tensor())
+    assert [record.name for record in collector.finish()] == ["0xdeadbeef_inner_var_1", "out"]
+
+
 @pytest.mark.parametrize(
     "dtype,gpu", [("float16", 0), ("bfloat16", 0), ("float32", 1), ("float32", None)]
 )
@@ -45,6 +118,20 @@ def test_unsealed_collector_rejects_precision_device_and_unproven_cpu_float(dtyp
     collector.observe_output("matmul", "result", tensor())
     with pytest.raises(ValueError):
         collector.finish()
+
+
+def test_collector_reports_first_safe_reason_and_native_callback_counts():
+    module = bootstrap()
+    collector = module.HookCollector(0)
+    collector.start()
+    collector.observe_input("memcpy_h2d", "private-tensor-name", tensor("float32", None))
+    collector.observe_input("conv2d", "another-private-name", tensor("float16"))
+    collector.observe_output("conv2d", "out", tensor())
+    with pytest.raises(module.HookCollectionError) as captured:
+        collector.finish()
+    failure = captured.value
+    assert (failure.reason_code, failure.input_count, failure.output_count) == ("hook_cpu_float", 2, 1)
+    assert "private" not in str(failure)
 
 
 def test_collector_empty_and_unbounded_stream_fail():

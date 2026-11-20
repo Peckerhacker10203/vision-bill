@@ -83,9 +83,6 @@ class FakeProcess:
             failure = {"generation": generation, "kind": "init_failed"}
             if self.context.init_fail == "gpu_memory":
                 failure["code"] = "ocr_gpu_out_of_memory"
-                failure["preload_memory"] = {
-                    "accelerator": "rocm", "gpu_index": 2, "free_bytes": 100, "total_bytes": 200
-                }
             out_q.put(failure)
             self.dead.set()
             return
@@ -965,11 +962,25 @@ def test_worker_rejects_crc_correct_invalid_deflate_before_publication(tmp_path)
     assert not list(tmp_path.glob("*.json"))
 
 
-def test_managed_load_reports_gpu_memory_failure_and_snapshot():
+def test_managed_load_reports_gpu_memory_failure_and_snapshot(monkeypatch):
+    from types import SimpleNamespace
+
+    from ocr_contract import GpuMemorySnapshot
+    from ocr_service import worker as worker_module
     from ocr_service.worker import OcrWorkerError, OcrWorkerManager
 
     context = FakeContext(init_fail="gpu_memory")
-    worker = OcrWorkerManager(mp_context=context, startup_timeout=1)
+    runtime = SimpleNamespace(accelerator="rocm", gpu_index=2)
+    worker = OcrWorkerManager(mp_context=context, startup_timeout=1, runtime=runtime)
+
+    def probe(accelerator, gpu_index, *, timeout):
+        assert context.processes == []
+        assert 0 < timeout <= 1
+        return GpuMemorySnapshot(
+            accelerator=accelerator, gpu_index=gpu_index, free_bytes=100, total_bytes=200
+        )
+
+    monkeypatch.setattr(worker_module, "probe_gpu_memory", probe, raising=False)
     owner = f"1:{uuid4()}"
     worker.claim(owner)
     try:
@@ -1157,3 +1168,83 @@ def test_final_gpu_memory_reply_survives_receive_timeout_before_child_exit(
         assert worker._proc is None
     finally:
         worker.stop()
+
+
+def test_park_waits_for_the_managers_preload_probe(monkeypatch):
+    from types import SimpleNamespace
+
+    from ocr_service import worker as worker_module
+    from ocr_service.worker import OcrWorkerError, OcrWorkerManager
+
+    context = FakeContext()
+    runtime = SimpleNamespace(accelerator="cuda", gpu_index=0)
+    manager = OcrWorkerManager(mp_context=context, startup_timeout=3, runtime=runtime)
+    owner = f"1:{uuid4()}"
+    manager.claim(owner)
+    probe_entered = threading.Event()
+    release_probe = threading.Event()
+    park_requested = threading.Event()
+    cancelled = threading.Event()
+
+    def probe(*args, **kwargs):
+        probe_entered.set()
+        assert release_probe.wait(2)
+
+    def park():
+        park_requested.set()
+        manager.park(owner)
+
+    monkeypatch.setattr(worker_module, "probe_gpu_memory", probe, raising=False)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            loading = pool.submit(manager.load, owner, cancel_event=cancelled)
+            try:
+                assert probe_entered.wait(1)
+                parking = pool.submit(park)
+                assert park_requested.wait(1)
+                with pytest.raises(TimeoutError):
+                    parking.result(0.05)
+                assert not context.processes
+                cancelled.set()
+            finally:
+                release_probe.set()
+            with pytest.raises(OcrWorkerError, match="ocr_cancelled"):
+                loading.result(1)
+            parking.result(1)
+        assert manager.readiness().reason_code == "ocr_parked"
+        assert not context.processes
+    finally:
+        release_probe.set()
+        manager.stop()
+
+
+@pytest.mark.parametrize("now", [5.0, 3.0])
+def test_preload_probe_spends_the_existing_startup_budget(monkeypatch, now):
+    from types import SimpleNamespace
+
+    from ocr_service import worker as worker_module
+    from ocr_service.worker import OcrWorkerError, OcrWorkerManager
+
+    clock = now
+    monkeypatch.setattr(worker_module, "time", SimpleNamespace(monotonic=lambda: clock))
+    context = FakeContext()
+    runtime = SimpleNamespace(accelerator="cuda", gpu_index=0)
+    manager = OcrWorkerManager(mp_context=context, startup_timeout=10, runtime=runtime)
+    owner = f"1:{uuid4()}"
+    manager.claim(owner)
+    probe_calls = []
+
+    def probe(*args, timeout):
+        nonlocal clock
+        probe_calls.append(timeout)
+        clock += timeout
+
+    monkeypatch.setattr(worker_module, "probe_gpu_memory", probe, raising=False)
+    try:
+        with pytest.raises(OcrWorkerError, match="ocr_deadline_exceeded") as raised:
+            manager.load(owner, deadline_monotonic=5.0)
+        assert raised.value.status_code == 504
+        assert probe_calls == ([] if now == 5.0 else [2.0])
+        assert not context.processes
+    finally:
+        manager.stop()

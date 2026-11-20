@@ -6,6 +6,7 @@ no Docker socket or guessed self-image identity is used inside this container.
 
 import argparse
 import json
+import logging
 import os
 import shutil
 import sys
@@ -39,6 +40,8 @@ from .supervision import (
     managed_installation,
     run_owned_qualification,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class InitializationFailed(RuntimeError):
@@ -284,6 +287,18 @@ def initialize(
             if exit_code == GPU_OOM_EXIT:
                 raise InitializationGpuOutOfMemory(GPU_OOM_CODE)
             if exit_code:
+                from .qualify import STATIC_HOOK_FAILURE_CODE, read_static_hook_failure
+
+                diagnostic = read_static_hook_failure(output)
+                if diagnostic is not None:
+                    logger.warning(
+                        "%s model=%s reason=%s input=%d output=%d",
+                        STATIC_HOOK_FAILURE_CODE,
+                        diagnostic.model_name,
+                        diagnostic.reason_code,
+                        diagnostic.input_count,
+                        diagnostic.output_count,
+                    )
                 raise InitializationFailed(
                     "Full native qualification failed; selected settings were not published"
                 )

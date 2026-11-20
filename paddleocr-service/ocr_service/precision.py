@@ -4,6 +4,8 @@ A manifest is build evidence, never runtime success. Each session must execute
 its actual compiled predictor after hooks are installed before finish can pass.
 """
 
+import re
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any, Literal
 
@@ -11,6 +13,36 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .fp32 import floating_dtype
 from .profile import content_identity, file_digest
+
+# Paddle 3.3.1 on Linux x86_64 emits a pointer followed by epoch nanoseconds.
+_PIR_VARIABLE = re.compile(r"(0x[0-9a-f]{1,16}[1-9][0-9]{18})_inner_var_(0|[1-9][0-9]*)")
+_PIR_NAME_PREFIX = "pir-temporary:"
+
+
+class HookVariableNames:
+    """Keep Paddle's variable ordinal while removing its process-local scope prefix."""
+
+    def __init__(self, parameter_names: Collection[str]):
+        self.parameter_names = frozenset(parameter_names)
+        if any(name.startswith(_PIR_NAME_PREFIX) for name in self.parameter_names):
+            raise ValueError("Static parameter uses the reserved PIR identity prefix")
+        self.scope: str | None = None
+
+    def canonical(self, name: str) -> str:
+        if name.startswith(_PIR_NAME_PREFIX):
+            raise ValueError("Native variable uses the reserved PIR identity prefix")
+        if name in self.parameter_names:
+            return name
+        generated = _PIR_VARIABLE.fullmatch(name)
+        if generated is None:
+            return name
+        scope, ordinal = generated.groups()
+        # The ordinal is scoped to the interpreter. Bind its scope for the
+        # whole predictor lifetime and reject any ambiguous remapping.
+        if self.scope is not None and self.scope != scope:
+            raise ValueError("Static forward uses multiple generated PIR scopes")
+        self.scope = scope
+        return f"{_PIR_NAME_PREFIX}{ordinal}"
 
 
 class ParameterRecord(BaseModel):
@@ -83,6 +115,9 @@ class StaticAuditSession:
         self.counts = {"input": 0, "output": 0}
         self.observed: set[tuple[str, str, str, str, str]] = set()
         self.violations: set[str] = set()
+        self.names = HookVariableNames(
+            {param.name for param in artifact.parameters} | set(artifact.parameter_bindings.values())
+        )
         self.expected = {tuple(item.model_dump().values()) for item in artifact.coverage}
         required = set(artifact.parameter_bindings.values())
         declared = {
@@ -120,7 +155,7 @@ class StaticAuditSession:
             else:
                 self.violations.add("Floating tensor uses an unsupported device place")
                 return
-            record = (hook, str(op), str(name), dtype, location)
+            record = (hook, str(op), self.names.canonical(str(name)), dtype, location)
             if dtype != "float32" or record not in self.expected:
                 # Bound memory even if a native graph emits an unbounded stream.
                 self.violations.add("Unexpected floating precision/device/coverage")
