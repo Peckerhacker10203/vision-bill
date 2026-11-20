@@ -51,10 +51,16 @@ may be retained/reused across retries; formatting requires every ordered photo.
 `POST /api/v1/images/<id>/retry` takes `expected_generation` and a nonempty
 `request_key`. Replaying that key returns its original outcome; a new retry must
 use the current generation and a new key. Conflicts return 409. Retrying preserves
-sources and frozen intent by default (`policy: "preserve"`). Changed OCR routing
+sources and frozen intent by default (`policy: "preserve"`). New uploads bind the
+provider and its credential-free endpoint fingerprint for direct vision and OCR
+formatting, including separate GPUs. Changes to that destination, OCR routing,
 or historical image-fallback permissions can hold pending work with
-`wait_reason: "execution_policy_changed"` before claim. To adopt current server
-policy explicitly, send `policy: "current"` with the current generation and a new
+`wait_reason: "execution_policy_changed"` before claim. Pending inference from
+older releases, including rows without a snapshot, also requires explicit
+adoption because its original LLM destination is unknown. Inference-free
+completion can still use an existing checkpoint that proves the original
+destination and matches current policy. To adopt current server policy
+explicitly, send `policy: "current"` with the current generation and a new
 request key. The server preserves the original request/fingerprint and old effective
 policy in history, increments generation and clears incompatible execution/checkpoint
 state. Retry-key replay binds the policy choice too. Live claims, linked receipts
@@ -144,8 +150,9 @@ and unit price are known, their product is checked against the line total.
 
 Receipt review uses checks version 3. See the
 [amount policy and human acknowledgement contract](UPGRADE_AND_VERIFY.md#review-and-financial-contract).
-Verify uses current operation and review revisions with acknowledgements for the
-exact displayed finding IDs. Integrity failures block even with an acknowledgement.
+**Verify** and **Save & verify** fetch the current server preview. Enter comments
+for the displayed review findings. The request binds these acknowledgements to
+the exact finding IDs and the operation and review revisions. Integrity failures block even with an acknowledgement.
 Previously bypassed, legacy or older-version verification can receive explicit
 human review of the current receipt. Use the current `GET /api/v1/receipts/<id>/verify` preview and
 submit both expected revisions and acknowledgements to the matching POST.

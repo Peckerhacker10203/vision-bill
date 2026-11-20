@@ -38,6 +38,9 @@ def detailed_score_v3(expected: Receipt, actual: Receipt, *, classification: boo
             # Decimal serialization differences (12.9 vs 12.90) are equivalent;
             # a one-cent error is not forgiven. No lossy rounding is applied.
             equal = Decimal(str(e)) == Decimal(str(a))
+            # These v3 fields were JSON numbers. Their scale never affected strict scores.
+            if path.endswith((".quantity", ".rate")):
+                exact = equal
         else:
             equal = normalized(e) == normalized(a)
         if path == "time" and isinstance(e, str) and isinstance(a, str):

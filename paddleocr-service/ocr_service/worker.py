@@ -20,7 +20,14 @@ from ocr_contract.document_image import decode_working_png, validate_working_png
 from ocr_contract.limits import MAX_OCR_RESPONSE_BYTES
 
 from .gpu_memory import GPU_OOM_CODE, is_gpu_out_of_memory, probe_gpu_memory
-from .profile import RuntimeSettings, load_profile
+from .profile import (
+    InvalidReceiptOutput,
+    PreparedRuntimeSettings,
+    RuntimeIdentityMismatch,
+    RuntimeSettings,
+    load_profile,
+    serving_identity,
+)
 
 MAX_CONTROL_BYTES = 4096
 
@@ -113,18 +120,16 @@ def _worker_main(
     output_channel: Any,
     generation: int,
     profile_path: Path,
-    runtime: RuntimeSettings | None,
-    smoke_path: Path | None,
+    runtime: PreparedRuntimeSettings | RuntimeSettings | None,
     reply_directory: Path,
 ) -> None:
     # No exception text or receipt content crosses the general error/log boundary.
     try:
-        from .pipeline import build_pipeline
+        from .pipeline import build_serving_pipeline
 
-        if runtime is None or smoke_path is None:
-            raise ValueError("Explicit runtime and sealed smoke image are required")
-        adapter = build_pipeline(load_profile(profile_path), runtime)
-        adapter.qualify(smoke_path)
+        if runtime is None:
+            raise ValueError("Explicit local runtime settings are required")
+        adapter = build_serving_pipeline(load_profile(profile_path), runtime)
         output_channel.put(
             {
                 "kind": "ready",
@@ -134,7 +139,11 @@ def _worker_main(
             }
         )
     except Exception as exc:  # noqa: BLE001 - native boundary must hide exception details
-        code = GPU_OOM_CODE if is_gpu_out_of_memory(exc) else "ocr_init_failed"
+        code = "ocr_model_load_failed"
+        if is_gpu_out_of_memory(exc):
+            code = GPU_OOM_CODE
+        elif isinstance(exc, RuntimeIdentityMismatch):
+            code = "ocr_runtime_identity_mismatch"
         output_channel.put({"kind": "init_failed", "code": code, "generation": generation})
         return
     while True:
@@ -152,19 +161,21 @@ def _worker_main(
                 photo_index=request.photo_index,
                 source_sha256=request.source_sha256,
             )
-            message.update(kind="result", artifact=publish_result(result, reply_directory))
+            try:
+                artifact = publish_result(result, reply_directory)
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise InvalidReceiptOutput("Invalid OCR response artifact") from exc
+            message.update(kind="result", artifact=artifact)
         except Exception as exc:  # noqa: BLE001 - native boundary must hide exception details
+            # A failed native execution can leave the accelerator context unusable.
+            code = "ocr_inference_failed"
             if is_gpu_out_of_memory(exc):
-                message.update(kind="qualification_invalidated", code=GPU_OOM_CODE)
-                output_channel.put(message)
-                return
-            if not adapter.qualified:
-                message.update(
-                    kind="qualification_invalidated", code="ocr_qualification_invalidated"
-                )
-                output_channel.put(message)
-                return
-            message.update(kind="error", code="ocr_inference_failed")
+                code = GPU_OOM_CODE
+            elif isinstance(exc, InvalidReceiptOutput):
+                code = "ocr_invalid_result"
+            message.update(kind="worker_failed", code=code)
+            output_channel.put(message)
+            return
         output_channel.put(message)
 
 
@@ -172,8 +183,7 @@ class OcrWorkerManager:
     def __init__(
         self,
         *,
-        runtime: RuntimeSettings | None = None,
-        smoke_path: Path | None = None,
+        runtime: PreparedRuntimeSettings | RuntimeSettings | None = None,
         profile_path: Path = Path(__file__).parents[1] / "profile.json",
         startup_timeout: float = 600,
         mp_context: Any = None,
@@ -182,7 +192,6 @@ class OcrWorkerManager:
             raise ValueError("Startup timeout must be finite and positive")
         self._ctx = mp_context if mp_context is not None else mp.get_context("spawn")
         self._runtime = runtime
-        self._smoke_path = smoke_path
         self._profile_path = profile_path
         self._startup_timeout = startup_timeout
         self._control = threading.RLock()
@@ -201,6 +210,15 @@ class OcrWorkerManager:
         self._owner_generation = 0
         self._owner_load_allowed = False
         self.last_identity: dict[str, str | None] = {}
+        if isinstance(runtime, PreparedRuntimeSettings):
+            self.last_identity.update(
+                serving_identity(
+                    load_profile(profile_path),
+                    runtime,
+                    runtime.model_content,
+                    runtime.device_identity,
+                )
+            )
         self._profile_id: str | None = None
         self._runtime_fingerprint: str | None = None
         self._preload_memory: GpuMemorySnapshot | None = None
@@ -347,7 +365,6 @@ class OcrWorkerManager:
                         self._generation,
                         self._profile_path,
                         self._runtime,
-                        self._smoke_path,
                         Path(self._reply_directory.name),
                     ),
                     daemon=True,
@@ -383,12 +400,13 @@ class OcrWorkerManager:
                             }
                         if self._ready:
                             return
-                    code = (
-                        GPU_OOM_CODE
-                        if message.get("kind") == "init_failed"
-                        and message.get("code") == GPU_OOM_CODE
-                        else "ocr_init_failed"
-                    )
+                    code = "ocr_init_failed"
+                    if message.get("kind") == "init_failed" and message.get("code") in (
+                        GPU_OOM_CODE,
+                        "ocr_model_load_failed",
+                        "ocr_runtime_identity_mismatch",
+                    ):
+                        code = message["code"]
                     self._set_unready(code, keep_preload=True)
                     break
             except Exception:  # noqa: BLE001 - native boundary must hide exception details
@@ -436,7 +454,7 @@ class OcrWorkerManager:
             self._teardown()
         if not restart:
             return
-        # A new generation is qualified separately; never replay the failed request.
+        # A replacement loads the runtime without replaying the failed request.
         threading.Thread(
             target=self._restart_generation,
             args=(generation,),
@@ -634,12 +652,15 @@ class OcrWorkerManager:
                     request.request_id
                 ):
                     continue
-                if message.get("kind") == "qualification_invalidated":
-                    if message.get("code") == GPU_OOM_CODE:
+                if message.get("kind") == "worker_failed":
+                    code = message.get("code")
+                    if code == GPU_OOM_CODE:
                         self._recover(GPU_OOM_CODE, restart=False)
                         raise OcrWorkerError(GPU_OOM_CODE, 503)
-                    self._recover("ocr_qualification_invalidated", restart=recover)
-                    raise OcrWorkerError("ocr_qualification_invalidated", 503)
+                    if code not in ("ocr_inference_failed", "ocr_invalid_result"):
+                        code = "ocr_invalid_result"
+                    self._recover(code, restart=recover)
+                    raise OcrWorkerError(code, 502)
                 if message.get("kind") != "result":
                     raise OcrWorkerError("ocr_inference_failed", 502)
                 try:

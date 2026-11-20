@@ -423,3 +423,60 @@ async def test_ready_install_can_disable_restart_and_reenable_without_new_genera
     assert (await activation.status()).reason == "llm_lifecycle_required"
     disabled = await activation.submit(enabled=False, confirm_handoff=False)
     assert disabled.state == "disabled" and not disabled.selected
+
+
+async def test_explicitly_disable_clean_failed_setup_for_direct_vision(settings, tmp_path, monkeypatch):
+    import pytest
+    from ocr_contract.activation import (
+        ActivationPhase,
+        ActivationStatus,
+        ActivationStore,
+        MaintenanceIntent,
+    )
+
+    from vision_bill.model.handoff import HandoffWait
+    from vision_bill.service.activation_admission import inference_admission
+    from vision_bill.service.dedicated_ocr import DedicatedOcrActivation
+    monkeypatch.setenv("VISION_BILL_OCR_ACTIVATION", "true")
+    store = ActivationStore(tmp_path / "request", tmp_path / "status", tmp_path / "lock")
+    store.set_shared_gpu(False)
+    request = store.submit_request(MaintenanceIntent.SEPARATE_OCR_DEVICE)
+    provider = SimpleNamespace(handoff=None, supports_model_release=False)
+    activation = DedicatedOcrActivation(settings, provider, lambda *_: None, lambda: None,
+                                        store=store, handoff_path=tmp_path / "gpu.lock")
+    assert (await activation.submit(confirm_handoff=False, enabled=False)).state == "action_required"
+    store.publish_status(ActivationStatus(request.generation, ActivationPhase.FAILED, "native_qualification_failed"))
+    with pytest.raises(HandoffWait), inference_admission(provider, store=store):
+        pass
+    assert (await activation.submit(confirm_handoff=False, enabled=False)).state == "disabled"
+    assert (await activation.status()).state == "disabled"
+    with (
+        inference_admission(provider, store=store),
+        pytest.raises(HandoffWait, match="execution_policy_changed"),
+        inference_admission(provider, uses_ocr=True),
+    ):
+        pass
+    assert not settings.ocr.enabled and provider.handoff is None
+    assert store.read_request() == request and not store.runtime_enabled(request)
+    next_request = store.submit_request(MaintenanceIntent.SEPARATE_OCR_DEVICE, retry_generation=request.generation)
+    assert store.runtime_enabled(next_request)
+    store.publish_status(ActivationStatus(next_request.generation, ActivationPhase.FAILED, "native_activation_recovery_required"))
+    assert (await activation.submit(confirm_handoff=False, enabled=False)).state == "action_required"
+    with pytest.raises(HandoffWait), inference_admission(provider, store=store):
+        pass
+
+
+async def test_managed_mode_does_not_imply_working_runtime(settings, tmp_path, monkeypatch):
+    import httpx
+    from test_ocr_provider import http_client
+
+    from vision_bill.service.dedicated_ocr import DedicatedOcrActivation
+
+    activation = DedicatedOcrActivation(settings, SimpleNamespace(), lambda *_: None, lambda: None)
+    def handler(request):
+        worker = {"ready": False, "generation": 1, "reason_code": "ocr_init_failed"}
+        if request.url.path == "/info":
+            return httpx.Response(200, json={"service_mode": "managed", "contract_version": 2, "profile": {}, "worker": worker})
+        return httpx.Response(503, json=worker)
+    http_client(monkeypatch, handler)
+    assert not await activation._runtime_is_serving()

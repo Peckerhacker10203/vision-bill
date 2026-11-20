@@ -85,14 +85,19 @@ def test_source_command_prepares_default_inputs(
     calls = []
 
     def bootstrap(
-        chosen: str, inputs: Path | None, *, restart: bool, reuse_native_image: str | None
+        chosen: str,
+        inputs: Path | None,
+        *,
+        restart: bool,
+        reuse_native_image: str | None,
+        upgrade: bool,
     ) -> None:
-        calls.append((chosen, inputs, restart, reuse_native_image))
+        calls.append((chosen, inputs, restart, reuse_native_image, upgrade))
 
     monkeypatch.setattr(sys, "argv", [str(SCRIPT), accelerator])
     monkeypatch.setattr(ocr_source_up, "bootstrap", bootstrap)
     assert ocr_source_up.main() == 0
-    assert calls == [(accelerator, None, False, None)]
+    assert calls == [(accelerator, None, False, None, False)]
 
 
 def test_source_command_rejects_supplied_inputs_with_restart() -> None:
@@ -720,7 +725,7 @@ def test_automatic_rocm_build_uses_the_selected_target_and_keeps_explicit_build_
     monkeypatch.setattr(ocr_source_up, "gpu_args", lambda *_: ([], {"OCR_RENDER_NODE": "/dev/dri/renderD129"}))
     monkeypatch.setattr(ocr_source_up, "rocm_render_target", detect, raising=False)
     for name in ("reject_other_profile", "reject_existing_ocr", "verify_existing_app", "stage_first_run_inputs"):
-        monkeypatch.setattr(ocr_source_up, name, lambda *_: None)
+        monkeypatch.setattr(ocr_source_up, name, lambda *_, **_kwargs: None)
     for key in ("VB_IMAGE_TAG", "OCR_IMAGE_TAG", "OCR_AMDGPU_TARGETS", "OCR_RENDER_NODE"):
         monkeypatch.setenv(key, "")
 
@@ -920,3 +925,194 @@ def test_reserved_claim_cannot_adopt_database_before_admission(
     monkeypatch.setattr(ocr_source_up, "command", docker_boundary)
     with pytest.raises(ValueError, match="existing database volume"):
         ocr_source_up.deploy(("docker", "compose"), tmp_path, "cuda", None, restart=True)
+
+
+def test_upgrade_keeps_original_claim_across_successive_image_changes(tmp_path):
+    from scripts import ocr_source_up as source
+
+    first = tmp_path / "release-first"
+    second = tmp_path / "release-second"
+    original = {
+        "project": "receipts",
+        "bundle_sha256": "a" * 64,
+        "image_ids": {"vision_bill": "sha256:" + "1" * 64, source.NATIVE: "sha256:" + "2" * 64},
+    }
+    replacement = {**original, "bundle_sha256": "b" * 64}
+    replacement["claim_origin"] = source.claim_origin(original, first)
+    assert source.project_claim(replacement, "cuda", second) == source.project_claim(
+        original, "cuda", first
+    )
+    assert source.claim_origin(replacement, second) == replacement["claim_origin"]
+    assert source.project_claim(replacement, "rocm", second) != source.project_claim(
+        original, "cuda", first
+    )
+
+
+def test_upgrade_verifies_the_admitted_original_before_reusing_volumes(
+    tmp_path, managed_release, monkeypatch
+):
+    from scripts import ocr_source_up as source
+
+    release, config_id, digest = managed_release
+    overlay = source.managed_overlay(
+        "cuda",
+        release,
+        config_id,
+        config_id,
+        "saved",
+        {"OCR_CUDA_DEVICE_ID": "2"},
+        digest,
+        config_id=config_id,
+    )
+    managed = tmp_path / "compose.local.json"
+    managed.write_text(json.dumps(overlay))
+    state = {"claim": False, "running": ""}
+    monkeypatch.setattr(source, "has_project_claim", lambda *args: state["claim"])
+    monkeypatch.setattr(source, "command", lambda *args, **kwargs: state["running"])
+    for recorded in (False, True):
+        if recorded:
+            source.record_admission(managed)
+        with pytest.raises(ValueError, match="admitted"):
+            source.deploy(("docker", "compose"), tmp_path, "cuda", None, upgrade=True)
+    state.update(claim=True, running="old-container")
+    with pytest.raises(ValueError, match="compose down"):
+        source.deploy(("docker", "compose"), tmp_path, "cuda", None, upgrade=True)
+
+
+def test_cutover_keeps_admission_if_interrupted_before_or_after_pointer_change(tmp_path):
+    from scripts import ocr_source_up as source
+
+    managed = tmp_path / "compose.local.json"
+    managed.write_text("before")
+    pending = tmp_path / "next.json"
+    pending.write_text("after")
+    source.record_admission(managed, pending)
+    assert source.was_admitted(managed)
+    pending.replace(managed)
+    assert source.was_admitted(managed)
+    managed.write_text("foreign")
+    assert not source.was_admitted(managed)
+
+
+@pytest.mark.parametrize(
+    ("shell", "dotenv", "expected"),
+    [(None, "", "cu126"), (None, "cu129", "cu129"), ("cu129", "cu126", "cu129")],
+)
+def test_source_upgrade_channel_only_changes_on_explicit_selection(
+    monkeypatch, shell, dotenv, expected
+):
+    from scripts import ocr_source_up as source
+
+    def compose(*args, capture=False):
+        assert args == ("docker", "compose", "config", "--environment") and capture
+        return f"OCR_CUDA_CHANNEL={dotenv}\n"
+
+    monkeypatch.setattr(source, "command", compose)
+    monkeypatch.delenv("OCR_CUDA_CHANNEL", raising=False)
+    if shell:
+        monkeypatch.setenv("OCR_CUDA_CHANNEL", shell)
+    overlay = {"build": {"args": {"OCR_CUDA_CHANNEL": "cu129"}}}
+    assert (
+        source.cuda_build_channel(("docker", "compose"), overlay, {"cuda_channel": "cu126"})
+        == expected
+    )
+
+
+@pytest.mark.parametrize("fail_build", [True, False])
+def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
+    tmp_path, managed_release, monkeypatch, fail_build
+):
+    from scripts import ocr_source_up as source
+
+    old_release, config_id, digest = managed_release
+    monkeypatch.delenv("OCR_CUDA_CHANNEL", raising=False)
+    new_id = "sha256:" + "c" * 64
+    project = "saved-project"
+    prior = source.managed_overlay(
+        "cuda",
+        old_release,
+        config_id,
+        config_id,
+        project,
+        {"OCR_CUDA_DEVICE_ID": "2"},
+        digest,
+        config_id=config_id,
+    )
+    managed = tmp_path / "compose.local.json"
+    managed.write_text(json.dumps(prior))
+    source.record_admission(managed)
+    commands = []
+    service = source.NATIVE
+    built_config = {
+        "name": project,
+        "services": {
+            service: {
+                "image": "native-new",
+                "deploy": {"resources": {"reservations": {"devices": [{"device_ids": ["2"]}]}}},
+            },
+            "vision_bill": {"image": "app-new"},
+        },
+    }
+
+    def docker(*args, capture=False):
+        commands.append(args)
+        if "--environment" in args:
+            return "COMPOSE_PROJECT_NAME=saved-project\n"
+        if args[:2] == ("docker", "run") and "--volume" not in args:
+            assert config_id in args and "--gpus" not in args and "none" in args
+            return "cu126\n"
+        if "--check" in args:
+            assert args[args.index("--channel") + 1] == "cu126"
+            if "--wheel-context" in args:
+                assert args[-2:] == ("--prior-image", config_id)
+            return ""
+        if "config" in args:
+            assert args[args.index("--project-name") + 1] == project
+            return json.dumps(built_config)
+        if (
+            "ps" in args
+            or "ls" in args
+            or args[:2] == ("make", "ocr-build-cuda")
+            or args[0] == "uv"
+        ):
+            return ""
+        if args[:3] == ("docker", "image", "inspect"):
+            return new_id
+        if args[:2] == ("docker", "run"):
+            staged = Path(args[args.index("--volume") + 1].removesuffix(":/release:ro"))
+            return (staged / "bundle.json").read_text()
+        if "build" in args and fail_build:
+            raise subprocess.CalledProcessError(2, args)
+        if "tag" in args or "build" in args or "up" in args:
+            return ""
+        pytest.fail(args)
+
+    monkeypatch.setattr(source, "command", docker)
+    monkeypatch.setattr(source, "has_project_claim", lambda *args: True)
+    monkeypatch.setattr(source, "acquire_project_claim", lambda *args: None)
+
+    def image_config(release, image_id):
+        (release / "image-config.json").write_bytes(
+            (old_release / "image-config.json").read_bytes()
+        )
+        return config_id
+
+    monkeypatch.setattr(source, "export_config", image_config)
+    if fail_build:
+        with pytest.raises(subprocess.CalledProcessError):
+            source.deploy(("docker", "compose"), tmp_path, "cuda", None, upgrade=True)
+        assert json.loads(managed.read_bytes()) == prior
+        assert list(tmp_path.glob("release-*")) == [old_release]
+    else:
+        source.deploy(("docker", "compose"), tmp_path, "cuda", None, upgrade=True)
+        saved = json.loads(managed.read_bytes())["x-vision-bill-source"]
+        assert (
+            saved["project"] == project
+            and saved["device_environment"] == prior["x-vision-bill-source"]["device_environment"]
+        )
+        assert saved["image_ids"][service] == new_id
+        assert saved["cuda_channel"] == "cu126"
+        assert saved["claim_origin"]["release"] == old_release.name
+        assert "--no-build" in commands[-1] and project in commands[-1]
+    assert source.was_admitted(managed)
+    assert all("rm" not in args and "down" not in args for args in commands)

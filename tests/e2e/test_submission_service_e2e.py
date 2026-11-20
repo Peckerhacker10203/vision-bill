@@ -46,18 +46,18 @@ async def setup(w, scope, settings, tmp_path, *, ocr=True):
     settings.ocr = config
     settings.llm.temperature = 0.13
     settings.llm.max_output_tokens = 1234
+    llm, native = formatter(not ocr), sidecar()
     upload = SubmissionCreate(
         id=uuid4(),
         parts=[ImagePart(image_path=str(p)) for p in paths],
         source_manifest=[{"photo_index": i, "source_sha256": h} for i, h in enumerate(hashes)],
         requested_options={},
-        effective_options=current_snapshot(settings),
+        effective_options=current_snapshot(settings, inference_identity=llm.inference_identity),
         request_fingerprint=uuid4().hex,
         model_id="fixture",
         bypass_review=True,
     )
     image = (await w.enqueue_submission(upload, scope=scope, idempotency_key=None)).submission
-    llm, native = formatter(not ocr), sidecar()
     native.get_capabilities.return_value.runtime_fingerprint = "runtime"
     receipts = ReceiptService(settings.images, settings.pg, llm)
     receipts._workflow_db = w
@@ -242,7 +242,7 @@ async def test_cancelled_formatter_retains_checkpoint_and_no_receipt(
 
 
 @pytest.mark.parametrize("old_status", ["pending", "failed"])
-async def test_migrated_legacy_first_resolution_persisted_once(db, settings, tmp_path, old_status):
+async def test_migrated_unknown_destination_requires_explicit_adoption(db, settings, tmp_path, old_status):
     from vision_bill.provider.db.workflow_db import WorkflowDB
 
     migrate(db, "0010")
@@ -264,25 +264,15 @@ async def test_migrated_legacy_first_resolution_persisted_once(db, settings, tmp
         receipts.list_tags = AsyncMock(return_value=[])
         service = SubmissionService(settings, receipts, ImageService(settings.images))
         claim = await w.claim_next()
-        snapshot = {
-            "ocr": settings.ocr.model_dump(mode="json"),
-            "temperature": settings.llm.temperature,
-            "max_output_tokens": settings.llm.max_output_tokens,
-        }
-        first = await w.ensure_execution_snapshot(
-            claim, model_id="fixture", effective_options=snapshot
-        )
-        settings.llm.model_name = "changed"
-        settings.llm.temperature = 0.99
-        repeated = await w.ensure_execution_snapshot(
-            claim, model_id="changed", effective_options=service.current_snapshot()
-        )
-        assert repeated.model_id == first.model_id == "fixture"
-        assert repeated.effective_options == snapshot
-        result = await service.process_claim(claim.model_copy(update={"image": repeated}))
-        assert result.receipt and result.submission.attempt_count == 1
+        assert not claim.image.effective_options
+        result = await service.process_claim(claim)
         assert result.submission.id == image_id and path.exists()
-        assert await w.claim_next() is None
+        assert result.submission.wait_reason == "execution_policy_changed"
+        assert result.submission.attempt_count == 0
+        async with w.pool.acquire() as conn:
+            saved = await conn.fetchval("SELECT effective_options FROM images WHERE id=$1", image_id)
+        assert json.loads(saved) == {}
+        llm._client.chat.assert_not_awaited()
     finally:
         await w.destroy_db()
 
@@ -643,11 +633,17 @@ async def test_scheduler_initial_legacy_model_resolution_is_frozen_once(workflow
     await scheduler.process_pending()
     async with w.pool.acquire() as conn:
         saved=await conn.fetchrow('SELECT * FROM images WHERE id=$1',image.id)
+    if legacy:
+        assert saved['wait_reason'] == 'execution_policy_changed'
+        assert saved['attempt_count'] == 0 and saved['receipt_id'] is None
+        assert json.loads(saved['effective_options']) == frozen
+        llm._client.chat.assert_not_awaited()
+        return
     if discovery == 'selected':
         assert saved['attempt_count']==1 and saved['receipt_id'] is not None, (saved['status'],saved['result_code'],saved['model_id'])
         assert saved['model_id']=='fixture'
         snapshot=json.loads(saved['effective_options'])
-        assert snapshot == (current_snapshot(settings) if legacy else frozen)
+        assert snapshot == frozen
         assert snapshot['allow_ocr_fallback'] is False
         assert llm._client.chat.call_args.kwargs['model']=='fixture'
         assert await w.claim_next() is None
@@ -686,3 +682,40 @@ async def test_bound_direct_model_vanishing_before_dispatch_refunds_reservation(
     result = await service.process_claim(resumed)
     assert result.receipt is not None and result.submission.attempt_count == 1
     assert llm._client.chat.await_args.kwargs["model"] == "fixture"
+
+
+@pytest.mark.parametrize("ocr", [False, True], ids=["direct", "ocr_formatter"])
+async def test_provider_change_requires_explicit_policy_adoption(workflow_db, settings, tmp_path, ocr):
+    from vision_bill.model.workflow import RetryRequest
+    from vision_bill.provider.llm.openai import OpenAIProvider
+
+    w, scope = workflow_db
+    image, paths, original, _, service = await setup(w, scope, settings, tmp_path, ocr=ocr)
+    changed = OpenAIProvider("http://other.invalid/v1", "fixture-secret")
+    try:
+        restarted = ReceiptService(settings.images, settings.pg, changed)
+        restarted._workflow_db = w
+        restarted.check_connection = AsyncMock(side_effect=AssertionError("held job probed new provider"))
+        worker = SubmissionService(settings, restarted, service.images)
+        candidate, = await w.due_candidates()
+        assert not await worker.ready_for(candidate)
+        held = await w.get_submission(image.id, scope=scope)
+        assert held.wait_reason == "execution_policy_changed" and held.attempt_count == 0
+        restarted.check_connection.assert_not_awaited()
+        original._client.chat.assert_not_awaited()
+
+        request = RetryRequest(expected_generation=1, request_key="accept-new-provider", policy="current")
+        adopted = await w.retry_submission(
+            image.id, request, scope=scope, replacement_snapshot=worker.current_snapshot(),
+        )
+        assert adopted.generation == 2 and adopted.attempt_count == 0
+        assert await w.retry_submission(image.id, request, scope=scope) == adopted
+        updated, = await w.due_candidates()
+        assert updated.effective_options["inference_identity"] == changed.inference_identity
+        async with w.pool.acquire() as conn:
+            history = json.loads(await conn.fetchval("SELECT legacy_events FROM images WHERE id=$1", image.id))
+        assert history[-1]["effective_options"]["inference_identity"] == original.inference_identity
+        assert all(path.exists() for path in paths)
+    finally:
+        await changed._client.close()
+        await original._client._client.aclose()

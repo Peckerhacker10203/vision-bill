@@ -680,10 +680,10 @@ async def test_review_quantity_and_rate_are_exact_after_storage(workflow_db, tmp
     w, scope = workflow_db
     row, body, path = await seed(w, scope, tmp_path, verified=True)
     digest = sha256(path.read_bytes()).hexdigest()
-    body.line_items[0].quantity = 1.00001
+    body.line_items[0].quantity = Decimal("1.00001000000000000001")
     body.line_items[0].unit_price = Decimal(10000)
     body.line_items[0].total_price = body.total = body.subtotal = Decimal("10000.1")
-    body.taxes = [TaxLine(name="VAT", rate=0.123456, amount=Decimal(0))]
+    body.taxes = [TaxLine(name="VAT", rate=Decimal("0.12345600000000000001"), amount=Decimal(0))]
     document = Receipt.model_validate(body.model_dump())
     if write_path == "put":
         async with w.pool.acquire() as conn:
@@ -711,10 +711,10 @@ async def test_review_quantity_and_rate_are_exact_after_storage(workflow_db, tmp
     async with w.pool.acquire() as conn:
         assert await conn.fetchval(
             "SELECT quantity FROM line_items WHERE receipt_id=$1", saved.id
-        ) == Decimal("1.00001")
+        ) == Decimal("1.00001000000000000001")
         assert await conn.fetchval(
             "SELECT rate FROM taxes WHERE receipt_id=$1", saved.id
-        ) == Decimal("0.123456")
+        ) == Decimal("0.12345600000000000001")
     details = await w._receipts.get_receipt_with_details(saved.id)
     reread = ExtractionDraft.model_validate(
         {
@@ -974,7 +974,8 @@ async def test_delete_preserves_owner_scope_and_benchmark_foreign_key(workflow_d
     ).id == row.id
 
 
-async def test_rereview_migrated_verified_receipt_via_http(db, tmp_path):
+@pytest.mark.parametrize("was_verified", [True, False])
+async def test_review_migrated_receipt_via_http(db, tmp_path, was_verified):
     import asyncpg
     import httpx
     from fastapi import FastAPI
@@ -991,7 +992,7 @@ async def test_rereview_migrated_verified_receipt_via_http(db, tmp_path):
 
     original = tmp_path / "migrated.png"
     original.write_bytes(b"original legacy receipt")
-    migrate(db, "0012")
+    migrate(db, "0010")
     conn = await asyncpg.connect(db.pg_dsn)
     try:
         owner = await conn.fetchval(
@@ -1007,9 +1008,11 @@ async def test_rereview_migrated_verified_receipt_via_http(db, tmp_path):
         )
         receipt_id = await conn.fetchval(
             """INSERT INTO receipts(user_id,image_id,merchant_name,date,subtotal,total,currency,status,verified)
-            VALUES($1,$2,'Migrated','2026-01-01',10.25,10.25,'EUR','verified',TRUE) RETURNING id""",
+            VALUES($1,$2,'Migrated','2026-01-01',10.25,10.25,'EUR',$3,$4) RETURNING id""",
             owner,
             image,
+            "verified" if was_verified else "unverified",
+            was_verified,
         )
         await conn.execute("UPDATE images SET receipt_id=$2 WHERE id=$1", image, receipt_id)
         await conn.execute(
@@ -1034,8 +1037,9 @@ async def test_rereview_migrated_verified_receipt_via_http(db, tmp_path):
     try:
         before = await receipts.get_receipt_with_details(receipt_id, user_id=owner)
         stats = await receipts.get_statistics(user_id=owner)
-        assert before.receipt.verification_source == "legacy" and before.receipt.findings == []
-        assert stats.verified_receipt_count == 1
+        assert before.receipt.verification_source == ("legacy" if was_verified else None)
+        assert before.receipt.findings == []
+        assert stats.verified_receipt_count == int(was_verified)
         with pytest.raises(ValueError, match="human"):
             await benchmarks.reference_preview(receipt_id, scope=scope)
 
@@ -1092,7 +1096,7 @@ async def test_rereview_migrated_verified_receipt_via_http(db, tmp_path):
         after = await receipts.get_receipt_with_details(receipt_id, user_id=owner)
         assert after.receipt.verification_source == "human"
         assert (
-            after.receipt.verified and after.receipt.status == before.receipt.status == "verified"
+            after.receipt.verified and after.receipt.status == "verified"
         )
         assert after.receipt.review_revision == before.receipt.review_revision == 1
         assert after.receipt.operation_revision == 2
@@ -1106,7 +1110,10 @@ async def test_rereview_migrated_verified_receipt_via_http(db, tmp_path):
         assert after.taxes == before.taxes
         assert after.image_path == before.image_path == str(original)
         assert original.read_bytes() == b"original legacy receipt"
-        assert await receipts.get_statistics(user_id=owner) == stats
+        after_stats = await receipts.get_statistics(user_id=owner)
+        assert after_stats.verified_receipt_count == 1
+        if was_verified:
+            assert after_stats == stats
         async with receipts.pool.acquire() as check:
             events = await check.fetch(
                 "SELECT * FROM receipt_review_revisions WHERE receipt_id=$1", receipt_id

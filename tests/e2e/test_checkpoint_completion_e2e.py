@@ -55,6 +55,7 @@ async def produce_checkpoint(
     managed=None,
     terminal=False,
     active=False,
+    historical=False,
 ):
     images = ImageService(settings.images)
     if managed is None:
@@ -74,7 +75,10 @@ async def produce_checkpoint(
     for i, path in enumerate(paths):
         Image.new("RGB", (120, 240), (i, 0, 0)).save(path)
     hashes = [hashlib.sha256(path.read_bytes()).hexdigest() for path in paths]
-    snapshot = current_snapshot(settings, handoff=handoff)
+    snapshot = current_snapshot(settings, inference_identity=ENDPOINT, handoff=handoff)
+    if historical:
+        snapshot.pop("inference_identity")
+        snapshot["execution_policy_version"] = 3
     image = (
         await w.enqueue_submission(
             workflow.SubmissionCreate(
@@ -145,11 +149,12 @@ async def state(w, image_id):
         return dict(producer), count, json.loads(events)
 
 
+@pytest.mark.parametrize("historical", [False, True], ids=["current", "historical"])
 @pytest.mark.parametrize("ocr", [False, True], ids=["direct", "all-photo-ocr"])
-async def test_last_attempt_completes_from_saved_observations(workflow_db, settings, tmp_path, ocr):
+async def test_last_attempt_completes_from_saved_observations(workflow_db, settings, tmp_path, ocr, historical):
     w, scope = workflow_db
     original, checkpoint, service, llm = await produce_checkpoint(
-        w, scope, settings, tmp_path, ocr=ocr, expired=ocr
+        w, scope, settings, tmp_path, ocr=ocr, expired=ocr, historical=historical
     )
     image_id = original.image.id
     producer_before, _, _ = await state(w, image_id)

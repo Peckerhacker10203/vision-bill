@@ -700,15 +700,27 @@ test("CUDA bundle verifies executable Paddle pin and the lock measured by the bu
 
 test("CUDA Make targets pass an expected channel by default and on explicit selection", (t) => {
   const directory = temp(t);
-  writeFileSync(join(directory, "uv"), '#!/bin/sh\nprintf "%s\\n" "$@"\n', {
-    mode: 0o755,
-  });
-  writeFileSync(join(directory, "docker"), "#!/bin/sh\nexit 0\n", {
-    mode: 0o755,
-  });
+  writeFileSync(
+    join(directory, "uv"),
+    '#!/bin/sh\nprintf "%s\\n" "$@" >&2\nprintf "%s\\n" "$TEST_CONTEXT"\n',
+    {
+      mode: 0o755,
+    },
+  );
+  writeFileSync(
+    join(directory, "docker"),
+    '#!/bin/sh\ntest "$OCR_CUDA_WHEEL_CONTEXT" = "$TEST_CONTEXT"\n',
+    {
+      mode: 0o755,
+    },
+  );
   for (const target of ["ocr-build-cuda", "ocr-lock-cuda"]) {
     for (const channel of [undefined, "", "cu126"]) {
-      const env = { ...process.env, PATH: directory + ":" + process.env.PATH };
+      const env = {
+        ...process.env,
+        PATH: directory + ":" + process.env.PATH,
+        TEST_CONTEXT: directory,
+      };
       if (channel === undefined) delete env.OCR_CUDA_CHANNEL;
       else env.OCR_CUDA_CHANNEL = channel;
       const result = spawnSync("make", ["--no-print-directory", target], {
@@ -717,7 +729,7 @@ test("CUDA Make targets pass an expected channel by default and on explicit sele
       });
       assert.equal(result.status, 0, result.stderr);
       assert.ok(
-        result.stdout.split("\n").includes("--channel=" + (channel || "cu129")),
+        result.stderr.split("\n").includes("--channel=" + (channel || "cu129")),
       );
     }
   }
@@ -1049,6 +1061,29 @@ test("maintainer request rejects foreign forks, events, mutable source and missi
   const cudaRequest = { ...request, variant: "app-ocr-cuda" };
   const { rocm, ...cudaPlan } = plan;
   assert.equal(release.validateReleaseInputs(cudaPlan, cudaRequest), cudaPlan);
+  const uuid = "GPU-a1234567-aaaa-bbbb-cccc-12345678abcd";
+  assert.deepEqual(release.cudaQualificationGpuArgs(), ["--gpus", "device=0"]);
+  for (const id of ["1", uuid]) {
+    release.validateReleaseInputs(
+      { ...cudaPlan, cuda_device_id: id },
+      cudaRequest,
+    );
+    assert.deepEqual(release.cudaQualificationGpuArgs(id), [
+      "--gpus",
+      `device=${id}`,
+    ]);
+  }
+  for (const id of [1, null, "all", "1,2", "GPU-wrong", "-1"]) {
+    assert.throws(() =>
+      release.validateReleaseInputs(
+        { ...cudaPlan, cuda_device_id: id },
+        cudaRequest,
+      ),
+    );
+  }
+  assert.throws(() =>
+    release.validateReleaseInputs({ ...plan, cuda_device_id: "0" }, request),
+  );
   for (const cuda_channel of ["cu126", "cu129"]) {
     const selected = { ...cudaPlan, cuda_channel };
     assert.equal(

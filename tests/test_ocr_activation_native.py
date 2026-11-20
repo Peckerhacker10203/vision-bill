@@ -112,15 +112,14 @@ def test_native_waits_for_app_admissions_and_publishes_only_after_park(
     scopes = []
     installation = inputs.state_dir / "installation"
 
-    def qualify(*args, **kwargs):
+    def prepare(*args, **kwargs):
         assert args == (inputs.bundle_path, inputs.state_dir, inputs.image_config, inputs.image_id)
         assert kwargs == {
             "maintenance_intent": "external-llm-quiesced",
             "handoff_lock": inputs.handoff_lock,
-            "require_remote_models": True,
-            "retry_collection_timeout": True,
+            "repair": True,
         }
-        assert store.read_status(request).phase is ActivationPhase.QUALIFYING
+        assert store.read_status(request).phase is ActivationPhase.PREPARING
         with pytest.raises(ActivationBusy), store.admission(exclusive=False):
             pass
         scopes.append("initialized")
@@ -150,11 +149,11 @@ def test_native_waits_for_app_admissions_and_publishes_only_after_park(
     def verify_park(process, port):
         assert isinstance(process, Process)
         assert port == idle_health.port
-        assert store.read_status(request).phase is ActivationPhase.QUALIFYING
+        assert store.read_status(request).phase is ActivationPhase.PREPARING
         with pytest.raises(ActivationBusy), store.admission(exclusive=False):
             pass
 
-    monkeypatch.setattr(activation, "initialize", qualify)
+    monkeypatch.setattr(activation, "prepare_installation", prepare)
     monkeypatch.setattr(activation, "managed_installation", serving_scope)
     monkeypatch.setattr(activation, "start_server", start)
     monkeypatch.setattr(activation, "wait_for_park", verify_park)
@@ -169,80 +168,58 @@ def test_native_waits_for_app_admissions_and_publishes_only_after_park(
     assert store.read_status(request) == ActivationStatus(request.generation, ActivationPhase.READY)
 
 
-@pytest.mark.parametrize("failure", ["archive", "qualification", "gpu_memory"])
+@pytest.mark.parametrize(
+    "failure,reason",
+    [
+        ("archive", "native_model_integrity_failed"),
+        ("download", "native_model_download_failed"),
+    ],
+)
 def test_activation_failure_requires_an_explicit_new_generation(
-    store, inputs, idle_health, release, monkeypatch, failure
+    store, inputs, idle_health, release, monkeypatch, failure, reason
 ):
     from ocr_service import activation, initialize, provision
 
     path, bundle, _ = release
-    archives = {}
     for name, row in bundle["models"].items():
-        data = Path(row["source"]).read_bytes()
         row["source"] = f"https://example.invalid/{name}.tar"
-        archives[row["source"]] = data
     path.write_text(json.dumps(bundle))
-    requested_urls = []
-    qualification_attempts = []
+    attempts = []
 
     def fetch_archive(url, *, timeout):
+        attempts.append(url)
+        if failure == "download":
+            raise ConnectionError("private upstream location")
+
         class ArchiveResponse(io.BytesIO):
             def geturl(self):
                 return url
 
-        assert timeout > 0
-        requested_urls.append(url)
-        data = b"incorrect archive bytes" if failure == "archive" else archives[url]
-        return ArchiveResponse(data)
+        return ArchiveResponse(b"incorrect archive bytes")
 
     @contextmanager
     def initializer_scope(role, _path):
         assert role == "initializer"
         yield
 
-    def qualification(command):
-        assert failure in {"qualification", "gpu_memory"}
-        assert command[1:3] == ["-m", "ocr_service.qualify"]
-        qualification_attempts.append(command)
-        return 42 if failure == "gpu_memory" else 1
-
-    def must_not_serve(*args, **kwargs):
-        pytest.fail("Failed initialization reached native serving")
-
     monkeypatch.setattr(provision.urllib.request, "urlopen", fetch_archive)
     monkeypatch.setattr(initialize, "managed_installation", initializer_scope)
     monkeypatch.setattr(initialize, "inspect_device_identity", lambda *args: {})
-    monkeypatch.setattr(initialize, "owned_qualification_process", qualification)
-    monkeypatch.setattr(activation, "start_server", must_not_serve)
-
+    monkeypatch.setattr(initialize, "verify_package_pins", lambda bundle: None, raising=False)
     request = store.submit_request(MaintenanceIntent.SEPARATE_OCR_DEVICE)
     assert activation.process_request(store, request, inputs, idle_health) is True
-    reason = {
-        "archive": "native_activation_inputs_invalid",
-        "qualification": "native_qualification_failed",
-        "gpu_memory": "ocr_gpu_out_of_memory",
-    }[failure]
     assert store.read_status(request) == ActivationStatus(
         request.generation, ActivationPhase.FAILED, reason
     )
     assert not (inputs.state_dir / "selected").exists()
-    expected_downloads = 1 if failure == "archive" else 4
-    expected_qualifications = 0 if failure == "archive" else 1
-    assert len(requested_urls) == expected_downloads
-    assert len(qualification_attempts) == expected_qualifications
+    assert len(attempts) == 1
     assert activation.process_request(store, request, inputs, idle_health) is False
-    assert len(requested_urls) == expected_downloads
-    assert len(qualification_attempts) == expected_qualifications
+    assert len(attempts) == 1
 
     retry = store.submit_request(request.maintenance_intent, retry_generation=request.generation)
-    assert retry.generation != request.generation
     assert activation.process_request(store, request, inputs, idle_health) is False
     assert activation.process_request(store, retry, inputs, idle_health) is True
-    if failure == "archive":
-        assert requested_urls == [requested_urls[0], requested_urls[0]]
-    else:
-        assert len(requested_urls) == 4  # Verified archives survive an explicit retry.
-        assert len(qualification_attempts) == 2
+    assert attempts == [attempts[0], attempts[0]]
 
 
 def test_local_model_archives_cannot_start_automatic_activation(
@@ -287,11 +264,13 @@ def test_a_published_generation_restarts_from_verified_cache_without_requalifyin
             pass
         raise ValueError("Invalid cache")
 
-    monkeypatch.setattr(activation, "initialize", forbidden)
+    monkeypatch.setattr(activation, "prepare_installation", forbidden)
     monkeypatch.setattr(activation, "start_server", forbidden)
-    monkeypatch.setattr(activation, "check_installation", invalid_cache)
+    monkeypatch.setattr(activation, "check_prepared_installation", invalid_cache)
     assert activation.process_request(store, request, inputs, idle_health) is True
-    assert store.read_status(request) == ready
+    assert store.read_status(request) == ActivationStatus(
+        request.generation, ActivationPhase.FAILED, "native_activation_recovery_required"
+    )
 
 
 @pytest.mark.parametrize("busy_scope", ["cache", "serving"])
@@ -331,8 +310,8 @@ def test_cached_restart_retries_busy_installation_lock(
         parked.append(port)
 
     monkeypatch.setenv("OCR_INSTALLATION_LOCK_PATH", str(lock))
-    monkeypatch.setattr(activation, "initialize", forbidden)
-    monkeypatch.setattr(activation, "check_installation", cached)
+    monkeypatch.setattr(activation, "prepare_installation", forbidden)
+    monkeypatch.setattr(activation, "check_prepared_installation", cached)
     monkeypatch.setattr(activation, "managed_installation", serving_scope)
     monkeypatch.setattr(activation, "start_server", lambda *args: Process())
     monkeypatch.setattr(activation, "wait_for_park", wait_for_park)
@@ -362,7 +341,7 @@ def test_failed_native_cleanup_reports_existing_recovery_fence(
         marker.write_text("retained crash fence")
         raise RuntimeError("Cannot confirm initializer process exit")
 
-    monkeypatch.setattr(activation, "initialize", failed_cleanup)
+    monkeypatch.setattr(activation, "prepare_installation", failed_cleanup)
     request = store.submit_request(MaintenanceIntent.EXTERNAL_LLM_QUIESCED)
     assert activation.process_request(store, request, inputs, idle_health) is True
     assert marker.is_file()
@@ -407,3 +386,126 @@ def test_existing_native_api_parks_without_initializing_the_gpu(inputs, idle_hea
             if child.poll() is None:
                 child.terminate()
                 child.wait(timeout=5)
+
+
+def test_prepare_and_restore_use_verified_models_without_qualification_or_fixtures(
+    inputs,
+    release,
+    idle_health,
+    monkeypatch,
+):
+    from ocr_service import activation, initialize, provision
+    from test_ocr_initialize import DEVICE
+
+    path, raw, _ = release
+    legacy_bundle = provision.load_release_bundle(path)
+    # An upgraded image can reuse archives populated before a failed qualification.
+    old = provision.provision_bundle(legacy_bundle, inputs.state_dir)
+    for name, asset in raw["models"].items():
+        asset["source"] = f"https://example.invalid/{name}.tar"
+    path.write_text(json.dumps(raw))
+    Path(raw["fixtures"]["source"]).unlink()
+
+    @contextmanager
+    def initializer(role, lock):
+        assert role == "initializer"
+        yield
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Preparation or restart ran inference, fetched a model, or staged a fixture")
+
+    monkeypatch.setattr(initialize, "managed_installation", initializer)
+    monkeypatch.setattr(initialize, "inspect_device_identity", lambda *args: DEVICE)
+    monkeypatch.setattr(initialize, "verify_package_pins", lambda bundle: None, raising=False)
+    monkeypatch.setattr(initialize, "owned_qualification_process", forbidden)
+    monkeypatch.setattr(provision.urllib.request, "urlopen", forbidden)
+    monkeypatch.setenv("OCR_INSTALLATION_LOCK_PATH", str(inputs.state_dir / "installation.lock"))
+    args = (inputs.bundle_path, inputs.state_dir, inputs.image_config, inputs.image_id)
+    root = initialize.prepare_installation(
+        *args,
+        maintenance_intent=MaintenanceIntent.SEPARATE_OCR_DEVICE,
+        handoff_lock=inputs.handoff_lock,
+    )
+    assert (inputs.state_dir / "selected").resolve() == root
+    assert not (root / "qualification.json").exists()
+    runtime = json.loads((root / "runtime.json").read_bytes())
+    assert runtime["schema_version"] == 2 and runtime["device_identity"] == DEVICE
+    assert "qualification_manifest" not in runtime
+    for name, directory in runtime["model_dirs"].items():
+        assert (Path(directory) / "weights").read_bytes() == name.encode()
+    assert initialize.check_prepared_installation(*args) == root
+    # The actual server can announce itself parked on a CPU-only host with no ML packages;
+    # it starts from the published runtime alone, before the operator has a real receipt.
+    with idle_health.paused(), activation.start_server(inputs, root, idle_health.port) as child:
+        try:
+            activation.wait_for_park(child, idle_health.port)
+            connection = HTTPConnection("127.0.0.1", idle_health.port, timeout=3)
+            try:
+                connection.request("GET", "/info")
+                info = json.loads(connection.getresponse().read())
+                assert info["service_mode"] == "managed"
+                assert info["worker"]["reason_code"] == "ocr_parked"
+            finally:
+                connection.close()
+        finally:
+            child.terminate()
+            child.wait(timeout=5)
+    assert old.smoke_path.is_file()
+    (Path(runtime["model_dirs"]["UVDoc"]) / "weights").write_bytes(b"corrupt")
+    with pytest.raises(ValueError):
+        initialize.check_prepared_installation(*args)
+
+    # A failed replacement preserves the existing selection and every valid model.
+    archive = inputs.state_dir / "archives" / raw["models"]["UVDoc"]["sha256"]
+    good_archive = archive.read_bytes()
+    archive.write_bytes(b"bad cached archive")
+    requests = []
+
+    class Response(io.BytesIO):
+        def geturl(self):
+            return raw["models"]["UVDoc"]["source"]
+
+    def replacement(url, *, timeout):
+        assert url == raw["models"]["UVDoc"]["source"]
+        requests.append(url)
+        return Response(b"bad download" if len(requests) == 1 else good_archive)
+
+    monkeypatch.setattr(provision.urllib.request, "urlopen", replacement)
+    with pytest.raises(initialize.PreparationFailed, match="native_model_integrity_failed"):
+        initialize.prepare_installation(
+            *args,
+            maintenance_intent=MaintenanceIntent.SEPARATE_OCR_DEVICE,
+            handoff_lock=inputs.handoff_lock,
+            repair=True,
+        )
+    assert (inputs.state_dir / "selected").resolve() == root
+    assert archive.read_bytes() == b"bad cached archive"
+    repaired = initialize.prepare_installation(
+        *args,
+        maintenance_intent=MaintenanceIntent.SEPARATE_OCR_DEVICE,
+        handoff_lock=inputs.handoff_lock,
+        repair=True,
+    )
+    assert initialize.check_prepared_installation(*args) == repaired
+    assert len(requests) == 2
+    assert archive.read_bytes() == good_archive
+    assert (Path(runtime["model_dirs"]["UVDoc"]) / "weights").read_bytes() == b"UVDoc"
+
+    # A redirected cache root can present perfectly matching bytes outside native ownership.
+    models = inputs.state_dir / "models"
+    moved = inputs.state_dir.parent / "external-models"
+    models.rename(moved)
+    models.symlink_to(moved, target_is_directory=True)
+    with pytest.raises(initialize.PreparationFailed, match="native_model_integrity_failed"):
+        initialize.check_prepared_installation(*args)
+
+
+def test_unclean_handoff_journal_remains_fenced_after_setup_failure(store, inputs, idle_health):
+    from ocr_service import activation
+
+    inputs.handoff_lock.with_suffix(".json").write_text('{"unsettled": true}')
+    request = store.submit_request(MaintenanceIntent.SEPARATE_OCR_DEVICE)
+    assert activation.process_request(store, request, inputs, idle_health) is True
+    assert store.read_status(request) == ActivationStatus(
+        request.generation, ActivationPhase.FAILED, "native_activation_recovery_required"
+    )

@@ -7,7 +7,7 @@
 	import { api } from '$lib/api/client';
 	import { queryClient } from '$lib/query/client';
 	import { queryKeys } from '$lib/query/keys';
-	import { isPlainDecimal, isSignedDecimal } from '$lib/ui/money';
+	import { isPlainDecimal, isSignedDecimal, validReviewDecimal } from '$lib/ui/money';
 	import { snackbar } from '$lib/ui/snackbar.svelte';
 	import Icon from '$lib/ui/Icon.svelte';
 	import TagEditor from '$lib/ui/TagEditor.svelte';
@@ -312,8 +312,7 @@
 		}
 		for (const line of form.lines) {
 			if (!line.description.trim()) set.add('editor.descriptionRequired');
-			const quantity = Number(line.quantity);
-			if (line.quantity.trim() !== '' && (!Number.isFinite(quantity) || quantity <= 0)) {
+			if (line.quantity.trim() && !validReviewDecimal(line.quantity, 'positive')) {
 				set.add('editor.invalidQuantity');
 			}
 			if (
@@ -328,8 +327,7 @@
 				set.add('editor.invalidAmount');
 			}
 			if (tax.rate.trim() !== '') {
-				const rate = Number(tax.rate);
-				if (!Number.isFinite(rate) || rate < 0 || rate > 1) {
+				if (!validReviewDecimal(tax.rate, 'rate')) {
 					set.add('editor.invalidRate');
 				}
 			}
@@ -357,7 +355,7 @@
 			line_items: form.lines.map((line) => ({
 				...(line.id ? { id: line.id } : {}),
 				description: line.description.trim(),
-				quantity: line.quantity.trim() === '' ? null : Number(line.quantity),
+				quantity: line.quantity.trim() || null,
 				unit_price: line.unit_price.trim() || null,
 				total_price: line.total_price.trim(),
 				spending_category: line.spending_category,
@@ -366,7 +364,7 @@
 			})),
 			taxes: form.taxLines.map((tax) => ({
 				name: tax.name.trim(),
-				rate: tax.rate.trim() === '' ? null : Number(tax.rate),
+				rate: tax.rate.trim() || null,
 				amount: tax.amount.trim()
 			})),
 			subtotal: form.subtotal.trim(),

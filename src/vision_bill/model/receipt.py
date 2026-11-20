@@ -46,7 +46,7 @@ class LineItem(BaseModel):
     spending_category: SpendingCategory = Field(
         default="unknown", description="One spending category code"
     )
-    quantity: float | None = Field(
+    quantity: Decimal | None = Field(
         default=None, gt=0, allow_inf_nan=False, description="Quantity purchased if printed"
     )
     unit_price: Decimal | None = Field(default=None, description="Price per unit if printed")
@@ -88,7 +88,7 @@ class LineItem(BaseModel):
 
 class TaxLine(BaseModel):
     name: str = Field(description="e.g. 'VAT', 'Sales Tax', 'GST'")
-    rate: float | None = Field(default=None, description="Tax rate as a decimal, e.g. 0.19 for 19%")
+    rate: Decimal | None = Field(default=None, description="Tax rate as a decimal, e.g. 0.19 for 19%")
     amount: Decimal = Field(ge=0, description="Tax amount charged")
 
 

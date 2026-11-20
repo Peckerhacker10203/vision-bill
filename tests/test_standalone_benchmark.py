@@ -3,6 +3,7 @@
 import re
 import sqlite3
 import sys
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -188,7 +189,7 @@ async def test_category_and_limit_bind_independently(query_pool, category, limit
 async def test_details_keep_tax_rate_and_position_order(query_pool):
     query_pool.connection.execute("INSERT INTO line_items VALUES ('aaa','groceries-new','Later product',1,2,2,NULL,'unknown',1)")
     result = await fetch_receipt_details(query_pool, 'groceries-new')
-    assert result.taxes[0].rate == .1
+    assert result.taxes[0].rate == Decimal("0.1")
     assert [item.description for item in result.line_items] == ['Test product','Later product']
 
 

@@ -101,7 +101,8 @@ OCR and always selects the OCR pipeline, preserving configured coordination/
 lifecycle settings.
 It reads an owner-scoped, repeatable-read read-only snapshot, without row locks,
 DB mutation, API startup or human-reference qualification writes. Explicit run
-creation loads, qualifies and parks native OCR to freeze the runtime identity.
+creation loads the managed OCR worker, records its runtime identity and parks it.
+The first benchmark prediction uses a selected benchmark input.
 Every selected case, including changed or missing sources and extraction failures, stays in the v4 denominator.
 An ambiguous post-observation classification failure retains available evidence
 and counts as a failed case. Upload-only completion recovery applies to queued

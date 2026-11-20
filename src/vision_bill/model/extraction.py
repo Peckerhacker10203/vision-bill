@@ -57,7 +57,7 @@ def assert_metadata_only(value: Any) -> None:
 class DraftLineItem(BaseModel):
     description: str | None = None
     spending_category: SpendingCategory | None = None
-    quantity: Annotated[float, Field(gt=0)] | None = None
+    quantity: Annotated[Decimal, Field(gt=0)] | None = None
     unit_price: Decimal | None = None
     total_price: Decimal | None = None
     tags: list[str] | None = None
@@ -75,7 +75,7 @@ class DraftLineItem(BaseModel):
 
 class DraftTaxLine(BaseModel):
     name: str | None = None
-    rate: float | None = None
+    rate: Decimal | None = None
     amount: Annotated[Decimal, Field(ge=0)] | None = None
 
 

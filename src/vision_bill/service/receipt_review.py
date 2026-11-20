@@ -61,6 +61,16 @@ def _canonical(value: Any) -> Any:
     return value
 
 
+def _review_factor(value: Any) -> Any:
+    # Earlier finding IDs used JSON numbers for quantity and tax rate. Keep those
+    # IDs when the old representation preserves the exact observation.
+    if isinstance(value, Decimal):
+        legacy = float(value)
+        if Decimal(str(legacy)) == value:
+            return legacy
+    return value
+
+
 def material_document(receipt: Receipt | ExtractionDraft) -> dict[str, Any]:
     """Ordered printed observations, excluding classification/tag/identity metadata."""
     fields = ExtractionDraft.model_fields.keys() - {"confidence", "category"}
@@ -74,6 +84,10 @@ def material_document(receipt: Receipt | ExtractionDraft) -> dict[str, Any]:
         data["taxes"] = [
             {key: item.get(key) for key in ("name", "rate", "amount")} for item in data["taxes"]
         ]
+    for item in data.get("line_items") or []:
+        item["quantity"] = _review_factor(item["quantity"])
+    for tax in data.get("taxes") or []:
+        tax["rate"] = _review_factor(tax["rate"])
     return _canonical(data)  # type: ignore[no-any-return]
 
 
@@ -187,7 +201,7 @@ def evaluate_receipt(
         for item in complete.line_items:
             numbers.append(item.total_price)
             if item.quantity is not None and item.unit_price is not None:
-                numbers.extend((Decimal(str(item.quantity)), item.unit_price))
+                numbers.extend((item.quantity, item.unit_price))
         numbers += [tax.amount for tax in complete.taxes]
         with localcontext() as context:
             context.prec = max(
@@ -216,7 +230,7 @@ def evaluate_receipt(
                         "line_discrepancy",
                         f"line_items.{index}.total_price",
                         item.total_price,
-                        Decimal(str(item.quantity)) * item.unit_price,
+                        item.quantity * item.unit_price,
                         "0.01",
                     )
             supported = (
@@ -328,24 +342,3 @@ def validate_acknowledgements(
         or any(not a.comment.strip() for a in acknowledgements)
     ):
         raise ValueError("review_acknowledgements_invalid")
-
-
-def admission_review(
-    document: ExtractionDraft,
-    *,
-    originals_valid: bool,
-    findings: Sequence[ReviewFinding] = (),
-) -> ReviewEvaluation:
-    """Compatibility admission for a draft; financial findings do not prevent saving it."""
-    complete = True
-    try:
-        receipt_from_draft(document)
-    except ValueError:
-        complete = False
-    return ReviewEvaluation(
-        findings=list(findings),
-        can_finalize=complete
-        and originals_valid
-        and not any(f.severity == "integrity" for f in findings),
-        can_auto_verify=False,
-    )

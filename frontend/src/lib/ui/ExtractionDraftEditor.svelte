@@ -16,7 +16,7 @@
 	import AmountPolicyEditor from './AmountPolicyEditor.svelte';
 	import { hasOverlapRows, unknownOverlap } from './overlap-decisions';
 	import TagEditor from './TagEditor.svelte';
-	import { isSignedDecimal, isPlainDecimal } from './money';
+	import { isSignedDecimal, isPlainDecimal, validReviewDecimal } from './money';
 	let { id }: { id: string } = $props();
 	const tags = createQuery(
 		() => ({ queryKey: queryKeys.tags(), queryFn: () => api.listTags() }),
@@ -166,7 +166,7 @@
 		)
 			errors.push('confidence');
 		for (const [i, line] of (document.line_items ?? []).entries()) {
-			if (line.quantity != null && (!Number.isFinite(line.quantity) || line.quantity <= 0))
+			if (line.quantity != null && !validReviewDecimal(line.quantity, 'positive'))
 				errors.push(`line_items.${i}.quantity`);
 			for (const key of ['unit_price', 'total_price'] as const)
 				if (line[key] != null && !isSignedDecimal(line[key]!))
@@ -174,7 +174,7 @@
 		}
 		for (const [i, tax] of (document.taxes ?? []).entries()) {
 			if (tax.amount != null && !isPlainDecimal(tax.amount)) errors.push(`taxes.${i}.amount`);
-			if (tax.rate != null && !Number.isFinite(tax.rate)) errors.push(`taxes.${i}.rate`);
+			if (tax.rate != null && !validReviewDecimal(tax.rate, 'any')) errors.push(`taxes.${i}.rate`);
 		}
 		return errors;
 	}
@@ -244,7 +244,7 @@
 			return;
 		}
 		const invalidRates = (document.taxes ?? []).flatMap(({ rate }, i) =>
-			rate != null && (!Number.isFinite(rate) || rate < 0 || rate > 1) ? [`taxes.${i}.rate`] : []
+			rate != null && !validReviewDecimal(rate, 'rate') ? [`taxes.${i}.rate`] : []
 		);
 		if (invalidRates.length) {
 			invalidFields = invalidRates;
@@ -328,10 +328,7 @@
 									value={line[field as keyof typeof line] ?? ''}
 									oninput={(e) =>
 										Object.assign(line, {
-											[field]:
-												field === 'quantity'
-													? numeric(e.currentTarget.value)
-													: e.currentTarget.value.trim() || null
+											[field]: e.currentTarget.value.trim() || null
 										})}
 								/></label
 							>{/each}
@@ -379,10 +376,7 @@
 									value={tax[field as keyof typeof tax] ?? ''}
 									oninput={(e) =>
 										Object.assign(tax, {
-											[field]:
-												field === 'rate'
-													? numeric(e.currentTarget.value)
-													: e.currentTarget.value.trim() || null
+											[field]: e.currentTarget.value.trim() || null
 										})}
 								/></label
 							>{/each}<button

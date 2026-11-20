@@ -92,6 +92,16 @@ export function releaseRequest(env) {
     run: env.GITHUB_RUN_ID,
   };
 }
+export function cudaQualificationGpuArgs(deviceId = "0") {
+  check(
+    typeof deviceId === "string" &&
+      /^(?:[0-9]+|GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.test(
+        deviceId,
+      ),
+    "Select one CUDA device by numeric index or GPU UUID",
+  );
+  return ["--gpus", `device=${deviceId}`];
+}
 export function validateReleaseInputs(plan, request) {
   check(variants.includes(request.variant), "Unknown distribution variant");
   const app =
@@ -102,7 +112,9 @@ export function validateReleaseInputs(plan, request) {
     "version",
     "platform",
     ...(app ? ["postgres"] : []),
-    ...(request.variant.endsWith("cuda") ? ["cuda_channel"] : []),
+    ...(request.variant.endsWith("cuda")
+      ? ["cuda_channel", "cuda_device_id"]
+      : []),
     ...(request.variant.endsWith("rocm") ? ["rocm"] : []),
   ];
   check(
@@ -125,6 +137,8 @@ export function validateReleaseInputs(plan, request) {
     );
   if (Object.hasOwn(plan, "cuda_channel"))
     check(cudaChannels.includes(plan.cuda_channel), "Unsupported CUDA channel");
+  if (Object.hasOwn(plan, "cuda_device_id"))
+    cudaQualificationGpuArgs(plan.cuda_device_id);
   if (request.variant.endsWith("rocm")) {
     check(
       plan.rocm &&
@@ -466,20 +480,27 @@ function build(request, inputs, output) {
       let cudaLockDigest;
       if (accelerator === "cuda") {
         const channel = plan.cuda_channel;
-        run(
+        const resolver = [
+          "run",
+          "--no-project",
+          "--with",
+          "packaging==26.2",
+          "python",
+          "paddleocr-service/build/resolve_cuda.py",
+          "--channel",
+          channel,
+        ];
+        run("uv", resolver, { stdio: "inherit" });
+        const wheelContext = run(
           "uv",
           [
-            "run",
-            "--no-project",
-            "--with",
-            "packaging==26.2",
-            "python",
-            "paddleocr-service/build/resolve_cuda.py",
-            "--channel",
-            channel,
+            ...resolver,
+            "--check",
+            "paddleocr-service/requirements.cuda.lock",
+            "--wheel-context",
           ],
-          { stdio: "inherit" },
-        );
+          { encoding: "utf8" },
+        ).trim();
         const attestation = readFileSync(
           "paddleocr-service/requirements.cuda.attestation.json",
         );
@@ -502,6 +523,8 @@ function build(request, inputs, output) {
         args.push(
           "--build-arg",
           `OCR_CUDA_CHANNEL=${channel}`,
+          "--build-context",
+          `cuda-wheel=${wheelContext}`,
           "--label",
           cudaLockDigestLabel + "=" + cudaLockDigest,
         );
@@ -648,7 +671,7 @@ function qualify(request, output, env) {
     );
     const gpu =
       accelerator === "cuda"
-        ? ["--gpus", "all"]
+        ? cudaQualificationGpuArgs(plan.cuda_device_id)
         : [
             "--device",
             "/dev/kfd:/dev/kfd",

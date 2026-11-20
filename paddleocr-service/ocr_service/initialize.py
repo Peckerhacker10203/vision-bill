@@ -1,4 +1,4 @@
-"""Owned, offline-verifying coordinator for the unchanged full native release gate.
+"""Prepare model files for serving, or explicitly run the full native release qualification.
 
 The operator supplies the actual raw OCI image config and Docker inspect image ID;
 no Docker socket or guessed self-image identity is used inside this container.
@@ -10,6 +10,10 @@ import logging
 import os
 import shutil
 import sys
+import tarfile
+from collections.abc import Iterator
+from contextlib import contextmanager
+from importlib import metadata
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -17,16 +21,19 @@ from uuid import uuid4
 
 from ocr_contract.activation import MaintenanceIntent
 
-from .device_inventory import inspect_device_identity
+from .device_inventory import DeviceIdentityUnavailable, inspect_device_identity
 from .gpu_memory import GPU_OOM_CODE, GPU_OOM_EXIT
 from .initialization_lock import lock_path, maintenance_handoff
 from .provision import (
     KINDS,
+    ModelDownloadFailed,
     ProvisionedRuntime,
     ReleaseBundle,
     file_digest,
     load_release_bundle,
+    model_paths,
     provision_bundle,
+    provision_models,
     safe_relative,
     source_identities,
     verify_cases,
@@ -40,6 +47,7 @@ from .supervision import (
     managed_installation,
     run_owned_qualification,
 )
+from .targets import validate_profile
 
 logger = logging.getLogger(__name__)
 
@@ -135,22 +143,37 @@ def verify_qualification(root: Path, bundle: ReleaseBundle, assets: ProvisionedR
         raise ValueError("Selected smoke fixture differs from qualified release")
 
 
-def cached_installation(
+def selected_installation(
     state: Path, bundle: ReleaseBundle, image_id: str, device: dict[str, Any]
-) -> Path | None:
+) -> tuple[Path, dict[str, Any]] | None:
     selected = state / "selected"
     if not selected.is_symlink():
         if selected.exists():
             raise ValueError("Selected installation must be an atomic pointer")
         return None
     root = selected.resolve(strict=True)
-    if root.parent != (state / "installations").resolve():
+    if root.parent != state / "installations":
         raise ValueError("Selected installation escapes owned state")
-    completion = json.loads((root / "complete.json").read_bytes())
+    record = root / "complete.json"
+    if record.is_symlink() or not record.is_file():
+        raise ValueError("Selected completion must be a regular file")
+    completion = json.loads(record.read_bytes())
     if completion.get("bundle_id") != bundle.identity or completion.get("image_id") != image_id:
         return None
     if completion.get("device_identity") != device:
         return None
+    return root, completion
+
+
+def cached_installation(
+    state: Path, bundle: ReleaseBundle, image_id: str, device: dict[str, Any]
+) -> Path | None:
+    selected = selected_installation(state, bundle, image_id, device)
+    if selected is None:
+        return None
+    root, completion = selected
+    if completion.get("schema_version") == 2:
+        return None  # A file-only installation does not satisfy an explicit release gate.
     files = completion.get("files", {})
     required = {
         "bundle.json",
@@ -203,6 +226,33 @@ def check_installation(
         return cached
 
 
+@contextmanager
+def new_installation(state: Path) -> Iterator[Path]:
+    """Publish one complete candidate atomically and preserve the last good selection on failure."""
+    installations = state / "installations"
+    if installations.is_symlink():
+        raise ValueError("Installation directory escapes owned state")
+    installations.mkdir(exist_ok=True, mode=0o700)
+    root = installations / uuid4().hex
+    selected = state / "selected"
+    target = root.relative_to(state)
+    root.mkdir(parents=True, mode=0o700)
+    try:
+        yield root
+        temporary = state / (".selected-" + uuid4().hex)
+        try:
+            temporary.symlink_to(target, target_is_directory=True)
+            temporary.replace(selected)
+        finally:
+            temporary.unlink(missing_ok=True)
+    except BaseException:
+        # A signal can raise after the atomic replacement succeeds. Read the
+        # pointer under the exclusive lock before deleting any candidate.
+        if not selected.is_symlink() or selected.readlink() != target:
+            shutil.rmtree(root)
+        raise
+
+
 def initialize(
     bundle_path: Path,
     state_dir: Path,
@@ -242,12 +292,7 @@ def initialize(
         # Tighten only this owned native state root, including fresh daemon volumes.
         state.chmod(0o700)
         assets = provision_bundle(bundle, state)
-        (state / "installations").mkdir(exist_ok=True, mode=0o700)
-        root = state / "installations" / uuid4().hex
-        selected = state / "selected"
-        target = root.relative_to(state)
-        root.mkdir(parents=True, mode=0o700)
-        try:
+        with new_installation(state) as root:
             runtime = {
                 "accelerator": bundle.accelerator,
                 "gpu_index": bundle.gpu_index,
@@ -340,19 +385,168 @@ def initialize(
                     "files": files,
                 },
             )
-            temporary = state / (".selected-" + uuid4().hex)
-            try:
-                temporary.symlink_to(target, target_is_directory=True)
-                temporary.replace(selected)
-            finally:
-                temporary.unlink(missing_ok=True)
+        return root
+
+
+class PreparationFailed(ValueError):
+    def __init__(self, reason_code: str):
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+
+
+class PreparationRequired(RuntimeError):
+    """A missing, previous-format or changed installation requires a new atomic publication."""
+
+
+def verify_package_pins(bundle: ReleaseBundle) -> None:
+    from .profile import verify_installed_versions
+
+    try:
+        verify_installed_versions(bundle.expected_packages, accelerator=bundle.accelerator)
+    except (metadata.PackageNotFoundError, ValueError) as exc:
+        raise PreparationFailed("native_package_mismatch") from exc
+
+
+def _prepared_inputs(
+    bundle_path: Path, config: Path, image_id: str
+) -> tuple[ReleaseBundle, dict[str, Any]]:
+    bundle = load_release_bundle(bundle_path)
+    verify_image(bundle, config, image_id)
+    if any(
+        source.scheme != "https" or not source.hostname
+        for source in (urlsplit(asset.source) for asset in bundle.models.values())
+    ):
+        raise PreparationFailed("native_activation_inputs_invalid")
+    verify_package_pins(bundle)
+    try:
+        device = inspect_device_identity(bundle.accelerator, bundle.gpu_index)
+        if bundle.accelerator == "rocm":
+            evidence = json.loads(Path("/opt/ocr/build-evidence/kernels.json").read_bytes())
+            if (
+                device["gfx_target"]
+                not in validate_profile(evidence["target_profile"])["candidate_targets"]
+            ):
+                raise ValueError("Selected GPU is outside this image's candidate targets")
+    except (DeviceIdentityUnavailable, ValueError, OSError, KeyError) as exc:
+        raise PreparationFailed("native_device_identity_unavailable") from exc
+    return bundle, device
+
+
+def _prepared_runtime(
+    root: Path, bundle: ReleaseBundle, state: Path, device: dict[str, Any]
+) -> dict[str, Any]:
+    from .profile import PreparedRuntimeSettings
+
+    return PreparedRuntimeSettings(
+        schema_version=2,
+        accelerator=bundle.accelerator,
+        gpu_index=bundle.gpu_index,
+        cache_dir=root / "cache",
+        model_dirs=model_paths(bundle, state),
+        model_content={name: asset.tree_sha256 for name, asset in bundle.models.items()},
+        expected_packages=bundle.expected_packages,
+        expected_paddle_commit=bundle.expected_paddle_commit,
+        image_identity=bundle.image_identity,
+        device_identity=device,
+    ).model_dump(mode="json")
+
+
+def _cached_prepared(
+    state: Path, bundle: ReleaseBundle, image_id: str, device: dict[str, Any]
+) -> Path | None:
+    selection = selected_installation(state, bundle, image_id, device)
+    if selection is None:
+        return None
+    root, complete = selection
+    if "schema_version" not in complete:
+        return None  # Legacy qualified installation; reuse its pinned archive cache.
+    if complete.get("schema_version") != 2:
+        raise ValueError("Unknown installed model metadata")
+    runtime_path = root / "runtime.json"
+    if (
+        runtime_path.is_symlink()
+        or not runtime_path.is_file()
+        or complete.get("runtime_sha256") != file_digest(runtime_path)
+    ):
+        raise ValueError("Selected runtime changed")
+    if json.loads(runtime_path.read_bytes()) != _prepared_runtime(root, bundle, state, device):
+        raise ValueError("Selected runtime differs from the pinned release")
+    try:
+        if (state / "models").is_symlink():
+            raise ValueError("Model cache must use an owned directory")
+        for name, path in model_paths(bundle, state).items():
+            verify_tree(path, bundle.models[name])
+    except (ValueError, OSError) as exc:
+        raise PreparationFailed("native_model_integrity_failed") from exc
+    return root
+
+
+def check_prepared_installation(
+    bundle_path: Path, state_dir: Path, image_config: Path, image_id: str
+) -> Path:
+    """Passive restart: verify files, image, package pins and device without starting Paddle."""
+    with installation_lock(lock_path(), exclusive=False):
+        check_fences(lock_path(), "check")
+        bundle, device = _prepared_inputs(bundle_path, image_config, image_id)
+        root = _cached_prepared(state_dir.resolve(), bundle, image_id, device)
+        if root is None:
+            raise PreparationRequired
+        return root
+
+
+def prepare_installation(
+    bundle_path: Path,
+    state_dir: Path,
+    image_config: Path,
+    image_id: str,
+    *,
+    maintenance_intent: MaintenanceIntent,
+    handoff_lock: Path,
+    repair: bool = False,
+) -> Path:
+    """Install the four verified model trees. This is not a physical qualification."""
+    MaintenanceIntent(maintenance_intent)
+    with maintenance_handoff(handoff_lock), managed_installation("initializer", lock_path()):
+        bundle, device = _prepared_inputs(bundle_path, image_config, image_id)
+        state = state_dir.resolve()
+        try:
+            cached = _cached_prepared(state, bundle, image_id, device)
+        except PreparationFailed as exc:
+            if not repair or exc.reason_code != "native_model_integrity_failed":
+                raise
+            cached = None
+        if cached is not None:
+            return cached
+        try:
+            state.mkdir(parents=True, exist_ok=True, mode=0o700)
+            state.chmod(0o700)
+            provision_models(bundle, state, repair=repair)
+            if inspect_device_identity(bundle.accelerator, bundle.gpu_index) != device:
+                raise PreparationFailed("native_device_identity_unavailable")
+            with new_installation(state) as root:
+                runtime_path = root / "runtime.json"
+                write_json(runtime_path, _prepared_runtime(root, bundle, state, device))
+                write_json(
+                    root / "complete.json",
+                    {
+                        "schema_version": 2,
+                        "bundle_id": bundle.identity,
+                        "image_id": image_id,
+                        "device_identity": device,
+                        "runtime_sha256": file_digest(runtime_path),
+                    },
+                )
             return root
-        except BaseException:
-            # A signal can raise after the atomic replacement succeeds. Read the
-            # pointer under the exclusive lock before deleting any candidate.
-            if not selected.is_symlink() or selected.readlink() != target:
-                shutil.rmtree(root)
+        except PreparationFailed:
             raise
+        except DeviceIdentityUnavailable as exc:
+            raise PreparationFailed("native_device_identity_unavailable") from exc
+        except ModelDownloadFailed as exc:
+            raise PreparationFailed("native_model_download_failed") from exc
+        except (ValueError, tarfile.TarError) as exc:
+            raise PreparationFailed("native_model_integrity_failed") from exc
+        except OSError as exc:
+            raise PreparationFailed("native_installation_write_failed") from exc
 
 
 def main() -> None:

@@ -459,7 +459,9 @@ it.each(['en', 'de'] as const)(
 		).not.toBeNull();
 		expect(
 			screen.getByText(
-				language === 'en' ? /OCR service is not ready/ : /OCR-Dienst ist nicht bereit/
+				language === 'en'
+					? /Waiting for the OCR service to become ready/
+					: /Es wird gewartet, bis der OCR-Dienst bereit ist/
 			)
 		).not.toBeNull();
 		setLocale('en');

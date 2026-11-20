@@ -74,7 +74,7 @@ class LineItemRow(BaseModel):
     original_description: str | None = None
     spending_category: str = "unknown"
     category_source: str = "unknown"
-    quantity: float | None
+    quantity: Decimal | None
     unit_price: Decimal | None
     total_price: Decimal
     tags: list[str] = Field(default_factory=list)
@@ -87,7 +87,7 @@ class TaxLineRow(BaseModel):
     id: UUID
     receipt_id: UUID
     name: str
-    rate: float | None = None
+    rate: Decimal | None = None
     amount: Decimal
 
 

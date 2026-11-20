@@ -24,7 +24,7 @@ def test_one_cent_difference_is_not_exact():
 def test_quantities_and_unit_prices_are_scored():
     expected = receipt()
     actual = expected.model_copy(deep=True)
-    actual.line_items[0].quantity = 2
+    actual.line_items[0].quantity = Decimal(2)
     actual.line_items[0].unit_price = Decimal("1.00")
     result = detailed_score(expected, actual)
     paths = {d["path"] for d in result["differences"]}
@@ -153,7 +153,7 @@ def test_exact_total_tax_rate_and_failed_receipt():
     expected = receipt()
     expected.taxes = [TaxLine(name='VAT', rate=19, amount='1.00')]
     actual = expected.model_copy(deep=True)
-    actual.taxes[0].rate = 7
+    actual.taxes[0].rate = Decimal(7)
     assert not detailed_score(expected, actual)['full_receipt_correct']
     perfect = detailed_score(expected, expected)
     assert perfect['full_receipt_correct']
@@ -172,3 +172,16 @@ def test_frozen_numeric_strings_are_scored_without_float_roundtrip():
     result = detailed_score(expected, receipt(('A',)))
     assert result['item_tp']==0 and result['item_fn']==1 and result['item_fp']==1
     assert not result['full_receipt_correct']
+
+
+def test_historical_factor_scores_ignore_scale_and_keep_decimal_differences():
+    from vision_bill.model.receipt import TaxLine
+
+    expected = receipt()
+    expected.taxes = [TaxLine(name="VAT", rate=Decimal("0.20"), amount=Decimal(0))]
+    actual = expected.model_copy(deep=True)
+    actual.line_items[0].quantity = Decimal("1.00")
+    actual.taxes[0].rate = Decimal("0.2")
+    assert detailed_score(expected, actual)["scores"]["strict"] == 1
+    actual.line_items[0].quantity = Decimal("1.0000000000000001")
+    assert detailed_score(expected, actual)["scores"]["strict"] < 1

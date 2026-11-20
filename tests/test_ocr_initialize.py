@@ -146,6 +146,39 @@ def test_success_publishes_verified_settings_then_cached_start_never_spawns_or_r
 
 
 @pytest.mark.usefixtures("native_pid1")
+def test_upgrade_preserves_explicit_qualification_and_installs_without_native_work(
+    tmp_path, release, monkeypatch
+):
+    from ocr_contract.activation import MaintenanceIntent
+    from ocr_service import initialize as module
+
+    state = tmp_path / "state"
+    monkeypatch.setenv("OCR_INSTALLATION_LOCK_PATH", str(tmp_path / "installation.lock"))
+    external_qualifier(monkeypatch)
+    old = initialize_release(tmp_path, release)
+    path, bundle, config = release
+    for name, asset in bundle["models"].items():
+        asset["source"] = f"https://example.invalid/{name}.tar"
+    path.write_text(json.dumps(bundle))
+    monkeypatch.setattr(module, "verify_package_pins", lambda bundle: None)
+    monkeypatch.setattr(module, "owned_qualification_process",
+                        lambda *args: pytest.fail("Migration ran qualification"))
+    args = (path, state, config, "sha256:" + sha(config.read_bytes()))
+    with pytest.raises(module.PreparationRequired):
+        module.check_prepared_installation(*args)
+    new = module.prepare_installation(
+        *args, maintenance_intent=MaintenanceIntent.SEPARATE_OCR_DEVICE,
+        handoff_lock=tmp_path / "handoff.lock",
+    )
+    assert (state / "selected").resolve() == new != old
+    assert (old / "qualification.json").is_file()
+    assert not (new / "qualification.json").exists()
+    assert module.check_prepared_installation(*args) == new
+    with pytest.raises(module.InitializationFailed):
+        module.check_installation(*args)
+
+
+@pytest.mark.usefixtures("native_pid1")
 @pytest.mark.parametrize("published", [False, True], ids=["pre-swap", "post-swap"])
 def test_interrupted_publication_preserves_selected_installation(
     tmp_path, release, monkeypatch, published
@@ -279,16 +312,13 @@ def test_entrypoint_resolves_selected_paths_without_native_import(tmp_path, monk
     root = tmp_path / "installations" / "private-test"
     root.mkdir(parents=True)
     (root / "complete.json").write_text("{}")
-    smoke = tmp_path / "smoke.png"
-    smoke.write_bytes(b"CPU-test-only")
-    (root / "selection.json").write_text(json.dumps({"smoke_path": str(smoke)}))
     (tmp_path / "selected").symlink_to(root, target_is_directory=True)
     monkeypatch.setenv("OCR_STATE_DIR", str(tmp_path))
     monkeypatch.delenv("OCR_RUNTIME_SETTINGS_PATH", raising=False)
     monkeypatch.delenv("OCR_QUALIFICATION_IMAGE_PATH", raising=False)
     configure_selected()
     assert os.environ["OCR_RUNTIME_SETTINGS_PATH"] == str(root / "runtime.json")
-    assert os.environ["OCR_QUALIFICATION_IMAGE_PATH"] == str(smoke)
+    assert "OCR_QUALIFICATION_IMAGE_PATH" not in os.environ
 
 
 @pytest.mark.parametrize("role", ["initializer", "ocr", "ollama"])

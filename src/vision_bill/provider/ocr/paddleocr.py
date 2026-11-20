@@ -17,30 +17,41 @@ from pydantic import ValidationError
 
 from ...helper.deadline import check_deadline, run_sync_before
 from ...model.ocr import OcrCapabilities, OcrResponse, WorkerReadiness
-from ...model.ocr_errors import OCR_GPU_OUT_OF_MEMORY, OcrGpuOutOfMemoryError
+from ...model.ocr_errors import (
+    OCR_GPU_OUT_OF_MEMORY,
+    OCR_HTTP_ERRORS,
+    OCR_RESULT_CODES,
+    OcrGpuOutOfMemoryError,
+    OcrWorkerFailure,
+)
 from .base import OcrProvider
 
 MAX_ERROR_BODY_BYTES = 4096
 
 
-async def _reports_gpu_oom(response: httpx.Response) -> bool:
+async def _raise_native_error(response: httpx.Response) -> None:
     """Only recognize the native detail within a short, bounded identity response."""
-    if response.status_code != 503:
-        return False
+    allowed = OCR_HTTP_ERRORS.get(response.status_code)
+    if allowed is None:
+        return
     if response.headers.get("Content-Encoding", "identity").lower() != "identity":
-        return False
+        return
     body = bytearray()
     try:
         async with asyncio.timeout(1):
             async for chunk in response.aiter_bytes():
                 if len(body) + len(chunk) > MAX_ERROR_BODY_BYTES:
-                    return False
+                    return
                 body.extend(chunk)
         # Keep object pairs to reject duplicate keys and any additional members.
         detail: object = json.loads(body, object_pairs_hook=list)
-        return detail == [("detail", OCR_GPU_OUT_OF_MEMORY)]
     except (httpx.HTTPError, TimeoutError, ValueError, RecursionError):
-        return False
+        return
+    for code in allowed:
+        if detail == [("detail", code)]:
+            if code == OCR_GPU_OUT_OF_MEMORY:
+                raise OcrGpuOutOfMemoryError
+            raise OcrWorkerFailure(code)
 
 
 class PaddleOcrProvider(OcrProvider):
@@ -60,8 +71,8 @@ class PaddleOcrProvider(OcrProvider):
                 headers={"Accept-Encoding": "identity"}, json={"owner_token": token},
             ) as response,
         ):
-            if action == "load" and await _reports_gpu_oom(response):
-                raise OcrGpuOutOfMemoryError
+            if action == "load":
+                await _raise_native_error(response)
             response.raise_for_status()
             body = await response.aread()
 
@@ -122,10 +133,10 @@ class PaddleOcrProvider(OcrProvider):
                 ready = await asyncio.to_thread(
                     WorkerReadiness.model_validate_json, response.content
                 )
-                if ready.reason_code == OCR_GPU_OUT_OF_MEMORY:
+                if ready.reason_code in OCR_RESULT_CODES or ready.reason_code == "ocr_parked":
                     if response.status_code != 503 or ready.ready:
-                        raise ValueError("ocr_invalid_oom_readiness")
-                    # The native OOM signal requires a JSON boolean, not a coerced value.
+                        raise ValueError("ocr_invalid_readiness")
+                    # An affirmative native state requires a JSON boolean, not a coerced value.
                     await asyncio.to_thread(
                         WorkerReadiness.model_validate_json, response.content, strict=True,
                     )
@@ -138,7 +149,7 @@ class PaddleOcrProvider(OcrProvider):
                     raise ValueError("ocr_profile_mismatch")
                 reported_limit = info["profile"].get("max_new_tokens")
                 parked = ready.reason_code == "ocr_parked"
-                identity = info.get("last_qualified_identity", {}) if parked else {}
+                identity = info.get("runtime_identity", info.get("last_qualified_identity", {})) if parked else {}
                 if not isinstance(identity, dict):
                     raise TypeError("ocr_contract_mismatch")
                 ocr_limit = (
@@ -203,8 +214,7 @@ class PaddleOcrProvider(OcrProvider):
                         "owner_token": owner.token if owner is not None else "",
                     },
                 ) as response:
-                    if await _reports_gpu_oom(response):
-                        raise OcrGpuOutOfMemoryError
+                    await _raise_native_error(response)
                     response.raise_for_status()
                     limits.check_ocr_response_headers(
                         response.headers.get("Content-Length"),

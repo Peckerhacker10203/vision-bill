@@ -38,6 +38,12 @@ paddleocr-service/**
 paddleocr-service/ocr_contract/**
 !paddleocr-service/ocr_contract/*.py
 
+# The Settings recovery guide ships these two public manuals with the SPA.
+!paddleocr-service/README.md
+!distribution/
+distribution/**
+!distribution/README.md
+
 # Local test output and runtime configuration are not build inputs.
 frontend/test-results
 frontend/test-results/**

@@ -19,9 +19,9 @@ from ocr_contract import OcrResponse
 from ocr_contract.document_image import decode_working_png, validate_working_png
 from ocr_contract.limits import MAX_IMAGE_PIXELS, NATIVE_SOURCE_MAX_BYTES
 from PIL import Image
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter
 
-from .profile import RuntimeSettings, load_profile
+from .profile import PreparedRuntimeSettings, RuntimeSettings, load_profile
 from .worker import OcrRequest, OcrWorkerError, OcrWorkerManager
 
 SOURCE_FORMATS = {
@@ -40,13 +40,13 @@ class LifecycleRequest(BaseModel):
 
 def configured_worker() -> OcrWorkerManager:
     runtime_path = os.environ.get("OCR_RUNTIME_SETTINGS_PATH")
-    smoke_path = os.environ.get("OCR_QUALIFICATION_IMAGE_PATH")
-    if not runtime_path or not smoke_path:
+    if not runtime_path:
         # Missing configuration is surfaced by the child's stable init failure.
         return OcrWorkerManager()
     return OcrWorkerManager(
-        runtime=RuntimeSettings.model_validate_json(Path(runtime_path).read_bytes()),
-        smoke_path=Path(smoke_path),
+        runtime=TypeAdapter(PreparedRuntimeSettings | RuntimeSettings).validate_json(
+            Path(runtime_path).read_bytes()
+        ),
         startup_timeout=float(os.environ.get("OCR_STARTUP_TIMEOUT_SECONDS", "600")),
     )
 
@@ -150,7 +150,7 @@ def create_app(
             "service_mode": mode,
             "profile": load_profile(Path(__file__).parents[1] / "profile.json").model_dump(),
             "worker": ready_body(),
-            "last_qualified_identity": getattr(worker, "last_identity", {}),
+            "runtime_identity": getattr(worker, "last_identity", {}),
             "max_upload_bytes": max_upload_bytes,
             "max_pending": 4,
             "max_timeout_ms": 600000,

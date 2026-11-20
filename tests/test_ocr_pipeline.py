@@ -355,16 +355,14 @@ def test_source_verifier_rejects_drift(tmp_path):
         verify_sources(tmp_path)
 
 
-@pytest.mark.parametrize("target_change", ["name", "architecture", "override", "missing_seal"])
-def test_factory_bootstraps_then_requires_real_forward_for_all_models(
-    tmp_path, monkeypatch, target_change
-):
+@pytest.fixture
+def native_runtime(tmp_path, monkeypatch):
     import json
     from types import ModuleType
 
     import ocr_service.pipeline as factory
     from ocr_service import device_inventory
-    from ocr_service.profile import MODEL_NAMES, RuntimeSettings, load_profile
+    from ocr_service.profile import MODEL_NAMES, RuntimeSettings
 
     source = tmp_path / "smoke.png"
     Image.new("RGB", (3, 8), "white").save(source)
@@ -492,8 +490,9 @@ def test_factory_bootstraps_then_requires_real_forward_for_all_models(
                 self.doc_preprocessor_pipeline.doc_ori_classify_model,
                 self.doc_preprocessor_pipeline.doc_unwarping_model,
             ]:
-                model.runner.input("conv2d", "compiled_w", tensor())
-                model.runner.output("conv2d", "result", tensor())
+                if hasattr(model.runner, "input"):
+                    model.runner.input("conv2d", "compiled_w", tensor())
+                    model.runner.output("conv2d", "result", tensor())
             yield {
                 "doc_preprocessor_res": {
                     "output_img": np.zeros((8, 3, 3), dtype=np.uint8),
@@ -533,6 +532,18 @@ def test_factory_bootstraps_then_requires_real_forward_for_all_models(
 
     monkeypatch.setattr(profile_module.importlib.metadata, "requires", lambda name: [])
     monkeypatch.setattr(profile_module, "dependency_identity", lambda name: "a" * 64)
+    return runtime, source, cuda_metadata, calls
+
+
+@pytest.mark.parametrize("target_change", ["name", "architecture", "override", "missing_seal"])
+def test_factory_bootstraps_then_requires_real_forward_for_all_models(native_runtime, monkeypatch, target_change):
+    import json
+
+    import ocr_service.pipeline as factory
+    from ocr_service.profile import MODEL_NAMES, load_profile
+
+    runtime, source, cuda_metadata, calls = native_runtime
+    manifest_path = runtime.qualification_manifest
     adapter = factory.build_pipeline(
         load_profile(Path(__file__).parents[1] / "paddleocr-service/profile.json"), runtime
     )
@@ -577,6 +588,83 @@ def test_factory_bootstraps_then_requires_real_forward_for_all_models(
             load_profile(Path(__file__).parents[1] / "paddleocr-service/profile.json"), runtime
         )
     assert calls == previous_calls
+
+
+@pytest.mark.parametrize("prepared", [False, True], ids=["qualified-offline", "prepared"])
+def test_serving_load_leaves_first_forward_to_real_receipt(native_runtime, monkeypatch, prepared):
+    import json
+
+    from ocr_service import pipeline
+    from ocr_service.profile import PreparedRuntimeSettings, load_profile, serving_identity
+
+    runtime, receipt, device, calls = native_runtime
+    profile = load_profile(Path(__file__).parents[1] / "paddleocr-service/profile.json")
+    if prepared:
+        runtime = PreparedRuntimeSettings(
+            **runtime.model_dump(exclude={"qualification_manifest"}),
+            schema_version=2,
+            model_content=json.loads(runtime.qualification_manifest.read_bytes())["model_content"],
+            device_identity=device.copy(),
+        )
+    monkeypatch.setattr(
+        pipeline,
+        "begin_static_audit",
+        lambda *a, **kw: pytest.fail("serving attached a diagnostic hook"),
+    )
+    adapter = pipeline.build_serving_pipeline(profile, runtime)
+    assert not any("min_pixels" in call for call in calls)
+    if prepared:
+        identity = serving_identity(profile, runtime, runtime.model_content, device)
+        assert (adapter.profile_id, adapter.runtime_fingerprint) == (
+            identity["profile_id"],
+            identity["runtime_fingerprint"],
+        )
+    page = adapter.predict(
+        receipt,
+        request_id=uuid4(),
+        photo_index=0,
+        source_sha256=hashlib.sha256(receipt.read_bytes()).hexdigest(),
+    )
+    assert page.text == "SHOP"
+    assert "precision_audits" not in page.telemetry
+    assert [call for call in calls if "max_pixels" in call] == [
+        {
+            "use_doc_orientation_classify": True,
+            "use_doc_unwarping": True,
+            "use_queues": False,
+            "min_pixels": 112896,
+            "max_pixels": 2000000,
+            "max_new_tokens": 4096,
+        }
+    ]
+
+
+@pytest.mark.parametrize("drift", ["device", "model", "symlink"])
+def test_prepared_serving_refuses_identity_drift_before_loading(native_runtime, drift):
+    import json
+
+    from ocr_service.pipeline import build_serving_pipeline
+    from ocr_service.profile import PreparedRuntimeSettings, RuntimeIdentityMismatch, load_profile
+
+    old, _, device, calls = native_runtime
+    runtime = PreparedRuntimeSettings(
+        **old.model_dump(exclude={"qualification_manifest"}),
+        schema_version=2,
+        model_content=json.loads(old.qualification_manifest.read_bytes())["model_content"],
+        device_identity=device.copy(),
+    )
+    if drift == "model":
+        (runtime.model_dirs["UVDoc"] / "extra").write_bytes(b"changed")
+    elif drift == "symlink":
+        directory = runtime.model_dirs["UVDoc"]
+        moved = directory.rename(directory.with_name("unowned"))
+        directory.symlink_to(moved, target_is_directory=True)
+    else:
+        device["uuid"] = "11" * 16
+    profile = load_profile(Path(__file__).parents[1] / "paddleocr-service/profile.json")
+    with pytest.raises(RuntimeIdentityMismatch):
+        build_serving_pipeline(profile, runtime)
+    assert calls == []
 
 
 def test_static_runner_actual_model_name_must_match(tmp_path):

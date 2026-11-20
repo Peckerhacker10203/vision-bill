@@ -34,6 +34,7 @@ async def main():
                 snapshot = json.loads(row["effective_options"])
                 snapshot.pop("execution_policy_version")
                 snapshot.pop("managed_binding_sha256")
+                snapshot.pop("inference_identity")
                 snapshot["ocr"]["enabled"] = False
                 snapshot["ocr"]["required"] = False
                 snapshot["allow_ocr_fallback"] = True

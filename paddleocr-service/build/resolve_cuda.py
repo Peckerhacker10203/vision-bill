@@ -13,6 +13,7 @@ import html.parser
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import urllib.parse
@@ -230,6 +231,118 @@ def validate_lock(
     return data
 
 
+def wheel_cache() -> Path:
+    root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    cache = root.expanduser() / "vision-bill" / "cuda-wheels"
+    cache.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    cache.mkdir(mode=0o700, exist_ok=True)
+    for directory in (cache.parent, cache):
+        if (
+            directory.is_symlink()
+            or directory.stat().st_uid != os.getuid()
+            or directory.stat().st_mode & 0o022
+        ):
+            raise ValueError("CUDA wheel cache must be an owned directory")
+    return cache.resolve()
+
+
+def download_wheel(url: str, target: Path) -> None:
+    opener = urllib.request.build_opener(NoRedirects())
+    with opener.open(url, timeout=600) as response, target.open("xb") as stream:
+        shutil.copyfileobj(response, stream, 1024 * 1024)
+
+
+def seed_from_previous_image(image: str, data: dict[str, Any], candidate: Path) -> bool:
+    """Try the one HTTP body pip 26.3 might have retained in an earlier image."""
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
+        raise ValueError("A previous CUDA image seed requires its exact Docker image ID")
+    # Official URLs admitted above are already in CacheControl's normalized form.
+    key = hashlib.sha224(data["wheel_url"].encode(), usedforsecurity=False).hexdigest()
+    body = Path("/root/.cache/pip/http-v2", *key[:5], key + ".body")
+    with candidate.open("xb") as output:
+        try:
+            result = subprocess.run(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--pull=never",
+                    "--network=none",
+                    "--read-only",
+                    "--cap-drop=ALL",
+                    "--security-opt=no-new-privileges",
+                    "--log-driver=none",
+                    "--entrypoint=/bin/cat",
+                    image,
+                    str(body),
+                ],
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=300,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+    return result.returncode == 0 and sha256(candidate) == data["wheel_sha256"]
+
+
+def wheel_context(
+    data: dict[str, Any], downloaded: Path | None = None, *, prior_image: str | None = None
+) -> Path:
+    """Expose only the verified wheel for this digest to the Docker builder."""
+    base = wheel_cache()
+    directory: Path = base / data["wheel_sha256"]
+    directory.mkdir(mode=0o700, exist_ok=True)
+    if (
+        directory.is_symlink()
+        or directory.stat().st_uid != os.getuid()
+        or directory.stat().st_mode & 0o077
+    ):
+        raise ValueError("CUDA wheel context must be a private owned directory")
+    target = directory / data["wheel_url"].rsplit("/", 1)[1]
+    if any(path != target for path in directory.iterdir()) or target.is_symlink():
+        raise ValueError("Unexpected files in CUDA wheel context")
+    if target.exists():
+        if not target.is_file():
+            raise ValueError("CUDA wheel cache contains a nonregular entry")
+        if sha256(target) == data["wheel_sha256"]:
+            return directory
+    if downloaded is not None:
+        # The resolver hashed this newly downloaded private file on this filesystem.
+        downloaded.replace(target)
+    else:
+        with tempfile.TemporaryDirectory(dir=base) as temporary:
+            candidate = Path(temporary) / target.name
+            if prior_image is None or not seed_from_previous_image(prior_image, data, candidate):
+                candidate.unlink(missing_ok=True)
+                download_wheel(data["wheel_url"], candidate)
+                if sha256(candidate) != data["wheel_sha256"]:
+                    raise ValueError("Downloaded CUDA wheel hash mismatch")
+            candidate.replace(target)
+    return directory
+
+
+def install_requirements(lock: Path, data: dict[str, Any], context: Path, output: Path) -> None:
+    """Use the immutable bind for the attested wheel; retain the original release lock."""
+    wheel = context / data["wheel_url"].rsplit("/", 1)[1]
+    if not list(context.glob("*.whl")):
+        # Direct Docker builds can still fetch the exact URL under --require-hashes.
+        output.write_bytes(lock.read_bytes())
+        return
+    if wheel.is_symlink() or not wheel.is_file() or sha256(wheel) != data["wheel_sha256"]:
+        raise ValueError("Build context CUDA wheel hash mismatch")
+    entries = executable_requirements(lock.read_text())
+    with output.open("w") as stream:
+        for name, (requirement, hashes) in entries.items():
+            source = (
+                f"paddlepaddle-gpu @ {wheel.as_uri()}"
+                if name == "paddlepaddle-gpu"
+                else str(requirement)
+            )
+            pins = " ".join(f"--hash=sha256:{digest}" for digest in sorted(hashes))
+            stream.write(f"{source} {pins}\n")
+
+
 def resolve(service: Path, channel: str = DEFAULT_CHANNEL) -> None:
     index = official_index(channel)
     opener = urllib.request.build_opener(NoRedirects())
@@ -238,12 +351,10 @@ def resolve(service: Path, channel: str = DEFAULT_CHANNEL) -> None:
     with opener.open(index, timeout=60) as response:
         document = response.read().decode()
     url = select_wheel(document, channel)
-    with tempfile.TemporaryDirectory(prefix="cuda-lock-") as scratch:
+    with tempfile.TemporaryDirectory(prefix="cuda-lock-", dir=wheel_cache()) as scratch:
         directory = Path(scratch)
         wheel = directory / urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1]
-        with opener.open(url, timeout=600) as response, wheel.open("wb") as target:
-            while chunk := response.read(1024 * 1024):
-                target.write(chunk)
+        download_wheel(url, wheel)
         digest = sha256(wheel)
         with zipfile.ZipFile(wheel) as archive:
             paths = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
@@ -277,6 +388,8 @@ def resolve(service: Path, channel: str = DEFAULT_CHANNEL) -> None:
                 "--python-platform",
                 "x86_64-manylinux_2_39",
                 "--generate-hashes",
+                "--no-header",
+                "--no-annotate",
                 "--constraint",
                 str(service / "requirements.runtime.lock"),
                 "--output-file",
@@ -302,6 +415,7 @@ def resolve(service: Path, channel: str = DEFAULT_CHANNEL) -> None:
         attestation = output.with_suffix(".attestation.json")
         attestation.write_text(json.dumps(data, sort_keys=True, indent=2) + "\n")
         validate_lock(output, service / "requirements.runtime.lock", channel=channel)
+        wheel_context(data, downloaded=wheel)
         (service / output.name).write_bytes(output.read_bytes())
         (service / attestation.name).write_bytes(attestation.read_bytes())
 
@@ -309,12 +423,28 @@ def resolve(service: Path, channel: str = DEFAULT_CHANNEL) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", type=Path)
+    parser.add_argument("--prior-image", help="optional exact previous image ID for --wheel-context")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--wheel-context", action="store_true", help="print the verified local Docker context"
+    )
+    mode.add_argument("--install-lock", nargs=2, type=Path, metavar=("WHEEL_CONTEXT", "OUTPUT"))
     parser.add_argument(
-        "--channel", choices=INDEXES, help=f"CUDA channel (resolution defaults to {DEFAULT_CHANNEL})"
+        "--channel",
+        choices=INDEXES,
+        help=f"CUDA channel (resolution defaults to {DEFAULT_CHANNEL})",
     )
     parser.add_argument("--service", type=Path, default=Path(__file__).resolve().parents[1])
     args = parser.parse_args()
+    if args.prior_image is not None and not args.wheel_context:
+        parser.error("--prior-image requires --wheel-context")
     if args.check:
-        validate_lock(args.check, channel=args.channel)
+        evidence = validate_lock(args.check, channel=args.channel)
+        if args.wheel_context:
+            print(wheel_context(evidence, prior_image=args.prior_image))
+        if args.install_lock:
+            install_requirements(args.check, evidence, *args.install_lock)
+    elif args.wheel_context or args.install_lock:
+        parser.error("wheel context and installation lock operations require --check")
     else:
         resolve(args.service, args.channel or DEFAULT_CHANNEL)

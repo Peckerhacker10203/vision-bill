@@ -16,8 +16,8 @@ environment template and the selected assets and evidence under `release/`.
 | `app` | Config initializer, PostgreSQL, app | External LLM endpoint and explicit model ID. Optional OCR endpoint. |
 | `ocr-cuda` | Cache gate, maintenance and independent OCR | Qualified NVIDIA device and approved OCR assets. |
 | `ocr-rocm` | Cache gate, maintenance and independent OCR | Qualified selected AMD device and approved OCR assets. |
-| `app-ocr-cuda` | App, PostgreSQL and an idle Dedicated OCR controller | Qualified NVIDIA device and a compatible dedicated LLM endpoint/model. |
-| `app-ocr-rocm` | App, PostgreSQL and an idle Dedicated OCR controller | Qualified selected AMD device and a compatible dedicated LLM endpoint/model. |
+| `app-ocr-cuda` | App, PostgreSQL and an idle Dedicated OCR controller | Qualified NVIDIA device and a compatible LLM endpoint/model. |
+| `app-ocr-rocm` | App, PostgreSQL and an idle Dedicated OCR controller | Qualified selected AMD device and a compatible LLM endpoint/model. |
 
 Provision the chosen model on your own Ollama or OpenAI-compatible endpoint.
 Installation starts the listed services. Combined bundles fetch the four model
@@ -135,13 +135,16 @@ dedicated private router. If the LLM runs on another GPU or an external
 server, clear this setting and save the GPU configuration. Its models can stay
 loaded. [llama.cpp router setup](../OPENAI_COMPATIBLE.md#configure-a-dedicated-llamacpp-router)
 
-Confirm the shared-GPU conditions if applicable and turn **Dedicated OCR** On. Downloads and
-native setup run in the background. The app invokes OCR for receipts after the
-managed service verifies the installed models and starts with its worker parked.
-During setup, inference waits. A confirmed GPU allocation failure reports
-insufficient local OCR GPU memory. If setup fails, review the status and explicitly
-retry after fixing the cause. Turning it Off routes new work to direct vision
-and retains the verified cache and idle native worker. Turning it On again reuses
+Confirm the shared-GPU conditions if applicable and turn **Dedicated OCR** On.
+The controller verifies the image, device, packages and four pinned models. It
+downloads missing model files and starts the service parked. No sample images
+run during installation or worker startup. The first real receipt loads the
+models and runs OCR. Images stay with local OCR, and the formatter receives
+text and layout evidence. On separate devices Vision Bill leaves the LLM loaded.
+During setup, inference waits. After a clean setup failure, switch **Dedicated
+OCR** on again to retry, or select **Resume direct vision**. An unsettled
+handoff requires recovery before switching routes. Turning OCR off routes new
+work to direct vision and keeps the service parked with its model files installed. Turning it On again reuses
 the verified generation instead of repeating installation. Frozen pending work
 may still require an explicit current-policy retry.
 
@@ -153,7 +156,7 @@ OCR_ACTIVATION_ON_STARTUP=true
 OCR_ACTIVATION_CONFIRM_HANDOFF=true
 ```
 
-`OCR_ACTIVATION_MAINTENANCE_INTENT` describes native qualification. To select
+`OCR_ACTIVATION_MAINTENANCE_INTENT` describes GPU ownership during setup. To select
 separate GPUs for normal receipt processing, save **LLM and OCR share a GPU**
 as off in Settings. Startup consent records one durable request. Fixing a failed
 generation requires an explicit retry.
@@ -180,26 +183,17 @@ docker compose --profile ocr-maintenance run --rm --no-deps ocr-maintenance \
   --maintenance-intent external-llm-quiesced
 ```
 
-For a combined bundle that reports its installed OCR service unavailable, check
-`docker compose logs ocr`. After draining all clients, stop `app` and `ocr`.
-If the installation needs repair, reuse the same image metadata and state and
-run the initializer with the original shared handoff lock.
+With physically separate hardware use `--maintenance-intent separate-ocr-device`.
+Use `--force` for a deliberate rerun of physical qualification. The initializer
+retains its crash and ownership fences.
 
-```bash
-image_id=$(jq -er '.images["ocr-cuda"].config_digest' release.json)
-docker compose run --rm --no-deps --entrypoint python ocr \
-  -m ocr_service.initialize maintain --bundle /release/bundle.json \
-  --state-dir /var/lib/ocr --image-config /release/image-config.json \
-  --image-id "$image_id" --maintenance-intent external-llm-quiesced \
-  --handoff-lock /coord/gpu-handoff.lock
-docker compose up -d
-```
-
-For ROCm read `.images["ocr-rocm"].config_digest`. With physically separate
-hardware use `--maintenance-intent separate-ocr-device`. The initializer checks
-ownership and app journal state. `--force` requests requalification and retains
-the crash and ownership fences. Restart a repaired instance with its original
-project name and volumes.
+For a combined bundle, sign in and use the Dedicated OCR controls described
+above. If an installed service is unavailable, check `docker compose logs ocr`
+and restart its original project with its volumes intact. If a prior handoff
+is unresolved, follow the [recovery procedure](#stop-cut-over-and-recover)
+before retrying. A combined installation obtains its serving metadata through
+the activation controller. The standalone `maintain` command produces a
+different installation record for the physical gate.
 
 Independent OCR bundles default to `OCR_SERVICE_MODE=standalone`. Direct clients
 use that service without an app or an LLM. Before pairing it with Vision Bill,
@@ -429,7 +423,10 @@ uv and adequate build/archive capacity. Labels are `vision-bill-cuda` and
 OCR device. ROCm selected targets must agree with compile inputs, kernel
 inventory and the actual qualified AMD device. For CUDA, `release-inputs.json`
 defaults to `cu129` for new candidates. Set `"cuda_channel": "cu126"` to select
-CUDA 12.6 explicitly. The producer records the selected channel in the candidate
+CUDA 12.6 explicitly. On multi-GPU runners set `cuda_device_id` to the physical
+GPU index as a string or to the NVIDIA GPU UUID. It defaults to `"0"`. Only
+that GPU is exposed to the release qualification process, at container index
+zero. The producer records the selected channel in the candidate
 plan and manifest, and resolves and attests the official GPU wheel for that
 channel. Existing candidate plans and manifests without a channel describe
 CUDA 12.6.

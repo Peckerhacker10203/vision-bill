@@ -253,7 +253,11 @@ it('submits one explicit activation and polls until the formatter switches to te
 		{ timeout: 3_000 }
 	);
 	expect(api.listModels).not.toHaveBeenCalledWith('text');
-	await screen.findByText('Dedicated OCR is active.', {}, { timeout: 3_000 });
+	await screen.findByText(
+		'Dedicated OCR is ready to process receipts. The first request loads the model on the GPU.',
+		{},
+		{ timeout: 3_000 }
+	);
 	await waitFor(() => expect(api.listModels).toHaveBeenCalledWith('text'));
 	const requestCount = fetchStatus.mock.calls.length;
 	await new Promise((resolve) => setTimeout(resolve, 2_100));
@@ -314,7 +318,9 @@ it('checks an unavailable installed runtime without offering another setup', asy
 	);
 	expect(screen.queryByRole('button', { name: 'Retry setup' })).toBeNull();
 	await fireEvent.click(screen.getByRole('button', { name: 'Check status again' }));
-	await screen.findByText('Dedicated OCR is active.');
+	await screen.findByText(
+		'Dedicated OCR is ready to process receipts. The first request loads the model on the GPU.'
+	);
 	expect(fetchStatus).toHaveBeenCalledTimes(2);
 	expect(fetchStatus.mock.calls[1][1].method).toBeUndefined();
 });
@@ -343,7 +349,9 @@ it('turns installed OCR off and on without downloading or reconfirming handoff',
 	vi.mocked(api.listModels).mockClear();
 	vi.mocked(api.getUiConfig).mockResolvedValue({ ...directVision, ocr_enabled: true });
 	await fireEvent.click(toggle);
-	await screen.findByText('Dedicated OCR is active.');
+	await screen.findByText(
+		'Dedicated OCR is ready to process receipts. The first request loads the model on the GPU.'
+	);
 	expect(fetchStatus.mock.calls[2][1].body).toBe('{"enabled":true,"confirm_handoff":false}');
 	await waitFor(() => expect(api.listModels).toHaveBeenCalledWith('text'));
 });
@@ -358,7 +366,9 @@ it('keeps the confirmed switch on when pausing fails and permits retry', async (
 	vi.stubGlobal('fetch', fetchStatus);
 	render(Settings);
 	const toggle = await screen.findByRole('switch', { name: 'Dedicated OCR' });
-	await screen.findByText('Dedicated OCR is active.');
+	await screen.findByText(
+		'Dedicated OCR is ready to process receipts. The first request loads the model on the GPU.'
+	);
 	await fireEvent.click(toggle);
 	await screen.findByText('Could not confirm the Dedicated OCR change.');
 	expect(toggle.getAttribute('aria-checked')).toBe('true');
@@ -413,7 +423,9 @@ it.each([
 		vi.stubGlobal('fetch', fetchStatus);
 		render(Settings);
 		const toggle = await screen.findByRole('switch', { name: 'Dedicated OCR' });
-		await screen.findByText('Dedicated OCR is active.');
+		await screen.findByText(
+			'Dedicated OCR is ready to process receipts. The first request loads the model on the GPU.'
+		);
 		await fireEvent.click(toggle);
 		const alert = await screen.findByRole('alert');
 		expect(alert.textContent).toBe(message);
@@ -421,3 +433,18 @@ it.each([
 		expect(screen.queryByText('Could not confirm the Dedicated OCR change.')).toBeNull();
 	}
 );
+
+it('can return to direct vision after a clean initial failure without starting another installation', async () => {
+	const fetchStatus = vi
+		.fn()
+		.mockResolvedValueOnce(status('failed', 'native_qualification_failed'))
+		.mockResolvedValue(status('disabled', null, 202));
+	vi.stubGlobal('fetch', fetchStatus);
+	render(Settings);
+	await fireEvent.click(await screen.findByRole('button', { name: 'Resume direct vision' }));
+	await waitFor(() => expect(fetchStatus).toHaveBeenCalledTimes(2));
+	expect(JSON.parse(fetchStatus.mock.calls[1][1].body)).toEqual({
+		confirm_handoff: false,
+		enabled: false
+	});
+});

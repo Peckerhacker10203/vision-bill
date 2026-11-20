@@ -476,7 +476,7 @@ class ReceiptService:
             handoff = self.execution_handoff(settings.ocr)
         except (HandoffWait, ValueError, OSError):
             handoff = None
-        return current_snapshot(settings, handoff=handoff)
+        return current_snapshot(settings, inference_identity=self.inference_identity, handoff=handoff)
 
     async def extract_receipt(
         self, model_id: str, paths: Sequence[Path], *, options: "ExperimentOptions",
@@ -499,10 +499,6 @@ class ReceiptService:
             max_output_tokens=max_output_tokens, expected_binding_sha256=expected_binding_sha256,
             handoff_deadline=handoff_deadline,
         )
-
-    async def analyse_receipt_with_ocr(self, model_id: str, image_path: Path) -> Receipt:
-        """Compatibility entry point using the same server-selected normal policy."""
-        return await self.analyse_receipt_from_path(model_id, image_path)
 
     async def analyse_receipt_from_path(
         self, model_id: str, image_path: Path | Sequence[Path]

@@ -218,7 +218,10 @@ test.describe('saved OCR evidence and original integrity', () => {
 		await expect(
 			page.getByRole('textbox', { name: /Review comment: The original is unavailable/ })
 		).toHaveCount(0);
-		await expect(page.getByRole('button', { name: 'Verify', exact: true })).toBeDisabled();
+		await page.getByRole('button', { name: 'Verify', exact: true }).click();
+		const dialog = page.getByRole('dialog', { name: 'Verify receipt?' });
+		await expect(dialog.getByRole('button', { name: 'Verify', exact: true })).toBeDisabled();
+		await expect(dialog.getByRole('textbox')).toHaveCount(0);
 		const denied = await context.request.post(`/api/v1/receipts/${job.receipt_id}/verify`, {
 			data: {
 				expected_operation_revision: detail.receipt.operation_revision,

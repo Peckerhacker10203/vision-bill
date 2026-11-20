@@ -20,7 +20,7 @@ ENV PATH="/opt/venv/bin:$PATH" \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEX=3.7.2 \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEOCR=3.7.0
 COPY requirements.build.lock requirements.bootstrap.lock /opt/locks/
-RUN python -m pip install --require-hashes --no-deps --only-binary=:all: -r /opt/locks/requirements.bootstrap.lock \
+RUN --mount=type=cache,target=/root/.cache/pip python -m pip install --require-hashes --no-deps --only-binary=:all: -r /opt/locks/requirements.bootstrap.lock \
  && python -m pip install --require-hashes --no-deps --no-build-isolation -r /opt/locks/requirements.build.lock
 # Rust archive identity comes from the official 1.95.0 distribution manifest.
 RUN curl --fail --location https://static.rust-lang.org/dist/2026-04-16/rust-1.95.0-x86_64-unknown-linux-gnu.tar.xz -o /tmp/rust.tar.xz \
@@ -28,17 +28,22 @@ RUN curl --fail --location https://static.rust-lang.org/dist/2026-04-16/rust-1.9
  && tar -xJf /tmp/rust.tar.xz -C /tmp \
  && /tmp/rust-1.95.0-x86_64-unknown-linux-gnu/install.sh --prefix=/usr/local --without=rust-docs \
  && rm -rf /tmp/rust.tar.xz /tmp/rust-1.95.0-x86_64-unknown-linux-gnu
-COPY build/ /opt/ocr/build/
+COPY build/build_therock.sh build/prepare_therock.sh build/source_inventory.py /opt/ocr/build/
 COPY ocr_service/targets.py /opt/ocr/ocr_service/targets.py
 ARG AMDGPU_TARGETS
 ARG BUILD_JOBS=8
-RUN BUILD_JOBS="$BUILD_JOBS" AMDGPU_TARGETS="$AMDGPU_TARGETS" bash /opt/ocr/build/build_rocm.sh
+RUN BUILD_JOBS="$BUILD_JOBS" AMDGPU_TARGETS="$AMDGPU_TARGETS" bash /opt/ocr/build/build_therock.sh \
+ && rm -rf /opt/native-src/TheRock /opt/native-src/therock-build
+COPY build/build_rocm.sh build/hip-rdna2-v1.patch build/hip-device-info.cpp /opt/ocr/build/
+RUN BUILD_JOBS="$BUILD_JOBS" AMDGPU_TARGETS="$AMDGPU_TARGETS" bash /opt/ocr/build/build_rocm.sh --paddle-only \
+ && rm -rf /opt/native-src/Paddle
 COPY requirements.runtime.lock /opt/locks/requirements.runtime.lock
-RUN python -m pip install --require-hashes --no-deps --no-build-isolation -r /opt/locks/requirements.runtime.lock \
+RUN --mount=type=cache,target=/root/.cache/pip python -m pip install --require-hashes --no-deps --no-build-isolation -r /opt/locks/requirements.runtime.lock \
  && cd / && sha256sum -c /opt/ocr/build-evidence/native-wheels.sha256 \
  && python -m pip install --no-deps /opt/wheels/*.whl \
  && python -m pip check
 ENV LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib:/opt/rocm/lib/rocm_sysdeps/lib
+COPY build/inspect_kernels.py /opt/ocr/build/inspect_kernels.py
 RUN python /opt/ocr/build/inspect_kernels.py --sdk /opt/rocm \
     --paddle /opt/venv/lib/python3.12/site-packages/paddle \
     --output /opt/ocr/build-evidence/kernels.json \

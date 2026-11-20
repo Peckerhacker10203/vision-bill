@@ -452,3 +452,37 @@ def test_app_provider_rejects_crc_correct_invalid_deflate(tmp_path):
             result.model_dump_json().encode(), result.request_id, result.photo_index,
             result.source_sha256, result.profile_id,
         )
+
+
+@pytest.mark.parametrize("action,status,code", [
+    ("load", 503, "ocr_model_load_failed"),
+    ("load", 503, "ocr_runtime_identity_mismatch"),
+    ("inference", 502, "ocr_invalid_result"),
+    ("inference", 502, "ocr_inference_failed"),
+    ("inference", 503, "ocr_worker_crashed"),
+    ("inference", 504, "ocr_deadline_exceeded"),
+])
+async def test_typed_native_reason_matches_http_contract(monkeypatch, tmp_path, action, status, code):
+    http_client(monkeypatch, lambda _: httpx.Response(status, json={"detail": code}))
+    provider = PaddleOcrProvider("http://local", managed_lifecycle=False)
+    with pytest.raises(RuntimeError, match=f"^{code}$"):
+        if action == "load":
+            await provider.load("1:owner", time.monotonic() + 2)
+        else:
+            await provider.extract_text(image_file(tmp_path))
+
+
+async def test_parked_prepared_identity_is_used_before_first_receipt(monkeypatch):
+    parked = {"ready": False, "generation": 1, "reason_code": "ocr_parked"}
+    def handler(request):
+        if request.url.path == "/info":
+            return httpx.Response(200, json={
+                "contract_version": 2, "service_mode": "managed", "profile": {}, "worker": parked,
+                "runtime_identity": {"profile_id": "profile", "runtime_fingerprint": "prepared"},
+                "last_qualified_identity": {"profile_id": "old", "runtime_fingerprint": "stale"},
+            })
+        return httpx.Response(503, json=parked)
+    http_client(monkeypatch, handler)
+    caps = await PaddleOcrProvider("http://local").get_capabilities()
+    assert caps.can_load and not caps.ready
+    assert caps.profile_id == "profile" and caps.runtime_fingerprint == "prepared"

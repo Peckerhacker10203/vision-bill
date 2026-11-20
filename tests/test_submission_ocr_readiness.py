@@ -34,11 +34,12 @@ async def submission_context(settings, monkeypatch, tmp_path, *, managed):
     )
     monkeypatch.setattr(config, "settings", settings)
     image = ImageRow(
-        id=uuid4(), model_id=settings.llm.model_name, effective_options=current_snapshot(settings)
+        id=uuid4(), model_id=settings.llm.model_name, effective_options=current_snapshot(settings, inference_identity="ollama:" + "d" * 64)
     )
     model = ModelInfo(settings.llm.model_name)
     model.capabilities = ["completion"]
     llm = SimpleNamespace(
+        inference_identity="ollama:" + "d" * 64,
         supports_model_release=True,
         lifecycle_identity="cpu-fixture:formatter",
         check_connection=AsyncMock(return_value=True),
@@ -162,7 +163,8 @@ async def test_ready_unmanaged_service_including_legacy_missing_mode_is_eligible
     llm.get_available_models.assert_awaited_once_with(capability="text")
 
 
-async def test_readiness_exposes_exact_oom_without_claiming_receipt(settings, monkeypatch, tmp_path):
+@pytest.mark.parametrize("code", ["ocr_gpu_out_of_memory", "ocr_model_load_failed", "ocr_runtime_identity_mismatch"])
+async def test_readiness_exposes_typed_native_error_without_claiming_receipt(settings, monkeypatch, tmp_path, code):
     from vision_bill.provider.db.workflow_db import READINESS_WAIT_REASONS
 
     service, _receipts, llm, image, waits, claims = await submission_context(
@@ -175,7 +177,7 @@ async def test_readiness_exposes_exact_oom_without_claiming_receipt(settings, mo
             return httpx.Response(200, json={"contract_version": 2, "profile": {}})
         assert request.url.path == "/ready"
         return httpx.Response(503, json={
-            "ready": False, "generation": 1, "reason_code": "ocr_gpu_out_of_memory",
+            "ready": False, "generation": 1, "reason_code": code,
         })
 
     monkeypatch.setattr(
@@ -183,6 +185,6 @@ async def test_readiness_exposes_exact_oom_without_claiming_receipt(settings, mo
         lambda **kwargs: original_client(**kwargs, transport=httpx.MockTransport(server)),
     )
     assert not await service.ready_for(image)
-    assert waits == ["ocr_gpu_out_of_memory"] and waits[0] in READINESS_WAIT_REASONS
+    assert waits == [code] and waits[0] in READINESS_WAIT_REASONS
     assert claims == [] and image.attempt_count == 0
     llm.get_available_models.assert_not_awaited()

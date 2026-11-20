@@ -143,7 +143,8 @@ ocr-lock-cuda: ## Resolve official CUDA lock (default cu129, optional OCR_CUDA_C
 	SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEX=3.7.2 SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEOCR=3.7.0 uv run --no-project --with packaging==26.2 python paddleocr-service/build/resolve_cuda.py --channel="$${OCR_CUDA_CHANNEL:-cu129}"
 
 ocr-build-cuda: ## Build candidate CUDA image after official lock resolution
-	uv run --no-project --with packaging==26.2 python paddleocr-service/build/resolve_cuda.py --check paddleocr-service/requirements.cuda.lock --channel="$${OCR_CUDA_CHANNEL:-cu129}"
+	OCR_CUDA_WHEEL_CONTEXT="$$(uv run --no-project --with packaging==26.2 python paddleocr-service/build/resolve_cuda.py --check paddleocr-service/requirements.cuda.lock --channel="$${OCR_CUDA_CHANNEL:-cu129}" --wheel-context)" && \
+	export OCR_CUDA_WHEEL_CONTEXT && \
 	docker compose --profile ocr -f docker-compose.yml -f docker-compose.cuda.yml build paddleocr-service
 
 ocr-build-rocm: ## Build native full-SDK RDNA2 candidate (large build; no support claim)

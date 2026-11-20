@@ -5,12 +5,12 @@ import importlib.metadata
 import json
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, Self
 
 from ocr_contract import document_image
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .paddle_distribution import installed_native_paddle, native_paddle_distribution
 
@@ -22,6 +22,14 @@ MODEL_NAMES = (
     "UVDoc",
     "PaddleOCR-VL-1.6-0.9B",
 )
+
+
+class InvalidReceiptOutput(ValueError):
+    """Native OCR returned an unusable page or working image."""
+
+
+class RuntimeIdentityMismatch(ValueError):
+    """The installed runtime differs from the selected artifacts or device."""
 
 
 class OcrProfile(BaseModel):
@@ -44,7 +52,7 @@ class OcrProfile(BaseModel):
     use_seal_recognition: Literal[False]
 
 
-class RuntimeSettings(BaseModel):
+class NativeRuntimeSettings(BaseModel):
     """Explicit identities and local paths supplied by the native image build."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -52,7 +60,6 @@ class RuntimeSettings(BaseModel):
     gpu_index: int = Field(ge=0)
     model_dirs: dict[str, Path]
     cache_dir: Path
-    qualification_manifest: Path
     expected_packages: dict[str, str]
     expected_paddle_commit: str = Field(min_length=7)
     image_identity: str = Field(min_length=1)
@@ -61,6 +68,31 @@ class RuntimeSettings(BaseModel):
     def device(self) -> str:
         # Paddle's native CUDA and HIP builds both expose GPUPlace.
         return "gpu:" + str(self.gpu_index)
+
+
+class RuntimeSettings(NativeRuntimeSettings):
+    """Legacy offline runtime and explicit hardware qualification input."""
+
+    qualification_manifest: Path
+
+
+class PreparedRuntimeSettings(NativeRuntimeSettings):
+    """Versioned local installation prepared without executing an OCR model."""
+
+    schema_version: Literal[2]
+    device_identity: dict[str, Any]
+    model_content: dict[str, Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]]
+
+    @model_validator(mode="after")
+    def complete_installation(self) -> Self:
+        if set(self.model_dirs) != set(MODEL_NAMES) or set(self.model_content) != set(MODEL_NAMES):
+            raise ValueError("Prepared installation requires all four native model identities")
+        if (
+            self.device_identity.get("accelerator") != self.accelerator
+            or self.device_identity.get("gpu_index") != self.gpu_index
+        ):
+            raise ValueError("Prepared device differs from the selected accelerator or index")
+        return self
 
 
 def load_profile(path: Path) -> OcrProfile:
@@ -115,21 +147,15 @@ class DependencyRecord(BaseModel):
     content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
-def verify_dependencies(
+def verify_installed_versions(
     expected_packages: dict[str, str],
-    sealed_dependencies: dict[str, Any],
     *,
     accelerator: str | None = None,
-) -> tuple[dict[str, str], dict[str, str]]:
-    """Verify only the active execution dependency closure, before native imports."""
-
-    def canonical_entries(entries: dict[str, Any]) -> dict[str, Any]:
-        canonical = {str(canonicalize_name(name)): value for name, value in entries.items()}
-        if len(canonical) != len(entries):
-            raise ValueError("Duplicate dependency identity aliases")
-        return canonical
-
-    expected = canonical_entries(expected_packages)
+) -> dict[str, str]:
+    """Check the runtime image's pinned versions and complete active dependency closure."""
+    expected = {str(canonicalize_name(name)): value for name, value in expected_packages.items()}
+    if len(expected) != len(expected_packages):
+        raise ValueError("Duplicate dependency identity aliases")
     required = {"paddleocr", "paddlex", "pillow", "pillow-heif", "numpy", "pydantic", "packaging"}
     paddle = native_paddle_distribution(expected, accelerator=accelerator)
     required.add(paddle)
@@ -141,10 +167,6 @@ def verify_dependencies(
         raise ValueError("Native Paddle source version must remain 3.3.1")
     if installed_native_paddle(accelerator=accelerator) != paddle:
         raise ValueError("Installed Paddle distribution differs from the expected identity")
-    sealed = {
-        name: DependencyRecord.model_validate(record)
-        for name, record in canonical_entries(sealed_dependencies).items()
-    }
     active = {name: set[str]() for name in required}
     active["paddlex"].add("ocr")
     pending = sorted(required)
@@ -155,10 +177,10 @@ def verify_dependencies(
         extras = frozenset(active[name])
         if processed.get(name) == extras:
             continue
-        if name not in expected or name not in sealed:
+        if name not in expected:
             raise ValueError(f"Active dependency identity omitted: {name}")
         actual_version = versions.setdefault(name, importlib.metadata.version(name))
-        if actual_version != expected[name] or sealed[name].version != expected[name]:
+        if actual_version != expected[name]:
             raise ValueError(f"Native dependency version identity mismatch: {name}")
         processed[name] = extras
         for specification in importlib.metadata.requires(name) or []:
@@ -169,7 +191,7 @@ def verify_dependencies(
             ):
                 continue
             child = str(canonicalize_name(requirement.name))
-            if child not in expected or child not in sealed:
+            if child not in expected:
                 raise ValueError(f"Active dependency identity omitted: {child}")
             if not requirement.specifier.contains(expected[child], prereleases=True):
                 raise ValueError(f"Pinned dependency violates active requirement: {specification}")
@@ -180,9 +202,31 @@ def verify_dependencies(
             elif not child_extras <= active[child]:
                 active[child].update(child_extras)
                 pending.append(child)
-    if set(active) != set(expected) or set(active) != set(sealed):
+    if set(active) != set(expected):
         raise ValueError("Dependency manifest must contain exactly the active execution closure")
-    contents = {name: dependency_identity(name) for name in sorted(active)}
+    return versions
+
+
+def verify_dependencies(
+    expected_packages: dict[str, str],
+    sealed_dependencies: dict[str, Any],
+    *,
+    accelerator: str | None = None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Also verify content seals required by explicitly qualified runtimes."""
+    versions = verify_installed_versions(expected_packages, accelerator=accelerator)
+    sealed = {
+        str(canonicalize_name(name)): DependencyRecord.model_validate(record)
+        for name, record in sealed_dependencies.items()
+    }
+    if len(sealed) != len(sealed_dependencies):
+        raise ValueError("Duplicate dependency identity aliases")
+    if set(versions) != set(sealed):
+        raise ValueError("Sealed dependency inventory differs from the active execution closure")
+    for name, version in versions.items():
+        if sealed[name].version != version:
+            raise ValueError(f"Native dependency version identity mismatch: {name}")
+    contents = {name: dependency_identity(name) for name in sorted(versions)}
     for name, digest in contents.items():
         if digest != sealed[name].content_sha256:
             raise ValueError(f"Native dependency content identity mismatch: {name}")
@@ -191,6 +235,36 @@ def verify_dependencies(
 
 def runtime_identity(profile_id: str, runtime: dict[str, Any]) -> str:
     return content_identity({"profile_id": profile_id, "runtime": runtime})
+
+
+def serving_identity(
+    profile: OcrProfile,
+    runtime: NativeRuntimeSettings,
+    model_content: dict[str, str],
+    device_identity: dict[str, Any],
+) -> dict[str, str]:
+    """Bind reusable receipt pages to their settings, artifacts, image and actual device."""
+    profile_id = content_identity(
+        {
+            "adapter": "native-receipt-fp32-v2",
+            "normalizer": NORMALIZER_VERSION,
+            "effective_config": effective_pipeline_config(profile),
+            "limits": profile.model_dump(),
+            "model_content": model_content,
+            "dependencies": runtime.expected_packages,
+            "paddle_commit": runtime.expected_paddle_commit,
+        }
+    )
+    fingerprint = runtime_identity(
+        profile_id,
+        {
+            "image_identity": runtime.image_identity,
+            "accelerator": runtime.accelerator,
+            "gpu_index": runtime.gpu_index,
+            "device": device_identity,
+        },
+    )
+    return {"profile_id": profile_id, "runtime_fingerprint": fingerprint}
 
 
 # Regenerated from the official PaddleX v3.7.2 PaddleOCR-VL-1.6 YAML.

@@ -46,6 +46,10 @@ These are correctness changes, not measured OCR accuracy or speed improvements.
 
 ## Backup and upgrade order
 
+For a source installation created with `ocr_source_up.py`, use the original
+checkout and the documented `--upgrade` procedure after backup and drain.
+`--restart` reuses the previously recorded images. [Source upgrade steps](paddleocr-service/README.md#upgrade-an-existing-source-installation)
+
 For a prepared upgrade, keep the old Compose project name and volume mounts.
 Use a schema-v2 bundle for the new installation. Changing the extraction directory
 does not require new volumes. Copy the private runtime file or use a private
@@ -177,7 +181,11 @@ uploads, set the canonical `OCR__ENDPOINT=` explicitly blank, ensure legacy
 `OCR__REQUIRED=false`, and restart deliberately. A nonblank canonical endpoint
 selects OCR and takes precedence over legacy `enabled`/`service_url`. Without it,
 legacy `OCR__ENABLED=false` can coexist with a retained URL without enabling OCR.
-Changed routing or historical fallback grants cause a policy hold before claim.
+Changing the LLM provider or endpoint, including for direct vision or separate
+GPUs, holds previously queued inference before claim. Pending inference without
+a saved endpoint fingerprint (upload policies through version 3) also waits for
+explicit adoption. Changed OCR routing and historical fallback grants can
+likewise hold work.
 Use an authorized retry with current `expected_generation`, new `request_key` and
 `policy: "current"` to adopt current policy explicitly. Default `preserve` retains
 intent. History keeps the original request and old effective snapshot; human-edited
@@ -231,7 +239,16 @@ Required missing observations, unavailable/changed originals and invalid source
 references prevent finalization/verification. Unknown source mapping and unresolved
 overlaps require review. Observations remain nullable; human correction fills
 actual missing mandatory data before finalization. Drafts can save partial edits.
-Discount, tip, quantity and unit price can remain absent on the finalized receipt.
+For both new and migrated receipts, **Verify** and **Save & verify** fetch
+a preview for the current revision. Enter a comment for each current review
+finding in the dialog. A clean **Save & verify** completes immediately.
+API clients fetch the same preview through `GET /api/v1/receipts/<id>/verify`
+and submit its revisions and acknowledgements to the matching POST.
+
+Receipt and draft responses encode monetary amounts, line quantities and tax
+rates as decimal strings. Write requests accept strings and JSON numbers. Clients
+that use binary floating point should keep the strings when editing or resubmitting
+printed values. Discount, tip, quantity and unit price can remain absent on the finalized receipt.
 Transaction and line totals remain required. Correct a present tax rate to its
 decimal fraction before finalizing, such as `0.07` for 7%.
 

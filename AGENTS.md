@@ -125,7 +125,9 @@ encoding. See the [native contract](paddleocr-service/README.md#fixed-extraction
 
 Base app OCR is off. CUDA/ROCm overlays and sidecar profile `ocr` prepare an
 idle controller. Admin activation or explicit startup configuration requests
-verified model downloads and native qualification. Default OCR Dockerfile
+verified model downloads and a versioned prepared installation. Ordinary
+installation, restart and worker creation must make zero model predictions.
+The explicit release qualifier owns all fixture inference. Default OCR Dockerfile
 requires a selected accelerator.
 Linux x86_64 candidates target CUDA and native ROCm, including intended consumer
 RX6000+/RDNA2. RDNA2 default gfx1030/1031/1032/1034 is distinct from a selected
@@ -139,12 +141,12 @@ including tables, OCR 4096. Official upstream grid alignment is not a whole-phot
 extra sampling parameters. EXIF applies independently. Formatter output defaults
 8192; discovered context capacity remains separate and may be unknown.
 
-`/health` is liveness; `/ready` is qualified-worker readiness; `/info` carries
-capability/profile/runtime identity. Serving uses target-sealed model/package/
-image/source/device evidence; invalidate/requalify after identity changes.
+`/health` is liveness. `/ready` is worker readiness and `/info` carries the
+capability, profile and runtime identity. Dedicated OCR serves a verified
+installation. A changed image, device or model requires validation before use.
 Readiness polling detects an already-explicitly-loaded idle worker death and
 schedules bounded coordinated replacement;
-failed replacement qualification stays unready, no endless loop/shutdown revival.
+failed worker initialization stays unready, with bounded recovery.
 Actual CUDA/ROCm builds, official CUDA lock resolution, physical inference/quality
 and current CPU comparator installation/inference are unexecuted here.
 
@@ -211,7 +213,8 @@ and copies static assets. Do not change locks/dependencies as a prose edit.
 
 Prepared bundles are the end-user path; source Compose is advanced development.
 See [distribution maintenance](distribution/README.md) for five external-LLM
-variants, private app bootstrap, cache-only native startup, explicit maintenance,
+variants, private app bootstrap, paired file-only preparation, standalone cache
+checks, explicit maintenance,
 retained PID1 crash fences and exact-source artifact gates. Native source contexts
 are independent of the app. The [native guide](paddleocr-service/README.md#local-qualification-inputs)
 documents guarded source qualification.

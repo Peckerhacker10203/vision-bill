@@ -432,6 +432,7 @@ def bootstrap(
     *,
     restart: bool = False,
     reuse_native_image: str | None = None,
+    upgrade: bool = False,
 ) -> None:
     need_host(accelerator, build=not restart, automatic_inputs=not restart and inputs is None)
     deployment = ROOT / "server_data" / "ocr-source"
@@ -465,6 +466,7 @@ def bootstrap(
             inputs,
             restart=restart,
             reuse_native_image=reuse_native_image,
+            upgrade=upgrade,
         )
 
 
@@ -536,8 +538,71 @@ def rocm_render_target(render: Path, topology: Path = KFD_TOPOLOGY) -> str:
         ) from exc
 
 
+def cuda_build_channel(
+    compose: tuple[str, ...], candidate: dict[str, Any], previous: dict[str, Any] | None
+) -> str:
+    channel = os.environ.get("OCR_CUDA_CHANNEL")
+    if previous is not None and not channel:
+        # The resolved build argument conflates an explicit .env selection with
+        # the overlay's default. Only the former overrides an installed channel.
+        environment = command(*compose, "config", "--environment", capture=True)
+        channel = next(
+            (
+                line.removeprefix("OCR_CUDA_CHANNEL=")
+                for line in environment.splitlines()
+                if line.startswith("OCR_CUDA_CHANNEL=")
+            ),
+            None,
+        ) or previous.get("cuda_channel")
+        if not channel:
+            # Older source records omit the channel. Read the lock from the immutable
+            # image actually admitted, independently of the current checkout lock.
+            image_id = previous["image_ids"][NATIVE]
+            if not IMAGE_ID.fullmatch(image_id):
+                raise ValueError("Invalid original native image ID")
+            channel = command(
+                "docker",
+                "run",
+                "--rm",
+                "--pull",
+                "never",
+                "--network",
+                "none",
+                "--entrypoint",
+                "python",
+                image_id,
+                "-c",
+                "from pathlib import Path\n"
+                "from runpy import run_path\n"
+                "validate = run_path('/opt/ocr/build/resolve_cuda.py')['validate_lock']\n"
+                "print(validate(Path('/opt/locks/requirements.cuda.lock')).get('cuda_channel', 'cu126'))",
+                capture=True,
+            ).strip()
+    if previous is None:
+        channel = (
+            channel or candidate.get("build", {}).get("args", {}).get("OCR_CUDA_CHANNEL") or "cu129"
+        )
+    if channel not in ("cu126", "cu129"):
+        raise ValueError("OCR_CUDA_CHANNEL must be cu126 or cu129")
+    return channel
+
+
 def existing_controllers(compose: tuple[str, ...]) -> list[str]:
     return command(*compose, "ps", "--all", "--quiet", NATIVE, capture=True).split()
+
+
+def claim_origin(identity: dict[str, Any], release: Path) -> dict[str, Any]:
+    """Keep the first generation's daemon ownership label across in-place upgrades."""
+    if "claim_origin" in identity:
+        origin: dict[str, Any] = identity["claim_origin"]
+        if not re.fullmatch(r"release-[a-zA-Z0-9_-]+", origin["release"]):
+            raise ValueError("Invalid original release directory")
+        return origin
+    return {
+        "release": release.name,
+        "bundle_sha256": identity["bundle_sha256"],
+        "image_ids": identity["image_ids"],
+    }
 
 
 def project_claim(
@@ -546,12 +611,13 @@ def project_claim(
     project: str = identity["project"]
     name = "vision-bill-source-claim-" + hashlib.sha256(project.encode()).hexdigest()
     label = "io.vision-bill.source-owner"
+    origin = claim_origin(identity, release)
     generation = {
         "checkout": str(ROOT),
         "accelerator": accelerator,
-        "release": str(release),
-        "bundle_sha256": identity["bundle_sha256"],
-        "image_ids": identity["image_ids"],
+        "bundle_sha256": origin["bundle_sha256"],
+        "image_ids": origin["image_ids"],
+        "release": str(release.with_name(origin["release"])),
     }
     owner = hashlib.sha256(json.dumps(generation, sort_keys=True).encode()).hexdigest()
     return name, label, owner
@@ -746,13 +812,19 @@ def was_admitted(managed: Path) -> bool:
     marker = managed.with_name("admitted.sha256")
     if not marker.exists():
         return False
-    return trusted_file(marker).st_size == 64 and marker.read_text() == path_digest(managed)
+    if trusted_file(marker).st_size not in (64, 129):
+        return False
+    return path_digest(managed) in marker.read_text().splitlines()
 
 
-def record_admission(managed: Path) -> None:
+def record_admission(managed: Path, replacement: Path | None = None) -> None:
     marker = managed.with_name("admitted.sha256")
     pending = marker.with_suffix(".pending")
-    pending.write_text(path_digest(managed))
+    admitted = path_digest(managed)
+    if replacement is not None:
+        # Both records are ours across the atomic change of compose.local.json.
+        admitted += "\n" + path_digest(replacement)
+    pending.write_text(admitted)
     pending.replace(marker)
 
 
@@ -764,6 +836,7 @@ def deploy(
     *,
     restart: bool = False,
     reuse_native_image: str | None = None,
+    upgrade: bool = False,
 ) -> None:
     if reuse_native_image is not None and (
         restart
@@ -773,6 +846,8 @@ def deploy(
     ):
         raise ValueError("Reuse requires a local source-build tag for the selected accelerator")
     managed = state / "compose.local.json"
+    if upgrade and (restart or reuse_native_image is not None):
+        raise ValueError("Upgrade builds the selected source checkout")
     if restart:
         trusted_file(managed)
         overlay = json.loads(managed.read_bytes())
@@ -807,9 +882,28 @@ def deploy(
         record_admission(managed)
         start(*selected)
         return
-    if managed.exists():
+    previous: dict[str, Any] | None = None
+    previous_digest = ""
+    if upgrade:
+        trusted_file(managed)
+        prior = json.loads(managed.read_bytes())
+        verify_prepared_release(prior, state, accelerator)
+        previous = prior["x-vision-bill-source"]
+        old_release = Path(prior["services"][NATIVE]["volumes"][0]["source"])
+        if not was_admitted(managed) or not has_project_claim(previous, accelerator, old_release):
+            raise ValueError("Upgrade requires the original admitted Compose project")
+        previous_digest = path_digest(managed)
+        compose = (*compose, "--project-name", previous["project"])
+        os.environ.update(previous["device_environment"])
+        if command(*compose, "ps", "--all", "--quiet", "vision_bill", NATIVE, capture=True).strip():
+            raise ValueError(
+                "Drain jobs, then run docker compose down with the original overlays and keep all volumes"
+            )
+        if inputs is None:
+            inputs = old_release
+    elif managed.exists():
         raise ValueError(
-            "Source OCR is already prepared. Use --restart to retain its activation state"
+            "Source OCR is already prepared. Use --restart for its installed images or --upgrade for a new build"
         )
     build_tag = f"source-build-{uuid4().hex}"
     os.environ.update({"VB_IMAGE_TAG": build_tag, "OCR_IMAGE_TAG": build_tag})
@@ -818,9 +912,12 @@ def deploy(
     )
     project = config["name"]
     reject_other_profile(state, accelerator, project)
-    compose = (*compose, "--project-name", project)
-    reject_existing_ocr(compose, project)
-    verify_existing_app(compose, project)
+    if previous is None:
+        compose = (*compose, "--project-name", project)
+        reject_existing_ocr(compose, project)
+    elif project != previous["project"]:
+        raise ValueError("Cannot change Compose project during upgrade")
+    verify_existing_app(compose, project, allow_orphan=upgrade)
     candidate = config["services"][NATIVE]
     devices, device_environment = gpu_args(accelerator, candidate)
     os.environ.update(device_environment)
@@ -856,13 +953,7 @@ def deploy(
                 "--check",
                 "paddleocr-service/requirements.cuda.lock",
             ]
-            channel = (
-                os.environ.get("OCR_CUDA_CHANNEL")
-                or candidate.get("build", {}).get("args", {}).get("OCR_CUDA_CHANNEL")
-                or "cu129"
-            )
-            if channel not in {"cu126", "cu129"}:
-                raise ValueError("OCR_CUDA_CHANNEL must be cu126 or cu129")
+            channel = cuda_build_channel(compose, candidate, previous)
             os.environ["OCR_CUDA_CHANNEL"] = channel
             lock.extend(("--channel", channel))
             try:
@@ -870,6 +961,15 @@ def deploy(
             except subprocess.CalledProcessError:
                 command("make", "ocr-lock-cuda")
                 command(*lock, capture=True)
+            if previous is not None:
+                # Older source builds may have the exact wheel in the previous image's pip cache.
+                command(
+                    *lock,
+                    "--wheel-context",
+                    "--prior-image",
+                    previous["image_ids"][NATIVE],
+                    capture=True,
+                )
             digest = path_digest(ROOT / "paddleocr-service" / "requirements.cuda.lock")
             cuda_verification = [
                 channel,
@@ -930,19 +1030,35 @@ def deploy(
             path_digest(release / "bundle.json"),
             config_id=config_id,
         )
+        if cuda_verification:
+            overlay["x-vision-bill-source"]["cuda_channel"] = channel
+        if previous is not None:
+            overlay["x-vision-bill-source"]["claim_origin"] = claim_origin(previous, old_release)
         command("docker", "image", "tag", app_id, overlay["services"]["vision_bill"]["image"])
         pending.write_text(json.dumps(overlay))
+        if previous is not None:
+            if (
+                not has_project_claim(previous, accelerator, old_release)
+                or command(
+                    *compose, "ps", "--all", "--quiet", "vision_bill", NATIVE, capture=True
+                ).strip()
+            ):
+                raise ValueError("Original project changed or restarted during upgrade")
+            record_admission(managed, pending)
         pending.replace(managed)
     except BaseException:
-        if not managed.exists():
+        if not managed.exists() or (upgrade and path_digest(managed) == previous_digest):
             shutil.rmtree(release)
         raise
     # A failed start can leave containers. Preserve the validated record so
     # restart can retry this exact image and the device selection.
     selected = (*compose, "-f", str(managed))
     acquire_project_claim(overlay["x-vision-bill-source"], accelerator, release)
-    reject_existing_ocr(selected, project)
-    verify_existing_app(selected, project)
+    if upgrade and existing_controllers(selected):
+        raise ValueError("An OCR controller started during upgrade")
+    if not upgrade:
+        reject_existing_ocr(selected, project)
+    verify_existing_app(selected, project, allow_orphan=upgrade)
     record_admission(managed)
     start(*selected)
 
@@ -970,6 +1086,11 @@ def main() -> int:
         "--restart", action="store_true", help="start the last prepared source deployment"
     )
     mode.add_argument(
+        "--upgrade",
+        action="store_true",
+        help="build updated images for the original, drained Compose project",
+    )
+    mode.add_argument(
         "--reuse-native-image",
         metavar="SOURCE_BUILD_TAG",
         help="verify and use a local OCR candidate from an earlier source build",
@@ -983,6 +1104,7 @@ def main() -> int:
             Path(os.path.abspath(args.approved_inputs)) if args.approved_inputs else None,
             restart=args.restart,
             reuse_native_image=args.reuse_native_image,
+            upgrade=args.upgrade,
         )
     except subprocess.CalledProcessError as exc:
         print(

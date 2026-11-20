@@ -64,9 +64,10 @@ def test_rocm_exact_pins_full_sdk_targets_and_no_spoofing():
     assert lock["sources"]["paddle"] == "7688495538f4d6c1893f084dd238a402e8f68ab6"
     assert lock["sources"]["therock"] == "b324869fb3116353ac7eec5e6926aa3d452ac987"
     assert lock["rdna2_targets"] == ["gfx1030", "gfx1031", "gfx1032", "gfx1034"]
-    assert "THEROCK_ENABLE_ALL=ON" in script and "--target dist-rocm" in script
-    assert 'CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS" cmake --build "$THEROCK_BUILD"' in script
-    assert "HSA_OVERRIDE_GFX_VERSION" not in script
+    sdk = (SERVICE / "build/build_therock.sh").read_text()
+    assert "THEROCK_ENABLE_ALL=ON" in sdk and "--target dist-rocm" in sdk
+    assert 'CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS" cmake --build "$THEROCK_BUILD"' in sdk
+    assert "HSA_OVERRIDE_GFX_VERSION" not in script + sdk
     assert "WITH_FLASHATTN=OFF" in script
     assert "git apply --check" in script
     patch = (SERVICE / "build/hip-rdna2-v1.patch").read_text()
@@ -497,3 +498,142 @@ def test_native_release_source_identity_covers_shared_ocr_limits():
     source = source_identities()
     for name in ("ocr_contract/limits.py", "ocr_contract/wire_json.py"):
         assert source[name] == sha256((SERVICE / name).read_bytes()).hexdigest()
+
+
+def test_verified_cuda_cache_reuse_and_pip_install_input(tmp_path, monkeypatch):
+    module, write, _, _ = cuda_lock_fixture(tmp_path)
+    lock = write()
+    data = module.validate_lock(lock)
+    original = lock.read_bytes()
+    calls = []
+
+    def download(url, target):
+        calls.append(url)
+        target.write_bytes(b"synthetic wheel test bytes")
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache with spaces"))
+    monkeypatch.setattr(module, "download_wheel", download)
+    context = module.wheel_context(data)
+    assert context.name == data["wheel_sha256"]
+    assert module.wheel_context(data) == context
+    assert calls == [data["wheel_url"]]
+
+    (wheel,) = context.iterdir()
+    output = tmp_path / "install.lock"
+    module.install_requirements(lock, data, context, output)
+    entries = module.executable_requirements(output.read_text())
+    expected = module.executable_requirements(original.decode())
+    local, hashes = entries.pop("paddlepaddle-gpu")
+    _, original_hashes = expected.pop("paddlepaddle-gpu")
+    assert entries == expected and local.url == wheel.as_uri() and hashes == original_hashes
+    assert lock.read_bytes() == original
+
+    wheel.write_bytes(b"corrupt")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        module.install_requirements(lock, data, context, output)
+    module.wheel_context(data)
+    assert len(calls) == 2 and module.sha256(wheel) == data["wheel_sha256"]
+    (context / "unrelated").write_text("extra file")
+    with pytest.raises(ValueError, match="Unexpected files"):
+        module.wheel_context(data)
+    fallback = tmp_path / "empty"
+    fallback.mkdir()
+    module.install_requirements(lock, data, fallback, output)
+    assert output.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    ("body", "code", "downloads"),
+    [
+        (b"synthetic wheel test bytes", 0, 0),
+        (b"wrong", 0, 1),
+        (b"", 1, 1),
+    ],
+)
+def test_old_image_cache_is_a_verified_optional_seed(tmp_path, monkeypatch, body, code, downloads):
+    from types import SimpleNamespace
+
+    module, write, _, _ = cuda_lock_fixture(tmp_path)
+    evidence = module.validate_lock(write())
+    image = "sha256:" + "f" * 64
+    seen = []
+
+    def docker(arguments, **kwargs):
+        assert arguments[-2] == image and arguments[-1].startswith("/root/.cache/pip/http-v2/")
+        assert "--network=none" in arguments and "--read-only" in arguments
+        assert "--pull=never" in arguments and "--log-driver=none" in arguments
+        kwargs["stdout"].write(body)
+        return SimpleNamespace(returncode=code)
+
+    def download(url, candidate):
+        seen.append(url)
+        candidate.write_bytes(b"synthetic wheel test bytes")
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(module.subprocess, "run", docker)
+    monkeypatch.setattr(module, "download_wheel", download)
+    context = module.wheel_context(evidence, prior_image=image)
+    assert (
+        len(seen) == downloads
+        and module.sha256(next(context.iterdir())) == evidence["wheel_sha256"]
+    )
+    with pytest.raises(ValueError, match="exact Docker image ID"):
+        module.seed_from_previous_image("previous:latest", evidence, tmp_path / "ignored")
+
+
+def test_cuda_resolution_is_identical_across_scratch_paths(tmp_path, monkeypatch):
+    import io
+    import shutil
+    import zipfile
+    from types import SimpleNamespace
+
+    module = load_build_module("resolve_cuda")
+    wheelhouse = tmp_path / "test-wheels"
+    wheelhouse.mkdir()
+    dependency = wheelhouse / "locked_fixture-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(dependency, "w") as archive:
+        archive.writestr(
+            "locked_fixture-1.0.dist-info/METADATA",
+            "Metadata-Version: 2.1\nName: locked-fixture\nVersion: 1.0\n",
+        )
+        archive.writestr(
+            "locked_fixture-1.0.dist-info/WHEEL", "Wheel-Version: 1.0\nTag: py3-none-any\n"
+        )
+        archive.writestr("locked_fixture-1.0.dist-info/RECORD", "")
+    filename = "paddlepaddle_gpu-3.3.1-cp312-cp312-linux_x86_64.whl"
+    official = "https://paddle-whl.bj.bcebos.com/stable/cu129/" + filename
+    wheel = tmp_path / filename
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(
+            "paddlepaddle_gpu-3.3.1.dist-info/METADATA",
+            "Metadata-Version: 2.1\nName: paddlepaddle-gpu\nVersion: 3.3.1\nRequires-Dist: locked-fixture==1.0\n",
+        )
+    monkeypatch.setattr(
+        module.urllib.request,
+        "build_opener",
+        lambda *_: SimpleNamespace(
+            open=lambda *_args, **_kw: io.BytesIO(f'<a href="{official}">wheel</a>'.encode())
+        ),
+    )
+    monkeypatch.setattr(
+        module, "download_wheel", lambda url, target: shutil.copyfile(wheel, target)
+    )
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("UV_NO_INDEX", "1")
+    monkeypatch.setenv("UV_OFFLINE", "1")
+    monkeypatch.setenv("UV_FIND_LINKS", str(wheelhouse))
+    outputs = []
+    for name in ["first", "second"]:
+        service = tmp_path / name
+        (service / "build").mkdir(parents=True)
+        (service / "build/runtime.in").write_text("locked-fixture==1.0\n")
+        (service / "requirements.runtime.lock").write_text(
+            f"locked-fixture==1.0 --hash=sha256:{module.sha256(dependency)}\n"
+        )
+        module.resolve(service)
+        lock = service / "requirements.cuda.lock"
+        evidence = module.validate_lock(lock)
+        assert (module.wheel_context(evidence) / filename).read_bytes() == wheel.read_bytes()
+        outputs.append((lock.read_bytes(), lock.with_suffix(".attestation.json").read_bytes()))
+    assert outputs[0] == outputs[1]
+    assert str(tmp_path).encode() not in outputs[0][0]

@@ -4,17 +4,21 @@ The release bundle is external to the image. No native framework is imported her
 Local sources are resolved relative to that bundle; remote sources require HTTPS.
 """
 
+import codecs
 import ctypes
 import hashlib
 import json
 import os
 import shutil
+import stat
 import tarfile
 import tempfile
 import tomllib
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from http.client import HTTPException
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal, Self
 
@@ -35,10 +39,11 @@ def file_digest(path: Path) -> str:
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-def publish_directory(staged: Path, output: Path) -> None:
-    # Linux renameat2 supports a no-replace directory rename. Path.rename could
-    # replace an empty directory created between staging and publication.
-    at_fdcwd, rename_noreplace = -100, 1
+def publish_directory(staged: Path, output: Path, *, exchange: bool = False) -> None:
+    # Linux renameat2 either publishes a new tree without replacement or exchanges
+    # both complete trees atomically. The old damaged tree is then private staging.
+    at_fdcwd = -100
+    flags = 2 if exchange else 1  # RENAME_EXCHANGE or RENAME_NOREPLACE
     libc = ctypes.CDLL(None, use_errno=True)
     try:
         rename = libc.renameat2
@@ -46,7 +51,7 @@ def publish_directory(staged: Path, output: Path) -> None:
         raise OSError("Atomic output publication requires Linux renameat2 support") from exc
     rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
     rename.restype = ctypes.c_int
-    if rename(at_fdcwd, os.fsencode(staged), at_fdcwd, os.fsencode(output), rename_noreplace) != 0:
+    if rename(at_fdcwd, os.fsencode(staged), at_fdcwd, os.fsencode(output), flags) != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error), output)
 
@@ -301,17 +306,17 @@ def materialize_snapshot(name: str, asset: Archive, target: Path) -> None:
 
 
 def fetch_archive(
-    asset: Archive, base: Path, cache: Path, *, model_name: str | None = None
+    asset: Archive, base: Path, cache: Path, *, model_name: str | None = None, repair: bool = False
 ) -> Path:
     target = cache / asset.sha256
-    if target.exists():
-        if (
-            target.is_symlink()
-            or target.stat().st_size != asset.size_bytes
-            or file_digest(target) != asset.sha256
-        ):
+    if os.path.lexists(target):
+        info = target.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("Cached archive must be a regular file")
+        if info.st_size == asset.size_bytes and file_digest(target) == asset.sha256:
+            return target
+        if not repair or info.st_uid != os.geteuid() or info.st_nlink != 1:
             raise ValueError("Cached archive identity mismatch")
-        return target
     if model_name is not None and paddle_snapshots.is_official_snapshot(model_name, asset.source):
         materialize_snapshot(model_name, asset, target)
         return target
@@ -321,9 +326,9 @@ def fetch_archive(
         if source_url.scheme
         else (base / asset.source).open("rb")
     )
-    temporary = target.with_suffix(".partial")
-    try:
-        with source, temporary.open("wb") as output:
+    with source, tempfile.TemporaryDirectory(prefix=".archive-", dir=cache) as scratch:
+        temporary = Path(scratch) / "archive"
+        with temporary.open("xb") as output:
             if source_url.scheme and urllib.parse.urlparse(source.geturl()).scheme != "https":
                 raise ValueError("Asset redirect must preserve HTTPS")
             remaining = asset.size_bytes
@@ -335,8 +340,6 @@ def fetch_archive(
         if remaining or file_digest(temporary) != asset.sha256:
             raise ValueError("Archive hash/size mismatch")
         temporary.replace(target)
-    finally:
-        temporary.unlink(missing_ok=True)
     return target
 
 
@@ -383,6 +386,98 @@ class ProvisionedRuntime:
     cases_path: Path
     smoke_path: Path
     bundle_id: str
+
+
+class ModelDownloadFailed(RuntimeError):
+    """A remote model transfer failed before the cache could be published."""
+
+
+def model_paths(bundle: ReleaseBundle, state: Path) -> dict[str, Path]:
+    return {name: state / "models" / asset.tree_sha256 for name, asset in bundle.models.items()}
+
+
+def _legacy_model(state: Path, name: str, asset: Archive) -> Path | None:
+    # Old versions cache trees by bundle identity, including source/image changes.
+    for candidate in (state / "bundles").glob(f"*/models/{name}"):
+        if candidate.resolve() != candidate:
+            continue
+        try:
+            verify_tree(candidate, asset)
+        except (OSError, ValueError):
+            continue
+        return candidate
+    return None
+
+
+def _require_repairable_tree(root: Path, asset: Archive) -> None:
+    directories = {
+        parent.as_posix() for name in asset.files for parent in PurePosixPath(name).parents
+    }
+    info = root.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise ValueError("Unsafe model cache repair target")
+    # A same-device bind mount can have the same owner and valid inventory names.
+    # Never recursively remove mounted inputs after exchanging the damaged directory.
+    for mount in Path("/proc/self/mountinfo").read_bytes().splitlines():
+        mount_path = Path(os.fsdecode(codecs.escape_decode(mount.split()[4])[0]))
+        if mount_path.is_relative_to(root):
+            raise ValueError("Model cache contains a mount; cannot repair")
+    for path in root.rglob("*"):
+        entry = path.lstat()
+        relative = path.relative_to(root).as_posix()
+        known = (stat.S_ISREG(entry.st_mode) and relative in asset.files) or (
+            stat.S_ISDIR(entry.st_mode) and relative in directories
+        )
+        if not known or entry.st_uid != os.geteuid() or entry.st_dev != info.st_dev:
+            raise ValueError("Model cache contains unexpected entries; cannot repair")
+
+
+def provision_models(
+    bundle: ReleaseBundle, state: Path, *, repair: bool = False
+) -> dict[str, Path]:
+    """Promote each verified model independently. Reuse archives from legacy installations."""
+    paths = model_paths(bundle, state)
+    with installation_lock(state / ".provision.lock", exclusive=True):
+        cache = state / "archives"
+        cache.mkdir(exist_ok=True, mode=0o700)
+        models = state / "models"
+        models.mkdir(exist_ok=True, mode=0o700)
+        if cache.is_symlink() or models.is_symlink():
+            raise ValueError("Model cache must use owned directories")
+        for name, asset in bundle.models.items():
+            target = paths[name]
+            replace = os.path.lexists(target)
+            if replace:
+                try:
+                    verify_tree(target, asset)
+                    continue
+                except ValueError:
+                    if not repair:
+                        raise
+                    _require_repairable_tree(target, asset)
+            with tempfile.TemporaryDirectory(prefix=".staging-", dir=models) as scratch:
+                tree = Path(scratch) / "model"
+                legacy = _legacy_model(state, name, asset)
+                if legacy is not None:
+                    # Both caches are on the native state volume. Each selection keeps
+                    # its own directory entries, including after removal of the old release.
+                    shutil.copytree(legacy, tree, copy_function=os.link)
+                else:
+                    tree.mkdir()
+                    try:
+                        archive = fetch_archive(
+                            asset, bundle._base, cache, model_name=name, repair=repair
+                        )
+                    except (
+                        urllib.error.URLError,
+                        ConnectionError,
+                        TimeoutError,
+                        HTTPException,
+                    ) as exc:
+                        raise ModelDownloadFailed from exc
+                    extract_archive(archive, tree, asset)
+                publish_directory(tree, target, exchange=replace)
+    return paths
 
 
 def provision_bundle(bundle: ReleaseBundle, state_dir: Path) -> ProvisionedRuntime:

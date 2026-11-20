@@ -36,7 +36,7 @@ def setup_api():
     )
     from vision_bill.service.execution_policy import current_snapshot
 
-    service.current_snapshot = lambda: current_snapshot(service.settings)
+    service.current_snapshot = lambda: current_snapshot(service.settings, inference_identity="ollama:" + "d" * 64)
     app.state.submission_service = service
     app.state.analysis_scheduler = SimpleNamespace(trigger=lambda: None)
     return app, service, user
@@ -112,4 +112,20 @@ async def test_retry_passes_explicit_policy_and_current_snapshot_only_when_adopt
     call = service.db.retry_submission.call_args
     assert call.args[1].policy == policy
     assert call.kwargs["scope"].user_id == user.id
-    assert call.kwargs["replacement_snapshot"] == (current_snapshot(service.settings) if policy == "current" else None)
+    assert call.kwargs["replacement_snapshot"] == (current_snapshot(service.settings, inference_identity="ollama:" + "d" * 64) if policy == "current" else None)
+
+
+async def test_draft_patch_preserves_numeric_observations_and_metadata_types(setup_api):
+    app, service, _user = setup_api
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.patch(
+            f"/api/v1/images/{uuid4()}/draft",
+            headers={"Content-Type": "application/json"},
+            content="""{"expected_revision":1,"changes":{"line_items":[{"quantity":1.00000000000000001}],
+                       "taxes":[{"rate":0.10000000000000001}],"overlap_decisions":[{"score":0.75}]}}""",
+        )
+    assert response.status_code == 404
+    changes = service.patch_draft.call_args.args[1].changes
+    assert changes["line_items"][0]["quantity"] == "1.00000000000000001"
+    assert changes["taxes"][0]["rate"] == "0.10000000000000001"
+    assert changes["overlap_decisions"][0]["score"] == 0.75

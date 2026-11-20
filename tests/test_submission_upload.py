@@ -66,6 +66,7 @@ class Queue:
 def upload_context(settings, monkeypatch):
     monkeypatch.setattr(images, "settings", settings)
     provider = MagicMock()
+    provider.inference_identity = "ollama:" + "d" * 64
     provider.check_connection = AsyncMock(side_effect=AssertionError("upload discovered models"))
     provider.get_available_models = AsyncMock(
         side_effect=AssertionError("upload discovered models")
@@ -118,7 +119,7 @@ async def test_one_and_many_accept_same_durable_pollable_contract(upload_context
 
 
 async def test_concurrent_replays_freeze_defaults_and_clean_only_loser(upload_context, settings):
-    app, queue, _, _, _ = upload_context
+    app, queue, _, _, provider = upload_context
     async with AsyncClient(transport=ASGITransport(app), base_url="http://test") as client:
 
         async def send():
@@ -129,6 +130,8 @@ async def test_concurrent_replays_freeze_defaults_and_clean_only_loser(upload_co
         first, second = await asyncio.gather(send(), send())
         assert first.status_code == second.status_code == 202
         assert first.json() == second.json()
+        first_endpoint = provider.inference_identity
+        provider.inference_identity = "openai:" + "a" * 64
         settings.llm.model_name = "changed-default"
         settings.images.bypass_review_default = True
         third = await send()
@@ -147,6 +150,7 @@ async def test_concurrent_replays_freeze_defaults_and_clean_only_loser(upload_co
         assert Path(part.image_path).is_file()
     assert len(list(Path(settings.images.save_dir).glob("submissions/*/*.jpg"))) == 2
     assert queue.creates[0].model_id != "changed-default"
+    assert queue.creates[0].effective_options["inference_identity"] == first_endpoint
 
 
 async def test_ambiguous_commit_and_thumbnail_failure_keep_winning_originals(
@@ -253,7 +257,8 @@ async def test_fallback_permission_is_separate_frozen_intent(upload_context, set
         )
         assert response.status_code == 202
         saved = queue.creates[0]
-        assert saved.effective_options["execution_policy_version"] == 3
+        assert saved.effective_options["execution_policy_version"] == 4
+        assert saved.effective_options["inference_identity"] == "ollama:" + "d" * 64
         assert saved.effective_options["managed_binding_sha256"] is None
         assert saved.effective_options["allow_ocr_fallback"] is False
         assert ("allow_ocr_fallback" in saved.requested_options) is (permission is not None)

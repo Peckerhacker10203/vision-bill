@@ -1,4 +1,4 @@
-# Native OCR runtime release gate
+# PaddleOCR-VL 1.6 installation and operation
 
 These are Linux x86_64/Python 3.12 **qualification candidates**. Neither CUDA nor
 any Radeon target has been hardware-qualified here. Do not advertise a target
@@ -79,9 +79,11 @@ and defaults to `0`. Run the source launcher from this checkout.
 python3 scripts/ocr_source_up.py cuda
 ```
 
-The launcher stages the project's five synthetic qualification images and the
-verified official Paddle model metadata. The first admin activation downloads
-the model files from their pinned revisions. Automatic CUDA source preparation
+The launcher binds the official model inventory to the selected image. Five
+sample images are available for explicit release qualification. The first admin
+activation downloads the pinned model files and verifies their contents. The
+Windows or Linux host supplies its own GPU driver. Installing these models
+does not install host graphics drivers or firmware. Automatic CUDA source preparation
 uses the official CUDA 12.9 candidate by default. Set `OCR_CUDA_CHANNEL=cu126`
 to select CUDA 12.6. Use a host driver that supports the selected runtime and
 verify it on the actual board. [CUDA build inputs](#build-inputs)
@@ -118,10 +120,18 @@ installed model ID. Keep your LLM endpoint reachable from the app container.
 Sign in as an administrator and open **Settings → Dedicated OCR**. For an LLM
 on another GPU or server, clear **LLM and OCR share a GPU**, save the GPU
 configuration and leave the LLM running. Turn **Dedicated OCR** On.
-The controller waits for this first explicit request before downloading the
-model archives and running native qualification. If collection reaches its
-time limit during automatic activation, the controller logs the timeout and
-retries the full qualification once after reaping the previous processes.
+The controller checks the image, GPU and package metadata, provisions the four
+pinned model directories (about 2.1 GB) and publishes the verified installation.
+The service starts parked. Uploading a receipt loads the pipeline and the first
+prediction uses that receipt. Enabling OCR, polling readiness, restarting and
+loading the worker do not process a sample image. On a clean setup failure,
+switch **Dedicated OCR** on again to retry, or choose **Resume direct vision**
+to accept new direct-vision uploads without OCR.
+A retry rechecks the owned model cache, reuses valid files and can replace a
+damaged model tree from a verified archive. If the archive itself is damaged,
+the controller can fetch its pinned replacement. If restoration finds damaged
+files, Settings requests recovery and the OCR container log records the reason.
+When the status reports an unsettled GPU handoff, follow the recovery guide.
 Turning it Off routes new work to direct vision and keeps the verified cache for
 reuse. On a shared GPU, Vision Bill confirms that the paired formatter model is
 unloaded before loading OCR. In both GPU modes, it waits for the OCR worker
@@ -145,12 +155,73 @@ If the native image finished building before initial preparation was interrupted
 use `--reuse-native-image` with the local `source-build-…` tag printed by the launcher.
 It checks the selected image against this checkout and continues preparing the app.
 
+### Upgrade an existing source installation
+
+Run from the original checkout. Back up the installation and let active jobs
+finish. Stop the old deployment with its original project, profile and all
+three Compose files. Keep its named volumes, private settings and bind-mounted
+files. For a CUDA deployment with the checkout's default project name:
+
+```bash
+docker compose --profile ocr -f docker-compose.yml -f docker-compose.cuda.yml \
+  -f server_data/ocr-source/cuda/compose.local.json down
+# Update this checkout to the desired revision, keeping server_data and .env.
+python3 scripts/ocr_source_up.py cuda --upgrade
+```
+
+If you originally selected a custom project name, use that same `-p NAME` on
+the stop command. For ROCm use `rocm` in the overlay name, directory and launcher
+argument. The upgrade verifies the original deployment claim, retains its
+project, device and approved model sources, then builds and starts the new
+images. If the build fails before the launcher publishes its new deployment
+record, `--restart` starts the previous recorded images. If the record was
+published and container startup fails, `--restart` retries the **new** images.
+
+For rollback, drain and stop the new deployment, account for writes since the
+backup, then restore the previous checkout and its original image tags. Restore
+the backed-up `server_data/ocr-source/<accelerator>/` directory, including
+`compose.local.json`, `admitted.sha256` and the original release directory.
+Restore the matching configuration, OCR activation, coordination and model
+state, database, original uploads and working files from the same recovery
+point before starting the old generation. [Compatible backout](../UPGRADE_AND_VERIFY.md#backup-and-upgrade-order)
+
+When upgrading a failed initial
+installation, switch **Dedicated OCR** on again in Settings. An installation
+that was already ready is checked and migrated under the existing ownership
+locks. Preparation reuses verified model assets. If the new image deliberately
+changes approved package pins or model sources, pass the matching approved
+input directory after the accelerator, before `--upgrade`.
+
+CUDA upgrades reuse the original wheel channel. For older source records the
+launcher reads the lock from the installed image, so a CUDA 12.6 installation
+stays on `cu126`. To switch deliberately, set `OCR_CUDA_CHANNEL=cu129` or
+`cu126` in your shell or the checkout's `.env` before running `--upgrade`.
+
+A CPU limit previously set with `docker update` belongs to the container that
+was replaced. To restore a previous limit of 6.4 CPUs on a CUDA source
+installation, run this in the original checkout after the upgrade. Use your
+previous limit and select `rocm` for a Radeon installation. The recorded
+project name selects the new OCR container.
+
+```bash
+accelerator=cuda
+overlay="server_data/ocr-source/$accelerator/compose.local.json"
+project=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["x-vision-bill-source"]["project"])' "$overlay")
+ocr_id=$(docker compose -p "$project" --profile ocr -f docker-compose.yml \
+  -f "docker-compose.$accelerator.yml" -f "$overlay" ps -q paddleocr-service)
+if [ -n "$ocr_id" ]; then
+  docker update --cpus 6.4 "$ocr_id" && docker inspect --format '{{.HostConfig.NanoCpus}}' "$ocr_id"
+fi
+```
+
+The example reports `6400000000` nanocpus when the limit is applied.
+
 ## Consumer GPU release targets
 
 Prepare a binary bundle for the accelerator and host platform before an end
 user starts the installation. The app uses the same Dedicated OCR settings on
-all GPU profiles. The native runtime validates the selected device against the
-included architecture and qualification evidence.
+all GPU profiles. The native runtime checks the selected device and the prepared installation.
+The release report records which physical device passed the full diagnostic.
 
 | Accelerator | Intended device families | Architectures to qualify | Host |
 | --- | --- | --- | --- |
@@ -205,7 +276,19 @@ unavailable. To resolve it manually, run `make ocr-lock-cuda` for `cu129` or
 exact official Paddle GPU 3.3.1 cp312 x86_64 wheel for that channel, inspects its
 METADATA, freezes the full closure, hashes the bytes, and emits the lock plus
 `requirements.cuda.attestation.json`. Review both outputs and use the same
-channel for `make ocr-build-cuda`. The Docker build requires a valid, resolved
+channel for `make ocr-build-cuda`. Keep the lock, its attestation and the host
+cache at `${XDG_CACHE_HOME:-~/.cache}/vision-bill/cuda-wheels`. With a
+matching lock and cached SHA-256, the build reuses those bytes locally.
+A source upgrade from `936c26d` can need one download of the full Paddle
+wheel. With a matching lock, the launcher first checks the previous image's
+pip cache for that URL and verifies any bytes it finds. If the wheel is
+missing or its hash differs, the launcher fetches it from the attested URL.
+An offline upgrade needs the matching lock and verified wheel, along with the
+other required build inputs. Starting the previously recorded images with
+`--restart` skips this build. BuildKit
+can reuse the app dependency layers and, on ROCm, the built TheRock SDK when
+only Paddle or the app changes. PostgreSQL uses a separate prebuilt image.
+The Docker build requires a valid, resolved
 lock and attestation for the official GPU wheel. Validation parses actual
 executable requirements, preserves every entry of the pinned common runtime lock,
 and requires the complete attestation. Includes, install options, duplicate or
@@ -335,7 +418,7 @@ exit nonzero with sanitized stage/type diagnostics. Each native child has a
 
 The acyclic sequence is installed dependency inspection → separate PIR/legacy
 artifact inspector subprocesses → exact unsealed native construction and hooks →
-seal → fresh ordinary `build_pipeline` → `adapter.qualify` → gated `predict`.
+seal → fresh instrumented `build_pipeline` → `adapter.qualify` → gated `predict`.
 No fabricated coverage enters construction. Exported DenseTensor inventory is
 CPU artifact evidence; actual compiled device/FP32 evidence comes from native
 hooks. Static Layout/Orientation/UVDoc are audited separately and every floating
@@ -347,7 +430,7 @@ have the same complete floating hook record set; a corpus union is never accepte
 Unproven CPU floats, optimized-away/renamed weight bindings, varying branch
 coverage, missing callbacks or unstable fresh-process identifiers fail the gate.
 Two independent fresh workers replay each case, first qualifying the sealed
-upright smoke through the ordinary adapter. Reports distinguish startup, actual
+upright smoke through the qualification adapter. Reports distinguish startup, actual
 cold smoke, first case **after smoke**, and warm case timings; they do not claim
 cold case inference after warming with smoke. Dynamic VL parameters and all three
 static models must pass FP32/device checks on each replay.
@@ -400,7 +483,7 @@ cache is reused. A missing, damaged or mismatched cache requires explicit
 maintenance, `ocr_service.initialize maintain` provisions verified OCR assets and
 runs full native qualification before publishing the runtime and smoke paths.
 Maintenance runs independently of receipt attempts and comparative benchmarks.
-Combined bundles run this initializer after an explicit Dedicated OCR request.
+Combined bundles use file-only preparation after an explicit Dedicated OCR request.
 Their shared model handoff lock lives at `/coord/gpu-handoff.lock`. See the
 [prepared bundle instructions](../distribution/README.md).
 
@@ -412,25 +495,26 @@ external quiescence or separate devices before setting the intent. OCR-only
 maintenance uses its native installation lock. See the bundle instructions for
 the exact Compose service and image identity arguments.
 
-Serving starts parked with no native child/loaded models. `/health` is passive;
-`/ready` stays false with `ocr_parked` until explicitly loaded and qualified. `/info`
-can expose last qualified identity as history, not current GPU readiness. Polling
+Managed serving starts parked with no native child or loaded models. `/health`
+reports liveness. `/ready` stays false with `ocr_parked` until the native worker
+loads. `/info` exposes worker state and runtime identity. Polling
 never cold-loads OCR merely to answer readiness. An already-explicitly-loaded idle
 worker's death can schedule one bounded coordinated replacement, fenced against
-active inference/park; failed qualification stays unready without an endless loop.
+active inference/park. A failed worker start exposes its error and stays unready.
 Parking disables recovery until a new explicit load; shutdown does not revive workers.
 
-Model/package/image/source/target changes invalidate the seal and require fresh
-qualification. The app distinguishes parked `can_load` from qualified readiness,
+Model/package/image/source/target changes invalidate the installation identity.
+The app distinguishes parked `can_load` from loaded-worker readiness,
 waits before claim on unavailable/incompatible managed pairs, and does not silently
 opt out. A cold unmanaged native pipeline also waits before claim.
 
-After a successful guarded source qualification, start the selected Compose overlay.
-`OCR_RUNTIME_SETTINGS_PATH` and `OCR_QUALIFICATION_IMAGE_PATH` select the source runtime
-and smoke input. Prepared startup selects its validated installation through the
-release manifest and image identities. The default native Dockerfile requires an
-accelerator-specific selection. Source GPU overlays select legacy OCR unless the
-operator supplies canonical `OCR__ENDPOINT`. Ordinary OCR uses text-only LLM
+The CUDA and ROCm source overlays start the UI activation controller. For a
+manually qualified offline source runtime, add `docker-compose.ocr-qualification.yml`
+after the selected accelerator overlay and start `paddleocr-service`. That
+overlay mounts `server_data/ocr-runtime` and selects the explicit runtime.
+Configure the app's external OCR endpoint separately when using that setup.
+Prepared installations select their runtime through the release manifest and
+image identities. Ordinary OCR uses text-only LLM
 formatting and does not fall back to image inference. See
 [worker drain and explicit adoption](../UPGRADE_AND_VERIFY.md#disable-pause-and-recover).
 
@@ -493,9 +577,9 @@ spending attempts or rewriting their saved intent. Benchmark capabilities mark
 managed OCR unavailable in this configuration. Pure LLM deployments and explicitly
 unmanaged CPU/replay modes remain supported.
 
-An explicitly requested OCR benchmark qualifies and parks OCR when freezing its
-identity. Readiness polling does not. The frozen identity omits transient residency
-but includes the actual qualified profile/runtime, checked again against execution.
+Creating a managed OCR benchmark explicitly loads the worker, reads its profile
+and runtime fingerprint, and parks it again. The frozen identity excludes
+transient residency. Execution rechecks it before recording a result.
 Recreate old benchmark manifests after changing this lifecycle contract.
 
 Failed teardown or unconfirmed unload blocks the next phase. A crashed/cancelled

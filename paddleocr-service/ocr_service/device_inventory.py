@@ -5,7 +5,11 @@ import json
 import os
 import re
 import subprocess
+from pathlib import Path
 from typing import Any, Literal
+
+from .profile import content_identity, file_digest
+from .targets import validate_profile
 
 
 class DeviceIdentityUnavailable(RuntimeError):
@@ -134,3 +138,29 @@ def inspect_device_identity(accelerator: Literal["cuda", "rocm"], gpu_index: int
         raise DeviceIdentityUnavailable(
             "Cannot verify native device metadata; explicit maintenance on a verifiable device is required"
         ) from exc
+
+
+def execution_target(paddle: Any, device: dict[str, Any], accelerator: str) -> dict[str, Any]:
+    """Bind the loader to the selected driver, build and installed HIP kernels without compute."""
+    result = dict(device)
+    result["paddle_build"] = str(paddle.version.full_version)
+    if accelerator == "rocm":
+        target = result["gfx_target"]
+        kernels = json.loads(Path("/opt/ocr/build-evidence/kernels.json").read_text())
+        profile = validate_profile(kernels.get("target_profile"))
+        if target not in profile["candidate_targets"]:
+            raise ValueError("Actual HIP target is outside the candidate target set")
+        for library in ("paddle", "rocblas", "miopen"):
+            if not kernels[library].get("files"):
+                raise ValueError("Required kernel/library inventory is empty")
+            if (
+                kernels[library].get("offline_status") != "unverified"
+                and target not in kernels[library]["targets"]
+            ):
+                raise ValueError("Required device kernels are missing")
+            for filename, digest in kernels[library]["files"].items():
+                if file_digest(Path(filename)) != digest:
+                    raise ValueError("Required kernel inventory changed")
+        result["gfx_target"] = target
+        result["kernel_inventory_sha256"] = content_identity(kernels)
+    return result

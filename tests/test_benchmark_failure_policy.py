@@ -5,7 +5,7 @@ import pytest
 from ollama import ResponseError
 from openai import APIConnectionError
 
-from vision_bill.model.ocr_errors import OcrGpuOutOfMemoryError
+from vision_bill.model.ocr_errors import OcrGpuOutOfMemoryError, OcrWorkerFailure
 from vision_bill.provider.llm.errors import AnalysisTimeoutError, UnreadableReceiptError
 from vision_bill.service.benchmark_service import BenchmarkService
 from vision_bill.service.experiment_execution import ExperimentFailure
@@ -26,6 +26,9 @@ from vision_bill.service.extraction_pipeline import (
     (ValueError("ocr_unavailable"), True),
     (OcrGpuOutOfMemoryError(), True),
     (ValueError("ocr_gpu_out_of_memory"), True),
+    (OcrWorkerFailure("ocr_model_load_failed"), True),
+    (ValueError("ocr_worker_crashed"), True),
+    (ValueError("ocr_deadline_exceeded"), True),
     # Historical page_failed includes blank/invalid pages; retries remain bounded.
     (ValueError("ocr_page_failed"), True),
     (ValueError("formatter_model_unavailable"), True),

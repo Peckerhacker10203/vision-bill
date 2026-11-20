@@ -311,13 +311,6 @@ class BenchmarkDB:
                             'path': part.image_path,
                             'sha256': actual_hash})
         expected = receipt_from_draft(document).model_dump(mode='json')
-        # Snapshot original NUMERIC observations before public float-compatible adapters.
-        items = await conn.fetch('SELECT quantity FROM line_items WHERE receipt_id=$1 ORDER BY position,id', receipt_id)
-        taxes = await conn.fetch('SELECT rate FROM taxes WHERE receipt_id=$1 ORDER BY position,id', receipt_id)
-        for item, raw in zip(expected['line_items'], items, strict=True):
-            item['quantity'] = str(raw['quantity']) if raw['quantity'] is not None else None
-        for tax, raw in zip(expected['taxes'], taxes, strict=True):
-            tax['rate'] = str(raw['rate']) if raw['rate'] is not None else None
         material = material_document(document)
         material['line_items'] = [{k: item[k] for k in ('description','quantity','unit_price','total_price')}
                                   for item in expected['line_items']]

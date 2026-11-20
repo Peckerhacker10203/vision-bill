@@ -8,10 +8,12 @@ WORKDIR /build/frontend
 # Locked dependencies first so this layer is cached until the lockfile changes.
 COPY frontend/package.json frontend/package-lock.json frontend/.npmrc ./
 COPY frontend/patches/ ./patches/
-RUN npm ci --no-audit --no-fund
+RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
 
 # Full frontend source, then produce the static SPA in /build/frontend/out.
 COPY frontend/ ./
+COPY paddleocr-service/README.md /build/paddleocr-service/README.md
+COPY distribution/README.md /build/distribution/README.md
 RUN npm run build
 
 # ── Stage 2: Python API ────────────────────────────────────────────────────
@@ -29,14 +31,14 @@ COPY pyproject.toml uv.lock ./
 
 # Install dependencies into a project-local venv, based only on the lockfile
 # (no source yet, so this layer is cached until deps actually change)
-RUN uv sync --no-cache --frozen --no-install-project
+RUN --mount=type=cache,target=/root/.cache/uv UV_LINK_MODE=copy uv sync --frozen --no-install-project
 
 # Now copy the source (plus the alembic migration tooling the app relies on)
 COPY ./src ./src
 COPY ./paddleocr-service/ocr_contract ./paddleocr-service/ocr_contract
 
 # The editable install reads the SPA from the source tree at runtime.
-RUN uv sync --no-cache --frozen
+RUN --mount=type=cache,target=/root/.cache/uv UV_LINK_MODE=copy uv sync --frozen
 
 COPY alembic.ini ./
 COPY ./alembic ./alembic

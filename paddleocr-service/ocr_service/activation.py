@@ -28,10 +28,10 @@ from ocr_contract.activation import (
 )
 
 from .initialize import (
-    InitializationFailed,
-    InitializationGpuOutOfMemory,
-    check_installation,
-    initialize,
+    PreparationFailed,
+    PreparationRequired,
+    check_prepared_installation,
+    prepare_installation,
 )
 from .supervision import (
     InstallationBusy,
@@ -83,7 +83,7 @@ class _IdleHealthHandler(BaseHTTPRequestHandler):
 
 
 class IdleHealth:
-    """Keep liveness available during qualification without importing native serving."""
+    """Keep liveness available while model files are being prepared."""
 
     def __init__(self, port: int):
         self.port = port
@@ -119,7 +119,6 @@ def start_server(inputs: ReleaseInputs, installation: Path, port: int) -> subpro
     # A separate maintenance owner might have changed it between lock scopes.
     if (inputs.state_dir / "selected").resolve(strict=True) != installation:
         raise ValueError("Native installation changed before serving")
-    selection = json.loads((installation / "selection.json").read_bytes())
     return subprocess.Popen(
         [sys.executable, str(Path(__file__).resolve().parents[1] / "server.py")],
         env={
@@ -127,7 +126,7 @@ def start_server(inputs: ReleaseInputs, installation: Path, port: int) -> subpro
             "OCR_PORT": str(port),
             "OCR_SERVICE_MODE": "managed",
             "OCR_RUNTIME_SETTINGS_PATH": str(installation / "runtime.json"),
-            "OCR_QUALIFICATION_IMAGE_PATH": selection["smoke_path"],
+            "OCR_QUALIFICATION_IMAGE_PATH": "",
         },
         start_new_session=True,
     )
@@ -185,20 +184,23 @@ def process_request(
         reason = "native_activation_inputs_invalid"
         try:
             args = (inputs.bundle_path, inputs.state_dir, inputs.image_config, inputs.image_id)
+            if not restarting and not store.publish_status(
+                ActivationStatus(request.generation, ActivationPhase.PREPARING)
+            ):
+                return False
+            installation = None
             if restarting:
                 reason = "native_activation_recovery_required"
-                installation = check_installation(*args)
-            else:
-                if not store.publish_status(
-                    ActivationStatus(request.generation, ActivationPhase.QUALIFYING)
-                ):
-                    return False
-                installation = initialize(
+                try:
+                    installation = check_prepared_installation(*args)
+                except PreparationRequired:
+                    pass  # Migrate a previously requested installation under maintenance exclusion.
+            if installation is None:
+                installation = prepare_installation(
                     *args,
                     maintenance_intent=request.maintenance_intent,
                     handoff_lock=inputs.handoff_lock,
-                    require_remote_models=True,
-                    retry_collection_timeout=True,
+                    repair=not restarting,
                 )
 
             reason = "native_serving_startup_failed"
@@ -222,26 +224,23 @@ def process_request(
             if restarting:
                 return False
             reason = "native_installation_busy"
-        except InitializationGpuOutOfMemory as exc:
+        except PreparationFailed as exc:
             reason = exc.reason_code
-        except InitializationFailed:
-            reason = (
-                "native_activation_recovery_required"
-                if restarting
-                else "native_qualification_failed"
-            )
         except Exception as exc:  # noqa: BLE001 - fail the generation with a stable reason
             logger.debug("Native activation failed with %s", type(exc).__name__)
 
-        if not restarting:
-            # A failed managed cleanup deliberately retains its original fence.
-            try:
-                check_fences(lock_path(), "initializer")
-            except UncleanInstallation:
-                reason = "native_activation_recovery_required"
-            store.publish_status(
-                ActivationStatus(request.generation, ActivationPhase.FAILED, reason)
-            )
+        # A failed managed cleanup deliberately retains its original fence.
+        try:
+            check_fences(lock_path(), "initializer")
+        except UncleanInstallation:
+            reason = "native_activation_recovery_required"
+        if restarting:
+            logger.warning("native_restoration_failed reason=%s", reason)
+            reason = "native_activation_recovery_required"
+        store.publish_status(
+            ActivationStatus(request.generation, ActivationPhase.FAILED, reason),
+            restoration_failed=restarting,
+        )
         logger.warning("%s", reason)
         return True
 

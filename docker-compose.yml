@@ -9,7 +9,7 @@ services:
       PYTHONUNBUFFERED: 1
       PG__HOST: db
       PG__PORT: "5432"
-      OCR__TIMEOUT_SECONDS: "600"
+      OCR__TIMEOUT_SECONDS: "${OCR__TIMEOUT_SECONDS:-600}"
     ports:
       - "${API__PORT:-8080}:8080"
     extra_hosts:

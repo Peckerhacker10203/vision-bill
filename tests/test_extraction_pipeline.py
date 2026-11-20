@@ -118,9 +118,12 @@ async def test_second_photo_failure_is_not_a_complete_prefix(photos, blank):
     assert not result.provenance.fallback_used
 
 
-@pytest.mark.parametrize("failure_phase", ["load", "inference"])
-async def test_managed_gpu_oom_parks_worker_and_records_receipt_retry(
-    photos, monkeypatch, failure_phase,
+@pytest.mark.parametrize("failure_phase,status,code", [
+    ("load", 503, "ocr_gpu_out_of_memory"), ("inference", 503, "ocr_gpu_out_of_memory"),
+    ("load", 503, "ocr_model_load_failed"), ("inference", 502, "ocr_invalid_result"),
+])
+async def test_native_error_parks_worker_and_records_receipt_retry(
+    photos, monkeypatch, failure_phase, status, code,
 ):
     import re
 
@@ -152,7 +155,7 @@ async def test_managed_gpu_oom_parks_worker_and_records_receipt_retry(
                 0, hashlib.sha256(photos[0].read_bytes()).hexdigest(), request_id[1].decode(),
             ))
         assert path in ("/ocr", "/lifecycle/load")
-        return httpx.Response(503, json={"detail": "ocr_gpu_out_of_memory"})
+        return httpx.Response(status, json={"detail": code})
 
     llm = formatter()
     http_client(monkeypatch, native)
@@ -171,8 +174,8 @@ async def test_managed_gpu_oom_parks_worker_and_records_receipt_retry(
     )
 
     outcome = SubmissionService._outcome(result, [], [])
-    assert outcome.kind == "retry" and outcome.result_code == "ocr_gpu_out_of_memory"
-    assert result.findings[-1].code == "ocr_gpu_out_of_memory"
+    assert outcome.kind == "retry" and outcome.result_code == code
+    assert result.findings[-1].code == code
     assert requests[-1] == "/lifecycle/park" and not handoff.read_journal().ocr_pending
     assert len(result.ocr_pages) == checkpoint.await_count == (1 if failure_phase == "inference" else 0)
     assert requests.count("/ocr") == (2 if failure_phase == "inference" else 0)
@@ -838,3 +841,27 @@ async def test_dedicated_off_real_route_executes_direct_upload_and_holds_explici
     queued._db.begin_attempt.assert_not_awaited()
     queued._db.finish_task.assert_not_awaited()
     activation.ocr.load.assert_not_awaited()
+
+
+async def test_complete_cache_formats_with_parked_owner_without_native_load(photos, monkeypatch):
+    from vision_bill.service import extraction_pipeline
+
+    ocr, llm = sidecar(), formatter(False)
+    caps = ocr.get_capabilities.return_value
+    caps.runtime_fingerprint = "runtime"
+    caps.ready = False
+    caps.can_load = True
+    owner = SimpleNamespace(deadline=time.monotonic() + 5, llm_phase=AsyncMock(), ocr_phase=AsyncMock())
+    monkeypatch.setattr(extraction_pipeline, "current_owner", lambda: owner)
+    pages = [
+        OcrResponse.model_validate(wire_page(i, hashlib.sha256(path.read_bytes()).hexdigest()))
+        for i, path in enumerate(photos)
+    ]
+    result = await pipeline(llm, ocr).extract(
+        "fixture", photos, options=ExperimentOptions(pipeline="ocr", include_classification=False),
+        deadline=owner.deadline, tags=[], resume_pages=pages,
+    )
+    assert result.receipt is not None
+    ocr.extract_page.assert_not_awaited()
+    owner.ocr_phase.assert_not_awaited()
+    owner.llm_phase.assert_awaited_once_with("fixture")

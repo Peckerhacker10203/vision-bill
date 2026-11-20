@@ -18,8 +18,9 @@ from ..service.activation_admission import policy_capture
 from ..service.analysis_scheduler import AnalysisScheduler
 from ..service.submission_service import SubmissionService
 from .helper.helper import get_analysis_scheduler
+from .helper.receipt_json import ReceiptWriteRoute
 
-router = APIRouter(dependencies=[Depends(get_current_user)])
+router = APIRouter(dependencies=[Depends(get_current_user)], route_class=ReceiptWriteRoute)
 
 
 def get_submission_service(request: Request) -> SubmissionService:

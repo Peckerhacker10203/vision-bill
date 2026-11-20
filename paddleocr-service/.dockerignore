@@ -14,6 +14,7 @@ ocr_service/**
 !build/
 build/**
 !build/build_rocm.sh
+!build/build_therock.sh
 !build/prepare_therock.sh
 !build/hip-rdna2-v1.patch
 !build/hip-device-info.cpp

@@ -7,7 +7,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from .supervision import InstallationBusy, installation_lock, lock_path
+from .supervision import InstallationBusy, UncleanInstallation, installation_lock, lock_path
 
 __all__ = ["InstallationBusy", "installation_lock", "lock_path", "maintenance_handoff"]
 
@@ -43,7 +43,7 @@ def _require_clean_journal(journal: Path, *, ocr_only: bool = False) -> None:
     except FileNotFoundError:
         return
     except OSError as exc:
-        raise RuntimeError(
+        raise UncleanInstallation(
             "Unsafe handoff journal path; preserve and externally recover before maintenance"
         ) from exc
     try:
@@ -95,7 +95,7 @@ def _require_clean_journal(journal: Path, *, ocr_only: bool = False) -> None:
         ):
             raise ValueError("Outstanding handoff work")
     except (OSError, ValueError) as exc:
-        raise RuntimeError(
+        raise UncleanInstallation(
             "Unsafe handoff journal; preserve and externally recover recorded resources before maintenance"
         ) from exc
     finally:

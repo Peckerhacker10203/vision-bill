@@ -199,11 +199,12 @@ async def test_incompatible_ocr_mode_waits_before_claim_and_preserves_attempt_bu
     monkeypatch.setattr(config, "settings", settings)
     image = ImageRow(
         id=uuid4(), model_id="formatter", attempt_count=attempt_count,
-        effective_options=current_snapshot(settings),
+        effective_options=current_snapshot(settings, inference_identity="ollama:" + "d" * 64),
     )
     model = ModelInfo("formatter")
     model.capabilities = ["completion"]
     formatter = SimpleNamespace(
+        inference_identity="ollama:" + "d" * 64,
         supports_model_release=True,
         lifecycle_identity="cpu-fixture:formatter",
         resident_model_ids=AsyncMock(return_value=frozenset()),

@@ -156,7 +156,7 @@ class ActivationStore:
         _write_record(self.request_dir, "topology.json", uuid4(),
                       shared_gpu="true" if shared_gpu else "false")
 
-    def publish_status(self, status: ActivationStatus) -> bool:
+    def publish_status(self, status: ActivationStatus, *, restoration_failed: bool = False) -> bool:
         """Publish for the current generation. The controller owns the status writer."""
         phase = ActivationPhase(status.phase)
         reason = _validated_reason(status.reason_code)
@@ -173,7 +173,12 @@ class ActivationStore:
                 if current is not None:
                     if current == status:
                         return True
-                    if current.phase in (ActivationPhase.READY, ActivationPhase.FAILED):
+                    if current.phase is ActivationPhase.FAILED:
+                        return False
+                    if current.phase is ActivationPhase.READY and not (
+                        restoration_failed and phase is ActivationPhase.FAILED
+                        and reason == "native_activation_recovery_required"
+                    ):
                         return False
                 _write_record(self.status_dir, _STATUS, status.generation, phase=phase, reason_code=reason)
                 return True

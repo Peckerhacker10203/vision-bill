@@ -32,6 +32,7 @@ async def test_unmanaged_marker_fences_classifier_and_ambiguous_results(settings
     receipts = ReceiptService(settings.images, settings.pg, llm)
     receipts.list_tags = AsyncMock(return_value=[])
     service.receipts = receipts
+    claim.image.effective_options["inference_identity"] = receipts.inference_identity
     claim.image.model_id = "fixture"
     db.unreferenced_views = AsyncMock(return_value=[])
     if scenario in ("classifier_timeout", "short_budget"):
@@ -144,7 +145,7 @@ async def test_managed_ocr_checkpoint_records_unmanaged_formatter_settlement(set
     _, _, _, claim, _ = context(settings, tmp_path)
     settings.ocr.enabled = True
     settings.ocr.shared_gpu = shared_gpu
-    snapshot = current_snapshot(settings)
+    snapshot = current_snapshot(settings, inference_identity="ollama:" + "d" * 64)
     checkpoint_id = uuid4()
     row = {
         "id": claim.image.id, "generation": claim.image.generation, "attempt_count": claim.image.attempt_count,

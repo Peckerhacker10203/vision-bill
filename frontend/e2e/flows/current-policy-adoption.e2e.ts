@@ -166,13 +166,14 @@ test.describe('explicit current policy adoption', () => {
 			expect(after[key]).toEqual(before[key]);
 		expect(after.requested_options.allow_ocr_fallback).toBe(true);
 		expect(after.effective_options).toMatchObject({
-			execution_policy_version: 3,
+			execution_policy_version: 4,
 			managed_binding_sha256: null,
 			allow_ocr_fallback: false,
 			ocr: { enabled: true, allow_vision_fallback: false }
 		});
 		// Use the app's Compose-side stub endpoint, which differs from the published test URL.
 		const inferenceIdentity = `openai:${bytesToHex(sha256(utf8ToBytes('http://llm-stub:9123/v1')))}`;
+		expect(after.effective_options.inference_identity).toBe(inferenceIdentity);
 		expect(after.inference_identity).toBe(inferenceIdentity);
 		expect(after.checkpoint_id).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
 		const checkpoint = {

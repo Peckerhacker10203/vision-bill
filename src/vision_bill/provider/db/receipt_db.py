@@ -340,7 +340,7 @@ class ReceiptDB:
             original_description=d.get("original_description"),
             spending_category=d.get("spending_category", "unknown"),
             category_source=d.get("category_source", "unknown"),
-            quantity=float(d["quantity"]) if d["quantity"] is not None else None,
+            quantity=d["quantity"],
             unit_price=Decimal(d["unit_price"]) if d["unit_price"] is not None else None,
             total_price=Decimal(d["total_price"]),
             tags=list(d.get("tags") or []),
@@ -357,7 +357,7 @@ class ReceiptDB:
             merchant_name=d["merchant_name"],
             date=d["date"],
             time=t.isoformat() if t is not None else None,
-            quantity=float(d["quantity"]) if d["quantity"] is not None else None,
+            quantity=d["quantity"],
             unit_price=Decimal(d["unit_price"]) if d["unit_price"] is not None else None,
             currency=d["currency"],
         )
@@ -369,7 +369,7 @@ class ReceiptDB:
             id=d["id"],
             receipt_id=d["receipt_id"],
             name=d["name"],
-            rate=float(d["rate"]) if d["rate"] is not None else None,
+            rate=d["rate"],
             amount=Decimal(d["amount"]),
         )
 
@@ -384,7 +384,7 @@ class ReceiptDB:
                     INSERT_LINE_ITEM_SQL,
                     receipt_id,
                     item.description,
-                    Decimal(str(item.quantity)) if item.quantity is not None else None,
+                    item.quantity,
                     item.unit_price,
                     item.total_price,
                     list(item.tags),
@@ -401,7 +401,7 @@ class ReceiptDB:
                     INSERT_TAX_SQL,
                     receipt_id,
                     tax.name,
-                    Decimal(str(tax.rate)) if tax.rate is not None else None,
+                    tax.rate,
                     tax.amount,
                     position,
                 )
@@ -1039,7 +1039,7 @@ class ReceiptDB:
             if row is None:
                 return None
             current = self._receipt_row_from_record(row)
-            if not current.can_rereview():
+            if (current.verified or current.status != "unverified") and not current.can_rereview():
                 raise ValueError("human_rereview_not_available")
             evaluation = await self._evaluate_current_review(conn, row, current, lock=False)
             return ReviewPreview(

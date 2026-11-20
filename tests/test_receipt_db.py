@@ -438,7 +438,7 @@ async def test_get_receipt_with_details(db: ReceiptDB) -> None:
     assert details.line_items[0].quantity == 2.0
     assert details.line_items[0].tags == ["test"]
     assert len(details.taxes) == 1
-    assert details.taxes[0].rate == 0.19
+    assert details.taxes[0].rate == Decimal("0.19")
 
 
 @pytest.mark.asyncio

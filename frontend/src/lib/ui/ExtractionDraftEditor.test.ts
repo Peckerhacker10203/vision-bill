@@ -187,18 +187,21 @@ it('saves partial corrections with an out-of-range tax observation', async () =>
 	expect((screen.getByLabelText('Rate (0–1)') as HTMLInputElement).value).toBe('7');
 });
 
-it('prompts for a decimal tax rate before finalizing a saved out-of-range observation', async () => {
-	vi.mocked(api.getDraft).mockResolvedValue({
-		...completeDraft,
-		document: { ...completeDraft.document, taxes: [{ name: 'VAT', rate: 7, amount: '0' }] }
-	});
-	const finalize = vi.spyOn(api, 'finalizeDraft');
-	render(ExtractionDraftEditor, { id: 'job' });
-	await screen.findByLabelText('Rate (0–1)');
-	await fireEvent.click(screen.getByRole('button', { name: 'Finalize draft' }));
-	expect(screen.getByRole('alert').textContent).toContain('between 0 and 1');
-	expect(finalize).not.toHaveBeenCalled();
-});
+it.each([7, '1.00000000000000001'])(
+	'prompts for a fractional tax rate before finalizing %s',
+	async (rate) => {
+		vi.mocked(api.getDraft).mockResolvedValue({
+			...completeDraft,
+			document: { ...completeDraft.document, taxes: [{ name: 'VAT', rate, amount: '0' }] }
+		});
+		const finalize = vi.spyOn(api, 'finalizeDraft');
+		render(ExtractionDraftEditor, { id: 'job' });
+		await screen.findByLabelText('Rate (0–1)');
+		await fireEvent.click(screen.getByRole('button', { name: 'Finalize draft' }));
+		expect(screen.getByRole('alert').textContent).toContain('between 0 and 1');
+		expect(finalize).not.toHaveBeenCalled();
+	}
+);
 
 it('finalizes the current saved revision with one stable key across ambiguous responses', async () => {
 	const complete = {

@@ -9,8 +9,10 @@ from fastapi import FastAPI
 from vision_bill.api.benchmarks import router
 from vision_bill.api.helper.helper import get_benchmark_service
 from vision_bill.model.benchmark import BenchmarkCreate
+from vision_bill.model.ocr_errors import OcrWorkerFailure
 from vision_bill.security.dependencies import get_current_user
 from vision_bill.security.models import User
+from vision_bill.service.experiment_execution import ExperimentFailure
 
 
 @pytest.mark.parametrize('method,suffix,name,body', [
@@ -58,3 +60,26 @@ def test_benchmark_selection_deduplicates_receipts_in_first_seen_order():
     first, second = uuid4(), uuid4()
     request = BenchmarkCreate(model_ids=["m"], receipt_ids=[second, first, second])
     assert request.receipt_ids == [second, first]
+
+
+@pytest.mark.parametrize("method, error, status", [
+    ("create_run", OcrWorkerFailure("ocr_model_load_failed"), 503),
+    ("reevaluate", ExperimentFailure("ocr_invalid_result", {}), 502),
+    ("reevaluate", ExperimentFailure("ocr_deadline_exceeded", {}), 504),
+    ("reevaluate", ExperimentFailure("ocr_gpu_out_of_memory", {}), 503),
+    ("reevaluate", ValueError("Receipt/model is not part of this benchmark run"), 404),
+])
+async def test_benchmark_route_preserves_worker_failures(method, error, status):
+    app = FastAPI()
+    app.include_router(router, prefix="/benchmarks")
+    user = User(id=uuid4(), username="admin", is_admin=True, can_see_all=False)
+    app.dependency_overrides[get_current_user] = lambda: user
+    service = SimpleNamespace(**{method: AsyncMock(side_effect=error)})
+    app.dependency_overrides[get_benchmark_service] = lambda: service
+    url, body = "/benchmarks", {"model_ids": ["m"]}
+    if method == "reevaluate":
+        url, body = f"/benchmarks/{uuid4()}/reevaluate", {"receipt_id": str(uuid4()), "model_id": "m"}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://test") as client:
+        response = await client.post(url, json=body)
+    assert response.status_code == status
+    assert response.json()["detail"] == str(error)

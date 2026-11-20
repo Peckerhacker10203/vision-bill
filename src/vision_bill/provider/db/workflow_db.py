@@ -30,7 +30,7 @@ from ...model.extraction import (
 )
 from ...model.handoff import HANDOFF_WAIT_REASONS
 from ...model.ocr import OcrPageMetadata, Sha256, SourceRef, WorkingImageMetadata
-from ...model.ocr_errors import OCR_GPU_OUT_OF_MEMORY
+from ...model.ocr_errors import OCR_RESULT_CODES
 from ...model.review import AmountPolicy, OriginalAvailability, ReviewEvaluation, SourceView
 from ...model.workflow import (
     AccessScope,
@@ -66,8 +66,7 @@ OBSERVATION_RECOVERY_WAIT = "observation_recovery_required"
 COMPLETION_WAIT_REASONS = HANDOFF_WAIT_REASONS | {
     OBSERVATION_RECOVERY_WAIT, "observation_checkpoint_invalid", "source_integrity_failed",
 }
-READINESS_WAIT_REASONS = HANDOFF_WAIT_REASONS | {
-    OCR_GPU_OUT_OF_MEMORY,
+READINESS_WAIT_REASONS = HANDOFF_WAIT_REASONS | OCR_RESULT_CODES | {
     "provider_unavailable",
     "vision_model_unavailable",
     "formatter_model_unavailable",
@@ -697,6 +696,7 @@ class WorkflowDB:
         if (
             row["model_id"] != checkpoint.model_id
             or identity.semantic_policy_sha256 != semantic_policy_sha256(snapshot)
+            or snapshot.get("inference_identity", identity.inference_identity) != identity.inference_identity
             or checkpoint.envelope.provenance.used_pipeline != expected_mode
         ):
             raise ValueError("observation checkpoint execution policy mismatch")
@@ -799,26 +799,17 @@ class WorkflowDB:
         effective_options: dict[str, Any],
         deadline: float | None = None,
     ) -> ImageRow | None:
-        """Resolve an unbound snapshot/model once under the original claim fence."""
+        """Bind model selection once under the claim fence and original frozen policy."""
         if claim.purpose != "inference":
             return None
         async with connection(self.pool, deadline=deadline, transaction=True) as conn:
             row = await self._lock_claim(conn, claim)
             if row is None:
                 return None
-            if not _decoded(row["effective_options"]):
-                # Only migrated jobs lack a request fingerprint. Never repair a malformed upload.
-                if row["request_fingerprint"] is not None:
-                    raise ValueError("execution_snapshot_invalid")
-                row = await conn.fetchrow(
-                    """UPDATE images SET effective_options=$2::jsonb,model_id=$3,
-                    legacy_events=legacy_events || '[{"event":"legacy_execution_resolved"}]'::jsonb
-                    WHERE id=$1 RETURNING *""",
-                    claim.image.id,
-                    _json(effective_options),
-                    model_id,
-                )
-            elif row["model_id"] is None:
+            snapshot = _decoded(row["effective_options"])
+            if not snapshot or snapshot != effective_options:
+                raise ValueError("execution_snapshot_invalid")
+            if row["model_id"] is None:
                 # Explicit current-policy adoption clears only a formerly resolved default.
                 # Bind its selection once without changing the already frozen policy.
                 row = await conn.fetchrow(

@@ -16,7 +16,10 @@ and an external LLM. Every app variant uses your endpoint. The combined CUDA
 bundle includes a Windows launcher for Docker Desktop. Combined CUDA and ROCm
 bundles also include a Linux launcher. The OCR controller starts idle
 and downloads the pinned Paddle models when an admin first turns **Dedicated
-OCR** On or explicitly requests setup in the configuration.
+OCR** On or explicitly requests setup in the configuration. The four model
+downloads total about 2.1 GB. The controller verifies their hashes and parks.
+The first receipt loads PaddleOCR-VL 1.6 and runs the first prediction. Setup,
+restart and the Settings connection check do not process sample images.
 [Installation guide](distribution/README.md)
 
 **Status: Unreleased.** Source candidates and release tooling are available.
@@ -54,9 +57,8 @@ explicitly blank for initial direct vision. With a prepared GPU profile, an admi
 can still opt in through the Dedicated OCR toggle. Leave it unset for a new
 Dedicated OCR installation. A nonblank external endpoint remains operator-owned
 and cannot be switched with that toggle. Turning Dedicated OCR Off routes new
-work to direct vision while retaining the verified cache and idle native worker;
-turning it On again reuses the verified generation. When OCR is configured,
-ordinary formatting,
+work to direct vision. The OCR service stays parked, and turning it On again
+reuses the installed models. When OCR is configured, ordinary formatting,
 repairs and classification use **text/evidence only**; OCR failure never sends
 receipt images to the LLM. Deprecated fallback fields remain for request replay
 and history, not as new permission. Compare OCR and direct vision only through an
@@ -92,9 +94,9 @@ include failed cases and exact receipt/item/amount checks. See
 [split experiments](scripts/receipt_split_experiment.md) remain research evidence;
 blanket splitting and global product deduplication are not production behavior.
 Benchmarks are explicitly requested. App installation and startup use the
-configured endpoint and leave model provisioning to its operator. Native
-startup checks the qualified installation cache and explicit maintenance performs
-physical qualification. Persisted pending work can resume when its readiness and
+configured LLM endpoint. Dedicated OCR reuses its verified local models.
+Maintainers can run physical hardware qualification explicitly. Pending work
+can resume when its readiness and
 policy checks pass.
 
 ## Advanced: develop from source

@@ -90,6 +90,9 @@ deploying llama.cpp.
 
 ## Adopt the managed pair
 
+Adoption is required for the shared-GPU configuration described above. An
+LLM configured on a separate server uses ordinary inference without adoption.
+
 Drain participating work before adoption. Start the dedicated router with all
 models unloaded, all startup loading disabled and access limited to coordinated
 Vision Bill model-loading requests. Start the configured managed OCR and app

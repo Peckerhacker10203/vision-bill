@@ -104,7 +104,7 @@ class FakeProcess:
             self.context.entered.set()
             if self.context.mode == "fatal":
                 self.context.init_release.clear()
-                out_q.put({"generation":generation, "request_id":str(request.request_id), "kind":"qualification_invalidated"})
+                out_q.put({"generation":generation, "request_id":str(request.request_id), "kind":"worker_failed", "code":"ocr_inference_failed"})
                 continue
             if self.context.mode in ("gpu_memory", "gpu_memory_after_timeout"):
                 if self.context.mode == "gpu_memory_after_timeout":
@@ -113,7 +113,7 @@ class FakeProcess:
                             return
                 out_q.put({
                     "generation": generation, "request_id": str(request.request_id),
-                    "kind": "qualification_invalidated", "code": "ocr_gpu_out_of_memory",
+                    "kind": "worker_failed", "code": "ocr_gpu_out_of_memory",
                 })
                 return
             if self.context.mode == "crash":
@@ -342,7 +342,7 @@ def test_shutdown_waits_for_active_input_ownership_before_return(tmp_path):
         assert all(not process.is_alive() for process in context.processes)
 
 
-def test_native_entrypoint_qualifies_before_predict(tmp_path, monkeypatch):
+def test_worker_first_prediction_is_the_uploaded_receipt(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
     from ocr_service import pipeline
@@ -352,7 +352,7 @@ def test_native_entrypoint_qualifies_before_predict(tmp_path, monkeypatch):
     item = request(tmp_path)
 
     def predict(*args, **kwargs):
-        calls.append("predict")
+        calls.append(args[0])
         return response(item)
 
     adapter = SimpleNamespace(
@@ -361,7 +361,7 @@ def test_native_entrypoint_qualifies_before_predict(tmp_path, monkeypatch):
         qualify=lambda image: calls.append("qualify"),
         predict=predict,
     )
-    monkeypatch.setattr(pipeline, "build_pipeline", lambda profile, runtime, **kwargs: adapter)
+    monkeypatch.setattr(pipeline, "build_serving_pipeline", lambda profile, runtime, **kwargs: adapter)
     incoming, outgoing = queue.Queue(), queue.Queue()
     incoming.put(item)
     incoming.put(None)
@@ -372,9 +372,8 @@ def test_native_entrypoint_qualifies_before_predict(tmp_path, monkeypatch):
         Path(__file__).parents[1] / "paddleocr-service/profile.json",
         object(),
         tmp_path,
-        tmp_path,
     )
-    assert calls == ["qualify", "predict"]
+    assert calls == [item.original_path]
     ready = outgoing.get()
     assert ready["kind"] == "ready"
     assert ready["runtime_fingerprint"] == "qualified-runtime"
@@ -659,7 +658,7 @@ def test_runtime_readiness_belongs_to_live_generation_only():
     assert worker.readiness().runtime_fingerprint is None
 
 
-def test_native_invalidated_qualification_exits_child_instead_of_serving_again(tmp_path, monkeypatch):
+def test_native_failure_exits_child_instead_of_serving_again(tmp_path, monkeypatch):
     from types import SimpleNamespace
 
     from ocr_service import pipeline
@@ -667,24 +666,23 @@ def test_native_invalidated_qualification_exits_child_instead_of_serving_again(t
 
     item = request(tmp_path)
     calls = []
-    adapter = SimpleNamespace(qualified=True, profile_id='p', runtime_fingerprint='r', qualify=lambda p: None)
+    adapter = SimpleNamespace(profile_id='p', runtime_fingerprint='r')
     def predict(*args, **kwargs):
         calls.append(kwargs['request_id'])
-        adapter.qualified = False
         raise ValueError('private native failure')
     adapter.predict = predict
-    monkeypatch.setattr(pipeline, 'build_pipeline', lambda *a, **kw: adapter)
+    monkeypatch.setattr(pipeline, 'build_serving_pipeline', lambda *a, **kw: adapter)
     incoming, outgoing = queue.Queue(), queue.Queue()
     incoming.put(item)
     incoming.put(item)
     incoming.put(None)
-    _worker_main(incoming, outgoing, 1, Path(__file__).parents[1] / 'paddleocr-service/profile.json', object(), tmp_path, tmp_path)
+    _worker_main(incoming, outgoing, 1, Path(__file__).parents[1] / 'paddleocr-service/profile.json', object(), tmp_path)
     assert outgoing.get()['kind'] == 'ready'
-    assert outgoing.get()['kind'] == 'qualification_invalidated'
+    assert outgoing.get()['kind'] == 'worker_failed'
     assert calls == [item.request_id]
 
 
-def test_fatal_live_worker_retires_owned_generation_and_waits_for_fresh_qualification(tmp_path):
+def test_fatal_live_worker_retires_owned_generation_and_waits_for_replacement(tmp_path):
     from ocr_service.worker import OcrWorkerError
     context = FakeContext('fatal')
     worker = manager(context)
@@ -692,7 +690,7 @@ def test_fatal_live_worker_retires_owned_generation_and_waits_for_fresh_qualific
     old_proc, old_in, old_out = worker._proc, worker._in_q, worker._out_q
     old_directory = Path(worker._reply_directory.name)
     try:
-        with pytest.raises(OcrWorkerError, match='ocr_qualification_invalidated'):
+        with pytest.raises(OcrWorkerError, match='ocr_inference_failed'):
             worker.infer(first, deadline_monotonic=time.monotonic()+1)
         assert not worker.readiness().ready
         assert not old_proc.is_alive() and old_in.closed and old_out.closed
@@ -1023,20 +1021,20 @@ def test_inference_gpu_memory_failure_reaps_child_without_immediate_reload(tmp_p
     [
         ("load", MemoryError("Out of memory error on GPU 2. private"),
          "init_failed", "ocr_gpu_out_of_memory"),
-        ("smoke", MemoryError("(ResourceExhausted)\nOut of memory error on GPU 2. private"),
+        ("load", MemoryError("(ResourceExhausted)\nOut of memory error on GPU 2. private"),
          "init_failed", "ocr_gpu_out_of_memory"),
         ("infer", MemoryError("Out of memory error on GPU 2. private"),
-         "qualification_invalidated", "ocr_gpu_out_of_memory"),
-        ("load", MemoryError("private host memory exhausted"), "init_failed", "ocr_init_failed"),
+         "worker_failed", "ocr_gpu_out_of_memory"),
+        ("load", MemoryError("private host memory exhausted"), "init_failed", "ocr_model_load_failed"),
         ("load", OSError("(External) Hip error(2), out of memory in hipHostMalloc. private"),
-         "init_failed", "ocr_init_failed"),
-        ("smoke", OSError("(External) CUDA error(2), out of memory. private"),
-         "init_failed", "ocr_init_failed"),
+         "init_failed", "ocr_model_load_failed"),
+        ("load", OSError("(External) CUDA error(2), out of memory. private"),
+         "init_failed", "ocr_model_load_failed"),
         ("infer", RuntimeError("CUDA error: out of memory in cudaMallocHost. private"),
-         "error", "ocr_inference_failed"),
+         "worker_failed", "ocr_inference_failed"),
         ("infer", OSError("(External) CU error(2) in cuMemHostAlloc. private"),
-         "error", "ocr_inference_failed"),
-        ("infer", RuntimeError("private inference failed"), "error", "ocr_inference_failed"),
+         "worker_failed", "ocr_inference_failed"),
+        ("infer", RuntimeError("private inference failed"), "worker_failed", "ocr_inference_failed"),
     ],
 )
 def test_child_distinguishes_native_gpu_allocator_errors(
@@ -1054,17 +1052,17 @@ def test_child_distinguishes_native_gpu_allocator_errors(
     def build(_profile, _runtime, **kwargs):
         fail("load")
         return SimpleNamespace(
-            profile_id="p", runtime_fingerprint="r", qualified=True,
-            qualify=lambda _image: fail("smoke"), predict=lambda *_a, **_k: fail("infer"),
+            profile_id="p", runtime_fingerprint="r",
+            predict=lambda *_a, **_k: fail("infer"),
         )
 
-    monkeypatch.setattr(pipeline, "build_pipeline", build)
+    monkeypatch.setattr(pipeline, "build_serving_pipeline", build)
     incoming, outgoing = queue.Queue(), queue.Queue()
     incoming.put(request(tmp_path))
     incoming.put(None)
     _worker_main(
         incoming, outgoing, 2, Path(__file__).parents[1] / "paddleocr-service/profile.json",
-        object(), tmp_path, tmp_path,
+        object(), tmp_path,
     )
     if stage == "infer":
         assert outgoing.get_nowait()["kind"] == "ready"

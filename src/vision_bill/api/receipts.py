@@ -17,10 +17,11 @@ from ..security.models import User
 from ..service.image_service import ImageService
 from ..service.receipt_service import ReceiptReferencedError, ReceiptService
 from .helper.helper import get_image_service, get_receipt_service
+from .helper.receipt_json import ReceiptWriteRoute
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(dependencies=[Depends(get_current_user)])
+router = APIRouter(dependencies=[Depends(get_current_user)], route_class=ReceiptWriteRoute)
 
 
 class LineItemUpdate(LineItem):
@@ -145,7 +146,7 @@ async def preview_human_review(
     receipt_service: ReceiptService = Depends(get_receipt_service),  # noqa: B008
     current_user: User = Depends(get_current_user),  # noqa: B008
 ) -> ReviewPreview:
-    """Preview current findings for a verified receipt eligible for human review."""
+    """Preview current findings for initial human verification or an eligible re-review."""
     if not receipt_service.db_ready:
         raise HTTPException(status_code=503, detail="Database not available")
     try:

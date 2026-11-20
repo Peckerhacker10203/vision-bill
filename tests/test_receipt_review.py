@@ -115,7 +115,7 @@ def test_nulls_are_integrity_and_do_not_gain_defaults():
     assert draft.currency is None
 
 
-@pytest.mark.parametrize("quantity,unit_price", [(None, None), (None, "5"), (2, None)])
+@pytest.mark.parametrize("quantity,unit_price", [(None, None), (None, "5"), (Decimal(2), None)])
 def test_unprinted_line_factors_and_adjustments_remain_null(quantity, unit_price):
     draft = ExtractionDraft.model_validate(document().model_dump())
     draft.line_items[0].quantity = quantity
@@ -160,7 +160,7 @@ def test_line_description_and_total_remain_mandatory(field):
     ]
 
 
-@pytest.mark.parametrize("rate", [-0.01, 7])
+@pytest.mark.parametrize("rate", [Decimal("-0.01"), Decimal(7), Decimal("1.00000000000000001")])
 def test_unscaled_tax_rate_stays_in_draft_with_nonwaivable_integrity_finding(rate):
     draft = ExtractionDraft.model_validate(document().model_dump())
     draft.taxes[0].rate = rate
@@ -208,6 +208,8 @@ def test_unknown_mapping_overlap_policy_remain_reviewable():
 
 def test_stable_ids_bind_whole_material_document_but_ignore_classification():
     first = evaluate(document(total="12"))
+    # An acknowledgement stored with checks version 3 before exact factor parsing.
+    assert first.findings[0].id == "593f54a3f07826b7acf11579da85fa31be1d7f514b995bcab2ff8d0600e7cae0"
     assert first.findings[0].id == evaluate(document(total=Decimal("12.000"))).findings[0].id
     assert (
         first.findings[0].id != evaluate(document(total="12", merchant_name="Other")).findings[0].id

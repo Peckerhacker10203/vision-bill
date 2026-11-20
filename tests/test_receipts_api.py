@@ -84,6 +84,7 @@ def _make_pool(conn: AsyncMock) -> MagicMock:
 
 def _make_provider() -> MagicMock:
     provider = MagicMock(spec=LLMProvider)
+    provider.inference_identity = "ollama:" + "d" * 64
     provider.analysis_timeout_seconds = 600
     provider.check_connection = AsyncMock(return_value=True)
     provider.get_available_models = AsyncMock(return_value=[ModelInfo(id="test-model")])
@@ -1282,3 +1283,21 @@ def test_locked_review_gate_errors_are_http_responses(api_context, error, status
     response = api_context.client.post(f"{RECEIPTS_URL}/{RECEIPT_ID}/verify", json={"expected_operation_revision":2,"expected_review_revision":2,"acknowledgements":[]})
     assert response.status_code == status
     assert response.json()["detail"] == error
+
+
+def test_put_decodes_unquoted_decimal_observations_exactly(api_context: ApiContext) -> None:
+    ctx = api_context
+    ctx.conn.fetchrow = AsyncMock(return_value=_receipt_row(id=RECEIPT_ID))
+    response = ctx.client.put(
+        f"{RECEIPTS_URL}/{RECEIPT_ID}",
+        headers={"Content-Type": "application/json"},
+        content="""{"confidence": 95, "merchant_name": "Shop", "date": "2024-01-15",
+            "line_items": [{"description": "Item", "quantity": 1.0000000000000001,
+                            "unit_price": 10, "total_price": 10}],
+            "taxes": [{"name": "VAT", "rate": 0.20000000000000001, "amount": 0}],
+            "subtotal": 10, "total": 10, "expected_operation_revision": 1}""",
+    )
+    assert response.status_code == 200, response.text
+    writes = {call.args[0]: call.args for call in ctx.conn.execute.call_args_list}
+    assert writes[receipt_db_module.INSERT_LINE_ITEM_SQL][3] == Decimal("1.0000000000000001")
+    assert writes[receipt_db_module.INSERT_TAX_SQL][3] == Decimal("0.20000000000000001")

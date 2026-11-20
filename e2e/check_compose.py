@@ -71,11 +71,19 @@ def main() -> None:
             assert services["db"]["environment"]["POSTGRES_USER"] == "compose_test"
             assert services["vision_bill"]["environment"]["PG__PASSWORD"] == "unused_test_value"
             app_env = services["vision_bill"]["environment"]
+            assert app_env["OCR__TIMEOUT_SECONDS"] == "600"
             assert str(app_env.get("OCR__ENABLED", "false")).lower() == "false"
             assert "OCR__ENDPOINT" not in app_env
             assert str(app_env.get("OCR__REQUIRED", "false")).lower() == "false"
             assert str(app_env.get("OCR__ALLOW_VISION_FALLBACK", "false")).lower() == "false"
             if accelerator is None:
+                configured = resolve_compose(
+                    command, private, {**environment, "OCR__TIMEOUT_SECONDS": "723"}
+                )
+                assert (
+                    configured["services"]["vision_bill"]["environment"]["OCR__TIMEOUT_SECONDS"]
+                    == "723"
+                )
                 assert "VISION_BILL_OCR_ACTIVATION" not in app_env
                 assert set(config["volumes"]) == {"db_data"}
                 print("main: OCR disabled (no services started)")

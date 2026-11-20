@@ -1,6 +1,5 @@
 """Native serving entrypoint: hold the installation's shared lock for its lifetime."""
 
-import json
 import os
 import sys
 from pathlib import Path
@@ -9,17 +8,13 @@ from .supervision import ManagedInterrupted, lock_path, managed_installation, ru
 
 
 def configure_selected() -> None:
-    if os.environ.get("OCR_RUNTIME_SETTINGS_PATH") and os.environ.get(
-        "OCR_QUALIFICATION_IMAGE_PATH"
-    ):
-        return  # Preserve the existing explicitly supplied manual qualifier route.
+    if os.environ.get("OCR_RUNTIME_SETTINGS_PATH"):
+        return  # Preserve explicitly supplied local runtime settings.
     selected = Path(os.environ.get("OCR_STATE_DIR", "/var/lib/ocr")) / "selected"
     root = selected.resolve(strict=True)
     if not (root / "complete.json").is_file():
         raise ValueError("Native initialization has not completed")
-    selection = json.loads((root / "selection.json").read_bytes())
     os.environ.setdefault("OCR_RUNTIME_SETTINGS_PATH", str(root / "runtime.json"))
-    os.environ.setdefault("OCR_QUALIFICATION_IMAGE_PATH", selection["smoke_path"])
 
 
 def main() -> None:

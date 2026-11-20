@@ -900,7 +900,7 @@ class LLMProvider(ABC):
         """Parse the LLM response into a Receipt object."""
         raw_text = response.strip().removeprefix("```json").removesuffix("```").strip()
         try:
-            payload = json.loads(raw_text)
+            payload = json.loads(raw_text, parse_float=Decimal)
         except json.JSONDecodeError:
             payload = None
         if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
@@ -909,8 +909,8 @@ class LLMProvider(ABC):
                 raise UnreadableReceiptError(error["message"][:1000])
         try:
             if image_count > 1:
-                return MultiImageReceipt.model_validate_json(raw_text).reconciled(image_count)
-            return Receipt.model_validate_json(raw_text)
+                return MultiImageReceipt.model_validate(payload).reconciled(image_count)
+            return Receipt.model_validate(payload)
         except ValidationError as e:
             # retry logic: feed error back to the LLM, or raise
             raise ValueError(f"LLM output failed validation: {e}")

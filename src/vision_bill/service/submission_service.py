@@ -28,7 +28,7 @@ from ..model.extraction import (
 )
 from ..model.handoff import HandoffStatus, HandoffWait
 from ..model.ocr import OcrPageMetadata, OcrResponse, SourceRef, WorkingImage, WorkingImageMetadata
-from ..model.ocr_errors import OCR_GPU_OUT_OF_MEMORY
+from ..model.ocr_errors import OCR_RESULT_CODES
 from ..model.receipt import Receipt
 from ..model.review import OriginalAvailability
 from ..model.workflow import (
@@ -52,7 +52,6 @@ from ..provider.llm.errors import AnalysisTimeoutError, UnreadableReceiptError
 from ..provider.ocr.base import compact_ocr_text
 from .benchmark_scoring import PROMPT_VERSION
 from .execution_policy import (
-    current_snapshot,
     managed_ocr,
     policy_hold_reason,
     semantic_policy_sha256,
@@ -102,7 +101,7 @@ class SubmissionService:
 
     @staticmethod
     def _initial_model(models: list[ModelInfo], preferred: str, *, vision: bool) -> ModelInfo | None:
-        """Resolve only an unfrozen legacy binding from affirmative discovery."""
+        """Resolve the selected model from affirmative capability discovery."""
         if vision:
             return select_vision_model(models, preferred)
         return next((model for model in models if model.id == preferred), None)
@@ -130,7 +129,10 @@ class SubmissionService:
         ):
             raise ValueError("checkpoint producer or frozen policy mismatch")
         if (
-            policy_hold_reason(snapshot, self.settings.ocr)
+            policy_hold_reason(
+                snapshot, self.settings.ocr, self.receipts.inference_identity,
+                checkpoint_identity=identity.inference_identity,
+            )
             or identity.inference_identity != self.receipts.inference_identity
             or identity.prompt_version != PROMPT_VERSION
             or identity.extraction_schema_version != EXTRACTION_SCHEMA_VERSION
@@ -172,9 +174,9 @@ class SubmissionService:
 
     async def _readiness_reason(self, image: ImageRow) -> str | None:
         """Readiness precedes claim, and therefore never spends the attempt budget."""
-        snapshot = image.effective_options or current_snapshot(self.settings)
+        snapshot = image.effective_options
         try:
-            reason = policy_hold_reason(snapshot, self.settings.ocr)
+            reason = policy_hold_reason(snapshot, self.settings.ocr, self.receipts.inference_identity)
             if reason:
                 return reason
             ocr = snapshot_ocr(snapshot)
@@ -209,9 +211,7 @@ class SubmissionService:
                 if not (
                     capabilities.ready or (ocr.manage_model_lifecycle and capabilities.can_load)
                 ):
-                    if capabilities.reason_code == OCR_GPU_OUT_OF_MEMORY:
-                        return OCR_GPU_OUT_OF_MEMORY
-                    return "ocr_unavailable"
+                    return capabilities.reason_code if capabilities.reason_code in OCR_RESULT_CODES else "ocr_unavailable"
                 capability = "text"
             models = await self.receipts.get_available_models(capability=capability)
             if self._initial_model(models, selected, vision=capability == "vision") is not None:
@@ -403,21 +403,21 @@ class SubmissionService:
         *, db_deadline: float,
     ) -> AttemptOutcome:
         image = claim.image
-        snapshot = image.effective_options or self.current_snapshot()
-        if policy_hold_reason(snapshot, self.settings.ocr):
+        snapshot = image.effective_options
+        if policy_hold_reason(snapshot, self.settings.ocr, self.receipts.inference_identity):
             raise PolicyHoldError
-        if not image.effective_options or image.model_id is None:
+        if image.model_id is None:
             # Resolve an unbound selection from affirmative provider discovery.
             # This is repeated under the attempt budget and saved exactly once.
-            legacy_ocr = snapshot_ocr(snapshot)
+            adopted_ocr = snapshot_ocr(snapshot)
             models = await self.receipts.get_available_models(
-                capability="text" if legacy_ocr.enabled else "vision"
+                capability="text" if adopted_ocr.enabled else "vision"
             )
             preferred = image.model_id or self.settings.llm.model_name
-            selected = self._initial_model(models, preferred, vision=not legacy_ocr.enabled)
+            selected = self._initial_model(models, preferred, vision=not adopted_ocr.enabled)
             if selected is None:
                 raise ReadinessHoldError(
-                    "formatter_model_unavailable" if legacy_ocr.enabled else "vision_model_unavailable"
+                    "formatter_model_unavailable" if adopted_ocr.enabled else "vision_model_unavailable"
                 )
             saved = await self.db.ensure_execution_snapshot(
                 claim, model_id=selected.id, effective_options=snapshot, deadline=db_deadline
@@ -525,7 +525,7 @@ class SubmissionService:
         expected_binding = (snapshot.get("managed_binding_sha256") or "") if managed_ocr(ocr) and ocr.shared_gpu else None
         for retry in range(2):
             try:
-                if policy_hold_reason(snapshot, self.settings.ocr):
+                if policy_hold_reason(snapshot, self.settings.ocr, self.receipts.inference_identity):
                     if retry:
                         # A real dispatch already happened in this whole attempt.
                         # Keep it counted; the next readiness cycle will persist the hold.
@@ -621,9 +621,11 @@ class SubmissionService:
             raise SourceIntegrityError
         try:
             capabilities = await self.receipts.ocr_capabilities(ocr)
+            if ocr.enabled and not (capabilities.ready or capabilities.can_load):
+                reason = capabilities.reason_code
+                raise ReadinessHoldError(reason if reason in OCR_RESULT_CODES else "ocr_unavailable")
             if (
                 not ocr.enabled
-                or not (capabilities.ready or capabilities.can_load)
                 or not capabilities.runtime_fingerprint
                 or capabilities.profile_id != checkpoint.profile_id
                 or capabilities.runtime_fingerprint != checkpoint.runtime_fingerprint
@@ -663,7 +665,7 @@ class SubmissionService:
                 payload["working_image"]["png_base64"] = base64.b64encode(png).decode()
                 result.append(OcrResponse.model_validate(payload))
             return result, list(checkpoint.persisted_views)
-        except TimeoutError:
+        except (TimeoutError, ReadinessHoldError):
             raise
         except (ValueError, OSError):
             if not await self.db.clear_ocr_checkpoint(claim, deadline=db_deadline):
@@ -689,8 +691,7 @@ class SubmissionService:
             admission = envelope.model_copy(update={"draft": document})
         if document is None:
             code = envelope.findings[-1].code if envelope.findings else "analysis_incomplete"
-            if code not in {
-                OCR_GPU_OUT_OF_MEMORY,
+            if code not in OCR_RESULT_CODES and code not in {
                 "ocr_unavailable",
                 "ocr_page_failed",
                 "ocr_disabled",

@@ -27,7 +27,6 @@
 	let id = $derived(page.url.pathname.split('/').pop() ?? '');
 	const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 	type ReviewVersion = Pick<ReceiptRow, 'operation_revision' | 'review_revision'>;
-	let reviewTarget = $state<ReviewVersion | null>(null);
 	let renderedVersion = $state<(ReviewVersion & { id: string }) | null>(null);
 	let previewing = $state(false);
 	let humanPreview = $state<ReviewPreview | null>(null);
@@ -38,8 +37,6 @@
 	let savedRevision = $state(0);
 	let editorDirty = $state(false);
 	let childPending = $state(false);
-	let acknowledgements = $state<{ finding_id: string; comment: string }[]>([]);
-	let acknowledgementReset = $state(0);
 	let reviewMessage = $state('');
 	let needsReload = $state(false);
 	let selectedSources = $state<SourceRef[] | null>(null);
@@ -53,17 +50,14 @@
 		activeView = view;
 		editorRevision = 0;
 		savedRevision = 0;
-		acknowledgementReset = 0;
 		saving = false;
 		verifying = false;
-		reviewTarget = null;
 		previewing = false;
 		humanPreview = null;
 		humanAcknowledgements = [];
 		selectedSources = null;
 		editorDirty = false;
 		childPending = false;
-		acknowledgements = [];
 		reviewMessage = '';
 		needsReload = false;
 		return () => {
@@ -123,7 +117,7 @@
 		);
 	}
 	$effect(() => {
-		if (reviewTarget && !matchesReview(reviewTarget)) closeReview();
+		if (humanPreview && !matchesReview(humanPreview)) closeReview();
 	});
 
 	function findingsReady(findings: ReviewFinding[], comments: ReviewRequest['acknowledgements']) {
@@ -134,11 +128,10 @@
 					comments.some((comment) => comment.finding_id === finding.id && comment.comment.trim()))
 		);
 	}
-	let reviewReady = $derived(!!data && findingsReady(data.receipt.findings, acknowledgements));
 	let humanReviewReady = $derived(
 		!!humanPreview && findingsReady(humanPreview.findings, humanAcknowledgements)
 	);
-	function reviewBody(receipt: ReviewVersion, comments = acknowledgements) {
+	function reviewBody(receipt: ReviewVersion, comments: ReviewRequest['acknowledgements']) {
 		return {
 			expected_operation_revision: receipt.operation_revision,
 			expected_review_revision: receipt.review_revision,
@@ -182,8 +175,6 @@
 			saved = await api.updateReceipt(requestId, write);
 			if (!isCurrentView(view)) return;
 			savedRevision++;
-			acknowledgementReset++;
-			acknowledgements = [];
 			needsReload = true;
 			// Only a full detail response may advance the cache's review revisions.
 			void queryClient.invalidateQueries({
@@ -195,14 +186,14 @@
 			await refresh(requestId, view);
 			if (!isCurrentView(view)) return;
 			if (verify) {
-				if (saved.findings.some((f) => f.severity !== 'info')) {
-					reviewMessage = translate('review.savedReview');
+				await tick();
+				if (!isCurrentView(view)) return;
+				if (!matchesReview(saved)) {
+					reviewMessage = translate('review.conflict');
 					return;
 				}
-				await api.verifyReceipt(requestId, reviewBody(saved, []));
-				if (!isCurrentView(view)) return;
-				snackbar.notify('success', translate('receipt.verifySuccess'));
-				await refresh(requestId, view);
+				saving = false;
+				await openReviewPreview(true);
 			}
 		} catch (error) {
 			if (!isCurrentView(view)) return;
@@ -222,17 +213,12 @@
 		return save(write, true);
 	}
 	function closeReview() {
-		reviewTarget = null;
 		humanPreview = null;
 		humanAcknowledgements = [];
 	}
-	function openVerify() {
-		if (canVerify && reviewReady && !reviewBlocked && renderedVersion) {
-			reviewTarget = { ...renderedVersion };
-		}
-	}
-	async function openHumanReview() {
-		if (!canReviewAsHuman || previewing || reviewBlocked || !renderedVersion) return;
+	async function openReviewPreview(verifyIfClean = false) {
+		if ((!canReviewAsHuman && !canVerify) || previewing || reviewBlocked || !renderedVersion)
+			return;
 		const version = { ...renderedVersion };
 		const requestId = id;
 		const view = activeView;
@@ -246,9 +232,11 @@
 				reviewMessage = translate('review.conflict');
 				return;
 			}
-			if (!reviewBlocked) {
+			if (reviewBlocked) return;
+			if (verifyIfClean && findingsReady(preview.findings, [])) {
+				await submitReview(preview, []);
+			} else {
 				humanPreview = preview;
-				reviewTarget = version;
 			}
 		} catch (error) {
 			if (!isCurrentView(view)) return;
@@ -261,18 +249,19 @@
 		}
 	}
 	async function doVerify() {
+		if (humanPreview && humanReviewReady)
+			await submitReview(humanPreview, [...humanAcknowledgements]);
+	}
+	async function submitReview(preview: ReviewPreview, comments: ReviewRequest['acknowledgements']) {
 		const requestId = id;
 		const view = activeView;
-		const version = reviewTarget;
-		if (!isCurrentView(view) || !version || reviewBlocked) return;
-		const preview = humanPreview;
-		if (!matchesReview(version)) {
+		if (!isCurrentView(view) || reviewBlocked) return;
+		if (!matchesReview(preview)) {
 			closeReview();
 			reviewMessage = translate('review.conflict');
 			return;
 		}
-		if (preview ? !humanReviewReady : !canVerify || !reviewReady) return;
-		const request = reviewBody(version, [...(preview ? humanAcknowledgements : acknowledgements)]);
+		const request = reviewBody(preview, comments);
 		verifying = true;
 		try {
 			await api.verifyReceipt(requestId, request);
@@ -282,7 +271,7 @@
 			await refresh(requestId, view);
 		} catch (error) {
 			if (!isCurrentView(view)) return;
-			if (preview) closeReview();
+			closeReview();
 			reviewMessage =
 				error instanceof ApiError && error.status === 409
 					? translate('review.conflict')
@@ -334,8 +323,8 @@
 				<button
 					type="button"
 					class="flex items-center gap-2 rounded-lg bg-action px-4 py-2.5 text-sm font-medium text-on-primary hover:opacity-90 disabled:opacity-50"
-					disabled={reviewBlocked || previewing || (canVerify && !reviewReady)}
-					onclick={canReviewAsHuman ? openHumanReview : openVerify}
+					disabled={reviewBlocked || previewing}
+					onclick={() => openReviewPreview()}
 				>
 					<Icon icon="check" />
 					{$t(canReviewAsHuman ? 'receipt.humanReview' : 'receipt.verify')}
@@ -380,9 +369,8 @@
 				document.getElementById(target)?.focus();
 			}}
 			findings={data.receipt.findings}
-			revision={`${id}:${data.receipt.review_revision}:${acknowledgementReset}`}
-			editable={canVerify && !reviewBlocked}
-			onChange={(value) => (acknowledgements = value)}
+			revision={data.receipt.review_revision}
+			editable={false}
 			onSource={(sources) => (selectedSources = [...sources])}
 		/>
 		<ReceiptWorkspace
@@ -421,12 +409,12 @@
 	</section>
 
 	<ConfirmDialog
-		open={reviewTarget !== null && matchesReview(reviewTarget)}
-		title={$t(humanPreview ? 'receipt.humanReviewTitle' : 'receipt.verifyTitle')}
-		body={$t(humanPreview ? 'receipt.humanReviewBody' : 'receipt.verifyBody')}
-		confirmLabel={$t(humanPreview ? 'receipt.humanReview' : 'receipt.verify')}
+		open={humanPreview !== null && matchesReview(humanPreview)}
+		title={$t(canReviewAsHuman ? 'receipt.humanReviewTitle' : 'receipt.verifyTitle')}
+		body={$t(canReviewAsHuman ? 'receipt.humanReviewBody' : 'receipt.verifyBody')}
+		confirmLabel={$t(canReviewAsHuman ? 'receipt.humanReview' : 'receipt.verify')}
 		busy={verifying}
-		confirmDisabled={reviewBlocked || (humanPreview ? !humanReviewReady : !reviewReady)}
+		confirmDisabled={reviewBlocked || !humanReviewReady}
 		onConfirm={doVerify}
 		onCancel={closeReview}
 	>

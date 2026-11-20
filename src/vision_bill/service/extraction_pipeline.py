@@ -21,7 +21,7 @@ from ..model.extraction import (
 )
 from ..model.handoff import HandoffStatus, HandoffWait
 from ..model.ocr import OcrPageMetadata, OcrResponse, SourceRef
-from ..model.ocr_errors import OCR_GPU_OUT_OF_MEMORY, OcrGpuOutOfMemoryError
+from ..model.ocr_errors import OcrWorkerFailure
 from ..model.review import ReviewFinding
 from ..provider.llm.base import LLMProvider, ModelInfo
 from ..provider.ocr.base import OcrProvider, compact_ocr_text
@@ -212,14 +212,16 @@ class ExtractionPipeline:
                 if self.ocr is None:
                     reason = "ocr_unavailable"
                 else:
-                    if owner is not None:
+                    cached_all = len(resume_pages) == len(paths)
+                    if owner is not None and not cached_all:
                         try:
                             await owner.ocr_phase()
-                        except OcrGpuOutOfMemoryError:
-                            result.provenance.fallback_reason = OCR_GPU_OUT_OF_MEMORY
-                            return self._failed(result, OCR_GPU_OUT_OF_MEMORY, started)
+                        except OcrWorkerFailure as exc:
+                            result.provenance.fallback_reason = str(exc)
+                            return self._failed(result, str(exc), started)
                     capabilities = await self.ocr.get_capabilities()
-                    if not capabilities.ready or not capabilities.profile_id:
+                    available = capabilities.ready or (cached_all and owner is not None and capabilities.can_load)
+                    if not available or not capabilities.profile_id:
                         reason = capabilities.reason_code or "ocr_unavailable"
                     else:
                         result.provenance.profile_id = capabilities.profile_id
@@ -261,8 +263,8 @@ class ExtractionPipeline:
                                     raise ValueError("ocr_identity_mismatch")
                             except OcrRuntimeChangedError:
                                 raise
-                            except OcrGpuOutOfMemoryError:
-                                reason = OCR_GPU_OUT_OF_MEMORY
+                            except OcrWorkerFailure as exc:
+                                reason = str(exc)
                                 break
                             except (httpx.HTTPError, OSError, ValueError) as exc:
                                 # Transport failures share the same whole-receipt policy as blank text.

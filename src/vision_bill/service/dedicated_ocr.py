@@ -20,9 +20,14 @@ from ..config import OcrSettings, Settings, runtime_restart_required
 from ..distribution.handoff import adopt_binding
 from ..model.dedicated_ocr import DedicatedOcrStatus
 from ..model.handoff import HandoffStatus, HandoffWait
+from ..model.ocr import WorkerReadiness
 from ..provider.llm.base import LLMProvider
 from ..provider.ocr.paddleocr import PaddleOcrProvider
-from .activation_admission import activation_handoff_path, unsettled_direct_calls
+from .activation_admission import (
+    activation_handoff_path,
+    failed_setup_can_disable,
+    unsettled_direct_calls,
+)
 from .gpu_handoff import ModelHandoff
 
 
@@ -79,7 +84,12 @@ class DedicatedOcrActivation:
                 response = await client.get(f"{self.ocr.service_url}/info")
                 response.raise_for_status()
                 info = response.json()
-                return isinstance(info, dict) and info.get("service_mode") == "managed"
+                if not isinstance(info, dict) or info.get("service_mode") != "managed" or info.get("contract_version") != 2:
+                    return False
+                worker = WorkerReadiness.model_validate(info.get("worker"), strict=True)
+                if worker.ready:
+                    return worker.reason_code is None and bool(worker.profile_id and worker.runtime_fingerprint)
+                return worker.reason_code == "ocr_parked"
         except (httpx.HTTPError, ValueError):
             return False
 
@@ -137,6 +147,8 @@ class DedicatedOcrActivation:
                 return DedicatedOcrStatus(state="action_required", reason=self._blocker, installed=True)
             return DedicatedOcrStatus(state="installing", installed=True)
         if current and current.phase == ActivationPhase.FAILED:
+            if not enabled and failed_setup_can_disable(current):
+                return DedicatedOcrStatus(state="disabled")
             return DedicatedOcrStatus(state="failed", reason=current.reason_code or "ocr_setup_failed")
         if request:
             return DedicatedOcrStatus(state="installing" if current else "requested")
@@ -283,10 +295,6 @@ class DedicatedOcrActivation:
             activation_status = self.store.read_status(request) if request else None
             if activation_status and activation_status.phase == ActivationPhase.READY:
                 return await self._toggle(enabled)
-            if not enabled:
-                if request:
-                    return DedicatedOcrStatus(state="action_required", reason="ocr_setup_pending")
-                return DedicatedOcrStatus(state="disabled")
         except (ActivationStateError, OSError):
             return DedicatedOcrStatus(state="action_required", reason="ocr_activation_state_invalid")
         try:
@@ -294,6 +302,26 @@ class DedicatedOcrActivation:
                 with self.store.admission(exclusive=True):
                     current = self.store.read_request()
                     phase = self.store.read_status(current) if current else None
+                    if not enabled:
+                        if current is None:
+                            return DedicatedOcrStatus(state="disabled")
+                        if phase is None or phase.phase != ActivationPhase.FAILED:
+                            return DedicatedOcrStatus(state="action_required", reason="ocr_setup_pending")
+                        if not failed_setup_can_disable(phase) or self.settings.ocr.enabled:
+                            return DedicatedOcrStatus(state="action_required", reason="native_activation_recovery_required")
+                        if not self.store.runtime_enabled(current):
+                            return DedicatedOcrStatus(state="disabled")
+                        if unsettled_direct_calls(self.store):
+                            return DedicatedOcrStatus(state="action_required", reason="llm_request_recovery_required")
+                        # Both journals must be clean, even after a topology change. The
+                        # initial native setup ended before creating a serving controller.
+                        try:
+                            await self.ocr_only_handoff.require_clean_for_maintenance(monotonic() + 2)
+                        except HandoffWait as exc:
+                            return DedicatedOcrStatus(state="action_required", reason=exc.status.reason_code)
+                        self.store.set_runtime_enabled(current, False)
+                        self.wake_receipts()
+                        return DedicatedOcrStatus(state="disabled")
                     if current and (phase is None or phase.phase != ActivationPhase.FAILED):
                         return await self.status()
                     shared_gpu = self.store.shared_gpu()

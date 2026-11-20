@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { resolve } from '$app/paths';
 	import { createQuery } from '@tanstack/svelte-query';
 	import { api, ApiError } from '$lib/api/client';
 	import { t } from '$lib/i18n';
@@ -41,7 +42,17 @@
 		'ocr_handoff_confirmation_required',
 		'ocr_runtime_unavailable',
 		'ocr_gpu_out_of_memory',
-		'ocr_download_failed'
+		'ocr_download_failed',
+		'native_model_download_failed',
+		'native_model_integrity_failed',
+		'native_device_identity_unavailable',
+		'native_package_mismatch',
+		'native_installation_write_failed',
+		'native_activation_inputs_invalid',
+		'native_qualification_failed',
+		'native_serving_startup_failed',
+		'native_activation_recovery_required',
+		'native_installation_busy'
 	]);
 	const installed = $derived(status.data?.installed ?? false);
 	const activationState = $derived(status.data?.state);
@@ -96,9 +107,22 @@
 		}
 	});
 
-	async function changeDedicatedOcr(targetSharedGpu: boolean | null = null) {
+	const canResumeDirect = $derived(
+		activationState === 'failed' &&
+			!busy &&
+			!topologyChanged &&
+			!status.isError &&
+			reason !== 'native_activation_recovery_required' &&
+			reason !== 'native_installation_busy'
+	);
+
+	async function changeDedicatedOcr(targetSharedGpu: boolean | null = null, resumeDirect = false) {
 		const previous = status.data;
-		if (!previous || !isCurrentView() || !(targetSharedGpu === null ? canToggle : canSaveTopology))
+		if (
+			!previous ||
+			!isCurrentView() ||
+			!(resumeDirect ? canResumeDirect : targetSharedGpu === null ? canToggle : canSaveTopology)
+		)
 			return;
 		submitting = true;
 		requestFailed = false;
@@ -108,7 +132,11 @@
 		try {
 			const result =
 				targetSharedGpu === null
-					? await api.requestDedicatedOcr(actor, confirmed, !selected)
+					? await api.requestDedicatedOcr(
+							actor,
+							resumeDirect ? false : confirmed,
+							resumeDirect ? false : !selected
+						)
 					: await api.setDedicatedOcrGpuTopology(actor, targetSharedGpu, confirmed);
 			if (!isCurrentView()) return;
 			await queryClient.cancelQueries({ queryKey });
@@ -238,14 +266,20 @@
 		</span>
 		{$t('settings.dedicatedOcr.title')}
 	</button>
+	{#if canResumeDirect}
+		<button
+			type="button"
+			class="rounded-lg border border-outline-variant px-4 py-2.5 text-sm font-medium"
+			onclick={() => changeDedicatedOcr(null, true)}
+		>
+			{$t('settings.dedicatedOcr.resumeDirect')}
+		</button>
+	{/if}
 	{#if needsSetupHandoff && !status.isError}
 		{@render handoffConfirmation()}
 	{/if}
 	<p class="text-sm text-on-surface-variant">{$t('settings.dedicatedOcr.prerequisites')}</p>
-	<a
-		class="text-sm underline"
-		href="https://github.com/tendstead/vision-bill/blob/main/paddleocr-service/README.md"
-		target="_blank"
-		rel="noreferrer">{$t('settings.dedicatedOcr.setupGuide')}</a
-	>
+	<a class="text-sm underline" href={resolve('/settings/ocr-guide')}>
+		{$t('settings.dedicatedOcr.setupGuide')}
+	</a>
 </section>

@@ -15,6 +15,7 @@ from uuid import UUID
 
 from ocr_contract import GpuMemorySnapshot, OcrBlock, OcrResponse
 
+from .device_inventory import execution_target, inspect_device_identity
 from .fp32 import audit_dynamic_model, fp32_predictor_class, native_pipeline_class
 from .gpu_memory import probe_gpu_memory
 from .images import normalize_source, working_image
@@ -23,14 +24,20 @@ from .profile import (
     ADAPTER_VERSION,
     MODEL_NAMES,
     NORMALIZER_VERSION,
+    InvalidReceiptOutput,
+    NativeRuntimeSettings,
     OcrProfile,
+    PreparedRuntimeSettings,
+    RuntimeIdentityMismatch,
     RuntimeSettings,
     check_accelerator,
     content_identity,
     effective_pipeline_config,
     file_digest,
     runtime_identity,
+    serving_identity,
     verify_dependencies,
+    verify_installed_versions,
 )
 
 # Official PaddleX v3.7.2 source bytes. Modifications require a new audited adapter.
@@ -48,14 +55,21 @@ PINNED_SOURCES = {
 def verify_sources(root: Path) -> None:
     for relative, expected in PINNED_SOURCES.items():
         if file_digest(root / "inference" / relative) != expected:
-            raise ValueError(f"Unsupported PaddleX source identity: {relative}")
+            raise RuntimeIdentityMismatch(f"Unsupported PaddleX source identity: {relative}")
 
 
 def tree_identity(root: Path) -> str:
-    files = sorted(path for path in root.rglob("*") if path.is_file())
-    if not files:
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("Expected a local model directory")
+    content = {}
+    for path in root.rglob("*"):
+        if path.is_symlink() or not (path.is_dir() or path.is_file()):
+            raise ValueError("Unexpected nonregular entry in model directory")
+        if path.is_file():
+            content[str(path.relative_to(root))] = file_digest(path)
+    if not content:
         raise ValueError("Model directory contains no sealed content")
-    return content_identity({str(path.relative_to(root)): file_digest(path) for path in files})
+    return content_identity(content)
 
 
 def recognized_blocks(result: Any, width: int, height: int) -> list[OcrBlock]:
@@ -99,26 +113,16 @@ def recognized_blocks(result: Any, width: int, height: int) -> list[OcrBlock]:
     return blocks
 
 
-class PipelineAdapter:
+class ReceiptPipeline:
+    """Serve real inputs using an explicitly constructed native pipeline."""
+
     def __init__(
-        self,
-        pipeline: Any,
-        profile: OcrProfile,
-        profile_id: str,
-        runtime_fingerprint: str,
-        static_audits: list[StaticAuditSession],
-        *,
-        smoke_sha256: str | None = None,
-        gpu_index: int = 0,
+        self, pipeline: Any, profile: OcrProfile, profile_id: str, runtime_fingerprint: str
     ):
         self.pipeline = pipeline
         self.profile = profile
         self.profile_id = profile_id
         self.runtime_fingerprint = runtime_fingerprint
-        self.static_audits = static_audits
-        self.smoke_sha256 = smoke_sha256
-        self.gpu_index = gpu_index
-        self.qualified = False
         self.evidence: list[dict[str, Any]] = []
 
     @property
@@ -133,13 +137,83 @@ class PipelineAdapter:
         }
 
     def _execute(self, image: Path) -> Any:
+        results = iter(self.pipeline.predict(str(image), **self.predict_kwargs))
+        result = next(results, None)
+        if result is None or next(results, None) is not None:
+            raise InvalidReceiptOutput("Native OCR requires one result per uploaded image")
+        return result
+
+    def convert_result(
+        self,
+        result: Any,
+        *,
+        request_id: UUID,
+        photo_index: int,
+        source_sha256: str,
+        transforms: list[dict[str, Any]],
+        findings: list[str],
+    ) -> OcrResponse:
+        view = working_image(result["doc_preprocessor_res"], transforms)
+        blocks = recognized_blocks(result, view.width, view.height)
+        return OcrResponse(
+            request_id=request_id,
+            photo_index=photo_index,
+            source_sha256=source_sha256,
+            text="\n".join(block.text for block in blocks),
+            blocks=blocks,
+            working_image=view,
+            profile_id=self.profile_id,
+            runtime_fingerprint=self.runtime_fingerprint,
+            telemetry={
+                "findings": findings,
+                "coordinate_space": "working",
+                **({"precision_audits": self.evidence} if self.evidence else {}),
+            },
+        )
+
+    def predict(
+        self, image: Path, *, request_id: UUID, photo_index: int, source_sha256: str
+    ) -> OcrResponse:
+        with normalize_source(image, source_sha256) as normalized:
+            result = self._execute(normalized.path)
+            try:
+                return self.convert_result(
+                    result,
+                    request_id=request_id,
+                    photo_index=photo_index,
+                    source_sha256=source_sha256,
+                    transforms=normalized.transforms,
+                    findings=normalized.findings,
+                )
+            except (AttributeError, KeyError, TypeError, ValueError, OverflowError) as exc:
+                raise InvalidReceiptOutput("Invalid OCR result") from exc
+
+
+class PipelineAdapter(ReceiptPipeline):
+    """Explicit hardware qualification with live static-model evidence."""
+
+    def __init__(
+        self,
+        pipeline: Any,
+        profile: OcrProfile,
+        profile_id: str,
+        runtime_fingerprint: str,
+        static_audits: list[StaticAuditSession],
+        *,
+        smoke_sha256: str | None = None,
+        gpu_index: int = 0,
+    ):
+        super().__init__(pipeline, profile, profile_id, runtime_fingerprint)
+        self.static_audits = static_audits
+        self.smoke_sha256 = smoke_sha256
+        self.gpu_index = gpu_index
+        self.qualified = False
+
+    def _execute(self, image: Path) -> Any:
         for session in self.static_audits:
             session.start()
         try:
-            results = iter(self.pipeline.predict(str(image), **self.predict_kwargs))
-            result = next(results)
-            if next(results, None) is not None:
-                raise ValueError("Single-image native inference returned multiple pages")
+            result = super()._execute(image)
             evidence = [session.finish() for session in self.static_audits]
             audit_dynamic_model(self.pipeline.vl_rec_model.infer, self.gpu_index)
             self.evidence = evidence
@@ -174,53 +248,19 @@ class PipelineAdapter:
         self.qualified = True
         return list(self.evidence)
 
-    def convert_result(
-        self,
-        result: Any,
-        *,
-        request_id: UUID,
-        photo_index: int,
-        source_sha256: str,
-        transforms: list[dict[str, Any]],
-        findings: list[str],
-    ) -> OcrResponse:
-        view = working_image(result["doc_preprocessor_res"], transforms)
-        blocks = recognized_blocks(result, view.width, view.height)
-        return OcrResponse(
-            request_id=request_id,
-            photo_index=photo_index,
-            source_sha256=source_sha256,
-            text="\n".join(block.text for block in blocks),
-            blocks=blocks,
-            working_image=view,
-            profile_id=self.profile_id,
-            runtime_fingerprint=self.runtime_fingerprint,
-            telemetry={
-                "findings": findings,
-                "coordinate_space": "working",
-                "precision_audits": self.evidence,
-            },
-        )
-
     def predict(
         self, image: Path, *, request_id: UUID, photo_index: int, source_sha256: str
     ) -> OcrResponse:
         if not self.qualified:
             raise ValueError("Native pipeline has not been qualified")
-        with normalize_source(image, source_sha256) as normalized:
-            return self.convert_result(
-                self._execute(normalized.path),
-                request_id=request_id,
-                photo_index=photo_index,
-                source_sha256=source_sha256,
-                transforms=normalized.transforms,
-                findings=normalized.findings,
-            )
+        return super().predict(
+            image, request_id=request_id, photo_index=photo_index, source_sha256=source_sha256
+        )
 
 
 def construct_native(
     profile: OcrProfile,
-    runtime: RuntimeSettings,
+    runtime: NativeRuntimeSettings,
     *,
     record_preload: Callable[[GpuMemorySnapshot], None] | None = None,
 ) -> tuple[Any, Any, type[Any]]:
@@ -251,16 +291,16 @@ def construct_native(
 
     verify_sources(Path(str(paddlex.__file__)).parent)
     if str(paddle.version.commit) != runtime.expected_paddle_commit:
-        raise ValueError("Paddle source commit mismatch")
+        raise RuntimeIdentityMismatch("Paddle source commit mismatch")
     check_accelerator(paddle, runtime.accelerator, runtime.gpu_index)
     if str(inspect.signature(DocVLMLocalPredictor._build)) != "(self, **kwargs)":
-        raise ValueError("Unsupported native predictor _build signature")
+        raise RuntimeIdentityMismatch("Unsupported native predictor _build signature")
     signature = inspect.signature(BasePipeline.create_model)
     if (
         list(signature.parameters) != ["self", "config", "kwargs"]
         or signature.parameters["kwargs"].kind != inspect.Parameter.VAR_KEYWORD
     ):
-        raise ValueError("Unsupported native pipeline create_model signature")
+        raise RuntimeIdentityMismatch("Unsupported native pipeline create_model signature")
     config = effective_pipeline_config(profile)
     static_config = {
         "run_mode": "paddle_fp32",
@@ -300,10 +340,9 @@ def construct_native(
     return native, paddle, PaddleStaticRunner
 
 
-def build_pipeline(
-    profile: OcrProfile,
+def verified_qualification_manifest(
     runtime: RuntimeSettings,
-) -> PipelineAdapter:
+) -> tuple[dict[str, Any], dict[str, StaticArtifact], dict[str, str], dict[str, str]]:
     if any(name == "paddlex" or name.startswith("paddlex.") for name in sys.modules):
         raise ValueError("Build native pipeline in a fresh worker before importing PaddleX")
     manifest = json.loads(runtime.qualification_manifest.read_text())
@@ -327,13 +366,68 @@ def build_pipeline(
     model_content = {name: tree_identity(path) for name, path in runtime.model_dirs.items()}
     if model_content != manifest["model_content"]:
         raise ValueError("Native model content identity mismatch")
-    from .qualify import device_identity
-
+    if os.environ.get("HSA_OVERRIDE_GFX_VERSION"):
+        raise ValueError("Architecture spoofing is forbidden")
     paddle = importlib.import_module("paddle")
     check_accelerator(paddle, runtime.accelerator, runtime.gpu_index)
-    actual_target = device_identity(paddle, runtime, compute=False)
+    device = inspect_device_identity(runtime.accelerator, runtime.gpu_index)
+    actual_target = execution_target(paddle, device, runtime.accelerator)
     if not manifest.get("qualified_target") or actual_target != manifest["qualified_target"]:
         raise ValueError("Native qualified target identity mismatch; requalification required")
+    return manifest, artifacts, versions, dependency_content
+
+
+def build_serving_pipeline(
+    profile: OcrProfile,
+    runtime: PreparedRuntimeSettings | RuntimeSettings,
+) -> ReceiptPipeline:
+    """Verify the selected runtime, then load local models without running a sample."""
+    try:
+        if isinstance(runtime, PreparedRuntimeSettings):
+            verify_installed_versions(runtime.expected_packages, accelerator=runtime.accelerator)
+            model_content = {name: tree_identity(path) for name, path in runtime.model_dirs.items()}
+            if model_content != runtime.model_content:
+                raise ValueError("Prepared model content changed")
+            paddle = importlib.import_module("paddle")
+            check_accelerator(paddle, runtime.accelerator, runtime.gpu_index)
+            device = inspect_device_identity(runtime.accelerator, runtime.gpu_index)
+            execution_target(paddle, device, runtime.accelerator)
+            if device != runtime.device_identity:
+                raise ValueError("Prepared device identity changed")
+        else:
+            manifest, _, _, _ = verified_qualification_manifest(runtime)
+            model_content = manifest["model_content"]
+            device = manifest["qualified_target"]
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise RuntimeIdentityMismatch("Native runtime identity mismatch") from exc
+
+    native, _, runner_type = construct_native(profile, runtime)
+    preprocessor = native.doc_preprocessor_pipeline
+    models = (
+        native.layout_det_model,
+        preprocessor.doc_ori_classify_model,
+        preprocessor.doc_unwarping_model,
+    )
+    for name, model in zip(MODEL_NAMES[:3], models, strict=True):
+        runner = model.runner
+        if (
+            not isinstance(runner, runner_type)
+            or runner._model_name != name
+            or Path(runner.model_dir).resolve() != runtime.model_dirs[name].resolve()
+            or runner._config.get("run_mode") != "paddle_fp32"
+            or runner._config.get("device_type") != "gpu"
+            or runner._config.get("device_id") != runtime.gpu_index
+            or runner._config.get("enable_cinn") is not False
+        ):
+            raise RuntimeIdentityMismatch("Unexpected native static runner settings")
+    identity = serving_identity(profile, runtime, model_content, device)
+    return ReceiptPipeline(native, profile, identity["profile_id"], identity["runtime_fingerprint"])
+
+
+def build_pipeline(profile: OcrProfile, runtime: RuntimeSettings) -> PipelineAdapter:
+    manifest, artifacts, versions, dependency_content = verified_qualification_manifest(runtime)
+    inspector = f"paddle:{runtime.expected_paddle_commit}"
+    model_content = manifest["model_content"]
     native, paddle, PaddleStaticRunner = construct_native(profile, runtime)
     preprocessor = native.doc_preprocessor_pipeline
     models = (

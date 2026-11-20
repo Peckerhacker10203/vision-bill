@@ -16,6 +16,8 @@ services:
     build:
       context: ./paddleocr-service
       dockerfile: Dockerfile.cuda
+      additional_contexts:
+        cuda-wheel: "${OCR_CUDA_WHEEL_CONTEXT:-./paddleocr-service/empty-wheel-context}"
       args:
         OCR_CUDA_CHANNEL: "${OCR_CUDA_CHANNEL:-cu129}"
     image: vision-bill-ocr-cuda:${OCR_IMAGE_TAG:-candidate}

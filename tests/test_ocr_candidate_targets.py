@@ -77,8 +77,9 @@ def test_executable_candidate_interface_reaches_both_compilers(tmp_path, monkeyp
     assert 'ARG AMDGPU_TARGETS' in docker and 'AMDGPU_TARGETS="$AMDGPU_TARGETS"' in docker
     assert '--target-profile /opt/ocr/build-evidence/targets.json' in docker
     script = (SERVICE / 'build/build_rocm.sh').read_text()
-    assert '"-DTHEROCK_AMDGPU_TARGETS=$TARGETS"' in script
-    assert '"-DTHEROCK_DIST_AMDGPU_TARGETS=$TARGETS"' in script
+    sdk = (SERVICE / 'build/build_therock.sh').read_text()
+    assert '"-DTHEROCK_AMDGPU_TARGETS=$TARGETS"' in sdk
+    assert '"-DTHEROCK_DIST_AMDGPU_TARGETS=$TARGETS"' in sdk
     assert 'export VISION_BILL_AMDGPU_TARGETS="$TARGETS"' in script
     patch = (SERVICE / 'build/hip-rdna2-v1.patch').read_text()
     added = '\n'.join(line[1:] for line in patch.splitlines() if line.startswith('+') and not line.startswith('+++'))

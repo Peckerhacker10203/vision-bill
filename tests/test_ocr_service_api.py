@@ -266,13 +266,48 @@ def test_explicit_runtime_startup_inputs_are_consumed(tmp_path, monkeypatch):
     settings = tmp_path / "runtime.json"
     settings.write_text(runtime.model_dump_json())
     monkeypatch.setenv("OCR_RUNTIME_SETTINGS_PATH", str(settings))
-    monkeypatch.setenv("OCR_QUALIFICATION_IMAGE_PATH", str(tmp_path / "smoke.png"))
+    monkeypatch.delenv("OCR_QUALIFICATION_IMAGE_PATH", raising=False)
     monkeypatch.setenv("OCR_STARTUP_TIMEOUT_SECONDS", "17")
     worker = configured_worker()
     assert worker._runtime == runtime
     assert worker._startup_timeout == 17
-    assert worker._smoke_path == tmp_path / "smoke.png"
     worker.stop()
+
+
+def test_prepared_worker_reports_parked_identity_without_loading(tmp_path, monkeypatch):
+    import json
+
+    from ocr_service.api import configured_worker, create_app
+    from ocr_service.profile import MODEL_NAMES, PreparedRuntimeSettings
+    from pydantic import ValidationError
+
+    runtime = {
+        "schema_version": 2,
+        "accelerator": "cuda",
+        "gpu_index": 0,
+        "cache_dir": str(tmp_path / "cache"),
+        "model_dirs": {name: str(tmp_path / name) for name in MODEL_NAMES},
+        "model_content": {name: "a" * 64 for name in MODEL_NAMES},
+        "device_identity": {"accelerator": "cuda", "gpu_index": 0, "uuid": "1" * 32},
+        "expected_packages": {"paddleocr": "3.7.0"},
+        "expected_paddle_commit": "a" * 40,
+        "image_identity": "sha256:" + "b" * 64,
+    }
+    settings = tmp_path / "runtime.json"
+    settings.write_text(json.dumps(runtime))
+    monkeypatch.setenv("OCR_RUNTIME_SETTINGS_PATH", str(settings))
+    monkeypatch.delenv("OCR_QUALIFICATION_IMAGE_PATH", raising=False)
+    worker = configured_worker()
+    with TestClient(create_app(worker_factory=lambda: worker)) as client:
+        for _ in range(2):
+            assert client.get("/ready").json()["reason_code"] == "ocr_parked"
+            identity = client.get("/info").json()["runtime_identity"]
+            assert len(identity["profile_id"]) == len(identity["runtime_fingerprint"]) == 64
+        assert worker._proc is None
+
+    runtime["model_content"].pop("UVDoc")
+    with pytest.raises(ValidationError):
+        PreparedRuntimeSettings.model_validate(runtime)
 
 
 @pytest.mark.parametrize(

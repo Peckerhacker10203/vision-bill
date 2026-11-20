@@ -24,16 +24,18 @@ from ..model.extraction import (
     pack_inference_metadata,
 )
 from ..model.handoff import HandoffStatus, HandoffWait
-from ..model.ocr_errors import OCR_GPU_OUT_OF_MEMORY, OcrGpuOutOfMemoryError
+from ..model.ocr_errors import OcrWorkerFailure, raise_for_worker_reason
 from ..model.receipt import Receipt
 from .activation_admission import inference_admission
-from .execution_policy import EXECUTION_POLICY_VERSION
 from .extraction_pipeline import ExtractionPipeline as ReceiptExtractionPipeline
 from .gpu_handoff import admission_deadline
 from .observation_admission import admit_observations
 
 if TYPE_CHECKING:
     from .receipt_service import ReceiptService
+
+# Benchmark manifests bind their provider endpoint separately from upload snapshots.
+BENCHMARK_EXECUTION_POLICY_VERSION = 3
 
 
 @dataclass
@@ -169,7 +171,7 @@ async def execute_submission(
             raise
         metadata.setdefault("calls", provider.experiment_trace or [])
         metadata["elapsed_ms"] = (perf_counter() - started) * 1000
-        code = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+        code = str(exc) if isinstance(exc, (OcrWorkerFailure, ValueError)) else type(exc).__name__
         failure = PostObservationFailure if observations_recorded else ExperimentFailure
         raise failure(code, metadata) from exc
     metadata["llm_ms"] = sum(call.get("elapsed_ms", 0) for call in metadata["calls"])
@@ -232,8 +234,8 @@ async def pipeline_identity(
                 ) as owner:
                     await owner.ocr_phase()
                     qualified = await ocr.get_capabilities()
-                    if not qualified.ready and qualified.reason_code == OCR_GPU_OUT_OF_MEMORY:
-                        raise OcrGpuOutOfMemoryError
+                    if not qualified.ready:
+                        raise_for_worker_reason(qualified.reason_code)
                     if not qualified.ready or not qualified.runtime_fingerprint:
                         raise ValueError("ocr_qualification_required")
                     capabilities = qualified.model_dump(mode="json")
@@ -245,7 +247,7 @@ async def pipeline_identity(
                     "profile_id", "runtime_fingerprint", "ocr_max_new_tokens"
                 )}
     return {
-        "execution_policy_version": EXECUTION_POLICY_VERSION,
+        "execution_policy_version": BENCHMARK_EXECUTION_POLICY_VERSION,
         "managed_binding_sha256": binding_sha256,
         "version": 1,
         "normalizer_version": NORMALIZER_VERSION,

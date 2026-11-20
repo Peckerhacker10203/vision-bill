@@ -1,4 +1,4 @@
-"""Keep inference and opt-in native OCR qualification mutually exclusive."""
+"""Coordinate inference with native OCR installation and routing changes."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from ocr_contract.activation import (
     ActivationPhase,
     ActivationRequest,
     ActivationStateError,
+    ActivationStatus,
     ActivationStore,
 )
 
@@ -38,6 +39,7 @@ class _Admission:
     shared_gpu: bool | None
     task: asyncio.Task[Any] | None
     thread: int
+    direct_only: bool
 
 
 _current: ContextVar[_Admission | None] = ContextVar("ocr_activation_admission", default=None)
@@ -65,16 +67,40 @@ def _current_admission() -> _Admission | None:
     return None
 
 
-def _require_current_route(store: ActivationStore, request: ActivationRequest, ocr: OcrSettings) -> bool:
+def failed_setup_can_disable(status: ActivationStatus | None) -> bool:
+    """Only initial setup failures with confirmed native cleanup permit direct recovery."""
+    return (
+        status is not None
+        and status.phase == ActivationPhase.FAILED
+        and status.reason_code
+        in {
+            "native_model_download_failed",
+            "native_model_integrity_failed",
+            "native_device_identity_unavailable",
+            "native_package_mismatch",
+            "native_installation_write_failed",
+            "native_activation_inputs_invalid",
+            "native_qualification_failed",
+            "ocr_gpu_out_of_memory",
+            "native_serving_startup_failed",
+        }
+    )
+
+
+def _require_current_route(
+    store: ActivationStore, request: ActivationRequest, ocr: OcrSettings
+) -> bool:
     shared_gpu = store.shared_gpu()
     if store.runtime_enabled(request) != ocr.enabled or shared_gpu != ocr.shared_gpu:
-        raise HandoffWait(HandoffStatus(state="configuration_required", reason_code="execution_policy_changed"))
+        raise HandoffWait(
+            HandoffStatus(state="configuration_required", reason_code="execution_policy_changed")
+        )
     return shared_gpu
 
 
 @contextmanager
 def policy_capture(ocr: OcrSettings) -> Iterator[None]:
-    """Capture a live policy without waiting for initial native qualification."""
+    """Capture the current routing decision while initial OCR setup may be pending."""
     if not activation_enabled():
         yield
         return
@@ -101,10 +127,15 @@ def policy_capture(ocr: OcrSettings) -> Iterator[None]:
 
 def _require_provider(
     provider: LLMProvider | None, shared_gpu: bool | None, *,
-    candidate: ModelHandoff | None, uses_ocr: bool,
+    candidate: ModelHandoff | None, uses_ocr: bool, direct_only: bool,
 ) -> None:
     from ..config import settings
 
+    if direct_only and (
+        uses_ocr or candidate is not None or settings.ocr.enabled
+        or (provider is not None and provider.handoff is not None)
+    ):
+        raise HandoffWait(HandoffStatus(state="configuration_required", reason_code="execution_policy_changed"))
     if uses_ocr and not settings.ocr.enabled:
         raise HandoffWait(HandoffStatus(state="configuration_required", reason_code="dedicated_ocr_disabled"))
     if shared_gpu is None or (provider is None and not uses_ocr and candidate is None):
@@ -145,7 +176,7 @@ def inference_admission(
         return
     admitted = _current_admission()
     if admitted is not None and (store is None or store == admitted.store):
-        _require_provider(provider, admitted.shared_gpu, candidate=handoff, uses_ocr=uses_ocr)
+        _require_provider(provider, admitted.shared_gpu, candidate=handoff, uses_ocr=uses_ocr, direct_only=admitted.direct_only)
         yield
         return
 
@@ -156,6 +187,7 @@ def inference_admission(
             lock.enter_context(selected.admission(exclusive=False, blocking=False))
             request = selected.read_request()
             status = selected.read_status(request) if request is not None else None
+            direct_only = request is not None and failed_setup_can_disable(status) and not selected.runtime_enabled(request)
             if request is not None and status is not None and status.phase == ActivationPhase.READY:
                 from ..config import settings
                 shared_gpu = _require_current_route(selected, request, settings.ocr)
@@ -165,11 +197,11 @@ def inference_admission(
             raise HandoffWait(HandoffStatus(
                 state="configuration_required", reason_code="dedicated_ocr_activation_state_invalid",
             )) from None
-        if request is not None and (status is None or status.phase != ActivationPhase.READY):
+        if request is not None and not direct_only and (status is None or status.phase != ActivationPhase.READY):
             raise HandoffWait(HandoffStatus(state="busy", reason_code="dedicated_ocr_activation_pending"))
 
-        _require_provider(provider, shared_gpu, candidate=handoff, uses_ocr=uses_ocr)
-        token = _current.set(_Admission(selected, shared_gpu, _task(), get_ident()))
+        _require_provider(provider, shared_gpu, candidate=handoff, uses_ocr=uses_ocr, direct_only=direct_only)
+        token = _current.set(_Admission(selected, shared_gpu, _task(), get_ident(), direct_only))
         try:
             yield
         finally:

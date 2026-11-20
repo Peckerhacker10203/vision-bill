@@ -79,6 +79,7 @@ async def test_submission_checkpoints_all_views_before_text_labels(
         receipts._ocr_provider = sidecar()
     receipts.list_tags = AsyncMock(return_value=[])
     service.receipts = receipts
+    claim.image.effective_options["inference_identity"] = receipts.inference_identity
     events = []
 
     async def save(claim_arg, checkpoint, *, deadline=None):

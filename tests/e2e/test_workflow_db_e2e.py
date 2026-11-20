@@ -29,6 +29,8 @@ from vision_bill.model.workflow import AccessScope, AttemptOutcome, RetryRequest
 pytestmark = pytest.mark.e2e
 ROOT = Path(__file__).resolve().parents[2]
 
+ENDPOINT = "ollama:" + "d" * 64
+
 
 @pytest.fixture(scope="module")
 def postgres():
@@ -339,7 +341,7 @@ async def test_policy_hold_and_adoption_fence_snapshot_history_and_replay(workfl
     from vision_bill.service.execution_policy import current_snapshot
 
     w, scope = workflow_db
-    old = current_snapshot(settings)
+    old = current_snapshot(settings, inference_identity=ENDPOINT)
     create = submission().model_copy(update={"effective_options": old, "requested_options": requested, "model_id": "old-resolved"})
     image = (await w.enqueue_submission(create, scope=scope, idempotency_key="upload")).submission
     # A previous real attempt must remain counted; a policy race only returns its own reservation.
@@ -353,7 +355,7 @@ async def test_policy_hold_and_adoption_fence_snapshot_history_and_replay(workfl
     assert (await w.finish_attempt(claim, complete())).stale
     assert (await w.hold_claim_for_policy(claim, "execution_policy_changed")).stale
     settings.ocr = OcrSettings(enabled=True)
-    replacement = current_snapshot(settings)
+    replacement = current_snapshot(settings, inference_identity=ENDPOINT)
     request = RetryRequest(expected_generation=1, request_key="adopt", policy="current")
     adopted = await w.retry_submission(image.id, request, scope=scope, replacement_snapshot=replacement)
     assert adopted.generation == 2 and adopted.attempt_count == 0
@@ -377,10 +379,10 @@ async def test_policy_hold_and_adoption_fence_snapshot_history_and_replay(workfl
     assert (await w.enqueue_submission(create, scope=scope, idempotency_key="upload")).submission.generation == 2
     # Selection binding is one-time and cannot replace the adopted frozen formatter policy.
     next_claim = await w.claim_next()
-    bound = await w.ensure_execution_snapshot(next_claim, model_id="current-default", effective_options={})
+    bound = await w.ensure_execution_snapshot(next_claim, model_id="current-default", effective_options=replacement)
     assert bound.model_id == requested.get("model_id", "current-default")
     assert bound.effective_options == replacement
-    rebound = await w.ensure_execution_snapshot(next_claim, model_id="later-default", effective_options={})
+    rebound = await w.ensure_execution_snapshot(next_claim, model_id="later-default", effective_options=replacement)
     assert rebound == bound
 
 
@@ -403,11 +405,11 @@ async def test_current_policy_cannot_replace_live_or_completed_work(workflow_db,
     image = await enqueue(w, scope)
     request = RetryRequest(expected_generation=1, request_key="adopt", policy="current")
     with pytest.raises(ValueError, match="retryable"):
-        await w.retry_submission(image.id, request, scope=scope, replacement_snapshot=current_snapshot(settings))
+        await w.retry_submission(image.id, request, scope=scope, replacement_snapshot=current_snapshot(settings, inference_identity=ENDPOINT))
     claim = await w.claim_next()
     await w.finish_attempt(claim, complete())
     with pytest.raises(ValueError, match="receipt"):
-        await w.retry_submission(image.id, request, scope=scope, replacement_snapshot=current_snapshot(settings))
+        await w.retry_submission(image.id, request, scope=scope, replacement_snapshot=current_snapshot(settings, inference_identity=ENDPOINT))
 
 
 async def test_expired_processing_policy_hold_can_adopt_but_live_claim_cannot(workflow_db, settings):
@@ -418,10 +420,10 @@ async def test_expired_processing_policy_hold_can_adopt_but_live_claim_cannot(wo
     assert await w.set_wait_reason(claim.image, "execution_policy_changed")
     request = RetryRequest(expected_generation=1, request_key="adopt-expired", policy="current")
     with pytest.raises(ValueError, match="retryable"):
-        await w.retry_submission(image.id, request, scope=scope, replacement_snapshot=current_snapshot(settings))
+        await w.retry_submission(image.id, request, scope=scope, replacement_snapshot=current_snapshot(settings, inference_identity=ENDPOINT))
     async with w.pool.acquire() as conn:
         await conn.execute("UPDATE images SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", image.id)
-    adopted = await w.retry_submission(image.id, request, scope=scope, replacement_snapshot=current_snapshot(settings))
+    adopted = await w.retry_submission(image.id, request, scope=scope, replacement_snapshot=current_snapshot(settings, inference_identity=ENDPOINT))
     assert adopted.generation == 2 and adopted.status == "pending" and adopted.attempt_count == 0
     assert (await w.finish_attempt(claim, complete())).stale
     async with w.pool.acquire() as conn:
@@ -441,7 +443,7 @@ async def test_policy_adoption_rechecks_extended_lease_under_row_lock(workflow_d
             await conn.fetchrow("SELECT id FROM images WHERE id=$1 FOR UPDATE", image.id)
             attempt = asyncio.create_task(w.retry_submission(
                 image.id, RetryRequest(expected_generation=1, request_key="race", policy="current"),
-                scope=scope, replacement_snapshot=current_snapshot(settings),
+                scope=scope, replacement_snapshot=current_snapshot(settings, inference_identity=ENDPOINT),
             ))
             # Observe the exact blocker from a separate session without a cached activity snapshot.
             for _ in range(100):
@@ -677,7 +679,7 @@ async def test_partial_draft_human_edits_and_receipt_link_are_preserved(workflow
     with pytest.raises(ValueError, match="edited draft"):
         await w.retry_submission(
             image.id, RetryRequest(expected_generation=1, request_key="human", policy=policy), scope=scope,
-            replacement_snapshot=current_snapshot(settings) if policy == "current" else None,
+            replacement_snapshot=current_snapshot(settings, inference_identity=ENDPOINT) if policy == "current" else None,
         )
     async with w.pool.acquire() as conn:
         assert (

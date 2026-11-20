@@ -577,3 +577,22 @@ it.each([
 	await fireEvent.input(screen.getByLabelText(label), { target: { value } });
 	expect((screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement).disabled).toBe(true);
 });
+
+it('submits the exact entered quantity and rate', async () => {
+	const onSave = vi.fn();
+	const { container } = render(ReceiptEditor, {
+		receipt,
+		lineItems: [line()],
+		taxes: [{ id: 'vat', receipt_id: receipt.id, name: 'VAT', rate: null, amount: '0' }],
+		onSave
+	});
+	await fireEvent.input(screen.getByLabelText('Qty'), { target: { value: '1.00000000000000001' } });
+	await fireEvent.input(container.querySelector('#tax-0-rate')!, {
+		target: { value: '0.20000000000000001' }
+	});
+	await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+	expect(onSave.mock.calls[0][0]).toMatchObject({
+		line_items: [expect.objectContaining({ quantity: '1.00000000000000001' })],
+		taxes: [expect.objectContaining({ rate: '0.20000000000000001' })]
+	});
+});

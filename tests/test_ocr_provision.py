@@ -369,3 +369,122 @@ def test_existing_model_directory_symlink_is_rejected(tmp_path, release):
     model.symlink_to(moved, target_is_directory=True)
     with pytest.raises(ValueError):
         provision_bundle(bundle, state)
+
+
+def test_prepared_installation_reuses_legacy_model_trees_when_archives_were_removed(
+    tmp_path, release
+):
+    from ocr_service.provision import provision_bundle, provision_models
+
+    bundle = load(release)
+    state = tmp_path / "state"
+    legacy = provision_bundle(bundle, state)
+    for asset in bundle.models.values():
+        (state / "archives" / asset.sha256).unlink()
+        Path(asset.source).unlink()
+
+    models = provision_models(bundle, state)
+    for name in NAMES:
+        assert (models[name] / "weights").read_bytes() == (
+            legacy.model_dirs[name] / "weights"
+        ).read_bytes()
+    assert models == provision_models(bundle, state)
+
+
+def test_prepared_retry_resumes_from_already_published_models(tmp_path, release):
+    from ocr_service.provision import model_paths, provision_models
+
+    bundle = load(release)
+    state = tmp_path / "state"
+    last = Path(bundle.models[NAMES[-1]].source)
+    data = last.read_bytes()
+    last.unlink()
+    with pytest.raises(FileNotFoundError):
+        provision_models(bundle, state)
+    paths = model_paths(bundle, state)
+    first = paths[NAMES[0]] / "weights"
+    inode = first.stat().st_ino
+    assert not paths[NAMES[-1]].exists()
+    Path(bundle.models[NAMES[0]].source).unlink()
+    last.write_bytes(data)
+    assert provision_models(bundle, state) == paths
+    assert first.stat().st_ino == inode
+
+
+@pytest.mark.parametrize("bad_download", [True, False])
+def test_only_explicit_repair_replaces_corrupt_owned_model_and_archive(
+    tmp_path, release, bad_download
+):
+    from ocr_service.provision import provision_models
+
+    bundle = load(release)
+    state = tmp_path / "state"
+    models = provision_models(bundle, state)
+    model, healthy = NAMES[:2]
+    content = models[model] / "weights"
+    content.write_bytes(b"bad model")
+    archive = state / "archives" / bundle.models[model].sha256
+    archive.write_bytes(b"bad archive")
+    original = Path(bundle.models[model].source)
+    if bad_download:
+        original.write_bytes(b"bad download")
+    source_bytes = original.read_bytes()
+    healthy_inode = (models[healthy] / "weights").stat().st_ino
+    with pytest.raises(ValueError):
+        provision_models(bundle, state)
+    if bad_download:
+        with pytest.raises(ValueError):
+            provision_models(bundle, state, repair=True)
+        assert content.read_bytes() == b"bad model"
+        assert archive.read_bytes() == b"bad archive"
+    else:
+        assert provision_models(bundle, state, repair=True) == models
+        assert content.read_bytes() == model.encode()
+        assert archive.read_bytes() == source_bytes
+    assert original.read_bytes() == source_bytes
+    assert (models[healthy] / "weights").stat().st_ino == healthy_inode
+
+
+@pytest.mark.parametrize("unsafe", ["archive_symlink", "model_symlink", "extra_file", "mount"])
+def test_explicit_repair_leaves_unsafe_cache_and_foreign_file_untouched(
+    tmp_path, release, unsafe, monkeypatch
+):
+    from ocr_service.provision import provision_models
+
+    bundle = load(release)
+    state = tmp_path / "state"
+    name = NAMES[0]
+    model = provision_models(bundle, state)[name]
+    owner_file = tmp_path / "outside"
+    owner_file.write_bytes(b"private")
+    (model / "weights").write_bytes(b"damaged")
+    if unsafe == "archive_symlink":
+        entry = state / "archives" / bundle.models[name].sha256
+        entry.unlink()
+        entry.symlink_to(owner_file)
+    elif unsafe == "model_symlink":
+        entry = model / "LICENSE"
+        entry.unlink()
+        entry.symlink_to(owner_file)
+    elif unsafe == "mount":
+        entry = model / "weights"
+        entry.write_bytes(b"private")
+        # Same-device bind mounts are not identified by Path.is_mount().
+        read_bytes = Path.read_bytes
+        monkeypatch.setattr(
+            Path,
+            "read_bytes",
+            lambda self: (
+                f"1 2 0:50 /external {entry} rw - ext4 /dev/test rw".encode()
+                if self == Path("/proc/self/mountinfo")
+                else read_bytes(self)
+            ),
+        )
+    else:
+        entry = model / "unexpected"
+        entry.write_bytes(b"private")
+    with pytest.raises(ValueError):
+        provision_models(bundle, state, repair=True)
+    assert entry.read_bytes() == owner_file.read_bytes() == b"private"
+    if unsafe != "mount":
+        assert (model / "weights").read_bytes() == b"damaged"

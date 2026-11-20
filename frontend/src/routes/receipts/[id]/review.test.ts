@@ -120,6 +120,7 @@ it('does not verify new material findings using pre-save comments', async () => 
 	};
 	vi.spyOn(api, 'updateReceipt').mockResolvedValue(saved);
 	vi.spyOn(api, 'getReceipt').mockResolvedValueOnce(detail()).mockResolvedValue(detail(saved));
+	vi.spyOn(api, 'previewHumanReview').mockResolvedValue(saved);
 	const verify = vi.spyOn(api, 'verifyReceipt');
 	render(Page);
 	await screen.findByLabelText('Merchant');
@@ -135,6 +136,7 @@ it('uses successful PUT versions for verification and keeps save successful if v
 	const saved = { ...row, merchant_name: 'Saved', operation_revision: 8, review_revision: 4 };
 	vi.spyOn(api, 'updateReceipt').mockResolvedValue(saved);
 	vi.spyOn(api, 'getReceipt').mockResolvedValueOnce(detail()).mockResolvedValue(detail(saved));
+	vi.spyOn(api, 'previewHumanReview').mockResolvedValue(saved);
 	const verify = vi
 		.spyOn(api, 'verifyReceipt')
 		.mockRejectedValue(new ApiError(422, 'missing original'));
@@ -154,25 +156,31 @@ it('uses successful PUT versions for verification and keeps save successful if v
 });
 
 it('has no acknowledgement control for missing originals and disables verification', async () => {
-	vi.mocked(api.getReceipt).mockResolvedValue(
-		detail({
-			...row,
-			findings: [
-				{
-					id: 'missing',
-					code: 'missing_original',
-					severity: 'integrity',
-					field_path: 'originals',
-					source_refs: [],
-					comparison: {}
-				}
-			]
-		})
-	);
+	const missing = detail({
+		...row,
+		findings: [
+			{
+				id: 'missing',
+				code: 'missing_original',
+				severity: 'integrity',
+				field_path: 'originals',
+				source_refs: [],
+				comparison: {}
+			}
+		]
+	});
+	vi.mocked(api.getReceipt).mockResolvedValue(missing);
+	vi.spyOn(api, 'previewHumanReview').mockResolvedValue({
+		...previewResponse,
+		findings: missing.receipt.findings
+	});
 	render(Page);
 	await screen.findByText(/Verification blocked: The original photo is missing/);
 	expect(screen.queryByRole('textbox', { name: /Review comment/ })).toBeNull();
-	expect((screen.getByRole('button', { name: 'Verify' }) as HTMLButtonElement).disabled).toBe(true);
+	await fireEvent.click(screen.getByRole('button', { name: 'Verify' }));
+	const dialog = within(await screen.findByRole('dialog'));
+	expect(dialog.queryByRole('textbox')).toBeNull();
+	expect((dialog.getByRole('button', { name: 'Verify' }) as HTMLButtonElement).disabled).toBe(true);
 });
 it('displays server revocation after editing a verified receipt', async () => {
 	vi.mocked(api.getReceipt)
@@ -229,6 +237,7 @@ it('resets busy state and ignores a late PUT across receipt navigation', async (
 });
 it('resets a pending verify and its dialog across receipt navigation', async () => {
 	const pending = deferred<ReceiptRow>();
+	vi.spyOn(api, 'previewHumanReview').mockResolvedValue(previewResponse);
 	vi.spyOn(api, 'verifyReceipt').mockReturnValue(pending.promise);
 	vi.mocked(api.getReceipt).mockImplementation(async (id) =>
 		detail(id === second.id ? second : row)
@@ -705,3 +714,70 @@ it('opens unknown evidence requests from receipt source decisions', async () => 
 	expect(screen.queryByRole('img', { name: 'Source view' })).toBeNull();
 	expect(screen.getByText('Source mapping unknown')).toBeTruthy();
 });
+
+it.each([
+	{ action: 'Verify', version: null },
+	{ action: 'Save & verify', version: null },
+	{ action: 'Verify', version: '2' },
+	{ action: 'Save & verify', version: '2' }
+])(
+	'previews current findings for checks version $version on $action',
+	async ({ action, version }) => {
+		const migrated = {
+			...row,
+			checks_version: version,
+			findings: version
+				? [
+						{
+							id: 'obsolete',
+							code: 'unknown_subtotal_origin',
+							severity: 'review' as const,
+							field_path: 'amount_policy.subtotal_origin',
+							source_refs: [],
+							comparison: {}
+						}
+					]
+				: []
+		};
+		const displayed = { ...migrated, operation_revision: action === 'Verify' ? 7 : 8 };
+		vi.mocked(api.getReceipt)
+			.mockResolvedValueOnce(detail(migrated))
+			.mockResolvedValue(detail(displayed));
+		vi.spyOn(api, 'updateReceipt').mockResolvedValue(displayed);
+		vi.spyOn(api, 'previewHumanReview').mockResolvedValue({
+			...previewResponse,
+			operation_revision: displayed.operation_revision,
+			findings: [
+				{
+					id: 'live',
+					code: 'unknown_tax_basis',
+					severity: 'review',
+					field_path: 'amount_policy.tax_basis',
+					source_refs: [],
+					comparison: {}
+				}
+			]
+		});
+		const verify = vi.spyOn(api, 'verifyReceipt').mockResolvedValue({ ...row, verified: true });
+		render(Page);
+		await screen.findByLabelText('Merchant');
+		if (action === 'Save & verify') {
+			await fireEvent.input(screen.getByLabelText('Merchant'), { target: { value: 'Edited' } });
+		}
+		await fireEvent.click(screen.getByRole('button', { name: action }));
+		const dialog = await screen.findByRole('dialog');
+		const confirm = within(dialog).getByRole('button', { name: 'Verify' }) as HTMLButtonElement;
+		expect(confirm.disabled).toBe(true);
+		await fireEvent.input(within(dialog).getByRole('textbox'), {
+			target: { value: 'Checked receipt' }
+		});
+		await fireEvent.click(confirm);
+		await waitFor(() =>
+			expect(verify).toHaveBeenCalledWith(row.id, {
+				expected_operation_revision: displayed.operation_revision,
+				expected_review_revision: 3,
+				acknowledgements: [{ finding_id: 'live', comment: 'Checked receipt' }]
+			})
+		);
+	}
+);

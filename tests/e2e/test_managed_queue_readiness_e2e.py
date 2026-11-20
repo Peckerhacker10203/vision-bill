@@ -133,8 +133,7 @@ def frozen(settings, handoff):
         json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     return {
-        **current_snapshot(settings),
-        "execution_policy_version": 3,
+        **current_snapshot(settings, inference_identity=handoff.provider.inference_identity),
         "managed_binding_sha256": digest,
     }
 
@@ -210,7 +209,8 @@ async def test_old_native_generation_cannot_supersede_active_new_coordinator(
     async with old_llm.handoff.session(monotonic() + 2, model_id="fixture"):
         pass
     old_native.worker.stop()
-    old = current_snapshot(settings)
+    old = current_snapshot(settings, inference_identity=old_llm.inference_identity)
+    old.pop("inference_identity")
     old.pop("managed_binding_sha256", None)
     old["execution_policy_version"] = 2
     image = await upload(w, scope, tmp_path, old)

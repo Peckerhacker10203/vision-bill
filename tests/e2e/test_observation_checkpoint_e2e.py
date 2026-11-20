@@ -22,12 +22,16 @@ pytestmark = pytest.mark.e2e
 
 
 async def claimed_checkpoint(w, scope, *, ocr=False, max_attempts=3):
+    payload = observation_payload(ocr=ocr)
     snapshot = {
+        "execution_policy_version": 4,
+        "inference_identity": payload["execution_identity"]["inference_identity"],
+        "managed_binding_sha256": None,
+        "allow_ocr_fallback": False,
         "ocr": {"enabled": ocr},
         "temperature": 0.0,
         "max_output_tokens": 8192,
     }
-    payload = observation_payload(ocr=ocr)
     parts = payload["source_parts"]
     image = (
         await w.enqueue_submission(
@@ -114,6 +118,7 @@ async def test_save_is_fenced_immutable_and_public_projection_is_safe(workflow_d
         ("unlisted_view", "checkpoint working view"),
         ("view_artifact_path", "artifact_path"),
         ("backend_identity", "inference_identity"),
+        ("other_endpoint", "execution policy"),
         ("view_foreign_ref", "bind to a real source"),
         ("view_unlisted_view", "checkpoint working view"),
         ("snapshot", "execution policy"),
@@ -138,10 +143,9 @@ async def test_rejected_checkpoint_keeps_no_artifacts_or_pointer(workflow_db, co
         )
     if corruption == "view_artifact_path":
         checkpoint.persisted_views[0].artifact_path = ""
-    if corruption == "backend_identity":
-        identity = checkpoint.execution_identity.model_copy(
-            update={"inference_identity": "invalid-endpoint-identity"}
-        )
+    if corruption in ("backend_identity", "other_endpoint"):
+        value = "invalid-endpoint-identity" if corruption == "backend_identity" else "ollama:" + "c" * 64
+        identity = checkpoint.execution_identity.model_copy(update={"inference_identity": value})
         checkpoint = checkpoint.model_copy(update={"execution_identity": identity})
     if corruption == "view_foreign_ref":
         checkpoint.persisted_views[0].metadata.transforms.append(
@@ -305,7 +309,7 @@ async def test_last_inference_attempt_keeps_completion_wait_and_retry_retires_ch
             expected_generation=1, request_key="adopt", policy="current"
         )
         snapshot = execution_policy.current_snapshot(
-            Settings(auth={"secret_key": "fixture-only-secret"}, pg=db)
+            Settings(auth={"secret_key": "fixture-only-secret"}, pg=db), inference_identity="ollama:" + "d" * 64
         )
         retried = await w.retry_submission(
             image_id, request, scope=scope, replacement_snapshot=snapshot

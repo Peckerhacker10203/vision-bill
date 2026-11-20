@@ -15,6 +15,8 @@ from vision_bill.config import OcrSettings
 from vision_bill.model.db.image import ImageRow
 from vision_bill.model.workflow import AnalysisClaim, CommitResult, PersistedSourcePart
 
+ENDPOINT = "ollama:" + "d" * 64
+
 
 def context(settings, tmp_path):
     from vision_bill.service.image_service import ImageService
@@ -28,6 +30,10 @@ def context(settings, tmp_path):
         image_path=str(path),
         model_id="saved-model",
         effective_options={
+            "execution_policy_version": 4,
+            "managed_binding_sha256": None,
+            "allow_ocr_fallback": False,
+            "inference_identity": ENDPOINT,
             "ocr": OcrSettings().model_dump(mode="json"),
             "temperature": 0.13,
             "max_output_tokens": 1234,
@@ -54,6 +60,7 @@ def context(settings, tmp_path):
         save_ocr_checkpoint=AsyncMock(return_value=True),
     )
     receipt = SimpleNamespace(
+        inference_identity=ENDPOINT,
         workflow_db=db, extract_receipt=AsyncMock(), list_tags=AsyncMock(return_value=[]),
         execution_handoff=Mock(return_value=None),
     )
@@ -289,6 +296,8 @@ async def test_saved_fallback_permission_cannot_enable_vision_readiness_or_execu
         enabled=True, allow_vision_fallback=True, manage_model_lifecycle=False
     ).model_dump(mode="json")
     settings.ocr = OcrSettings.model_validate(claim.image.effective_options["ocr"])
+    for key in ("inference_identity", "execution_policy_version", "managed_binding_sha256", "allow_ocr_fallback"):
+        claim.image.effective_options.pop(key)
     if permission is not None:
         claim.image.effective_options["allow_ocr_fallback"] = permission
     snapshot = dict(claim.image.effective_options)
@@ -305,12 +314,10 @@ async def test_saved_fallback_permission_cannot_enable_vision_readiness_or_execu
     if isinstance(permission, str):
         receipts.extract_receipt.assert_not_awaited()
         assert db.finish_attempt.call_args.args[1].result_code == "analysis_contract_failed"
-    elif permission is True:
+    else:
         db.hold_claim_for_policy.assert_awaited_once()
         receipts.extract_receipt.assert_not_awaited()
         db.finish_attempt.assert_not_awaited()
-    else:
-        assert receipts.extract_receipt.call_args.kwargs["options"].allow_ocr_fallback is False
     assert claim.image.effective_options == snapshot
 
 
@@ -319,6 +326,8 @@ async def test_ocr_readiness_never_uses_a_vision_alternate(settings,tmp_path,vis
     from vision_bill.model.ocr import OcrCapabilities
     from vision_bill.provider.llm.base import ModelInfo
     service, receipts, _db, claim, _ = context(settings,tmp_path)
+    for key in ("inference_identity", "execution_policy_version", "managed_binding_sha256"):
+        claim.image.effective_options.pop(key)
     claim.image.effective_options.update(allow_ocr_fallback=True,
         ocr=OcrSettings(enabled=True,allow_vision_fallback=True,vision_fallback_model_id="alternate",manage_model_lifecycle=False).model_dump(mode="json"))
     receipts.check_connection = AsyncMock(return_value=True)
@@ -336,7 +345,7 @@ async def test_current_snapshot_reaches_attempt_with_frozen_formatter_settings(s
     service, receipts, db, claim, _ = context(settings, tmp_path)
     settings.llm.temperature = 0.27
     settings.llm.max_output_tokens = 4321
-    claim.image.effective_options = current_snapshot(settings)
+    claim.image.effective_options = current_snapshot(settings, inference_identity=ENDPOINT)
     settings.llm.temperature = 0.91
     receipts.extract_receipt.side_effect = TimeoutError()
     await service.process_claim(claim)
@@ -371,7 +380,8 @@ async def test_policy_change_holds_before_claim_and_dispatch(settings, tmp_path,
     from vision_bill.service.execution_policy import current_snapshot
 
     service, receipts, db, claim, _ = context(settings, tmp_path)
-    snapshot = current_snapshot(settings)
+    snapshot = current_snapshot(settings, inference_identity=ENDPOINT)
+    snapshot.pop("inference_identity")
     snapshot.pop("managed_binding_sha256")
     if version is None:
         snapshot.pop("execution_policy_version")
@@ -411,7 +421,7 @@ async def test_adopted_default_resolves_once_without_changing_frozen_policy(sett
 
     service, receipts, db, claim, _ = context(settings, tmp_path)
     claim.image.model_id = None
-    claim.image.effective_options = current_snapshot(settings)
+    claim.image.effective_options = current_snapshot(settings, inference_identity=ENDPOINT)
     saved = claim.image.model_copy(update={"model_id": settings.llm.model_name})
     db.ensure_execution_snapshot = AsyncMock(return_value=saved)
     model = ModelInfo(settings.llm.model_name)
@@ -429,7 +439,7 @@ async def test_adopted_default_waits_for_exact_configured_model(settings, tmp_pa
 
     service, receipts, db, claim, _ = context(settings, tmp_path)
     claim.image.model_id = None
-    claim.image.effective_options = current_snapshot(settings)
+    claim.image.effective_options = current_snapshot(settings, inference_identity=ENDPOINT)
     receipts.check_connection = AsyncMock(return_value=True)
     model = ModelInfo("different")
     model.capabilities = ["vision"]
@@ -484,6 +494,7 @@ async def test_bound_direct_model_disappearance_holds_without_dispatch(settings,
     receipts.list_tags = AsyncMock(return_value=[])
     receipts.check_connection = AsyncMock(return_value=True)
     service.receipts = receipts
+    claim.image.effective_options["inference_identity"] = receipts.inference_identity
     llm.get_available_models.side_effect = [[selected], [], [selected]]
 
     assert await service.ready_for(claim.image)
@@ -493,3 +504,50 @@ async def test_bound_direct_model_disappearance_holds_without_dispatch(settings,
     db.finish_attempt.assert_not_awaited()
     llm._client.chat.assert_not_awaited()
     assert await service.ready_for(claim.image)
+
+
+@pytest.mark.parametrize("route", ["direct", "separate_gpu"])
+async def test_changed_formatter_endpoint_holds_before_discovery_and_dispatch(settings, tmp_path, route):
+    from vision_bill.service.execution_policy import current_snapshot
+
+    service, receipt, db, claim, _part = context(settings, tmp_path)
+    if route == "separate_gpu":
+        settings.ocr = OcrSettings(enabled=True, shared_gpu=False)
+    receipt.inference_identity = "ollama:" + "b" * 64
+    claim.image.effective_options = current_snapshot(settings, inference_identity="ollama:" + "a" * 64)
+    assert not await service.ready_for(claim.image)
+    db.set_wait_reason.assert_awaited_once_with(claim.image, "execution_policy_changed")
+    await service.process_claim(claim)
+    db.hold_claim_for_policy.assert_awaited_once()
+    receipt.extract_receipt.assert_not_awaited()
+
+
+async def test_endpoint_change_during_preparation_refunds_claim_before_extraction(settings, tmp_path):
+    service, receipt, db, claim, part = context(settings, tmp_path)
+
+    async def bind(*args, **kwargs):
+        receipt.inference_identity = "openai:" + "e" * 64
+        return [part]
+
+    db.bind_source_parts.side_effect = bind
+    await service.process_claim(claim)
+    db.hold_claim_for_policy.assert_awaited_once()
+    receipt.extract_receipt.assert_not_awaited()
+    db.finish_attempt.assert_not_awaited()
+
+
+async def test_resume_preserves_pages_while_native_identity_is_temporarily_unreachable(settings, tmp_path):
+    from time import monotonic
+
+    from vision_bill.model.ocr import OcrCapabilities
+    from vision_bill.service.extraction_pipeline import ReadinessHoldError
+
+    service, receipts, db, claim, part = context(settings, tmp_path)
+    db.get_ocr_checkpoint.return_value = SimpleNamespace(ordered_source_sha256=[part.source_sha256])
+    receipts.ocr_capabilities = AsyncMock(return_value=OcrCapabilities(
+        enabled=True, configured=True, reachable=False, ready=False, reason_code="ocr_unavailable",
+    ))
+    with pytest.raises(ReadinessHoldError, match="ocr_unavailable"):
+        await service._resume(claim, [part], OcrSettings(enabled=True), monotonic() + 5,
+                              db_deadline=asyncio.get_running_loop().time() + 5)
+    db.clear_ocr_checkpoint.assert_not_awaited()

@@ -102,13 +102,13 @@ async def admission_context(settings, monkeypatch, tmp_path):
             service_url="http://ocr",
             coordination_path=tmp_path / "coordination" / "lock",
         )
+        llm = provider(kind)
         image = ImageRow(
             id=uuid4(),
             model_id="formatter",
             attempt_count=attempts,
-            effective_options=current_snapshot(settings),
+            effective_options=current_snapshot(settings, inference_identity=llm.inference_identity),
         )
-        llm = provider(kind)
         receipts = ReceiptService(settings.images, settings.pg, llm)
         if adopt and managed and enabled and llm.supports_model_release:
             from test_handoff_binding import adopt as adopt_dedication

@@ -71,14 +71,14 @@ export interface ReviewFinding {
 export interface DraftLineItem {
 	description?: string | null;
 	spending_category?: string | null;
-	quantity?: number | null;
+	quantity?: string | number | null;
 	unit_price?: string | null;
 	total_price?: string | null;
 	tags?: string[] | null;
 }
 export interface DraftTaxLine {
 	name?: string | null;
-	rate?: number | null;
+	rate?: string | number | null;
 	amount?: string | null;
 }
 export interface ExtractionDraft {
@@ -224,7 +224,7 @@ export interface LineItemRow {
 	receipt_id: string;
 	description: string;
 	original_description: string | null;
-	quantity: number | null;
+	quantity: string | number | null;
 	unit_price: string | null;
 	total_price: string;
 	spending_category: string;
@@ -266,7 +266,7 @@ export interface TaxLineRow {
 	id: string;
 	receipt_id: string;
 	name: string;
-	rate: number | null;
+	rate: string | number | null;
 	amount: string;
 }
 
@@ -407,7 +407,7 @@ export interface DedicatedOcrStatus {
 export interface LineItemWrite {
 	id?: string;
 	description: string;
-	quantity: number | null;
+	quantity: string | number | null;
 	unit_price: string | null;
 	total_price: string;
 	spending_category: string;
@@ -417,7 +417,7 @@ export interface LineItemWrite {
 
 export interface TaxLineWrite {
 	name: string;
-	rate?: number | null;
+	rate?: string | number | null;
 	amount: string;
 }
 
@@ -491,7 +491,7 @@ export interface ProductPurchase {
 	date: string;
 	/** Local HH:MM[:SS[.ffffff]], preserving sub-minute precision */
 	time: string | null;
-	quantity: number | null;
+	quantity: string | number | null;
 	unit_price: string | null;
 	currency: string;
 }

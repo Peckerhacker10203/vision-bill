@@ -33,7 +33,7 @@ from .bootstrap import (
     parameter_bindings,
     seal_dependencies,
 )
-from .device_inventory import inspect_device_identity
+from .device_inventory import execution_target, inspect_device_identity
 from .fp32 import audit_dynamic_model, floating_dtype, require_gpu
 from .gpu_memory import GPU_OOM_CODE, GPU_OOM_EXIT, GpuOutOfMemory, is_gpu_out_of_memory
 from .images import normalize_source
@@ -41,14 +41,13 @@ from .pipeline import PipelineAdapter, build_pipeline, construct_native, tree_id
 from .precision import ParameterRecord, StaticArtifact
 from .profile import (
     MODEL_NAMES,
+    NativeRuntimeSettings,
     RuntimeSettings,
-    content_identity,
     file_digest,
     load_profile,
     verify_dependencies,
 )
 from .supervision import qualification_is_supervised
-from .targets import validate_profile
 
 PROFILE = Path(__file__).resolve().parents[1] / "profile.json"
 KINDS = {"upright", "rotated", "warped", "table", "formula"}
@@ -232,32 +231,16 @@ def run_stage(stage: str, payload: dict[str, Any], directory: Path) -> dict[str,
     return result
 
 
-def device_identity(paddle: Any, runtime: RuntimeSettings, *, compute: bool = True) -> dict[str, Any]:
+def device_identity(
+    paddle: Any, runtime: NativeRuntimeSettings, *, compute: bool = True
+) -> dict[str, Any]:
     if os.environ.get("HSA_OVERRIDE_GFX_VERSION"):
         raise ValueError("Architecture spoofing is forbidden")
-    result = inspect_device_identity(runtime.accelerator, runtime.gpu_index)
-    result["paddle_build"] = str(paddle.version.full_version)
-    if runtime.accelerator == "rocm":
-        target = result["gfx_target"]
-        kernels = json.loads(Path("/opt/ocr/build-evidence/kernels.json").read_text())
-        profile = validate_profile(kernels.get("target_profile"))
-        if target not in profile["candidate_targets"]:
-            raise ValueError("Actual HIP target is outside the candidate target set")
-        for library in ("paddle", "rocblas", "miopen"):
-            if not kernels[library].get("files"):
-                raise ValueError("Required kernel/library inventory is empty")
-            if (
-                kernels[library].get("offline_status") != "unverified"
-                and target not in kernels[library]["targets"]
-            ):
-                raise ValueError("Required device kernels are missing")
-            for filename, digest in kernels[library]["files"].items():
-                if file_digest(Path(filename)) != digest:
-                    raise ValueError("Required kernel inventory changed")
-        result["gfx_target"] = target
-        result["kernel_inventory_sha256"] = content_identity(kernels)
-        if compute:
-            result["compute_probe"] = compute_probe(paddle, runtime.gpu_index)
+    result = execution_target(
+        paddle, inspect_device_identity(runtime.accelerator, runtime.gpu_index), runtime.accelerator
+    )
+    if runtime.accelerator == "rocm" and compute:
+        result["compute_probe"] = compute_probe(paddle, runtime.gpu_index)
     return result
 
 

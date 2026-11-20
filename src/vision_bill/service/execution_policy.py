@@ -11,7 +11,8 @@ from ..model.handoff import HandoffWait
 if TYPE_CHECKING:
     from .gpu_handoff import ModelHandoff
 
-EXECUTION_POLICY_VERSION = 3
+EXECUTION_POLICY_VERSION = 4
+_ENDPOINT = re.compile(r"(?:ollama|openai):[0-9a-f]{64}")
 
 
 def semantic_policy_sha256(snapshot: dict[str, Any]) -> str:
@@ -24,7 +25,8 @@ def snapshot_ocr(snapshot: dict[str, Any]) -> OcrSettings:
     """Validate current and historical shapes without rewriting frozen intent."""
     old = {"ocr", "temperature", "max_output_tokens"}
     versioned = old | {"allow_ocr_fallback", "execution_policy_version"}
-    shapes = {2: versioned, 3: versioned | {"managed_binding_sha256"}}
+    bound = versioned | {"managed_binding_sha256"}
+    shapes = {2: versioned, 3: bound, 4: bound | {"inference_identity"}}
     permission = snapshot.get("allow_ocr_fallback", False)
     version = snapshot.get("execution_policy_version")
     binding = snapshot.get("managed_binding_sha256")
@@ -35,6 +37,8 @@ def snapshot_ocr(snapshot: dict[str, Any]) -> OcrSettings:
             raise ValueError("execution_snapshot_invalid")
     elif set(snapshot) not in (old, old | {"allow_ocr_fallback"}):
         raise ValueError("execution_snapshot_invalid")
+    if version == 4:
+        _validate_endpoint(snapshot["inference_identity"])
     if binding is not None and (
         not isinstance(binding, str) or not re.fullmatch("[0-9a-f]{64}", binding)
     ):
@@ -42,11 +46,24 @@ def snapshot_ocr(snapshot: dict[str, Any]) -> OcrSettings:
     return OcrSettings.model_validate(snapshot["ocr"])
 
 
-def policy_hold_reason(snapshot: dict[str, Any], current_ocr: OcrSettings) -> str | None:
-    """Hold obsolete routing or an effective historical image fallback grant."""
+def _validate_endpoint(identity: object) -> None:
+    if not isinstance(identity, str) or not _ENDPOINT.fullmatch(identity):
+        raise ValueError("execution_snapshot_invalid")
+
+
+def policy_hold_reason(
+    snapshot: dict[str, Any], current_ocr: OcrSettings, inference_identity: str,
+    *, checkpoint_identity: str | None = None,
+) -> str | None:
+    """Only completion without inference may use its checkpoint as proof of the old destination."""
+    if not snapshot:
+        return "execution_policy_changed"
     ocr = snapshot_ocr(snapshot)
+    destination = snapshot.get("inference_identity", checkpoint_identity)
     if (
-        ocr.enabled != current_ocr.enabled
+        destination is None
+        or destination != inference_identity
+        or ocr.enabled != current_ocr.enabled
         or ocr.shared_gpu != current_ocr.shared_gpu
         or (
             ocr.enabled
@@ -80,8 +97,9 @@ def managed_ocr(settings: OcrSettings) -> bool:
 
 
 def current_snapshot(
-    settings: Settings, *, handoff: "ModelHandoff | None" = None
+    settings: Settings, *, inference_identity: str, handoff: "ModelHandoff | None" = None
 ) -> dict[str, Any]:
+    _validate_endpoint(inference_identity)
     binding = None
     if handoff is not None and handoff.shared_gpu:
         try:
@@ -100,6 +118,7 @@ def current_snapshot(
     return {
         "execution_policy_version": EXECUTION_POLICY_VERSION,
         "managed_binding_sha256": binding,
+        "inference_identity": inference_identity,
         "allow_ocr_fallback": False,
         "ocr": ocr.model_dump(mode="json", exclude={"shared_gpu"} if ocr.shared_gpu else set()),
         "temperature": settings.llm.temperature,
