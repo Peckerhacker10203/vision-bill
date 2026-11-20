@@ -138,6 +138,40 @@ it('explains a rejected topology change without applying the unsaved choice', as
 	expect(fetchStatus).toHaveBeenCalledTimes(3);
 });
 
+it.each([
+	[
+		'model_handoff_foreign_residency',
+		'Unload all models at the LLM endpoint before switching to a shared GPU.'
+	],
+	[
+		'model_handoff_residency_unknown',
+		'Check that the LLM endpoint can report which models are loaded, then retry.'
+	],
+	['model_handoff_busy', 'Wait for the current GPU handoff to finish, then retry.'],
+	[
+		'model_release_unconfirmed',
+		'Check that the LLM endpoint has unloaded its models and follow the recovery guide before retrying.'
+	]
+])('explains why a return to a shared GPU was blocked by %s', async (reason, message) => {
+	const fetchStatus = vi
+		.fn()
+		.mockResolvedValueOnce(status('active', null, 200, true, false))
+		.mockResolvedValueOnce(Response.json({ detail: reason }, { status: 409 }))
+		.mockResolvedValueOnce(status('active', null, 200, true, false));
+	vi.stubGlobal('fetch', fetchStatus);
+
+	render(Settings);
+	const shared = await screen.findByRole('checkbox', { name: 'LLM and OCR share a GPU' });
+	await fireEvent.click(shared);
+	await fireEvent.click(await handoffConfirmation());
+	await fireEvent.click(screen.getByRole('button', { name: 'Save GPU configuration' }));
+
+	expect((await screen.findByRole('alert')).textContent).toBe(message);
+	expect(shared).toHaveProperty('checked', false);
+	expect(fetchStatus).toHaveBeenCalledTimes(3);
+	expect(fetchStatus.mock.calls[2][1].method).toBeUndefined();
+});
+
 it('reports local OCR memory exhaustion during setup with the German GPU choice', async () => {
 	setLocale('de');
 	vi.stubGlobal(

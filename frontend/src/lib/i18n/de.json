@@ -473,6 +473,10 @@
 				"ocr_download_failed": "Die Modelle für dedizierte OCR konnten nicht heruntergeladen werden.",
 				"model_request_unsettled": "Schließen Sie den ausstehenden Modellvorgang ab, bevor Sie dedizierte OCR ändern.",
 				"model_handoff_model_not_adopted": "Speichern und übernehmen Sie das aktuelle Formatierungsmodell, bevor Sie dedizierte OCR aktivieren.",
+				"model_handoff_foreign_residency": "Entladen Sie alle Modelle am LLM-Endpunkt, bevor Sie auf eine gemeinsame GPU umstellen.",
+				"model_handoff_residency_unknown": "Prüfen Sie, ob der LLM-Endpunkt geladene Modelle melden kann, und versuchen Sie es erneut.",
+				"model_handoff_busy": "Warten Sie, bis die laufende GPU-Übergabe abgeschlossen ist, und versuchen Sie es erneut.",
+				"model_release_unconfirmed": "Prüfen Sie, ob der LLM-Endpunkt seine Modelle entladen hat, und folgen Sie vor einem erneuten Versuch der Wiederherstellungsanleitung.",
 				"ocr_setup_pending": "Warten Sie, bis die laufende Einrichtung der dedizierten OCR abgeschlossen ist.",
 				"ocr_activation_state_invalid": "Stellen Sie anhand der Wiederherstellungsanleitung eine gültige Aktivierungskonfiguration für dedizierte OCR her."
 			},

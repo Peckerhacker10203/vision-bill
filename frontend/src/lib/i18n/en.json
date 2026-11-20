@@ -473,6 +473,10 @@
 				"ocr_download_failed": "Dedicated OCR model download failed.",
 				"model_request_unsettled": "Resolve the pending model operation before changing Dedicated OCR.",
 				"model_handoff_model_not_adopted": "Save and adopt the current formatter model before enabling Dedicated OCR.",
+				"model_handoff_foreign_residency": "Unload all models at the LLM endpoint before switching to a shared GPU.",
+				"model_handoff_residency_unknown": "Check that the LLM endpoint can report which models are loaded, then retry.",
+				"model_handoff_busy": "Wait for the current GPU handoff to finish, then retry.",
+				"model_release_unconfirmed": "Check that the LLM endpoint has unloaded its models and follow the recovery guide before retrying.",
 				"ocr_setup_pending": "Wait for the current Dedicated OCR setup to finish before changing it.",
 				"ocr_activation_state_invalid": "Restore a valid Dedicated OCR activation configuration using the recovery guide."
 			},
