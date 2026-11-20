@@ -177,10 +177,13 @@ exact router status `unloaded`. Explicit adoption binds selected models and
 matching resources to the original shared coordinator. Keep the dedicated
 external endpoint quiescent or use a separate device for explicit native
 maintenance. Shared locks coordinate participating services. Preserve journal
-ownership and recovery before endpoint or lifecycle changes. See
+ownership and recovery before endpoint, topology or lifecycle changes. Separate
+GPUs keep the native OCR owner and confirmed park without requiring LLM model
+management. See
 [backend setup and adoption](OPENAI_COMPATIBLE.md).
-Editable settings expose source/restart flags without
-credentials. Provider/host need restart; model/temperature/registration apply live.
+Settings reads expose authentication state without credentials. Admin secret
+writes are origin-bound. Provider, host and effective authentication changes
+need restart. Model, temperature and registration apply live.
 `AUTH__SECRET_KEY` is required, optional pepper otherwise falls back to it. Empty
 users table permits bootstrap admin and legacy ownership backfill. Registration
 default true, admin-wide view default false. Preserve auth/session boundaries.

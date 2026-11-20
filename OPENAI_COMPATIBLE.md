@@ -21,9 +21,17 @@ LLM__API_KEY=none
 ```
 
 The URL must be reachable from the app container. Direct vision requires a model
-that supports image input. A generic server can leave lifecycle set to `none`.
-Use the configuration and explicit adoption below when pairing a compatible
-dedicated router with managed OCR. See the [installation guide](distribution/README.md).
+that supports image input. For OCR on a separate GPU, clear **LLM and OCR share a
+GPU** and save under **Settings → Dedicated OCR** before enabling OCR. An
+OpenAI-compatible endpoint can use model lifecycle `none` and keep its models
+loaded. Use the router setup below for a shared GPU.
+
+Under **Settings → Receipt formatter → Authentication**, select **None** for a
+server that accepts requests without a key, or **Bearer API key** to enter a
+key or an existing access token. **Test saved connection** checks read-only
+model discovery. The saved credential is tied to the endpoint origin and the
+UI only shows whether a key is configured. Restart the app service when Settings
+reports a pending configuration. [Installation guide](distribution/README.md)
 
 ## Configure a dedicated llama.cpp router
 
@@ -106,7 +114,7 @@ actually set up.
 
 ## Sequential GPU handoff
 
-With managed OCR enabled, one internal owner coordinates the complete job:
+On a shared GPU, one internal owner coordinates the complete job:
 
 1. Park any abandoned OCR worker and release the job's previously recorded LLM IDs.
 2. Load native OCR on demand and process every receipt photo.
@@ -116,7 +124,11 @@ With managed OCR enabled, one internal owner coordinates the complete job:
 5. Request that LLM's unload and wait for its canonical router status to become
    `unloaded` before another owner can load OCR.
 
-The control protocol is `GET /models` and
+On separate GPUs, the app still loads and parks the native OCR worker, confirms
+its exit, then sends text and evidence to the LLM. LLM requests use ordinary
+OpenAI-compatible inference without model-management calls.
+
+The shared-GPU control protocol is `GET /models` and
 `POST /models/unload {"model":"canonical-id"}`. A successful POST only schedules
 termination. Vision Bill polls until the exact model reports
 `status.value="unloaded"`; sleeping, missing IDs, unknown/duplicate states or an
@@ -127,12 +139,11 @@ Release has at most 30 seconds within the existing absolute attempt deadline.
 An unconfirmed/failed/cancelled request keeps durable ownership unresolved and
 blocks subsequent OCR. See [recovery](paddleocr-service/README.md#internal-model-ownership).
 
-Every app worker and supported standalone client must use matching provider,
-lifecycle mode and endpoint spelling plus the same underlying Linux
-`OCR__COORDINATION_PATH` file and adjacent journal. The dedicated router must not
-receive model-loading requests from outside those owners. This coordinates Vision
-Bill's models and does not reserve the physical GPU; other GPU applications can
-continue running.
+Every app worker and supported standalone client must use matching topology and
+OCR resource identity plus the same underlying Linux `OCR__COORDINATION_PATH`
+file and adjacent journals. On a shared GPU, they must also agree on the LLM
+provider, lifecycle mode and endpoint. Route model-loading requests for a shared
+GPU through those owners. Other GPU applications can continue running.
 
 Use the final inference URL without redirects. Lifecycle and managed inference
 requests refuse redirects and ignore environment proxy variables. A host ending
@@ -143,9 +154,9 @@ query/fragment components and ambiguous encoded/dot paths are rejected.
 ## Other providers, changes and verification
 
 `LLM__MODEL_LIFECYCLE=none` is the default for OpenAI-compatible providers without
-an implemented unload API. Pure LLM operation remains supported. Managed native
-OCR waits before claim when unloading support or stable identities are missing;
-no attempt is spent and coordination is never silently disabled. Selecting
+an implemented unload API. It supports direct vision and separately hosted LLMs.
+On a shared GPU, native OCR waits before claim when unloading support or stable
+identities are missing. No attempt is spent in that state. Selecting
 `llamacpp` alone does not enable automatic unloading while production managed
 OCR is off. An explicitly unmanaged
 CPU/replay test policy makes no shared-GPU handoff claim. Do not use lifecycle

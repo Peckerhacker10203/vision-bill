@@ -38,7 +38,9 @@ powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\start-windows.ps
 ```
 
 First startup asks for your LLM connection mode, endpoint and model ID. Choose
-`llamacpp` for the supported dedicated router. The launcher keeps the local
+`llamacpp` for the supported dedicated router on a shared GPU. For an LLM on a
+separate GPU or server, use ordinary inference and save the separate GPU setting
+in the web UI. The launcher keeps the local
 configuration and Compose project for subsequent starts. It opens the web UI
 with the OCR controller idle. Sign in and enable **Dedicated OCR** when you are
 ready to download and verify the model files. Use the launcher again to start
@@ -124,14 +126,18 @@ maintenance step below before `up`.
 ### Enable Dedicated OCR
 
 In a combined install, sign in as the administrator and open **Settings →
-Dedicated OCR**. Verify that your LLM endpoint is dedicated to Vision Bill,
-has eager loading disabled, and has unloaded its models. With llama.cpp use
-a dedicated private router. [llama.cpp router setup](../OPENAI_COMPATIBLE.md#configure-a-dedicated-llamacpp-router)
+Dedicated OCR**. Leave **LLM and OCR share a GPU** selected if both use the same
+physical GPU. Verify that your LLM endpoint is dedicated to Vision Bill, has
+eager loading disabled, and has unloaded its models. With llama.cpp use a
+dedicated private router. If the LLM runs on another GPU or an external
+server, clear this setting and save the GPU configuration. Its models can stay
+loaded. [llama.cpp router setup](../OPENAI_COMPATIBLE.md#configure-a-dedicated-llamacpp-router)
 
-Confirm those conditions and turn **Dedicated OCR** On. Downloads and
+Confirm the shared-GPU conditions if applicable and turn **Dedicated OCR** On. Downloads and
 native setup run in the background. The app invokes OCR for receipts after the
 managed service verifies the installed models and starts with its worker parked.
-During setup, inference waits. If setup fails, review the status and explicitly
+During setup, inference waits. A confirmed GPU allocation failure reports
+insufficient local OCR GPU memory. If setup fails, review the status and explicitly
 retry after fixing the cause. Turning it Off routes new work to direct vision
 and retains the verified cache and idle native worker. Turning it On again reuses
 the verified generation instead of repeating installation. Frozen pending work
@@ -145,9 +151,10 @@ OCR_ACTIVATION_ON_STARTUP=true
 OCR_ACTIVATION_CONFIRM_HANDOFF=true
 ```
 
-`OCR_ACTIVATION_MAINTENANCE_INTENT` defaults to `external-llm-quiesced`, with
-`separate-ocr-device` available for a separate OCR GPU. Startup consent records
-one durable request. Fixing a failed generation requires an explicit retry.
+`OCR_ACTIVATION_MAINTENANCE_INTENT` describes native qualification. To select
+separate GPUs for normal receipt processing, save **LLM and OCR share a GPU**
+as off in Settings. Startup consent records one durable request. Fixing a failed
+generation requires an explicit retry.
 
 ### Native cache check and maintenance
 
@@ -258,10 +265,10 @@ persistent volumes during Compose teardown.
 See [native ownership and recovery](../paddleocr-service/README.md#internal-model-ownership).
 
 When Dedicated OCR reports an unsettled direct LLM request, confirm settlement
-at the original LLM endpoint, unload its models, and stop the app, OCR service
-and standalone clients that share the project. Archive the retained markers
-only after remote work has settled. This keeps evidence and leaves the app able
-to perform a fresh idle and ownership check at the next activation request.
+at the original LLM endpoint. Stop the app, OCR service and standalone clients
+that share the project before archiving the retained markers. On separate GPUs,
+the LLM can remain loaded. For a return to a shared GPU, prepare the dedicated
+LLM endpoint for the shared-mode idle and ownership checks before activation.
 
 ```bash
 docker compose run --rm --no-deps --entrypoint sh app -ec '

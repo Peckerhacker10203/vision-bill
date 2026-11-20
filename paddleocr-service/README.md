@@ -107,21 +107,26 @@ fixture tar. The CUDA custom-input path defaults to `cu126`.
 
 Keep the existing `.env` OCR settings for a base install using the template
 defaults or an explicitly blank `OCR__ENDPOINT`. A configured external OCR route
-must be reconciled before switching. For a private llama.cpp server, use the
-dedicated router mode with autoload enabled, startup loading disabled, and all
-models unloaded before activation. Keep the server reachable
-from the app container on a trusted private network, configure
-`LLM__MODEL_LIFECYCLE=llamacpp`, and use the exact installed model ID.
+must be reconciled before switching. With a shared GPU and llama.cpp, use router
+mode with autoload enabled, startup loading disabled, and all models unloaded
+before activation. Configure `LLM__MODEL_LIFECYCLE=llamacpp` and use the exact
+installed model ID. Keep your LLM endpoint reachable from the app container.
 [llama.cpp router setup](../OPENAI_COMPATIBLE.md#configure-a-dedicated-llamacpp-router)
 
-Sign in as an administrator, open **Settings → Dedicated OCR** and turn it On.
+Sign in as an administrator and open **Settings → Dedicated OCR**. For an LLM
+on another GPU or server, clear **LLM and OCR share a GPU**, save the GPU
+configuration and leave the LLM running. Turn **Dedicated OCR** On.
 The controller waits for this first explicit request before downloading the
 model archives and running native qualification.
 Turning it Off routes new work to direct vision and keeps the verified cache for
-reuse. On each OCR receipt, Vision Bill confirms the paired formatter model is
-unloaded before loading OCR. It waits for the OCR worker process to exit before
-requesting formatting with text and evidence. An unconfirmed release blocks the
-handoff. Other applications still have normal GPU access. [Activation and retry](../distribution/README.md#enable-dedicated-ocr)
+reuse. On a shared GPU, Vision Bill confirms that the paired formatter model is
+unloaded before loading OCR. In both GPU modes, it waits for the OCR worker
+process to exit before requesting formatting with text and evidence. An
+unconfirmed park blocks formatting. Other applications still have normal GPU
+access. When available, `/ready` and `/info` include a snapshot of free and total
+memory from the selected OCR device before worker initialization. A confirmed
+allocation failure surfaces as `ocr_gpu_out_of_memory`.
+[Activation and retry](../distribution/README.md#enable-dedicated-ocr)
 
 Use `--restart` on subsequent starts to reuse the prepared app and OCR images,
 Compose project and GPU selection. Use `rocm` for AMD. Before replacing an
@@ -429,19 +434,21 @@ and the app's model-handoff journal are separate.
 
 With `OCR__MANAGE_MODEL_LIFECYCLE=true` (default), Linux app processes, uploads,
 benchmarks including direct vision, and supported standalone clients share one
-advisory lock and durable journal. `OCR__COORDINATION_PATH` defaults to
+advisory lock with topology-specific durable journals. `OCR__COORDINATION_PATH` defaults to
 `gpu-handoff.lock` beside `VISION_BILL_CONFIG_PATH`; Compose uses its existing
 `/app/config` bind mount. Every process must use the **same underlying file**, even when host/container
-paths differ, and agree on the LLM/OCR resource identities. Keep the directory
-private to Vision Bill and use local storage supporting flock. Before managed
-work is admitted, explicitly adopt the configured pair and selected models with
+paths differ, and agree on the OCR resource identity. Shared-GPU processes also
+agree on the LLM identity. Keep the directory private to Vision Bill and use
+local storage supporting flock. Before work on a
+shared GPU is admitted, explicitly adopt the configured pair and selected models with
 the operator CLI. The binding requires a dedicated endpoint and disabled eager
 loads. See the [adoption and endpoint instructions](../OPENAI_COMPATIBLE.md).
 
-One owner releases and verifies its exact owned LLM model IDs, loads OCR, processes
-every receipt photo, then parks OCR and confirms native child death. Only then can
-formatting, repairs and classification run; the owner unloads and verifies its LLM
-before releasing ownership. `/lifecycle/claim`, `/load` and `/park` (all under the
+One owner loads OCR, processes every receipt photo, parks OCR and confirms native
+child exit before formatting, repairs and classification. On a shared GPU, that
+owner also releases and verifies its exact owned LLM model IDs before loading OCR
+and before releasing ownership. On separate GPUs, the LLM endpoint manages its own
+model residency. `/lifecycle/claim`, `/load` and `/park` (all under the
 `/lifecycle` prefix) and `/ocr` use generation-fenced owner tokens; stale requests
 cannot park/reload a successor. These internal routes must stay on the private
 application network. No device-exclusive mode, foreign process termination, or

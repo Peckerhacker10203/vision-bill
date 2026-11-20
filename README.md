@@ -109,6 +109,8 @@ then use `docker compose up -d --build`. For a fresh source installation, set
 if you need admin access. Ordinary users can register from the login page.
 Base Compose starts the app and PostgreSQL. To try a local Dedicated OCR
 candidate, prepare the GPU profile once and then enable it from admin Settings.
+The admin settings include the LLM authentication mode and the choice of a shared
+or separate OCR GPU.
 Use CUDA on Linux or WSL 2 with Docker Desktop and NVIDIA, or ROCm on native
 Linux with a selected Radeon. [Source GPU setup](paddleocr-service/README.md#dedicated-ocr-from-source)
 
