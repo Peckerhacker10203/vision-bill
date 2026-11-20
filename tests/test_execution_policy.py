@@ -146,6 +146,17 @@ def test_compatible_frozen_formatter_and_inactive_endpoint_are_retained(settings
     assert execution_policy.policy_hold_reason(snapshot, current) is None
 
 
+def test_old_shared_policy_holds_after_switch_to_separate_gpu(settings):
+    from vision_bill.service.execution_policy import current_snapshot, policy_hold_reason
+
+    settings.ocr = OcrSettings(enabled=True)
+    snapshot = current_snapshot(settings)
+    snapshot["ocr"].pop("shared_gpu", None)
+    assert policy_hold_reason(snapshot, settings.ocr) is None
+    separate_gpu = settings.ocr.model_copy(update={"shared_gpu": False})
+    assert policy_hold_reason(snapshot, separate_gpu) == "execution_policy_changed"
+
+
 @pytest.mark.parametrize("version", [True, 1, 4, "2"])
 def test_policy_hold_parser_rejects_invalid_versions(settings, version):
     from vision_bill.service import execution_policy

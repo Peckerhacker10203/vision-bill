@@ -25,7 +25,7 @@ from ..model.review import ReviewFinding
 from ..provider.llm.base import LLMProvider, ModelInfo
 from ..provider.ocr.base import OcrProvider, compact_ocr_text
 from .activation_admission import inference_admission
-from .gpu_handoff import ModelHandoff, admission_deadline, current_owner
+from .gpu_handoff import ModelHandoff, admission_deadline, current_llm_owner, current_owner
 from .observation_admission import admit_observations
 
 UnmanagedClassificationEvent = Callable[[Literal["started", "settled"]], Awaitable[None]]
@@ -61,16 +61,20 @@ class ExtractionPipeline:
         self.ocr = ocr_provider
         self.settings = ocr_settings or OcrSettings(enabled=ocr_provider is not None)
 
-    def coordinator(self) -> ModelHandoff | None:
+    def coordinator(self, *, direct: bool = False) -> ModelHandoff | None:
         configured = getattr(self.provider, "handoff", None)
+        if direct and not self.settings.shared_gpu:
+            return None
         if self.ocr is None or not getattr(self.ocr, "managed_lifecycle", False):
             if isinstance(configured, ModelHandoff) and self.ocr is not None:
                 raise HandoffWait(HandoffStatus(
                     state="configuration_required", reason_code="execution_policy_changed",
                 ))
             return configured if isinstance(configured, ModelHandoff) else None
-        handoff = ModelHandoff(self.settings.coordination_path, self.provider, self.ocr)
-        if not self.provider.supports_model_release:
+        handoff = ModelHandoff(
+            self.settings.coordination_path, self.provider, self.ocr, shared_gpu=self.settings.shared_gpu,
+        )
+        if self.settings.shared_gpu and not self.provider.supports_model_release:
             raise HandoffWait(HandoffStatus(
                 state="configuration_required", reason_code="model_release_unsupported",
             ))
@@ -101,7 +105,7 @@ class ExtractionPipeline:
         if owner is not None:
             deadline = min(deadline, owner.deadline)
         started = perf_counter()
-        handoff = self.coordinator()
+        handoff = self.coordinator(direct=options.pipeline.value == "direct_vision")
         with inference_admission(self.provider):
             async with asyncio.timeout(max(0, deadline - monotonic())), (
                 handoff.session(
@@ -363,7 +367,7 @@ class ExtractionPipeline:
         if observation_checkpoint is not None:
             await observation_checkpoint(formatted)
         event = None
-        if formatted.classification_enrichment.state == "pending" and current_owner() is None:
+        if formatted.classification_enrichment.state == "pending" and current_llm_owner() is None:
             event = unmanaged_classification_event
         if event is not None:
             await event("started")

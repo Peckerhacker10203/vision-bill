@@ -229,7 +229,7 @@ class OpenAIProvider(LLMProvider):
                 raise ValueError("model_release_unsupported: managed OCR requires an unload-capable provider")
             owner = current_owner()
             if owner is not None:
-                if owner.resources.llm != self.lifecycle_identity:
+                if owner.coordinator.shared_gpu and owner.resources.llm != self.lifecycle_identity:
                     raise ValueError("model_handoff_identity_changed")
                 await owner.llm_phase(model_id)
             elif self.handoff is not None:
@@ -239,12 +239,12 @@ class OpenAIProvider(LLMProvider):
             return await self._send_message(model_id, messages)
 
     async def _send_message(self, model_id: str, messages: Sequence[Mapping[str, Any]]) -> str:
-        from ...service.gpu_handoff import current_owner
+        from ...service.gpu_handoff import current_llm_owner
 
         # Plain dicts are exactly what the SDK serializes (verified against
         # the live server); cast() satisfies the TypedDict-parameter overloads.
         started = perf_counter()
-        owner = current_owner()
+        owner = current_llm_owner()
         with direct_inference_call(coordinated=owner is not None):
             call = self._client.chat.completions.create(
                 model=model_id,

@@ -5,8 +5,10 @@ from vision_bill.service.gpu_handoff import ModelHandoff
 
 def install_owned_bindings(monkeypatch):
     initialize = ModelHandoff.__init__
-    def initialize_owned(self, path, provider, ocr):
-        initialize(self, path, provider, ocr)
+    def initialize_owned(self, path, provider, ocr, *, shared_gpu=True):
+        initialize(self, path, provider, ocr, shared_gpu=shared_gpu)
+        if not shared_gpu:
+            return
         try:
             resources = self.resources
         except ValueError:

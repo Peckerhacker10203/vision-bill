@@ -11,7 +11,12 @@ from ...config import (
     settings,
     write_config_file,
 )
-from ...model.dedicated_ocr import DedicatedOcrRequest, DedicatedOcrStatus
+from ...model.dedicated_ocr import (
+    DedicatedOcrRequest,
+    DedicatedOcrStatus,
+    DedicatedOcrTopologyRequest,
+)
+from ...model.handoff import HandoffWait
 from ...security.dependencies import require_admin
 
 router = APIRouter(tags=["System"])
@@ -61,6 +66,25 @@ async def activate_dedicated_ocr(
     )
     if result.state in {"unavailable", "action_required"}:
         raise HTTPException(status_code=409, detail=result.reason)
+    return result
+
+
+@router.put(
+    "/dedicated-ocr/gpu-topology", response_model=DedicatedOcrStatus,
+    dependencies=[Depends(require_admin)],
+)
+async def set_dedicated_ocr_gpu_topology(
+    request: Request, body: DedicatedOcrTopologyRequest,
+) -> DedicatedOcrStatus:
+    activation = getattr(request.app.state, "dedicated_ocr", None)
+    if activation is None:
+        raise HTTPException(status_code=409, detail="gpu_profile_required")
+    try:
+        result: DedicatedOcrStatus = await activation.set_gpu_topology(
+            body.shared_gpu, confirm_handoff=body.confirm_handoff,
+        )
+    except HandoffWait as exc:
+        raise HTTPException(status_code=409, detail=exc.status.reason_code) from None
     return result
 
 

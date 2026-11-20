@@ -10,6 +10,7 @@ class DedicatedOcrStatus(BaseModel):
     reason: str | None = None
     installed: bool = False
     selected: bool = False
+    shared_gpu: bool = True
 
 
 class DedicatedOcrRequest(BaseModel):
@@ -18,3 +19,9 @@ class DedicatedOcrRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     confirm_handoff: StrictBool = False
     enabled: StrictBool = True
+
+
+class DedicatedOcrTopologyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    shared_gpu: StrictBool
+    confirm_handoff: StrictBool = False

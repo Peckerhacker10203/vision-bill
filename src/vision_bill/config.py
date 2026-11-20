@@ -149,6 +149,7 @@ class OcrSettings(BaseModel):
         default_factory=lambda: get_config_path().parent / "gpu-handoff.lock"
     )
     manage_model_lifecycle: bool = True
+    shared_gpu: bool = True
 
     @model_validator(mode="before")
     @classmethod

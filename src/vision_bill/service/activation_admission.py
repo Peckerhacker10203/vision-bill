@@ -33,7 +33,7 @@ _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_
 @dataclass(frozen=True)
 class _Admission:
     store: ActivationStore
-    requires_handoff: bool
+    shared_gpu: bool | None
     task: asyncio.Task[Any] | None
     thread: int
 
@@ -63,22 +63,25 @@ def _current_admission() -> _Admission | None:
     return None
 
 
-def _require_provider(provider: LLMProvider | None) -> None:
-    if provider is None:
+def _require_provider(provider: LLMProvider | None, shared_gpu: bool | None) -> None:
+    if provider is None or shared_gpu is None:
         return
     owner = current_owner() if _task() is not None else None
     handoff = owner.coordinator if owner is not None else provider.handoff
     endpoint = os.environ.get("OCR_ACTIVATION_ENDPOINT")
+    if not shared_gpu and provider.handoff is None and owner is None:
+        return
     if (
         isinstance(handoff, ModelHandoff)
-        and provider.supports_model_release
+        and handoff.shared_gpu == shared_gpu
         and getattr(handoff.ocr, "managed_lifecycle", False)
         and handoff.path.resolve() == activation_handoff_path().resolve()
         and (endpoint is None or getattr(handoff.ocr, "service_url", None) == endpoint.rstrip("/"))
-        and handoff.resources.llm == provider.lifecycle_identity
         and (
-            owner is None or provider.handoff is None
-            or isinstance(provider.handoff, ModelHandoff) and handoff.matches(provider.handoff)
+            not shared_gpu and provider.handoff is None
+            or shared_gpu and provider.supports_model_release and handoff.resources.llm == provider.lifecycle_identity
+            and (owner is None or provider.handoff is None
+                 or isinstance(provider.handoff, ModelHandoff) and handoff.matches(provider.handoff))
         )
     ):
         return
@@ -95,20 +98,22 @@ def inference_admission(
         return
     admitted = _current_admission()
     if admitted is not None and (store is None or store == admitted.store):
-        if admitted.requires_handoff:
-            _require_provider(provider)
+        _require_provider(provider, admitted.shared_gpu)
         yield
         return
 
     selected = store if store is not None else ActivationStore()
     with ExitStack() as lock:
+        shared_gpu = None
         try:
             lock.enter_context(selected.admission(exclusive=False, blocking=False))
             request = selected.read_request()
             status = selected.read_status(request) if request is not None else None
             if request is not None and status is not None and status.phase == ActivationPhase.READY:
                 from ..config import settings
-                if selected.runtime_enabled(request) != settings.ocr.enabled:
+                shared_gpu = selected.shared_gpu()
+                if (selected.runtime_enabled(request) != settings.ocr.enabled
+                        or shared_gpu != settings.ocr.shared_gpu):
                     raise HandoffWait(HandoffStatus(
                         state="configuration_required", reason_code="execution_policy_changed",
                     ))
@@ -121,9 +126,8 @@ def inference_admission(
         if request is not None and (status is None or status.phase != ActivationPhase.READY):
             raise HandoffWait(HandoffStatus(state="busy", reason_code="dedicated_ocr_activation_pending"))
 
-        if request is not None:
-            _require_provider(provider)
-        token = _current.set(_Admission(selected, request is not None, _task(), get_ident()))
+        _require_provider(provider, shared_gpu)
+        token = _current.set(_Admission(selected, shared_gpu, _task(), get_ident()))
         try:
             yield
         finally:
@@ -178,7 +182,7 @@ def direct_inference_call(*, coordinated: bool = False) -> Iterator[None]:
         yield
         return
     admitted = _current_admission()
-    if admitted is None or (admitted.requires_handoff and not coordinated):
+    if admitted is None or (admitted.shared_gpu is True and not coordinated):
         raise HandoffWait(HandoffStatus(state="configuration_required", reason_code="execution_policy_changed"))
     if coordinated:
         # The ModelHandoff journal records dispatch and settlement under its lock.

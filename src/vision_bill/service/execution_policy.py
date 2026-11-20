@@ -47,6 +47,7 @@ def policy_hold_reason(snapshot: dict[str, Any], current_ocr: OcrSettings) -> st
     ocr = snapshot_ocr(snapshot)
     if (
         ocr.enabled != current_ocr.enabled
+        or ocr.shared_gpu != current_ocr.shared_gpu
         or (
             ocr.enabled
             and (
@@ -59,7 +60,7 @@ def policy_hold_reason(snapshot: dict[str, Any], current_ocr: OcrSettings) -> st
             managed_ocr(ocr)
             and (
                 ocr.coordination_path.resolve() != current_ocr.coordination_path.resolve()
-                or "managed_binding_sha256" not in snapshot
+                or (ocr.shared_gpu and "managed_binding_sha256" not in snapshot)
             )
         )
         or (
@@ -82,7 +83,7 @@ def current_snapshot(
     settings: Settings, *, handoff: "ModelHandoff | None" = None
 ) -> dict[str, Any]:
     binding = None
-    if handoff is not None:
+    if handoff is not None and handoff.shared_gpu:
         try:
             # Adoption publishes the binding atomically. Execution still
             # validates its current contents under the lifecycle lock.
@@ -100,7 +101,7 @@ def current_snapshot(
         "execution_policy_version": EXECUTION_POLICY_VERSION,
         "managed_binding_sha256": binding,
         "allow_ocr_fallback": False,
-        "ocr": ocr.model_dump(mode="json"),
+        "ocr": ocr.model_dump(mode="json", exclude={"shared_gpu"} if ocr.shared_gpu else set()),
         "temperature": settings.llm.temperature,
         "max_output_tokens": settings.llm.max_output_tokens,
     }

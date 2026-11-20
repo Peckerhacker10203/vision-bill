@@ -183,7 +183,7 @@ class OllamaProvider(LLMProvider):
         with inference_admission(self):
             owner = current_owner()
             if owner is not None:
-                if owner.resources.llm != self.lifecycle_identity:
+                if owner.coordinator.shared_gpu and owner.resources.llm != self.lifecycle_identity:
                     raise ValueError("model_handoff_identity_changed")
                 await owner.llm_phase(model_id)
             elif self.handoff is not None:
@@ -193,12 +193,12 @@ class OllamaProvider(LLMProvider):
             return await self._send_message(model_id, messages)
 
     async def _send_message(self, model_id: str, messages: Sequence[Mapping[str, Any]]) -> str:
-        from ...service.gpu_handoff import current_owner
+        from ...service.gpu_handoff import current_llm_owner
         started = perf_counter()
         extra: dict[str, Any] = {}
         if self.experiment_options and self.experiment_options.think is not None:
             extra["think"] = self.experiment_options.think
-        owner = current_owner()
+        owner = current_llm_owner()
         with direct_inference_call(coordinated=owner is not None):
             call = self._client.chat(
                 model=model_id,

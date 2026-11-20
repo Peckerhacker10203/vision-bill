@@ -204,9 +204,11 @@ async def pipeline_identity(
 
     ocr, settings, effective_options = effective_policy(service, options)
     provider = service._provider.for_experiment(effective_options)
-    handoff = ReceiptExtractionPipeline(provider, ocr, settings).coordinator()
+    handoff = ReceiptExtractionPipeline(provider, ocr, settings).coordinator(
+        direct=options.pipeline == ExtractionPipeline.DIRECT,
+    )
     binding_sha256 = None
-    if handoff is not None:
+    if handoff is not None and handoff.shared_gpu:
         binding = handoff.require_binding(expected_binding_sha256)
         if qualify and any(model not in binding.model_ids for model in managed_model_ids):
             raise HandoffWait(HandoffStatus(
@@ -260,7 +262,9 @@ async def pipeline_identity(
         ).hexdigest(),
         "ocr_client": ocr_fingerprint(ocr),
         "ocr_runtime": capabilities,
-        "ocr_settings": settings.model_dump(mode="json", exclude={"service_url"}),
+        "ocr_settings": settings.model_dump(
+            mode="json", exclude={"service_url", "shared_gpu"} if settings.shared_gpu else {"service_url"},
+        ),
         "requested_options": options.model_dump(mode="json"),
         "options": (provider.experiment_options or effective_options).model_dump(mode="json"),
         "formatter_output_tokens": provider.max_output_tokens,

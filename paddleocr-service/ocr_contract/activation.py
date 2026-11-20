@@ -137,6 +137,25 @@ class ActivationStore:
         _write_record(self.request_dir, "runtime.json", request.generation,
                       enabled="true" if enabled else "false")
 
+    def shared_gpu(self) -> bool:
+        """Existing and unconfigured deployments default to a shared GPU."""
+        record = _read_record(self.request_dir, "topology.json")
+        if record is None:
+            return True
+        try:
+            _generation(record, {"shared_gpu"})
+            shared_gpu = record["shared_gpu"]
+            if shared_gpu not in ("true", "false"):
+                raise ValueError("Invalid GPU topology")
+            return shared_gpu == "true"
+        except (TypeError, ValueError) as exc:
+            raise ActivationStateError("Invalid GPU topology") from exc
+
+    def set_shared_gpu(self, shared_gpu: bool) -> None:
+        """Caller holds exclusive activation admission through routing publication."""
+        _write_record(self.request_dir, "topology.json", uuid4(),
+                      shared_gpu="true" if shared_gpu else "false")
+
     def publish_status(self, status: ActivationStatus) -> bool:
         """Publish for the current generation. The controller owns the status writer."""
         phase = ActivationPhase(status.phase)

@@ -247,16 +247,20 @@ class PaddleOcrProvider(OcrProvider):
             page = await self.extract_page(image, photo_index=0, source_sha256=digest, deadline=deadline)
             return await run_sync_before(deadline, page.model_dump, mode="json")
         from ...config import settings
+        from ...service.activation_admission import inference_admission
         from ...service.gpu_handoff import ModelHandoff
         from ..factory import get_llm_provider
         provider = get_llm_provider(settings.llm)
         model_id = settings.llm.model_name
-        async with ModelHandoff(settings.ocr.coordination_path, provider, self).session(deadline, model_id=model_id) as owner:
-            owner.track(model_id)
-            await owner.ocr_phase()
-            page = await self.extract_page(
-                image, photo_index=0, source_sha256=digest, deadline=deadline
-            )
+        handoff = ModelHandoff(settings.ocr.coordination_path, provider, self, shared_gpu=settings.ocr.shared_gpu)
+        with inference_admission(provider):
+            async with handoff.session(deadline, model_id=model_id) as owner:
+                if handoff.shared_gpu:
+                    owner.track(model_id)
+                await owner.ocr_phase()
+                page = await self.extract_page(
+                    image, photo_index=0, source_sha256=digest, deadline=deadline
+                )
         return await run_sync_before(deadline, page.model_dump, mode="json")
 
     async def check_connection(self) -> bool:

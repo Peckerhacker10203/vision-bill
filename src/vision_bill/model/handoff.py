@@ -18,6 +18,7 @@ HANDOFF_WAIT_REASONS = frozenset({
     "model_handoff_foreign_residency",
     "model_handoff_invalid_binding",
     "model_handoff_invalid_configuration",
+    "model_handoff_journal_not_clean",
     "model_handoff_managed_ocr_required",
     "model_handoff_model_not_adopted",
     "model_handoff_recorded_model_not_adopted",

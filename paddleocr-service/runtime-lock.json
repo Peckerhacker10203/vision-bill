@@ -9,7 +9,7 @@
     "build/hip-device-info.cpp": "a56d4111b7117bc540f7d88fefc2455db112bb8725dd0d6ef0d0825d851f1204",
     "build/hip-rdna2-v1.patch": "017f955eb5a9d2adec5e416ab0dc17b58a9fd128e4665da28af2e730eba6306a",
     "ocr_contract/__init__.py": "15ee00813e4ec37204b6dae5c731154b8e92af07427bf10b70764f82068daeaf",
-    "ocr_contract/activation.py": "d1986d95dcc1f0b4167a261d9c71f3fe6fa8bb731bac193b9d93438e3071edb3",
+    "ocr_contract/activation.py": "5aaa01a03147dabba381526b7bec57357b8d46f7c85ec92c3ed9f15bea7e574c",
     "ocr_contract/document_image.py": "7af9acad1c00b5d99ca3c1d83e4cce938ba7374e8f5709112d9cb7e2d86e1deb",
     "ocr_contract/limits.py": "e8a3516793c6ddd3f8af037f96edbdde458377f0ab648cf3a0e0a5cacaa2ffa4",
     "ocr_contract/wire_json.py": "d68762507779fbae4a528c47f6d2587cb37cb5fe4ec583da2f72fc1f34431882",

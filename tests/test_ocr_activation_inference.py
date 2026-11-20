@@ -38,6 +38,102 @@ def activation_store(tmp_path, monkeypatch):
     return store
 
 
+@pytest.mark.parametrize("failed_park", [False, True])
+@pytest.mark.parametrize("model_lifecycle", ["none", "llamacpp"])
+async def test_separate_gpu_upload_uses_only_remote_inference_after_confirmed_park(
+    activation_store, tmp_path, monkeypatch, failed_park, model_lifecycle,
+):
+    from time import monotonic
+
+    from PIL import Image
+    from test_experiment_scoring import receipt
+    from test_extraction_pipeline import sidecar
+
+    from vision_bill.config import OcrSettings, settings
+    from vision_bill.model.experiment import ExperimentOptions
+    from vision_bill.service.extraction_pipeline import ExtractionPipeline
+
+    path = tmp_path / "handoff.lock"
+    photo = tmp_path / "receipt.png"
+    Image.new("RGB", (4, 5)).save(photo)
+    monkeypatch.setenv("OCR_ACTIVATION_HANDOFF_LOCK_PATH", str(path))
+    selected = OcrSettings(enabled=True, shared_gpu=False, coordination_path=path)
+    monkeypatch.setattr(settings, "ocr", selected)
+    activation_store.set_shared_gpu(False)
+    request = activation_store.submit_request(MaintenanceIntent.SEPARATE_OCR_DEVICE)
+    assert activation_store.publish_status(ActivationStatus(request.generation, ActivationPhase.READY))
+    events = []
+    provider = OpenAIProvider("http://running-llm.test/v1", "none", model_lifecycle=model_lifecycle)
+    await provider._client._client.aclose()
+
+    async def unexpected_model_management(*_args, **_kwargs):
+        pytest.fail("Separate GPUs must leave the resident remote model alone")
+
+    monkeypatch.setattr(provider, "resident_model_ids", unexpected_model_management)
+    monkeypatch.setattr(provider, "release_model", unexpected_model_management)
+
+    async def respond(request):
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": "fixture"}]})
+        assert request.url.path == "/v1/chat/completions"
+        assert events[-1] == "park"
+        assert len(unsettled_direct_calls(activation_store)) == 1
+        events.append("inference")
+        messages = json.loads(request.content)["messages"]
+        assert all(isinstance(message["content"], str) for message in messages)
+        assert "PHOTO 0" in messages[0]["content"]
+        assert "png_base64" not in messages[0]["content"]
+        payload = receipt().model_dump(mode="json")
+        for item in payload["line_items"]:
+            item["source_image"] = 0
+        payload["duplicate_candidates"] = []
+        return httpx.Response(200, json={
+            "id": "fixture", "model": "fixture", "created": 1, "object": "chat.completion",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                "role": "assistant", "content": json.dumps(payload),
+            }}],
+        })
+
+    provider._client._client = httpx.AsyncClient(
+        base_url="http://running-llm.test/v1", transport=httpx.MockTransport(respond),
+    )
+    ocr = sidecar()
+    ocr.managed_lifecycle = True
+
+    async def claim(_token, _deadline):
+        events.append("claim")
+
+    async def load(_token, _deadline):
+        events.append("load")
+
+    async def park(_token, _deadline):
+        events.append("park")
+        if failed_park:
+            raise RuntimeError("native_park_failed")
+
+    ocr.claim, ocr.load, ocr.park = claim, load, park
+
+    async def extract():
+        return await ExtractionPipeline(provider, ocr, selected).extract(
+            "fixture", [photo], options=ExperimentOptions(include_classification=False),
+            deadline=monotonic() + 3, tags=[],
+        )
+
+    try:
+        if failed_park:
+            with pytest.raises(RuntimeError, match="native_park_failed"):
+                await extract()
+            assert "inference" not in events
+        else:
+            result = await extract()
+            assert result.receipt is not None
+            assert events[:4] == ["claim", "load", "park", "inference"]
+            assert unsettled_direct_calls(activation_store) == ()
+        assert not path.with_suffix(".binding.json").exists()
+    finally:
+        await provider._client._client.aclose()
+
+
 @pytest.fixture(params=["openai", "ollama"])
 async def connect_provider(request):
     provider_type = request.param

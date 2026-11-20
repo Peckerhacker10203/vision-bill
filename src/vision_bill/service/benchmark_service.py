@@ -109,7 +109,9 @@ class BenchmarkService:
         counts = {len(item["images"]) for item in inputs}
         for item in inputs:
             item["pipeline"] = options.pipeline.value
-        self._managed_coordinator(effective_policy(self._receipts, options)[1])
+        self._managed_coordinator(
+            effective_policy(self._receipts, options)[1], direct=options.pipeline == ExtractionPipeline.DIRECT,
+        )
         manifest = {"identity": await pipeline_identity(self._receipts, options, qualify=True, managed_model_ids=selected_models), "options": options.model_dump(mode="json"), "tags": tags, "inputs": inputs,
                     "provider": type(self._provider).__name__,
                     "endpoint_fingerprint": endpoint_fingerprint(self._provider),
@@ -358,9 +360,12 @@ class BenchmarkService:
                 "images": reference.sources, "reference": reference.model_dump(mode="json"),
                 "scored_fields": reference.scored_fields}
 
-    def _managed_coordinator(self, settings: OcrSettings) -> ModelHandoff | None:
+    def _managed_coordinator(self, settings: OcrSettings, *, direct: bool = False) -> ModelHandoff | None:
+        if direct and not settings.shared_gpu:
+            return None
         handoff = self._receipts.execution_handoff(settings)
-        if handoff is not None and handoff_resource_identity(self._provider, "llm") != handoff.resources.llm:
+        if (handoff is not None and handoff.shared_gpu
+                and handoff_resource_identity(self._provider, "llm") != handoff.resources.llm):
             raise HandoffWait(HandoffStatus(
                 state="configuration_required", reason_code="execution_policy_changed",
             ))
@@ -380,10 +385,13 @@ class BenchmarkService:
         frozen_identity = manifest.get("identity")
         frozen_binding = (frozen_identity or {}).get("managed_binding_sha256")
         frozen_ocr = (frozen_identity or {}).get("ocr_settings") or {}
+        frozen_shared_gpu = frozen_ocr.get("shared_gpu", True)
         was_managed = frozen_binding is not None or (
             frozen_ocr.get("enabled") is True and frozen_ocr.get("manage_model_lifecycle") is True
+            and (frozen_shared_gpu or options.pipeline != ExtractionPipeline.DIRECT)
         )
-        handoff = self._managed_coordinator(settings)
+        handoff = self._managed_coordinator(settings, direct=options.pipeline == ExtractionPipeline.DIRECT)
+        shared_handoff = handoff is not None and handoff.shared_gpu
         was_or_is_managed = was_managed or handoff is not None
         frozen_path = frozen_ocr.get("coordination_path")
         coordinator_changed = was_managed and (
@@ -392,6 +400,8 @@ class BenchmarkService:
             )
         )
         topology_error = None
+        if frozen_shared_gpu != settings.shared_gpu:
+            raise HandoffWait(HandoffStatus(state="configuration_required", reason_code="execution_policy_changed"))
         if coordinator_changed:
             topology_error = "Managed coordinator changed since run creation"
         elif manifest.get("endpoint_fingerprint") != endpoint_fingerprint(self._provider):
@@ -416,7 +426,7 @@ class BenchmarkService:
         if handoff is not None:
             # Historical direct vision may still use the current dedicated
             # coordinator. Historical managed OCR must prove its own binding.
-            if (uses_ocr or "managed_binding_sha256" in (frozen_identity or {})) and not frozen_binding:
+            if shared_handoff and (uses_ocr or "managed_binding_sha256" in (frozen_identity or {})) and not frozen_binding:
                 frozen_binding = ""
             status = await handoff.inspect(
                 model_id=model_id, deadline=inference_deadline,
@@ -429,13 +439,13 @@ class BenchmarkService:
         ):
             # The client fingerprint includes the request timeout.
             # Recheck dedication because inspection released the lock.
-            if handoff is not None:
+            if handoff is not None and handoff.shared_gpu:
                 handoff.require_binding(frozen_binding)
             raise ValueError("OCR provider endpoint or client settings changed; create a new run")
         current_identity = await pipeline_identity(
             self._receipts, options, expected_binding_sha256=frozen_binding,
         )
-        if (current_identity["managed_binding_sha256"] is not None) != (handoff is not None):
+        if (current_identity["managed_binding_sha256"] is not None) != shared_handoff:
             raise HandoffWait(HandoffStatus(
                 state="configuration_required", reason_code="execution_policy_changed",
             ))

@@ -65,10 +65,30 @@ class HandoffJournal(BaseModel):
     ocr_pending: bool
 
 
+def _save_journal(path: Path, journal: HandoffJournal) -> None:
+    temporary = path.with_suffix(".pending")
+    with temporary.open("w") as stream:
+        os.chmod(temporary, 0o600)
+        json.dump(journal.model_dump(), stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+    descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def current_owner() -> "HandoffOwner | None":
     owner = _current.get()
     # ContextVars propagate to spawned tasks; that does not transfer ownership.
     return owner if owner is not None and owner.task is asyncio.current_task() else None
+
+
+def current_llm_owner() -> "HandoffOwner | None":
+    owner = current_owner()
+    return owner if owner is not None and owner.coordinator.shared_gpu else None
 
 
 def configure_handoff(provider: Any) -> None:
@@ -76,7 +96,7 @@ def configure_handoff(provider: Any) -> None:
     from ..config import settings
     from ..provider.factory import get_ocr_provider
     ocr = get_ocr_provider(settings.ocr)
-    if ocr is not None and getattr(ocr, "managed_lifecycle", False):
+    if settings.ocr.shared_gpu and ocr is not None and getattr(ocr, "managed_lifecycle", False):
         provider.handoff = ModelHandoff(settings.ocr.coordination_path, provider, ocr)
 
 
@@ -120,24 +140,12 @@ class HandoffOwner:
         self.ocr_pending = True  # Claim has not yet confirmed an abandoned worker parked.
 
     def save(self) -> None:
-        path = self.coordinator.journal
-        temporary = path.with_suffix(".pending")
-        with temporary.open("w") as stream:
-            os.chmod(temporary, 0o600)
-            json.dump(HandoffJournal(
-                version=2, coordinator="vision-bill-model-handoff-v2",
-                resources=self.resources, models=self.models,
-                generation=self.generation, unsettled=self.unsettled,
-                ocr_pending=self.ocr_pending,
-            ).model_dump(), stream)
-            stream.flush()
-            os.fsync(stream.fileno())
-        temporary.replace(path)
-        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        _save_journal(self.coordinator.journal, HandoffJournal(
+            version=2, coordinator="vision-bill-model-handoff-v2",
+            resources=self.resources, models=self.models,
+            generation=self.generation, unsettled=self.unsettled,
+            ocr_pending=self.ocr_pending,
+        ))
 
     async def release_models(self) -> None:
         if self.unsettled:
@@ -176,7 +184,8 @@ class HandoffOwner:
             self.ocr_loaded = False
             self.ocr_pending = False
             self.save()  # Only a confirmed park clears possible OCR residency.
-        self.track(model)
+        if self.coordinator.shared_gpu:
+            self.track(model)
 
     def track(self, model: str) -> None:
         self.require_model(model)
@@ -185,7 +194,7 @@ class HandoffOwner:
             self.save()  # Durable before the request can reach Ollama.
 
     def require_model(self, model: str) -> None:
-        if self.binding is None or model not in self.binding.model_ids:
+        if self.coordinator.shared_gpu and (self.binding is None or model not in self.binding.model_ids):
             raise _handoff_error(HandoffStatus(
                 state="configuration_required", reason_code="model_handoff_model_not_adopted",
             ), admission=not self.model_work_started)
@@ -226,9 +235,13 @@ class HandoffOwner:
 
 
 class ModelHandoff:
-    def __init__(self, path: Path, provider: Any, ocr: Any):
+    def __init__(self, path: Path, provider: Any, ocr: Any, *, shared_gpu: bool = True):
         self.path = Path(path)
-        self.journal = self.path.with_suffix(".json")
+        self.shared_gpu = shared_gpu
+        shared_journal = self.path.with_suffix(".json")
+        separate_journal = self.path.with_suffix(".ocr-only.json")
+        self.journal = shared_journal if shared_gpu else separate_journal
+        self.peer_journal = separate_journal if shared_gpu else shared_journal
         self.binding_path = self.path.with_suffix(".binding.json")
         self.provider = provider
         self.ocr = ocr
@@ -236,12 +249,13 @@ class ModelHandoff:
     @property
     def resources(self) -> HandoffResources:
         return HandoffResources(
-            llm=handoff_resource_identity(self.provider, "llm"),
+            llm=handoff_resource_identity(self.provider, "llm") if self.shared_gpu else "external-unmanaged",
             ocr=handoff_resource_identity(self.ocr, "ocr"),
         )
 
     def matches(self, other: "ModelHandoff") -> bool:
-        return self.path.resolve() == other.path.resolve() and self.resources == other.resources
+        return (self.path.resolve() == other.path.resolve() and self.shared_gpu == other.shared_gpu
+                and self.resources == other.resources)
 
     @asynccontextmanager
     async def exclusion(
@@ -280,11 +294,12 @@ class ModelHandoff:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
 
-    def read_journal(self) -> HandoffJournal | None:
-        if not self.journal.exists():
+    @staticmethod
+    def _read_journal(path: Path) -> HandoffJournal | None:
+        if not path.exists():
             return None
         try:
-            state = json.loads(self.journal.read_text(), object_pairs_hook=_unique_json_members)
+            state = json.loads(path.read_text(), object_pairs_hook=_unique_json_members)
         except (ValueError, UnicodeError):
             raise ValueError("model_handoff_invalid_journal: preserve journal and recover managed resources") from None
         if isinstance(state, dict) and "version" not in state:
@@ -294,13 +309,34 @@ class ModelHandoff:
                 "before manually archiving the journal"
             )
         try:
-            saved = HandoffJournal.model_validate(state)
+            return HandoffJournal.model_validate(state)
         except ValidationError:
             raise ValueError("model_handoff_invalid_journal: preserve journal and recover managed resources") from None
+
+    def read_journal(self) -> HandoffJournal | None:
+        saved = self._read_journal(self.journal)
+        if saved is None:
+            return None
         for name in ("llm", "ocr"):
             if getattr(saved.resources, name) != getattr(self.resources, name):
                 raise ValueError(f"model_handoff_{name}_resource_changed: recover old resources before switching")
+        if not self.shared_gpu and (saved.unsettled or saved.models):
+            raise ValueError("model_handoff_invalid_ocr_only_journal")
         return saved
+
+    def _read_peer_journal(self) -> HandoffJournal | None:
+        """Check alternate-mode ownership before reclaiming the same native worker."""
+        peer = self._read_journal(self.peer_journal)
+        if peer is None:
+            return None
+        if peer.unsettled or peer.models:
+            raise HandoffWait(HandoffStatus(
+                state="recovery_required",
+                reason_code="model_request_unsettled" if peer.unsettled else "model_handoff_journal_not_clean",
+            ))
+        if peer.ocr_pending and peer.resources.ocr != self.resources.ocr:
+            raise ValueError("model_handoff_ocr_resource_changed: recover old resources before switching")
+        return peer
 
     def read_binding(self) -> HandoffBinding:
         try:
@@ -344,6 +380,8 @@ class ModelHandoff:
         return binding
 
     async def require_residency(self, recorded: list[str], deadline: float, *, admission: bool = True) -> None:
+        if not self.shared_gpu:
+            return
         try:
             async with asyncio.timeout(max(0, deadline - monotonic())):
                 if monotonic() >= deadline:
@@ -370,12 +408,17 @@ class ModelHandoff:
         self, *, model_id: str, deadline: float, expected_binding_sha256: str | None = None,
     ) -> HandoffStatus:
         """Read-only admission evidence; never claim, release, or advance a journal."""
-        if not self.provider.supports_model_release:
+        if self.shared_gpu and not self.provider.supports_model_release:
             return HandoffStatus(state="configuration_required", reason_code="model_release_unsupported")
         try:
             async with self.exclusion(deadline, wait=False):
-                binding = self.require_binding(expected_binding_sha256)
+                binding = self.require_binding(expected_binding_sha256) if self.shared_gpu else None
                 saved = self.read_journal()
+                self._read_peer_journal()
+                if binding is None:
+                    if expected_binding_sha256 is not None:
+                        return HandoffStatus(state="configuration_required", reason_code="execution_policy_changed")
+                    return HandoffStatus(state="ready")
                 if model_id not in binding.model_ids:
                     return HandoffStatus(state="configuration_required", reason_code="model_handoff_model_not_adopted")
                 if saved is not None and saved.unsettled:
@@ -406,7 +449,7 @@ class ModelHandoff:
 
     @asynccontextmanager
     async def recover_checkpoint(
-        self, deadline: float, *, model_id: str, expected_binding_sha256: str,
+        self, deadline: float, *, model_id: str, expected_binding_sha256: str | None,
         before_dispatch: Callable[[], Awaitable[None]],
     ) -> AsyncIterator[None]:
         """Confirm owned resources are parked and keep exclusion through publication."""
@@ -415,6 +458,13 @@ class ModelHandoff:
             expected_binding_sha256=expected_binding_sha256, before_dispatch=before_dispatch,
             _recovery_only=True,
         ):
+            yield
+
+    @asynccontextmanager
+    async def quiesce(self, deadline: float, *, model_id: str | None = None) -> AsyncIterator[None]:
+        """Hold exclusion after recovery and verified parking during a route change."""
+        async with self.session(deadline, model_id=model_id, _recovery_only=True) as owner:
+            await self.ocr.park(owner.token, deadline)
             yield
 
     @asynccontextmanager
@@ -443,6 +493,8 @@ class ModelHandoff:
         timeout: asyncio.Timeout, recovery_only: bool,
     ) -> AsyncIterator[HandoffOwner]:
         expires_at = asyncio.get_running_loop().time() + (deadline - monotonic())
+        if not self.shared_gpu and expected_binding_sha256 is not None:
+            raise HandoffWait(HandoffStatus(state="configuration_required", reason_code="execution_policy_changed"))
         if getattr(self.ocr, "managed_lifecycle", False) and not managed_handoff_enabled():
             if expected_binding_sha256 is not None or before_dispatch is not None:
                 raise HandoffWait(HandoffStatus(
@@ -466,7 +518,7 @@ class ModelHandoff:
                 existing.require_model(model)
             yield existing
             return
-        if not self.provider.supports_model_release:
+        if self.shared_gpu and not self.provider.supports_model_release:
             if expected_binding_sha256 is not None or before_dispatch is not None:
                 raise HandoffWait(HandoffStatus(
                     state="configuration_required", reason_code="model_release_unsupported",
@@ -482,23 +534,24 @@ class ModelHandoff:
                 owner.binding = self.require_binding(expected_binding_sha256)
             try:
                 saved = self.read_journal()
+                peer = self._read_peer_journal()
             except (ValueError, OSError):
                 if lock_deadline is None:
                     raise
                 raise HandoffWait(HandoffStatus(
                     state="recovery_required", reason_code="model_handoff_invalid_configuration",
                 )) from None
-            if owner.binding is None:
+            if self.shared_gpu and owner.binding is None:
                 owner.binding = self.require_binding(None)
             for model in selected:
                 owner.require_model(model)
             if saved is not None:
                 owner.models = saved.models
-                owner.generation = saved.generation + 1
                 owner.unsettled = saved.unsettled
+            owner.generation = max(saved.generation if saved else 0, peer.generation if peer else 0) + 1
             if owner.unsettled:
                 raise HandoffWait(HandoffStatus(state="recovery_required", reason_code="model_request_unsettled"))
-            if any(model not in owner.binding.model_ids for model in owner.models):
+            if owner.binding is not None and any(model not in owner.binding.model_ids for model in owner.models):
                 raise HandoffWait(HandoffStatus(
                     state="recovery_required", reason_code="model_handoff_recorded_model_not_adopted",
                 ))
@@ -525,6 +578,8 @@ class ModelHandoff:
                     await self.ocr.claim(owner.token, deadline)
                     owner.ocr_pending = False
                     owner.save()
+                    if peer is not None and peer.ocr_pending:
+                        _save_journal(self.peer_journal, peer.model_copy(update={"ocr_pending": False}))
                     await owner.release_models()
                     owner.save()
                 except HandoffWait as exc:

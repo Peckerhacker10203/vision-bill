@@ -19,7 +19,7 @@ from ocr_contract.activation import (
 from ..config import OcrSettings, Settings, runtime_restart_required
 from ..distribution.handoff import adopt_binding
 from ..model.dedicated_ocr import DedicatedOcrStatus
-from ..model.handoff import HandoffWait
+from ..model.handoff import HandoffStatus, HandoffWait
 from ..provider.llm.base import LLMProvider
 from ..provider.ocr.paddleocr import PaddleOcrProvider
 from .activation_admission import activation_handoff_path, unsettled_direct_calls
@@ -57,8 +57,12 @@ class DedicatedOcrActivation:
             self.ocr_settings.service_url, self.ocr_settings.timeout_seconds
         )
         self.handoff = ModelHandoff(self.ocr_settings.coordination_path, provider, self.ocr)
+        self.ocr_only_handoff = ModelHandoff(
+            self.ocr_settings.coordination_path, provider, self.ocr, shared_gpu=False,
+        )
         self._applied: UUID | None = None
         self._enabled: bool | None = None
+        self._shared_gpu: bool | None = None
         self._blocker: str | None = None
 
     async def _controller_is_live(self) -> bool:
@@ -94,7 +98,7 @@ class DedicatedOcrActivation:
                 request and current and current.phase == ActivationPhase.READY
                 and self.store.runtime_enabled(request)
             )
-            return result.model_copy(update={"selected": selected})
+            return result.model_copy(update={"selected": selected, "shared_gpu": self.store.shared_gpu()})
         except (ActivationStateError, OSError):
             return result
 
@@ -108,21 +112,24 @@ class DedicatedOcrActivation:
             request = self.store.read_request()
             current = self.store.read_status(request) if request else None
             enabled = self.store.runtime_enabled(request) if request else True
+            shared_gpu = self.store.shared_gpu()
         except ActivationStateError:
             return DedicatedOcrStatus(state="action_required", reason="ocr_activation_state_invalid")
         if current and current.phase == ActivationPhase.READY:
-            if not enabled and self._applied == current.generation and self._enabled is False:
+            applied = (self._applied, self._enabled, self._shared_gpu) == (current.generation, enabled, shared_gpu)
+            if not enabled and applied:
                 return DedicatedOcrStatus(state="disabled", installed=True)
-            if blocker := self._lifecycle_blocker():
-                return DedicatedOcrStatus(state="action_required", reason=blocker, installed=True)
-            try:
-                if self.settings.llm.model_name not in self.handoff.read_binding().model_ids:
-                    return DedicatedOcrStatus(
-                        state="action_required", reason="model_handoff_model_not_adopted", installed=True,
-                    )
-            except (HandoffWait, OSError, ValueError):
-                return DedicatedOcrStatus(state="action_required", reason="ocr_activation_state_invalid", installed=True)
-            if self._applied == current.generation and self._enabled == enabled:
+            if shared_gpu:
+                if blocker := self._lifecycle_blocker():
+                    return DedicatedOcrStatus(state="action_required", reason=blocker, installed=True)
+                try:
+                    if self.settings.llm.model_name not in self.handoff.read_binding().model_ids:
+                        return DedicatedOcrStatus(
+                            state="action_required", reason="model_handoff_model_not_adopted", installed=True,
+                        )
+                except (HandoffWait, OSError, ValueError):
+                    return DedicatedOcrStatus(state="action_required", reason="ocr_activation_state_invalid", installed=True)
+            if applied:
                 if await self._runtime_is_serving():
                     return DedicatedOcrStatus(state="active", installed=True)
                 return DedicatedOcrStatus(state="action_required", reason="ocr_runtime_unavailable", installed=True)
@@ -135,18 +142,89 @@ class DedicatedOcrActivation:
             return DedicatedOcrStatus(state="installing" if current else "requested")
         if not await self._controller_is_live():
             return DedicatedOcrStatus(state="unavailable", reason="gpu_profile_required")
-        if blocker := self._blocker or self._lifecycle_blocker():
+        if blocker := self._blocker or (self._lifecycle_blocker() if shared_gpu else None):
             return DedicatedOcrStatus(state="action_required", reason=blocker)
         return DedicatedOcrStatus(state="disabled")
 
-    def _publish_route(self, generation: UUID, enabled: bool) -> None:
-        selected = self.ocr_settings.model_copy(update={"enabled": enabled, "required": False})
+    async def set_gpu_topology(self, shared_gpu: bool, *, confirm_handoff: bool) -> DedicatedOcrStatus:
+        if self.external_mode:
+            raise _topology_wait("ocr_config_managed_externally")
+        try:
+            async with asyncio.timeout(6):
+                with self.store.admission(exclusive=True):
+                    if shared_gpu != self.store.shared_gpu():
+                        await self._change_gpu_topology(shared_gpu, confirm_handoff, monotonic() + 5)
+        except (ActivationBusy, ActivationConflict, TimeoutError):
+            raise _topology_wait("llm_quiescence_required") from None
+        except (ActivationStateError, OSError, ValueError):
+            raise _topology_wait("ocr_activation_state_invalid") from None
+        except httpx.HTTPError:
+            raise _topology_wait("ocr_runtime_unavailable") from None
+        except HandoffWait:
+            raise
+        except RuntimeError as exc:
+            if str(exc) == "model_release_unconfirmed":
+                raise _topology_wait("model_release_unconfirmed") from None
+            raise _topology_wait("ocr_runtime_unavailable") from None
+        return await self.status()
+
+    async def _change_gpu_topology(self, shared_gpu: bool, confirm_handoff: bool, deadline: float) -> None:
+        request = self.store.read_request()
+        current = self.store.read_status(request) if request else None
+        if request is None or (current is not None and current.phase == ActivationPhase.FAILED):
+            self.store.set_shared_gpu(shared_gpu)
+            self._blocker = None
+            return
+        if current is None or current.phase != ActivationPhase.READY:
+            raise _topology_wait("ocr_setup_pending")
+        if unsettled_direct_calls(self.store):
+            raise _topology_wait("llm_request_recovery_required")
+        if not await self._runtime_is_serving():
+            raise _topology_wait("ocr_runtime_unavailable")
+        enabled = self.store.runtime_enabled(request)
+        if shared_gpu:
+            if not confirm_handoff:
+                raise _topology_wait("ocr_handoff_confirmation_required")
+            if blocker := self._lifecycle_blocker():
+                raise _topology_wait(blocker)
+            async with self.ocr_only_handoff.quiesce(deadline):
+                pass
+            model = self.settings.llm.model_name
+            models = self.handoff.read_binding().model_ids if self.handoff.binding_path.exists() else []
+            if model not in models:
+                await adopt_binding(
+                    self.handoff, [*models, model], dedicated_coordinated_requests=True,
+                    external_eager_loading_disabled=True, deadline=deadline,
+                )
+            async with self.handoff.quiesce(deadline, model_id=model):
+                pass
+        else:
+            try:
+                # A clean shared journal needs only native confirmation. A remote
+                # endpoint may already be serving unrelated resident models.
+                async with self.ocr_only_handoff.quiesce(deadline):
+                    pass
+            except HandoffWait as exc:
+                if exc.status.reason_code != "model_handoff_journal_not_clean":
+                    raise
+                if not self.provider.supports_model_release:
+                    raise _topology_wait("llm_lifecycle_required") from None
+                async with self.handoff.quiesce(deadline):
+                    pass
+        self.store.set_shared_gpu(shared_gpu)
+        self._publish_route(request.generation, enabled, shared_gpu)
+
+    def _publish_route(self, generation: UUID, enabled: bool, shared_gpu: bool) -> None:
+        selected = self.ocr_settings.model_copy(update={
+            "enabled": enabled, "required": False, "shared_gpu": shared_gpu,
+        })
         # Keep the shared coordinator on direct vision calls while OCR is OFF.
-        self.provider.handoff = self.handoff
+        self.provider.handoff = self.handoff if shared_gpu else None
         self.settings.ocr = selected
         self.apply_route(self.ocr if enabled else None, selected)
         self._applied = generation
         self._enabled = enabled
+        self._shared_gpu = shared_gpu
         self._blocker = None
         self.wake_receipts()
 
@@ -160,9 +238,10 @@ class DedicatedOcrActivation:
                         return DedicatedOcrStatus(state="action_required", reason="ocr_setup_pending")
                     if unsettled_direct_calls(self.store):
                         return DedicatedOcrStatus(state="action_required", reason="llm_request_recovery_required", installed=True)
-                    if enabled and (blocker := self._lifecycle_blocker()):
+                    shared_gpu = self.store.shared_gpu()
+                    if shared_gpu and enabled and (blocker := self._lifecycle_blocker()):
                         return DedicatedOcrStatus(state="action_required", reason=blocker, installed=True)
-                    if not self.provider.supports_model_release:
+                    if shared_gpu and not self.provider.supports_model_release:
                         return DedicatedOcrStatus(
                             state="action_required", reason="llm_lifecycle_required", installed=True,
                         )
@@ -170,12 +249,13 @@ class DedicatedOcrActivation:
                         return DedicatedOcrStatus(state="action_required", reason="ocr_runtime_unavailable", installed=True)
                     # Session refuses unsettled requests, recovers settled journals,
                     # parks the real native worker and releases owned LLM models.
-                    async with self.handoff.session(
+                    handoff = self.handoff if shared_gpu else self.ocr_only_handoff
+                    async with handoff.session(
                         monotonic() + 5, model_id=self.settings.llm.model_name if enabled else None,
                     ):
                         pass
                     self.store.set_runtime_enabled(request, enabled)
-                    self._publish_route(request.generation, enabled)
+                    self._publish_route(request.generation, enabled, shared_gpu)
                     return DedicatedOcrStatus(state="active" if enabled else "disabled", installed=True)
         except HandoffWait as exc:
             return DedicatedOcrStatus(state="action_required", reason=exc.status.reason_code, installed=True)
@@ -209,13 +289,6 @@ class DedicatedOcrActivation:
                 return DedicatedOcrStatus(state="disabled")
         except (ActivationStateError, OSError):
             return DedicatedOcrStatus(state="action_required", reason="ocr_activation_state_invalid")
-        if not confirm_handoff:
-            self._blocker = "ocr_handoff_confirmation_required"
-            return DedicatedOcrStatus(state="action_required", reason=self._blocker)
-        if blocker := self._lifecycle_blocker():
-            self._blocker = blocker
-            return DedicatedOcrStatus(state="action_required", reason=blocker)
-
         try:
             async with asyncio.timeout(6):
                 with self.store.admission(exclusive=True):
@@ -223,6 +296,14 @@ class DedicatedOcrActivation:
                     phase = self.store.read_status(current) if current else None
                     if current and (phase is None or phase.phase != ActivationPhase.FAILED):
                         return await self.status()
+                    shared_gpu = self.store.shared_gpu()
+                    if shared_gpu:
+                        if not confirm_handoff:
+                            self._blocker = "ocr_handoff_confirmation_required"
+                            return DedicatedOcrStatus(state="action_required", reason=self._blocker)
+                        if blocker := self._lifecycle_blocker():
+                            self._blocker = blocker
+                            return DedicatedOcrStatus(state="action_required", reason=blocker)
                     if not await self._controller_is_live():
                         self._blocker = "gpu_profile_required"
                         return DedicatedOcrStatus(state="action_required", reason=self._blocker)
@@ -235,16 +316,18 @@ class DedicatedOcrActivation:
                     ):
                         self._blocker = "ocr_existing_handoff"
                         return DedicatedOcrStatus(state="action_required", reason=self._blocker)
-                    intent = MaintenanceIntent(os.environ.get(
-                        "OCR_ACTIVATION_MAINTENANCE_INTENT",
-                        MaintenanceIntent.EXTERNAL_LLM_QUIESCED.value,
-                    ))
-                    await adopt_binding(
-                        self.handoff, [self.settings.llm.model_name],
-                        dedicated_coordinated_requests=True,
-                        external_eager_loading_disabled=True,
-                        deadline=monotonic() + 3,
-                    )
+                    intent = MaintenanceIntent.SEPARATE_OCR_DEVICE
+                    if shared_gpu:
+                        intent = MaintenanceIntent(os.environ.get(
+                            "OCR_ACTIVATION_MAINTENANCE_INTENT",
+                            MaintenanceIntent.EXTERNAL_LLM_QUIESCED.value,
+                        ))
+                        await adopt_binding(
+                            self.handoff, [self.settings.llm.model_name],
+                            dedicated_coordinated_requests=True,
+                            external_eager_loading_disabled=True,
+                            deadline=monotonic() + 3,
+                        )
                     self.store.submit_request(
                         intent, retry_generation=current.generation if current else None,
                     )
@@ -266,7 +349,8 @@ class DedicatedOcrActivation:
             if request is None:
                 return
             enabled = self.store.runtime_enabled(request)
-            if request.generation == self._applied and enabled == self._enabled:
+            shared_gpu = self.store.shared_gpu()
+            if (request.generation, enabled, shared_gpu) == (self._applied, self._enabled, self._shared_gpu):
                 return
             current = self.store.read_status(request)
             if current is None or current.phase != ActivationPhase.READY:
@@ -277,19 +361,21 @@ class DedicatedOcrActivation:
                 if request is None or current is None or current.phase != ActivationPhase.READY:
                     return
                 enabled = self.store.runtime_enabled(request)
-                binding = self.handoff.read_binding()
-                if (enabled and self._lifecycle_blocker()) or not self.provider.supports_model_release:
-                    self._blocker = "llm_lifecycle_required"
-                    return
-                if enabled and self.settings.llm.model_name not in binding.model_ids:
-                    self._blocker = "model_handoff_model_not_adopted"
-                    return
+                shared_gpu = self.store.shared_gpu()
+                if shared_gpu:
+                    binding = self.handoff.read_binding()
+                    if (enabled and self._lifecycle_blocker()) or not self.provider.supports_model_release:
+                        self._blocker = "llm_lifecycle_required"
+                        return
+                    if enabled and self.settings.llm.model_name not in binding.model_ids:
+                        self._blocker = "model_handoff_model_not_adopted"
+                        return
                 # Existing services keep the same provider and receipt store. All
                 # route-facing references are replaced together under admission.
-                if unsettled_direct_calls(self.store):
+                if shared_gpu and unsettled_direct_calls(self.store):
                     self._blocker = "llm_request_recovery_required"
                     return
-                self._publish_route(request.generation, enabled)
+                self._publish_route(request.generation, enabled, shared_gpu)
         except ActivationBusy:
             return
         except (ActivationStateError, HandoffWait, OSError, ValueError):
@@ -309,3 +395,7 @@ class DedicatedOcrActivation:
                     self._blocker = "ocr_activation_state_invalid"
             await self.reconcile()
             await asyncio.sleep(1)
+
+
+def _topology_wait(reason_code: str) -> HandoffWait:
+    return HandoffWait(HandoffStatus(state="configuration_required", reason_code=reason_code))

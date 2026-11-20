@@ -677,7 +677,8 @@ async def test_failed_park_never_allows_fallback_or_formatter(photos, tmp_path, 
 
 
 @pytest.mark.asyncio
-async def test_explicit_benchmark_identity_qualifies_once_and_is_stable_while_parked(tmp_path, monkeypatch):
+@pytest.mark.parametrize("shared_gpu", [True, False])
+async def test_explicit_benchmark_identity_qualifies_once_and_is_stable_while_parked(tmp_path, monkeypatch, shared_gpu):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
 
@@ -712,11 +713,13 @@ async def test_explicit_benchmark_identity_qualifies_once_and_is_stable_while_pa
 
     events = []
     llm = formatter()
+    llm.supports_model_release = shared_gpu
     enable_managed_ocr(monkeypatch)
     llm.release_model = AsyncMock()
     ocr = ManagedOcr(events)
-    service = SimpleNamespace(_provider=llm, _ocr_provider=ocr,
-                              _ocr_settings=OcrSettings(enabled=True, coordination_path=tmp_path / "handoff"))
+    service = SimpleNamespace(_provider=llm, _ocr_provider=ocr, _ocr_settings=OcrSettings(
+        enabled=True, coordination_path=tmp_path / "handoff", shared_gpu=shared_gpu,
+    ))
     options = ExperimentOptions(pipeline="ocr")
     before = await pipeline_identity(service, options)
     assert before["ocr_runtime"]["runtime_fingerprint"] is None
@@ -726,6 +729,16 @@ async def test_explicit_benchmark_identity_qualifies_once_and_is_stable_while_pa
     assert frozen["ocr_runtime"]["runtime_fingerprint"] == "qualified-runtime"
     assert frozen == await pipeline_identity(service, options)
     assert events.count("load_ocr") == 1
+    if shared_gpu:
+        assert "shared_gpu" not in frozen["ocr_settings"]
+        assert frozen["managed_binding_sha256"]
+    else:
+        assert frozen["ocr_settings"]["shared_gpu"] is False
+        assert frozen["managed_binding_sha256"] is None
+        events.clear()
+        direct = await pipeline_identity(service, ExperimentOptions(pipeline="direct_vision"), qualify=True)
+        assert direct["managed_binding_sha256"] is None and direct["ocr_runtime"] is None
+        assert not events
     ocr.runtime = "different-runtime"
     assert frozen != await pipeline_identity(service, options)
 

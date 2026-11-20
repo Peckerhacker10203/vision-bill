@@ -155,7 +155,8 @@ class SubmissionService:
             if handoff is not None:
                 status = await handoff.inspect(
                     model_id=checkpoint.model_id, deadline=monotonic() + 1,
-                    expected_binding_sha256=image.effective_options.get("managed_binding_sha256") or "",
+                    expected_binding_sha256=(image.effective_options.get("managed_binding_sha256") or "")
+                    if handoff.shared_gpu else None,
                 )
                 if status.state != "ready":
                     reason = status.reason_code or OBSERVATION_RECOVERY_WAIT
@@ -184,14 +185,14 @@ class SubmissionService:
             if managed_ocr(ocr):
                 if not managed_ocr_enabled():
                     return "model_handoff_managed_ocr_required"
-                if not self.receipts.managed_ocr_compatible():
+                if ocr.shared_gpu and not self.receipts.managed_ocr_compatible():
                     return "model_release_unsupported"
                 handoff = self.receipts.execution_handoff(ocr)
                 assert handoff is not None
                 status = await handoff.inspect(
                     model_id=selected, deadline=monotonic() + 1,
                     expected_binding_sha256=(snapshot.get("managed_binding_sha256") or "")
-                    if image.effective_options else None,
+                    if image.effective_options and handoff.shared_gpu else None,
                 )
                 if status.state != "ready":
                     return status.reason_code
@@ -309,7 +310,8 @@ class SubmissionService:
                         try:
                             await recovery.enter_async_context(handoff.recover_checkpoint(
                                 deadline, model_id=checkpoint.model_id,
-                                expected_binding_sha256=claim.image.effective_options.get("managed_binding_sha256") or "",
+                                expected_binding_sha256=(claim.image.effective_options.get("managed_binding_sha256") or "")
+                                if handoff.shared_gpu else None,
                                 before_dispatch=check_before_recovery,
                             ))
                         except HandoffWait:
@@ -517,7 +519,7 @@ class SubmissionService:
                 raise StaleClaimError
 
         tags = await self.receipts.list_tags(deadline=db_deadline)
-        expected_binding = (snapshot.get("managed_binding_sha256") or "") if managed_ocr(ocr) else None
+        expected_binding = (snapshot.get("managed_binding_sha256") or "") if managed_ocr(ocr) and ocr.shared_gpu else None
         for retry in range(2):
             try:
                 if policy_hold_reason(snapshot, self.settings.ocr):
