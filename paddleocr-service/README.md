@@ -347,10 +347,15 @@ For ROCm replace `cuda` with `rocm`. The launcher checks the original volume
 ownership and exclusive locks, saved separate-GPU topology, exact local managed
 OCR identity and a single valid pending OCR-only handoff. It preserves the
 original journal bytes in a private `gpu-handoff.ocr-only.recovered-<uuid>.json`
-next to the journal in the coordination volume. The recovery concerns that
-retired worker. Resume the receipt separately through the queue. A shared-GPU
-handoff, foreign or unproven owner, invalid journal, crash marker or unresolved
-external work still requires investigation under the original ownership.
+next to the journal in the coordination volume. A hard stop can also leave
+`installation.active-ocr.json`, which the native supervisor writes before starting
+its worker. For a single valid marker from the removed OCR worker, recovery
+acquires the original OCR role lock, verifies container removal and archives the
+marker before settling the journal. The saved files stay on the coordination
+volume. If Settings still shows a failed activation after the upgrade, enable
+Dedicated OCR again. Check the existing receipt in the queue before retrying it.
+A shared-GPU handoff, unresolved external work, a foreign owner, an initializer
+marker, or damaged or unrecognized records require separate investigation.
 Use ordinary `--upgrade` for a clean deployment.
 
 If a build fails before the new deployment record is published, fix the build
@@ -731,7 +736,9 @@ After hard death, externally confirm all managed containers recorded by the
 markers and their descendants are gone. Only then archive the applicable
 `/coord/installation.active-*.json` markers and retain the installation and role
 lockfiles. Preserve the user's volumes through recovery. The installation fence
-and the app's model-handoff journal are separate.
+and the app's model-handoff journal are separate. A stopped source deployment
+can use the [retired-worker procedure](#upgrade-an-existing-source-installation)
+when only the local OCR worker and its matching journal need recovery.
 
 ## Internal model ownership
 

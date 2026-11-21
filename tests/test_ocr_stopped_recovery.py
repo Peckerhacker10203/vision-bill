@@ -263,3 +263,204 @@ def test_recovery_checks_foreign_container_access(foreign):
 
     with pytest.raises(ValueError, match="network|volume"):
         recovery._verify_stopped(names, "sample", "helper", run)
+
+
+def crashed_native(coord):
+    marker = coord / "installation.active-ocr.json"
+    marker.touch(mode=0o600)
+    marker.write_text(json.dumps({"schema": 1, "role": "ocr", "run_id": uuid4().hex}))
+    (coord / "installation.role-ocr.lock").touch(mode=0o600)
+    return marker
+
+
+def test_valid_native_crash_marker_archived_only_after_removal(stopped):
+    coord, store, journal, saved = stopped
+    marker = crashed_native(coord)
+    original_marker, original_journal = marker.read_bytes(), journal.read_bytes()
+    role_inode = (coord / "installation.role-ocr.lock").stat().st_ino
+
+    def confirm():
+        assert marker.read_bytes() == original_marker
+        assert journal.read_bytes() == original_journal
+        assert not list(coord.glob("*.recovered-*.json"))
+
+    journal_backup = recovery.settle_stopped_owner(coord, store, confirm)
+    (backup,) = coord.glob("installation.ocr.recovered-*.json")
+    assert backup.read_bytes() == original_marker
+    assert backup.stat().st_mode & 0o777 == 0o600
+    assert backup.name.removeprefix("installation.ocr.") == journal_backup.name.removeprefix(
+        "gpu-handoff.ocr-only."
+    )
+    assert not marker.exists()
+    assert (coord / "installation.role-ocr.lock").stat().st_ino == role_inode
+    assert json.loads(journal.read_bytes()) == dict(saved, ocr_pending=False)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "initializer",
+        "ollama",
+        "unknown",
+        "wrong-role",
+        "not-uuid4",
+        "duplicate",
+        "schema-bool",
+        "shape",
+        "mode",
+        "symlink",
+        "hardlink",
+        "busy-role",
+        "missing-role-lock",
+        "changed",
+        "new-marker",
+        "container",
+    ],
+)
+def test_crash_marker_ambiguous_ownership_preserves_journal(stopped, case):
+    import fcntl
+
+    coord, store, journal, _ = stopped
+    marker = crashed_native(coord)
+    role_lock = coord / "installation.role-ocr.lock"
+    with role_lock.open("rb") as role:
+        saved = json.loads(marker.read_bytes())
+        if case in ("initializer", "ollama", "unknown"):
+            (coord / f"installation.active-{case}.json").touch(mode=0o600)
+        if case == "wrong-role":
+            saved["role"] = "initializer"
+        if case == "not-uuid4":
+            saved["run_id"] = "a" * 32
+        if case == "schema-bool":
+            saved["schema"] = True
+        if case == "shape":
+            saved["container_id"] = "unknown"
+        marker.write_text(json.dumps(saved))
+        if case == "duplicate":
+            marker.write_text(marker.read_text().replace('"schema": 1', '"schema": 2, "schema": 1'))
+        if case == "mode":
+            marker.chmod(0o644)
+        if case == "symlink":
+            target = coord / "unrelated"
+            marker.rename(target)
+            marker.symlink_to(target)
+        if case == "hardlink":
+            os.link(marker, coord / "other-file")
+        if case == "missing-role-lock":
+            role_lock.unlink()
+        if case == "busy-role":
+            fcntl.flock(role, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        before = journal.read_bytes()
+
+        def confirm():
+            if case == "container":
+                raise ValueError("attached container")
+            if case == "changed":
+                marker.write_text(json.dumps({**saved, "run_id": uuid4().hex}))
+            if case == "new-marker":
+                (coord / "installation.active-old.json").touch()
+
+        with pytest.raises((ValueError, OSError, RuntimeError)):
+            recovery.settle_stopped_owner(coord, store, confirm)
+        assert journal.read_bytes() == before
+        assert marker.exists()
+        assert not list(coord.glob("*.recovered-*.json"))
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_crash_marker_interruption_after_archive_is_retryable(stopped, monkeypatch, failed):
+    coord, store, journal, saved = stopped
+    marker = crashed_native(coord)
+    if failed:
+        rec = store.status_dir / "status.json"
+        rec.write_text(
+            json.dumps(
+                {
+                    **json.loads(rec.read_text()),
+                    "phase": "failed",
+                    "reason_code": "native_activation_recovery_required",
+                }
+            )
+        )
+    prior = marker.read_bytes()
+    original = journal.read_bytes()
+    replace = os.replace
+
+    def fail_at_journal(src, dst):
+        if dst == journal:
+            raise OSError("disk failure")
+        return replace(src, dst)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "replace", fail_at_journal)
+        with pytest.raises(OSError):
+            recovery.settle_stopped_owner(coord, store, lambda: None)
+    assert journal.read_bytes() == original
+    assert not marker.exists()
+    (backup,) = coord.glob("installation.ocr.recovered-*.json")
+    assert backup.read_bytes() == prior
+    recovery.settle_stopped_owner(coord, store, lambda: None)
+    assert json.loads(journal.read_bytes()) == dict(saved, ocr_pending=False)
+
+
+@pytest.mark.parametrize(
+    "phase,reason,has_marker,allowed",
+    [
+        (ActivationPhase.FAILED, "native_activation_recovery_required", True, True),
+        (ActivationPhase.FAILED, "native_activation_recovery_required", False, False),
+        (ActivationPhase.FAILED, "native_installation_busy", True, False),
+        (ActivationPhase.PREPARING, None, True, False),
+    ],
+)
+def test_matching_restoration_failure_requires_crash_evidence(
+    stopped, phase, reason, has_marker, allowed
+):
+    coord, store, journal, _ = stopped
+    if has_marker:
+        crashed_native(coord)
+    path = store.status_dir / "status.json"
+    record = json.loads(path.read_text())
+    path.write_text(json.dumps({**record, "phase": phase.value, "reason_code": reason}))
+    if allowed:
+        recovery.settle_stopped_owner(coord, store, lambda: None)
+        assert not json.loads(journal.read_bytes())["ocr_pending"]
+    else:
+        with pytest.raises((ValueError, RuntimeError)):
+            recovery.settle_stopped_owner(coord, store, lambda: None)
+        assert json.loads(journal.read_bytes())["ocr_pending"]
+
+
+def test_retry_syncs_retired_marker_before_settling_journal(stopped, monkeypatch):
+    import stat
+
+    coord, store, journal, _ = stopped
+    marker = crashed_native(coord)
+    fsync, replace = os.fsync, os.replace
+
+    def interrupted_sync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode) and not marker.exists():
+            raise OSError("marker rename not yet durably acknowledged")
+        fsync(fd)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "fsync", interrupted_sync)
+        with pytest.raises(OSError):
+            recovery.settle_stopped_owner(coord, store, lambda: None)
+    assert json.loads(journal.read_bytes())["ocr_pending"]
+    assert not marker.exists()
+    synced = False
+
+    def sync(fd):
+        nonlocal synced
+        fsync(fd)
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            synced = True
+
+    def publish(src, dst):
+        if dst == journal:
+            assert synced, "must sync archived marker before retiring journal"
+        replace(src, dst)
+
+    monkeypatch.setattr(os, "fsync", sync)
+    monkeypatch.setattr(os, "replace", publish)
+    recovery.settle_stopped_owner(coord, store, lambda: None)

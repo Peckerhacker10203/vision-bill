@@ -14,7 +14,7 @@ from collections.abc import Callable
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 ENDPOINT = "http://paddleocr-service:8082"
 OCR_RESOURCE = "paddleocr:" + hashlib.sha256(ENDPOINT.encode()).hexdigest()
@@ -30,8 +30,8 @@ SERVING = "paddleocr-service"
 REFUSALS = {
     "locks": "An original controller, admission, handoff or installation lock is unavailable. Stop all owners and preserve the lockfiles.",
     "metadata": "The original activation metadata or handoff records could not be verified. Preserve the volumes and inspect the original deployment.",
-    "markers": "A native crash marker remains. Reconcile the original stopped native scope before recovery.",
-    "topology": "The current activation must record separate GPUs and a ready, previously installed local OCR service.",
+    "markers": "The native marker is ambiguous or unsafe. Preserve it and reconcile the original managed container before recovery.",
+    "topology": "Separate GPUs and a matching ready installation or evidenced OCR restoration failure are required.",
     "direct": "The direct-call directory contains a marker or has unsafe permissions. Reconcile the original LLM request before recovery.",
     "shared": "The shared handoff journal is unsettled or belongs to another OCR endpoint. Reconcile its recorded owners first.",
     "ocr_only": "The separate-GPU journal must identify only the original local OCR worker with no LLM work.",
@@ -81,11 +81,61 @@ def _journal_bytes(path: Path) -> bytes:
         return data
 
 
+def _native_marker(path: Path) -> bytes:
+    """Exact v1 supervisor record; its run UUID is not a Docker container ID."""
+    from ocr_service.initialization_lock import _unique_pairs
+
+    try:
+        raw = _journal_bytes(path)
+        if len(raw) > 4096:
+            raise ValueError("Oversized marker")
+        value = json.loads(raw, object_pairs_hook=_unique_pairs)
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"schema", "role", "run_id"}
+            or type(value["schema"]) is not int
+            or value["schema"] != 1
+            or value["role"] != "ocr"
+            or not isinstance(value["run_id"], str)
+            or not re.fullmatch(r"[0-9a-f]{32}", value["run_id"])
+            or UUID(value["run_id"]).version != 4
+        ):
+            raise ValueError("Unknown marker")
+        return raw
+    except (OSError, ValueError) as exc:
+        raise RecoveryRefused("markers") from exc
+
+
+def _active_ocr_marker(coord: Path) -> bytes | None:
+    names = [
+        entry.name for entry in coord.iterdir() if entry.name.startswith("installation.active-")
+    ]
+    if not names:
+        return None
+    if names != ["installation.active-ocr.json"]:
+        raise RecoveryRefused("markers")
+    return _native_marker(coord / names[0])
+
+
+def _publish_file(path: Path, data: bytes, directory: int) -> None:
+    # Both backup and journal must be complete after any interrupted publication.
+    fd, temporary = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        os.fsync(directory)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
 def settle_stopped_owner(coord: Path, store: Any, confirm_stopped: Callable[[], None]) -> Path:
     """Caller proves daemon ownership while these original lock inodes are held."""
     from ocr_contract.activation import ActivationPhase, _lock, _private_directory
     from ocr_service.initialization_lock import OutstandingHandoff, _require_clean_journal
-    from ocr_service.supervision import check_fences
+    from ocr_service.supervision import role_lock_path
 
     with ExitStack() as stack:
         for directory, name in (
@@ -100,13 +150,18 @@ def settle_stopped_owner(coord: Path, store: Any, confirm_stopped: Callable[[], 
                 )
             except (OSError, RuntimeError) as exc:
                 raise RecoveryRefused("locks") from exc
-        try:
-            check_fences(coord / "installation.lock", "initializer")
-        except RuntimeError as exc:
-            raise RecoveryRefused("markers") from exc
+        marker = _active_ocr_marker(coord)
         request = store.read_request()
         status = store.read_status(request) if request else None
-        if store.shared_gpu() or status is None or status.phase != ActivationPhase.READY:
+        restoration_failed = status is not None and (
+            status.phase == ActivationPhase.FAILED
+            and status.reason_code == "native_activation_recovery_required"
+        )
+        if (
+            store.shared_gpu()
+            or status is None
+            or (status.phase != ActivationPhase.READY and not restoration_failed)
+        ):
             raise RecoveryRefused("topology")
         markers = store.request_dir / "direct-calls"
         if os.path.lexists(markers):
@@ -142,29 +197,58 @@ def settle_stopped_owner(coord: Path, store: Any, confirm_stopped: Callable[[], 
             raise RecoveryRefused("ocr_only")
         if any(os.path.lexists(p.with_suffix(".pending")) for p in (journal, peer)):
             raise RecoveryRefused("pending_write")
+        # Correlate recovery evidence with this activation generation and exact pending
+        # journal. A crash after retiring the marker must leave a verifiable retry.
+        evidence_id = uuid5(
+            NAMESPACE_URL,
+            f"vision-bill/ocr/{request.generation}/{hashlib.sha256(before).hexdigest()}",
+        ).hex
+        archived_marker = coord / f"installation.ocr.recovered-{evidence_id}.json"
+        backup = coord / f"gpu-handoff.ocr-only.recovered-{evidence_id}.json"
+        archived = os.path.lexists(archived_marker)
+        if archived:
+            _native_marker(archived_marker)
+            if (
+                marker is not None
+                or not os.path.lexists(backup)
+                or _journal_bytes(backup) != before
+            ):
+                raise RecoveryRefused("markers")
+        if marker is not None or archived:
+            # The original PID1 owns this lock for its whole native OCR scope. Never
+            # create a replacement inode as evidence of a stopped container.
+            role_lock = role_lock_path(coord / "installation.lock", "ocr")
+            try:
+                stack.enter_context(
+                    _lock(coord, role_lock.name, exclusive=True, blocking=False, create=False)
+                )
+            except (OSError, RuntimeError) as exc:
+                raise RecoveryRefused("locks") from exc
+        elif restoration_failed:
+            raise RecoveryRefused("topology")
+        else:
+            backup = coord / f"gpu-handoff.ocr-only.recovered-{uuid4().hex}.json"
+
         confirm_stopped()
-        if _journal_bytes(journal) != before:
-            raise ValueError("Handoff changed during stopped-owner verification")
-        backup = coord / f"gpu-handoff.ocr-only.recovered-{uuid4().hex}.json"
+        if _active_ocr_marker(coord) != marker or _journal_bytes(journal) != before:
+            raise ValueError("Ownership evidence changed during stopped-owner verification")
         state["ocr_pending"] = False
         with _private_directory(coord, create=False) as directory:
-            with os.fdopen(
-                os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb"
-            ) as out:
-                out.write(before)
-                out.flush()
-                os.fsync(out.fileno())
+            if os.path.lexists(backup):
+                if _journal_bytes(backup) != before:
+                    raise RecoveryRefused("markers")
+            else:
+                _publish_file(backup, before, directory)
+            if marker is not None:
+                if os.path.lexists(archived_marker):
+                    raise RecoveryRefused("markers")
+                # Atomically archive the original inode while the journal is still
+                # pending. Never overwrite or clear an initializer or legacy fence.
+                os.rename(coord / "installation.active-ocr.json", archived_marker)
+            # A resumed rename may have survived an interrupted fsync. Establish
+            # the archive barrier again before a clean journal can become visible.
             os.fsync(directory)
-            fd, temporary = tempfile.mkstemp(dir=coord)
-            try:
-                with os.fdopen(fd, "w") as updated:
-                    json.dump(state, updated)
-                    updated.flush()
-                    os.fsync(updated.fileno())
-                os.replace(temporary, journal)
-                os.fsync(directory)
-            finally:
-                Path(temporary).unlink(missing_ok=True)
+            _publish_file(journal, json.dumps(state).encode(), directory)
         return backup
 
 
@@ -192,6 +276,9 @@ def _inside() -> None:
         print("metadata", flush=True)
         raise SystemExit(1) from None
     print(backup.name)
+    archived = backup.with_name(backup.name.replace("gpu-handoff.ocr-only.", "installation.ocr."))
+    if archived.exists():
+        print(archived.name)
 
 
 def _volume_names(config: dict[str, Any], project: str) -> dict[str, str]:
@@ -420,12 +507,19 @@ def recover_stopped_ocr(
         )
         if run("docker", "wait", helper, capture=True).strip() != "0":
             raise ValueError("Stopped OCR ownership could not be settled")
-        backup = run("docker", "logs", helper, capture=True).strip()
-        if not re.fullmatch(r"gpu-handoff\.ocr-only\.recovered-[0-9a-f]{32}\.json", backup):
-            raise ValueError("Cannot confirm the saved OCR handoff backup")
+        archives = run("docker", "logs", helper, capture=True).strip().splitlines()
+        if (
+            not archives
+            or not re.fullmatch(r"gpu-handoff\.ocr-only\.recovered-[0-9a-f]{32}\.json", archives[0])
+            or len(archives) > 1
+            and archives[1:] != [archives[0].replace("gpu-handoff.ocr-only.", "installation.ocr.")]
+        ):
+            raise ValueError("Cannot confirm the saved OCR recovery evidence")
         print(
-            f"Stopped local OCR ownership settled. Original journal saved in {names['ocr-coordination']}/{backup}."
+            f"Stopped local OCR ownership settled. Original journal saved in {names['ocr-coordination']}/{archives[0]}."
         )
+        if len(archives) == 2:
+            print(f"Native OCR crash marker archived in {names['ocr-coordination']}/{archives[1]}.")
     except subprocess.CalledProcessError:
         # Docker logs on stderr for a refused helper; read via explicit exit status text on stdout.
         failure = run("docker", "logs", helper, capture=True).strip()
