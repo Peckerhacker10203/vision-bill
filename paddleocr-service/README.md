@@ -287,13 +287,9 @@ Run from the original checkout. Back up the installation and let active jobs
 finish. If an OCR load timed out on a separate GPU, keep that topology and
 switch **Dedicated OCR** off on the old stack. Wait for Settings to confirm
 it is off. An installed service can park a failed worker while leaving the
-remote LLM loaded. If the upgrade reports a pending handoff after shutdown,
-use `python3 scripts/ocr_source_up.py cuda --restart` from the original
-checkout with its saved deployment record. Switch OCR off there, confirm it
-is off, stop the stack, and back up the settled state before retrying the
-upgrade. Keep the handoff journal intact. After upgrading, turn OCR back on
-and resume the existing receipt in the queue. If it reports changed settings,
-review them and choose the current-policy retry for that receipt.
+remote LLM loaded. After upgrading, turn OCR back on and resume the existing
+receipt in the queue. If it reports changed settings, review them and choose
+the current-policy retry for that receipt.
 
 Stop the old deployment with its original project, profile and complete
 Compose file set. Keep its named volumes, private settings and bind-mounted
@@ -309,11 +305,58 @@ python3 scripts/ocr_source_up.py cuda --upgrade
 If you originally selected a custom project name, use that same `-p NAME` on
 the stop command. For ROCm use `rocm` in the overlay name, directory and launcher
 argument. On ROCm WSL, include `-f docker-compose.rocm-wsl.yml` between the
-ROCm overlay and the generated `compose.local.json`. The upgrade verifies the original deployment claim, retains its
-project, device and approved model sources, then builds and starts the new
-images. If the build fails before the launcher publishes its new deployment
-record, `--restart` starts the previous recorded images. If the record was
-published and container startup fails, `--restart` retries the **new** images.
+ROCm overlay and the generated `compose.local.json`.
+
+**If the old app or OCR image was deleted**, use the same `--upgrade` command.
+Keep the stopped original project, its volumes and ownership claim, the
+private `.env`, and the source deployment record and release directory in
+`server_data/ocr-source/<accelerator>/`. The launcher verifies the original
+coordination volume and checks both handoff journals with a read-only CPU
+container. It uses the repository-pinned Python image and pulls it if missing.
+A clean result lets the launcher rebuild the app and OCR images with the
+recorded device and model sources.
+
+* **Docker or inspector error.** Read Docker's reported error. Check access to
+  the pinned image and the original coordination volume, then retry the upgrade.
+* **Lock held.** Identify and drain the original owner before retrying.
+* **Outstanding handoff.** Preserve both journals. Recover the original stack
+  and settle the reported work with its original endpoint. For an OCR-only
+  pending handoff, switch Dedicated OCR off and wait for Settings to show
+  Disabled. Stop the original project and retry the upgrade. If its recorded
+  images are missing, use the narrowly scoped retired-worker procedure below
+  if applicable. To restart the old generation, restore its exact images first.
+* **Invalid journal or ambiguous volume identity.** Keep the original volume,
+  deployment metadata and backup together. Investigate the reported ownership
+  or integrity issue before proceeding. [Handoff recovery](#internal-model-ownership)
+
+**Recover a retired separate-GPU OCR worker.** A distinct opt-in upgrade path
+is available when the original local OCR worker is fully stopped, its deployment
+is retired, and only that worker’s separate-GPU OCR handoff remains. Keep the
+original project, volumes, source deployment record and release. Back up the
+installation before recovery. Drain the original Compose project and take it
+down with its volumes retained. Verify that Compose removed its default network
+and `postgres_net`. Containers attached to the original OCR volumes must be gone,
+including stopped containers.
+In the original checkout, use the recorded project and accelerator:
+
+```bash
+python3 scripts/ocr_source_up.py cuda --upgrade --recover-stopped-ocr
+```
+
+For ROCm replace `cuda` with `rocm`. The launcher checks the original volume
+ownership and exclusive locks, saved separate-GPU topology, exact local managed
+OCR identity and a single valid pending OCR-only handoff. It preserves the
+original journal bytes in a private `gpu-handoff.ocr-only.recovered-<uuid>.json`
+next to the journal in the coordination volume. The recovery concerns that
+retired worker. Resume the receipt separately through the queue. A shared-GPU
+handoff, foreign or unproven owner, invalid journal, crash marker or unresolved
+external work still requires investigation under the original ownership.
+Use ordinary `--upgrade` for a clean deployment.
+
+If a build fails before the new deployment record is published, fix the build
+error and retry `--upgrade`. An available set of original recorded images can
+also be started with `--restart`. If a new record was published before
+container startup failed, `--restart` retries its recorded **new** images.
 
 For rollback, drain and stop the new deployment, account for writes since the
 backup, then restore the previous checkout and its original image tags. Restore
@@ -330,10 +373,13 @@ locks. Preparation reuses verified model assets. If the new image deliberately
 changes approved package pins or model sources, pass the matching approved
 input directory after the accelerator, before `--upgrade`.
 
-CUDA upgrades reuse the original wheel channel. For older source records the
-launcher reads the lock from the installed image, so a CUDA 12.6 installation
-stays on `cu126`. To switch deliberately, set `OCR_CUDA_CHANNEL=cu129` or
-`cu126` in your shell or the checkout's `.env` before running `--upgrade`.
+CUDA upgrades preserve the channel saved in the original deployment record or
+its image configuration. For an older record that lacks usable channel
+metadata, the launcher can read the lock from the original image if it still
+exists. If neither source identifies the channel, set `OCR_CUDA_CHANNEL=cu126`
+or `OCR_CUDA_CHANNEL=cu129` to the intended channel in the shell or checkout’s
+`.env`, then retry `--upgrade`. The same setting selects a deliberate channel
+change.
 
 A CPU limit previously set with `docker update` belongs to the container that
 was replaced. To restore a previous limit of 6.4 CPUs on a CUDA source

@@ -48,7 +48,9 @@ These are correctness changes, not measured OCR accuracy or speed improvements.
 
 For a source installation created with `ocr_source_up.py`, use the original
 checkout and the documented `--upgrade` procedure after backup and drain.
-`--restart` reuses the previously recorded images. [Source upgrade steps](paddleocr-service/README.md#upgrade-an-existing-source-installation)
+A stopped, settled original deployment with its records, release and volumes intact
+can rebuild deleted app or OCR images through `--upgrade`. The read-only handoff
+check uses a separate pinned CPU image. `--restart` needs the recorded images. [Source upgrade steps](paddleocr-service/README.md#upgrade-an-existing-source-installation)
 
 For a prepared upgrade, keep the old Compose project name and volume mounts.
 Use a schema-v2 bundle for the new installation. Changing the extraction directory

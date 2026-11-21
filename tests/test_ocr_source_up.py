@@ -113,13 +113,14 @@ def test_source_command_prepares_default_inputs(
         restart: bool,
         reuse_native_image: str | None,
         upgrade: bool,
+        recover_stopped_ocr: bool,
     ) -> None:
-        calls.append((chosen, inputs, restart, reuse_native_image, upgrade))
+        calls.append((chosen, inputs, restart, reuse_native_image, upgrade, recover_stopped_ocr))
 
     monkeypatch.setattr(sys, "argv", [str(SCRIPT), accelerator])
     monkeypatch.setattr(ocr_source_up, "bootstrap", bootstrap)
     assert ocr_source_up.main() == 0
-    assert calls == [(accelerator, None, False, None, False)]
+    assert calls == [(accelerator, None, False, None, False, False)]
 
 
 def test_source_command_rejects_supplied_inputs_with_restart() -> None:
@@ -1072,7 +1073,7 @@ def test_source_upgrade_channel_only_changes_on_explicit_selection(
     )
 
 
-@pytest.mark.parametrize("failure", [None, "build", "pending_ocr", "volume_mismatch"])
+@pytest.mark.parametrize("failure", [None, "build", "pending_ocr", "volume_mismatch", "late_pending"])
 def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
     tmp_path, managed_release, monkeypatch, failure
 ):
@@ -1130,12 +1131,18 @@ def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
             assert f"label=com.docker.compose.project={project}" in args
             return volume_name if failure != "volume_mismatch" else "other-volume"
         if args[:2] == ("docker", "run") and "--mount" in args:
-            assert config_id in args and "--gpus" not in args
-            assert "--pull=never" in args and "--network=none" in args and "--read-only" in args
+            assert source.JOURNAL_INSPECTOR in args and config_id not in args and "--gpus" not in args
+            assert "--pull=missing" in args and "--network=none" in args and "--read-only" in args
+            assert not any("type=bind" in item for item in args)
+            assert "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=1m" in args
             assert args[args.index("--mount") + 1] == (
                 f"type=volume,source={volume_name},target=/coord,readonly,volume-nocopy"
             )
-            return "needs-recovery" if failure == "pending_ocr" else "clean"
+            if failure == "pending_ocr" or (
+                failure == "late_pending" and sum(source.JOURNAL_INSPECTOR in call for call in commands) == 2
+            ):
+                return "pending gpu-handoff.ocr-only.json"
+            return "clean"
         if "--environment" in args:
             return "COMPOSE_PROJECT_NAME=saved-project\n"
         if args[:2] == ("docker", "run") and "--volume" not in args:
@@ -1179,7 +1186,7 @@ def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
 
     monkeypatch.setattr(source, "export_config", image_config)
     if failure in {"pending_ocr", "volume_mismatch"}:
-        expected = "switch Dedicated OCR off" if failure == "pending_ocr" else "coordination volume"
+        expected = "gpu-handoff.ocr-only.json" if failure == "pending_ocr" else "coordination volume"
         with pytest.raises(ValueError, match=expected):
             source.deploy(("docker", "compose"), tmp_path, "cuda", None, upgrade=True)
         assert json.loads(managed.read_bytes()) == prior
@@ -1187,6 +1194,14 @@ def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
         assert not any(
             "build" in call or "up" in call or call[:1] == ("make",) for call in commands
         )
+        return
+    if failure == "late_pending":
+        with pytest.raises(ValueError, match="gpu-handoff.ocr-only.json"):
+            source.deploy(("docker", "compose"), tmp_path, "cuda", None, upgrade=True)
+        assert json.loads(managed.read_bytes()) == prior
+        assert source.was_admitted(managed)
+        assert list(tmp_path.glob("release-*")) == [old_release]
+        assert not any("up" in call for call in commands)
         return
     if failure == "build":
         with pytest.raises(subprocess.CalledProcessError):
@@ -1213,8 +1228,8 @@ def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
     [
         (None, False, "clean"),
         ("gpu-handoff.ocr-only.json", False, "clean"),
-        ("gpu-handoff.ocr-only.json", True, "needs-recovery"),
-        ("gpu-handoff.json", True, "needs-recovery"),
+        ("gpu-handoff.ocr-only.json", True, "pending gpu-handoff.ocr-only.json"),
+        ("gpu-handoff.json", True, "pending gpu-handoff.json"),
     ],
 )
 def test_offline_upgrade_preflight_uses_both_real_journal_checks_without_writes(
@@ -1235,6 +1250,7 @@ def test_offline_upgrade_preflight_uses_both_real_journal_checks_without_writes(
         record = tmp_path / journal
         record.write_text(json.dumps(data))
         record.chmod(0o600)
+        (tmp_path / "gpu-handoff.lock").touch(mode=0o600)
     before = {p: (p.stat().st_mtime_ns, p.read_bytes()) for p in tmp_path.iterdir()}
     result = subprocess.run(
         [
@@ -1251,3 +1267,157 @@ def test_offline_upgrade_preflight_uses_both_real_journal_checks_without_writes(
     )
     assert result.stdout.strip() == verdict
     assert before == {p: (p.stat().st_mtime_ns, p.read_bytes()) for p in tmp_path.iterdir()}
+
+
+@pytest.mark.parametrize("channel", ["cu126", "cu129"])
+def test_legacy_cuda_channel_uses_verified_install_run_after_image_deleted(
+    tmp_path, monkeypatch, channel
+):
+    from scripts import ocr_source_up as source
+
+    config = tmp_path / "image-config.json"
+    default = {"created_by": "ARG OCR_CUDA_CHANNEL=cu129"}
+    instruction = (
+        f"RUN |1 OCR_CUDA_CHANNEL={channel} /bin/sh -c python /opt/ocr/build/resolve_cuda.py "
+        '--check /opt/locks/requirements.cuda.lock --channel "$OCR_CUDA_CHANNEL" '
+        "&& python -m pip install --require-hashes --no-deps -r /opt/locks/requirements.cuda.lock"
+    )
+    previous = {"image_ids": {source.NATIVE: "sha256:" + "a" * 64}}
+
+    def command(*args, capture=False):
+        if args[-1] == "--environment":
+            return ""
+        raise subprocess.CalledProcessError(125, args)
+
+    monkeypatch.setattr(source, "command", command)
+    monkeypatch.delenv("OCR_CUDA_CHANNEL", raising=False)
+    config.write_text(json.dumps({"history": [default, {"created_by": instruction}]}))
+    assert source.cuda_build_channel(("docker", "compose"), {}, previous, config) == channel
+    config.write_text(json.dumps({"history": [default]}))
+    with pytest.raises(ValueError, match="Set OCR_CUDA_CHANNEL"):
+        source.cuda_build_channel(("docker", "compose"), {}, previous, config)
+
+
+def test_upgrade_inspector_respects_another_owner_and_rejects_unsafe_evidence(tmp_path):
+    import fcntl
+
+    from scripts import ocr_source_up as source
+
+    lock = tmp_path / "gpu-handoff.lock"
+
+    def inspect():
+        return subprocess.check_output(
+            [sys.executable, "-B", "-c", source.CHECK_UPGRADE_HANDOFF, str(lock)],
+            cwd=source.ROOT / "paddleocr-service",
+            text=True,
+        ).strip()
+
+    with lock.open("w") as owner:
+        lock.chmod(0o600)
+        fcntl.flock(owner, fcntl.LOCK_EX)
+        assert inspect() == "busy"
+    journal = lock.with_suffix(".json")
+    journal.symlink_to(tmp_path / "missing")
+    assert inspect() == "invalid gpu-handoff.json"
+    assert journal.is_symlink()
+
+
+@pytest.mark.parametrize(
+    ("initial", "after", "expect_recovery", "error"),
+    [
+        ("clean", None, False, None),
+        ("pending gpu-handoff.ocr-only.json", "clean", True, None),
+        (
+            "pending gpu-handoff.ocr-only.json",
+            "invalid gpu-handoff.json",
+            True,
+            "failed validation",
+        ),
+        ("pending gpu-handoff.json", None, False, "shared GPU handoff"),
+        ("invalid gpu-handoff.ocr-only.json", None, False, "failed validation"),
+        ("busy", None, False, "lock is held"),
+    ],
+)
+def test_recovery_dispatch_requires_specific_journal_and_rechecks_clean(
+    monkeypatch, initial, after, expect_recovery, error
+):
+    from scripts import ocr_source_up as source
+
+    volume = "original_ocr-coordination"
+    lock = "/coord/gpu-handoff.lock"
+    mounts = [{"target": "/coord", "source": "ocr-coordination", "type": "volume"}]
+    config = {
+        "volumes": {"ocr-coordination": {"name": volume}},
+        "services": {
+            "vision_bill": {
+                "environment": {"OCR_ACTIVATION_HANDOFF_LOCK_PATH": lock},
+                "volumes": mounts,
+            },
+            source.NATIVE: {"environment": {"OCR_HANDOFF_LOCK_PATH": lock}, "volumes": mounts},
+        },
+    }
+    previous = {"project": "original"}
+    verdicts = iter([initial, after] if after is not None else [initial])
+
+    def docker(*args, capture=False):
+        assert source.JOURNAL_INSPECTOR in args and "--user=0:0" in args
+        assert "--read-only" in args and "--network=none" in args
+        return next(verdicts)
+
+    calls = []
+
+    def recover(config_arg, previous_arg, *, run, helper_image):
+        assert (config_arg, previous_arg, run, helper_image) == (
+            config,
+            previous,
+            docker,
+            source.JOURNAL_INSPECTOR,
+        )
+        calls.append(True)
+
+    monkeypatch.setattr(source, "command", docker)
+    monkeypatch.setattr(source, "compose_volumes", lambda *_: [volume])
+    monkeypatch.setattr(
+        source.importlib,
+        "import_module",
+        lambda *_, **kw: SimpleNamespace(
+            recover_stopped_ocr=recover, inspection_program=lambda code: code
+        ),
+    )
+    if error:
+        with pytest.raises(ValueError, match=error):
+            source.verify_upgrade_handoff(config, previous, recover_stopped_ocr=True)
+    else:
+        source.verify_upgrade_handoff(config, previous, recover_stopped_ocr=True)
+    assert calls == ([True] if expect_recovery else [])
+    assert list(verdicts) == []
+
+
+def test_stopped_ocr_recovery_flag_requires_upgrade():
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "cuda", "--recover-stopped-ocr"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "--recover-stopped-ocr requires --upgrade" in result.stderr
+
+@pytest.mark.parametrize("reason", ["missing", "hardlink", "executable"])
+def test_preflight_journals_require_original_private_lock(tmp_path, reason):
+    from ocr_service.initialization_lock import inspect_stopped_handoff
+
+    lock = tmp_path / "gpu-handoff.lock"
+    record = lock.with_suffix(".ocr-only.json")
+    record.touch(mode=0o600)
+    record.write_text(json.dumps({
+        "version": 2, "coordinator": "vision-bill-model-handoff-v2", "generation": 1,
+        "resources": {"llm": "external-unmanaged", "ocr": "local"},
+        "models": [], "ocr_pending": False, "unsettled": False,
+    }))
+    if reason == "hardlink":
+        lock.touch(mode=0o600)
+        os.link(lock, tmp_path / "alias")
+    elif reason == "executable":
+        lock.touch(mode=0o700)
+    assert inspect_stopped_handoff(lock) == "invalid gpu-handoff.lock"

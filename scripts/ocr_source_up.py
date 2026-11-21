@@ -4,6 +4,7 @@
 import argparse
 import fcntl
 import hashlib
+import importlib
 import json
 import os
 import platform
@@ -25,6 +26,8 @@ NATIVE = "paddleocr-service"
 RECORD_LIMIT = 32 * 1024**2
 IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 NATIVE_PLATFORM = "linux/amd64"
+# The official Python base also pinned in the native Dockerfiles.
+JOURNAL_INSPECTOR = "python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b"
 KFD_TOPOLOGY = Path("/sys/class/kfd/kfd/topology/nodes")
 MANIFEST_TYPES = {
     "application/vnd.oci.image.manifest.v1+json",
@@ -437,6 +440,7 @@ def bootstrap(
     restart: bool = False,
     reuse_native_image: str | None = None,
     upgrade: bool = False,
+    recover_stopped_ocr: bool = False,
 ) -> None:
     need_host(accelerator, build=not restart, automatic_inputs=not restart and inputs is None)
     deployment = ROOT / "server_data" / "ocr-source"
@@ -473,6 +477,7 @@ def bootstrap(
             restart=restart,
             reuse_native_image=reuse_native_image,
             upgrade=upgrade,
+            recover_stopped_ocr=recover_stopped_ocr,
         )
 
 
@@ -560,7 +565,10 @@ def rocm_render_target(render: Path, topology: Path = KFD_TOPOLOGY) -> str:
 
 
 def cuda_build_channel(
-    compose: tuple[str, ...], candidate: dict[str, Any], previous: dict[str, Any] | None
+    compose: tuple[str, ...],
+    candidate: dict[str, Any],
+    previous: dict[str, Any] | None,
+    saved_config: Path | None = None,
 ) -> str:
     channel = os.environ.get("OCR_CUDA_CHANNEL")
     if previous is not None and not channel:
@@ -575,30 +583,56 @@ def cuda_build_channel(
             ),
             None,
         ) or previous.get("cuda_channel")
+        if not channel and saved_config is not None:
+            # BuildKit's RUN history records the actual argument used for the
+            # wheel check/install. An ARG default alone does not establish it.
+            history = json.loads(saved_config.read_bytes()).get("history", [])
+            installed_channels = set()
+            for layer in history:
+                instruction = layer.get("created_by", "")
+                if (
+                    'resolve_cuda.py --check /opt/locks/requirements.cuda.lock --channel "$OCR_CUDA_CHANNEL"'
+                    in instruction
+                    and "pip install --require-hashes" in instruction
+                ):
+                    match = re.match(
+                        r"RUN \|1 OCR_CUDA_CHANNEL=(cu126|cu129) /bin/sh -c ", instruction
+                    )
+                    if match:
+                        installed_channels.add(match[1])
+            if len(installed_channels) == 1:
+                channel = installed_channels.pop()
         if not channel:
             # Older source records omit the channel. Read the lock from the immutable
             # image actually admitted, independently of the current checkout lock.
             image_id = previous["image_ids"][NATIVE]
             if not IMAGE_ID.fullmatch(image_id):
                 raise ValueError("Invalid original native image ID")
-            channel = command(
-                "docker",
-                "run",
-                "--rm",
-                "--pull",
-                "never",
-                "--network",
-                "none",
-                "--entrypoint",
-                "python",
-                image_id,
-                "-c",
-                "from pathlib import Path\n"
-                "from runpy import run_path\n"
-                "validate = run_path('/opt/ocr/build/resolve_cuda.py')['validate_lock']\n"
-                "print(validate(Path('/opt/locks/requirements.cuda.lock')).get('cuda_channel', 'cu126'))",
-                capture=True,
-            ).strip()
+            try:
+                channel = command(
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--pull",
+                    "never",
+                    "--network",
+                    "none",
+                    "--entrypoint",
+                    "python",
+                    image_id,
+                    "-c",
+                    "from pathlib import Path\n"
+                    "from runpy import run_path\n"
+                    "validate = run_path('/opt/ocr/build/resolve_cuda.py')['validate_lock']\n"
+                    "print(validate(Path('/opt/locks/requirements.cuda.lock')).get('cuda_channel', 'cu126'))",
+                    capture=True,
+                ).strip()
+            except subprocess.CalledProcessError as exc:
+                raise ValueError(
+                    "Cannot read the previously installed CUDA channel from the saved metadata "
+                    "or original image. Set OCR_CUDA_CHANNEL=cu126 or cu129 to the intended "
+                    "wheel channel and retry --upgrade."
+                ) from exc
     if previous is None:
         channel = (
             channel or candidate.get("build", {}).get("args", {}).get("OCR_CUDA_CHANNEL") or "cu129"
@@ -653,25 +687,18 @@ def has_project_claim(identity: dict[str, Any], accelerator: str, release: Path)
     return len(records) == 1 and (records[0].get("Labels") or {}).get(label) == owner
 
 
-# Run the installed image's journal validator on a read-only mount. An absent
-# journal is valid for a deployment that has never used the corresponding topology.
+# No GPU, model state or previous image is needed to inspect the original volume.
 CHECK_UPGRADE_HANDOFF = """
-from pathlib import Path
 import sys
-from ocr_service.initialization_lock import _require_clean_journal
-
-lock = Path(sys.argv[1])
-try:
-    _require_clean_journal(lock.with_suffix(".json"))
-    _require_clean_journal(lock.with_suffix(".ocr-only.json"), ocr_only=True)
-except (OSError, RuntimeError, ValueError):
-    print("needs-recovery")
-else:
-    print("clean")
+from pathlib import Path
+from ocr_service.initialization_lock import inspect_stopped_handoff
+print(inspect_stopped_handoff(Path(sys.argv[1])))
 """
 
 
-def verify_upgrade_handoff(config: dict[str, Any], previous: dict[str, Any]) -> None:
+def verify_upgrade_handoff(
+    config: dict[str, Any], previous: dict[str, Any], *, recover_stopped_ocr: bool = False
+) -> None:
     """Check the stopped source project's original coordination volume before rebuilding."""
     volume = "ocr-coordination"
     lock = "/coord/gpu-handoff.lock"
@@ -692,37 +719,73 @@ def verify_upgrade_handoff(config: dict[str, Any], previous: dict[str, Any]) -> 
     actual = config.get("volumes", {}).get(volume, {}).get("name")
     if not isinstance(actual, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", actual):
         raise ValueError("Missing original source coordination volume")
-    if compose_volumes(previous["project"], volume) != [actual]:
-        raise ValueError("Cannot uniquely identify the original project's coordination volume")
-    verdict = command(
-        "docker",
-        "run",
-        "--rm",
-        "--pull=never",
-        "--network=none",
-        "--read-only",
-        "--cap-drop=ALL",
-        "--env",
-        "NVIDIA_VISIBLE_DEVICES=void",
-        "--mount",
-        f"type=volume,source={actual},target=/coord,readonly,volume-nocopy",
-        "--entrypoint",
-        "python",
-        previous["image_ids"][NATIVE],
-        "-B",
-        "-c",
-        CHECK_UPGRADE_HANDOFF,
-        lock,
-        capture=True,
-    ).strip()
-    if compose_volumes(previous["project"], volume) != [actual]:
-        raise ValueError("The original coordination volume changed during the upgrade check")
+
+    inspector = importlib.import_module(
+        ".ocr_stopped_recovery" if __package__ else "ocr_stopped_recovery", package=__package__
+    )
+    program = inspector.inspection_program(CHECK_UPGRADE_HANDOFF)
+
+    def inspect_journals() -> str:
+        if compose_volumes(previous["project"], volume) != [actual]:
+            raise ValueError("Cannot uniquely identify the original project's coordination volume")
+        try:
+            verdict = command(
+                "docker",
+                "run",
+                "--rm",
+                "--pull=missing",
+                "--platform",
+                NATIVE_PLATFORM,
+                "--network=none",
+                "--read-only",
+                "--user=0:0",
+                "--cap-drop=ALL",
+                "--security-opt=no-new-privileges",
+                "--env",
+                "NVIDIA_VISIBLE_DEVICES=void",
+                "--mount",
+                f"type=volume,source={actual},target=/coord,readonly,volume-nocopy",
+                "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=1m",
+                "--entrypoint",
+                "python",
+                JOURNAL_INSPECTOR,
+                "-B",
+                "-c",
+                program,
+                lock,
+                capture=True,
+            ).strip()
+        except subprocess.CalledProcessError as exc:
+            raise ValueError(
+                f"Could not run the pinned read-only handoff inspector on Docker volume {actual}. "
+                f"Check access to {JOURNAL_INSPECTOR} and the coordination volume. "
+                f"Docker reported: {(exc.stderr or '').strip()}"
+            ) from exc
+        if compose_volumes(previous["project"], volume) != [actual]:
+            raise ValueError("The original coordination volume changed during the upgrade check")
+        return verdict
+
+    verdict = inspect_journals()
+    if recover_stopped_ocr and verdict == "pending gpu-handoff.ocr-only.json":
+        inspector.recover_stopped_ocr(config, previous, run=command, helper_image=JOURNAL_INSPECTOR)
+        verdict = inspect_journals()
+    if verdict == "busy":
+        raise ValueError("The original GPU handoff lock is held; drain the owning process first.")
+    if verdict == "pending gpu-handoff.ocr-only.json":
+        raise ValueError(
+            "Outstanding work in gpu-handoff.ocr-only.json. On the original stack switch "
+            "Dedicated OCR off in Settings and wait for Disabled, or use --upgrade "
+            "--recover-stopped-ocr to verify and settle the stopped local OCR owner."
+        )
+    if verdict == "pending gpu-handoff.json":
+        raise ValueError(
+            "Outstanding shared GPU handoff in gpu-handoff.json; recover the original "
+            "coordinator and its recorded resources before upgrading. Preserve the journals."
+        )
     if verdict != "clean":
         raise ValueError(
-            "GPU handoff is pending or cannot be verified. Restart the original recorded stack "
-            "with --restart; for an OCR-only pending handoff, switch Dedicated OCR off in Settings "
-            "and wait for Disabled. Resolve other ownership errors on the original stack. "
-            "Then drain and stop the original project before retrying --upgrade. Preserve the journals."
+            f"The GPU handoff journal failed validation ({verdict}); "
+            "preserve the coordination volume and recover its ownership state before upgrading."
         )
 
 
@@ -929,7 +992,10 @@ def deploy(
     restart: bool = False,
     reuse_native_image: str | None = None,
     upgrade: bool = False,
+    recover_stopped_ocr: bool = False,
 ) -> None:
+    if recover_stopped_ocr and not upgrade:
+        raise ValueError("--recover-stopped-ocr requires --upgrade")
     if reuse_native_image is not None and (
         restart
         or not re.fullmatch(
@@ -1020,7 +1086,7 @@ def deploy(
         raise ValueError("Cannot change Compose project during upgrade")
     verify_existing_app(compose, project, allow_orphan=upgrade)
     if previous is not None:
-        verify_upgrade_handoff(config, previous)
+        verify_upgrade_handoff(config, previous, recover_stopped_ocr=recover_stopped_ocr)
     candidate = config["services"][NATIVE]
     devices, device_environment = gpu_args(accelerator, candidate)
     os.environ.update(device_environment)
@@ -1058,7 +1124,10 @@ def deploy(
                 "--check",
                 "paddleocr-service/requirements.cuda.lock",
             ]
-            channel = cuda_build_channel(compose, candidate, previous)
+            channel = cuda_build_channel(
+                compose, candidate, previous,
+                old_release / "image-config.json" if previous is not None else None,
+            )
             os.environ["OCR_CUDA_CHANNEL"] = channel
             lock.extend(("--channel", channel))
             try:
@@ -1149,6 +1218,9 @@ def deploy(
                 ).strip()
             ):
                 raise ValueError("Original project changed or restarted during upgrade")
+            # The detached build can outlast a stop/start/stop of the old stack.
+            # Recheck both journals before admitting new images, without recovery.
+            verify_upgrade_handoff(config, previous)
             record_admission(managed, pending)
         pending.replace(managed)
     except BaseException:
@@ -1200,7 +1272,14 @@ def main() -> int:
         metavar="SOURCE_BUILD_TAG",
         help="verify and use a local OCR candidate from an earlier source build",
     )
+    parser.add_argument(
+        "--recover-stopped-ocr",
+        action="store_true",
+        help="during --upgrade, reconcile a pending local OCR-only handoff after verified shutdown",
+    )
     args = parser.parse_args()
+    if args.recover_stopped_ocr and not args.upgrade:
+        parser.error("--recover-stopped-ocr requires --upgrade")
     if args.approved_inputs is not None and args.restart:
         parser.error("Choose either APPROVED_DIRECTORY or --restart")
     try:
@@ -1210,6 +1289,7 @@ def main() -> int:
             restart=args.restart,
             reuse_native_image=args.reuse_native_image,
             upgrade=args.upgrade,
+            recover_stopped_ocr=args.recover_stopped_ocr,
         )
     except subprocess.CalledProcessError as exc:
         print(
