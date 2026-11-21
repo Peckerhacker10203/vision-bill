@@ -1,6 +1,6 @@
 """HTTP endpoints for durable, local LLM benchmark runs."""
 
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
@@ -60,13 +60,16 @@ async def create_benchmark_run(
 @router.get("", response_model=list[BenchmarkRun])
 async def list_benchmark_runs(
     limit: int = Query(50, ge=1, le=500),
+    comparison_id: UUID | None = None,
     offset: int = Query(0, ge=0),
     user: User = Depends(require_admin),  # noqa: B008
     benchmark_service: BenchmarkService = Depends(get_benchmark_service),  # noqa: B008
 ) -> list[BenchmarkRun]:
     """Return benchmark history, newest first."""
-    runs = await benchmark_service.list_runs(scope=AccessScope(user_id=user.id, can_see_all=user.can_see_all))
-    return runs[offset : offset + limit]
+    return await benchmark_service.list_runs(
+        scope=AccessScope(user_id=user.id, can_see_all=user.can_see_all),
+        comparison_id=comparison_id, limit=limit, offset=offset,
+    )
 
 
 @router.get("/capabilities")
@@ -108,12 +111,17 @@ async def qualify_reference(
 async def individual_results(
     run_id: UUID,
     limit: int = Query(50, ge=1, le=200),
+    model_id: str | None = Query(None, min_length=1),
+    receipt_id: Annotated[list[UUID] | None, Query(max_length=50)] = None,
     offset: int = Query(0, ge=0),
     user: User = Depends(require_admin),  # noqa: B008
     benchmark_service: BenchmarkService = Depends(get_benchmark_service),  # noqa: B008
 ) -> list[dict[str, Any]]:
     try:
-        return await benchmark_service.results(run_id, limit=limit, offset=offset, scope=AccessScope(user_id=user.id, can_see_all=user.can_see_all))
+        return await benchmark_service.results(
+            run_id, limit=limit, offset=offset, model_id=model_id, receipt_ids=receipt_id,
+            scope=AccessScope(user_id=user.id, can_see_all=user.can_see_all),
+        )
     except ValueError as error:
         raise HTTPException(404, detail=str(error)) from error
 

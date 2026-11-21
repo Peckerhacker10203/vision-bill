@@ -25,6 +25,7 @@ function beginSession(state: SessionState = null): number {
 	queryClient.clear();
 	snackbar.clear();
 	sessionStorage.removeItem('benchmark-reuse-receipts');
+	sessionStorage.removeItem('benchmark-reuse-cases');
 	session.set(state);
 	return generation;
 }

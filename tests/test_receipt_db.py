@@ -367,6 +367,8 @@ async def test_list_receipts(db: ReceiptDB) -> None:
 
     results = await db.list_receipts(limit=10, offset=0)
 
+    assert "ORDER BY r.date DESC, r.id" in mock_conn.fetch.call_args.args[0]
+
     assert len(results) == 2
     assert results[0].merchant_name == "Store B"
     assert results[1].merchant_name == "Store A"

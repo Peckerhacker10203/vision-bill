@@ -13,11 +13,9 @@ test.describe('admin: benchmarks', () => {
 		await loginAdmin(context);
 		const receiptId = await uploadFixture(page, context, await loadFixture('a'));
 
-		await page.goto('/benchmarks');
-		await expect(page.getByRole('checkbox', { name: 'e2e-vision' })).toBeChecked();
-		const textOnlyModel = page.getByRole('checkbox', { name: 'e2e-text', exact: true });
-		if (await textOnlyModel.count()) await textOnlyModel.uncheck();
-		await page.getByPlaceholder('Comma-separated receipt UUIDs').fill(receiptId);
+		await page.getByRole('link', { name: 'Use this receipt in a benchmark' }).click();
+		await expect(page).toHaveURL(new RegExp('\\?receipt=' + receiptId));
+		await page.getByRole('checkbox', { name: 'e2e-vision' }).check();
 		await page.getByRole('button', { name: 'Preview human references' }).click();
 		await page.locator('summary').filter({ hasText: receiptId }).click();
 		await expect(page.locator('pre')).toContainText('Aldi Test');
@@ -28,7 +26,7 @@ test.describe('admin: benchmarks', () => {
 			.check();
 		await page.getByRole('button', { name: 'Create benchmark' }).first().click();
 		await page.getByRole('button', { name: 'Confirm and start', exact: true }).click();
-		await expect(page).toHaveURL(/\/benchmarks\/results$/);
+		await expect(page).toHaveURL(/\/benchmarks\/results\?run=[0-9a-f-]+$/);
 
 		// The run is picked up by the benchmark worker and finishes fast
 		// (the stub answers instantly; ground truth = the verified receipt).
@@ -55,6 +53,7 @@ test.describe('admin: benchmarks', () => {
 			data: { model_ids: ['e2e-vision'], receipt_ids: [receiptId] }
 		});
 		expect(run.status()).toBe(202);
+		const { id: runId } = await run.json();
 
 		// The benchmark FK (benchmark_tasks.receipt_id -> receipts) is committed
 		// together with the run (create_run inserts run + tasks + summaries in one
@@ -68,5 +67,15 @@ test.describe('admin: benchmarks', () => {
 		// The UI still shows the receipt (it was not deleted).
 		await page.goto(`/receipts/${receiptId}`);
 		await expect(page.locator('#re-merchant')).toBeVisible();
+		await expect
+			.poll(
+				async () => {
+					const status = await context.request.get('/api/v1/benchmarks/' + runId);
+					expect(status.status()).toBe(200);
+					return (await status.json()).terminal;
+				},
+				{ timeout: 60_000 }
+			)
+			.toBe(1);
 	});
 });

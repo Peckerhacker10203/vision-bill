@@ -27,7 +27,7 @@ experiment reports do not certify production hardware or accuracy.
 - `src/vision_bill/provider/db/`: raw SQL and transactional ownership/CAS/leases;
   services delegate DB access here. `provider/llm/`: model discovery, extraction,
   repairs/classification; services do not call provider SDKs directly.
-- `alembic/versions/`: migrations 0001–0021. No application DDL/autogenerate.
+- `alembic/versions/`: migrations 0001–0023. No application DDL/autogenerate.
 - `paddleocr-service/ocr_service/`: isolated native pipeline, qualification and
   disposable worker lifecycle. `build/` and locks pin runtime/build candidates.
 - `frontend/`: SvelteKit static SPA, TypeScript, Tailwind, Vitest, Playwright,
@@ -75,6 +75,10 @@ return 400. Actor mismatch returns 409 before the protected operation.
   Status, results and reevaluation use current owner permissions. GET/POST
   `/benchmarks/references/{receipt_id}` previews and explicitly qualifies current
   human Gold. Verification provenance and current document identity govern Gold.
+- Dedicated test cases use `/benchmarks/cases` and ordered `photos` multipart
+  fields. Case creation only stores originals and an unconfirmed reference.
+  Keep case storage, revision-fenced confirmation and benchmark tasks separate
+  from the receipt ledger, spending statistics and ordinary submission queue.
 
 ## Workflow and contracts
 
@@ -156,8 +160,13 @@ and current CPU comparator installation/inference are unexecuted here.
 ## Benchmarks and scripts
 
 `benchmark_service.py` / `benchmark_db.py` freeze current explicitly human-qualified
-Gold and manifest identity, queue model×receipt jobs and fence leases/begin/retry/
-finish. Data/reference changes are checked transactionally. V4 exact full-receipt,
+Gold and manifest identity, queue one job per eligible model/input/pipeline and
+fence leases/begin/retry/finish. Data/reference changes are checked transactionally.
+Single direct and single OCR requests schedule one pipeline. An explicit
+`comparison: true` creates two linked runs against the same captured inputs.
+Include text-only models only in the OCR arm. History and result reads never
+dispatch inference. Use scoring version 5 for runs with dedicated test cases
+so their partial references score only confirmed observations. V4 exact full-receipt,
 occurrence-aware items, amounts/taxes and all-case denominators supplement the
 separately named historical success-only averages/v3 scores. Do not redefine old
 results or leak expected values into inference. Standalone benchmarks require
@@ -197,7 +206,7 @@ Lifespan creates provider/services, initializes DB, bootstraps admin, starts ana
 and benchmark workers when ready; shutdown stops workers before closing DB.
 SPA fallback is registered after API routes. DB initialization failures are sanitized.
 
-Current migration head `0021`. Stop/drain old app/benchmark/standalone workers
+Current migration head `0023`. Stop/drain old app/benchmark/standalone workers
 **before** schema, queue or policy cutover; never run old/new workers concurrently. Alembic uses settings `PG__*`, including on the image entrypoint;
 `MIGRATION_DATABASE_URL` is only the grant tool input. Bootstrap missing group roles
 as admin/CREATEROLE, execute grants/default ACL as the actual migration owner,

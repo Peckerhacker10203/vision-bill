@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 
 from .api.auth import router as auth_router
+from .api.benchmark_cases import router as benchmark_case_router
 from .api.benchmarks import router as benchmark_router
 from .api.collections import router as collections_router
 from .api.drafts import router as draft_router
@@ -21,6 +22,7 @@ from .api.system.main import router as system_router
 from .api.tags import router as tags_router
 from .config import Settings, mark_startup_settings, settings
 from .helper.logging_config import setup_logging
+from .provider.db.benchmark_cases import BenchmarkCaseDB
 from .provider.db.collection_db import CollectionDB
 from .provider.db.user_db import UserDB
 from .provider.factory import get_llm_provider, get_ocr_provider
@@ -122,6 +124,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.llm_provider = provider
     app.state.user_db = receipt_service.user_db
     app.state.analysis_scheduler = scheduler
+    app.state.benchmark_cases = BenchmarkCaseDB(receipt_service.pool) if receipt_service.db_ready else None
     app.state.benchmark_service = benchmark_service
     app.state.collection_service = collection_service
     activation = None
@@ -163,6 +166,7 @@ app.include_router(draft_router, prefix="/api/v1/images", tags=["Drafts"])
 app.include_router(image_router, prefix="/api/v1/images", tags=["Images"])
 app.include_router(search_router, prefix="/api/v1/search", tags=["Search"])
 app.include_router(statistics_router, prefix="/api/v1/statistics", tags=["Statistics"])
+app.include_router(benchmark_case_router, prefix="/api/v1/benchmarks/cases", tags=["Benchmarks"])
 app.include_router(benchmark_router, prefix="/api/v1/benchmarks", tags=["Benchmarks"])
 app.include_router(tags_router, prefix="/api/v1/tags", tags=["Tags"])
 app.include_router(collections_router, prefix="/api/v1/collections", tags=["Collections"])

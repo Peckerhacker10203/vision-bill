@@ -83,3 +83,21 @@ async def test_benchmark_route_preserves_worker_failures(method, error, status):
         response = await client.post(url, json=body)
     assert response.status_code == status
     assert response.json()["detail"] == str(error)
+
+
+async def test_group_and_case_queries_forward_only_scoped_selection():
+    group, run, first, second = uuid4(), uuid4(), uuid4(), uuid4()
+    user = User(id=uuid4(), username="admin", is_admin=True, can_see_all=False)
+    service = SimpleNamespace(list_runs=AsyncMock(return_value=[]), results=AsyncMock(return_value=[]))
+    app = FastAPI()
+    app.include_router(router, prefix="/benchmarks")
+    app.dependency_overrides[get_current_user] = lambda: user
+    app.dependency_overrides[get_benchmark_service] = lambda: service
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        assert (await client.get(f"/benchmarks?comparison_id={group}")).status_code == 200
+        path = f"/benchmarks/{run}/results?model_id=test&receipt_id={first}&receipt_id={second}"
+        assert (await client.get(path)).status_code == 200
+    assert service.list_runs.await_args.kwargs["comparison_id"] == group
+    assert service.results.await_args.kwargs["receipt_ids"] == [first, second]
+    assert service.results.await_args.kwargs["model_id"] == "test"
+    assert service.results.await_args.kwargs["scope"].user_id == user.id

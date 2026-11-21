@@ -90,10 +90,15 @@ shared coordination storage. Explicitly adopt the dedicated endpoint and selecte
 model identities before running managed work. Incompatible pairs wait before claim. This coordinates
 owned models and leaves the physical GPU available to independent processes.
 
-Benchmark Gold requires human verification plus explicit qualification of the
-**current** document and sources. Bypass or legacy `verified` alone is insufficient.
-Admin runs freeze Gold, ordered source hashes and execution identity; v4 diagnostics
-include failed cases and exact receipt/item/amount checks. See
+In **Benchmarks**, admins can pick human-verified receipts or upload separate
+test cases. A case stores its photos without running OCR or an LLM and stays
+outside the receipt ledger and spending reports. Confirm its expected values,
+then choose an image-model run, an OCR-plus-LLM run, or both. In a paired run,
+results show each model's scores side by side and their difference in percentage
+points. [Benchmark walkthrough and API](UPGRADE_AND_VERIFY.md#benchmarks-and-reproducibility)
+
+Receipt references require explicit qualification of the current document and
+sources. Runs freeze the expected values, source hashes and execution identity. See
 [scripts and role setup](scripts/README.md) and the
 [comparison harness](scripts/ocr_harness/README.md). Historical CPU comparisons and
 [split experiments](scripts/receipt_split_experiment.md) remain research evidence;

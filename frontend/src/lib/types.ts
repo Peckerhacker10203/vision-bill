@@ -557,6 +557,7 @@ export interface BenchmarkReferenceConfirmation {
 }
 
 export interface BenchmarkReferencePreview {
+	currently_qualified?: boolean;
 	receipt_identity: string;
 	review_revision: number;
 	document_sha256: string;
@@ -575,6 +576,8 @@ export interface BenchmarkCapabilities {
 export type BenchmarkCouncilPolicy = 'all' | 'material' | 'custom';
 
 export interface BenchmarkCreate {
+	comparison?: boolean;
+	case_ids?: string[];
 	model_ids: string[];
 	experiment: {
 		pipeline: 'upload' | 'direct_vision' | 'ocr';
@@ -596,6 +599,11 @@ export interface BenchmarkCreate {
 
 export interface BenchmarkRun {
 	id: string;
+	comparison_id?: string | null;
+	comparison_arm?: 'direct_vision' | 'ocr' | null;
+	case_ids?: string[];
+	case_names?: Record<string, string>;
+	dataset_fingerprint?: string;
 	status: string;
 	model_ids: string[];
 	receipt_ids: string[];

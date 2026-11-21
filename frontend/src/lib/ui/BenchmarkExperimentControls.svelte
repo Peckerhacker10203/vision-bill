@@ -3,25 +3,13 @@
 	import type { ExperimentSettings } from '$lib/benchmark-experiments';
 	let {
 		settings = $bindable(),
-		ocrAvailable = false,
 		thinkingControl = false
-	}: { settings: ExperimentSettings; ocrAvailable?: boolean; thinkingControl?: boolean } = $props();
+	}: { settings: ExperimentSettings; thinkingControl?: boolean } = $props();
 </script>
 
 <fieldset class="rounded-xl border border-outline-variant p-4">
 	<legend class="px-1 font-medium">{$t('benchmarkUi.experiment')}</legend>
 	<div class="grid gap-3 sm:grid-cols-2">
-		<label class="text-sm"
-			>{$t('benchmarkUi.pipeline')}
-			<select
-				class="mt-1 block w-full rounded-lg border border-outline-variant p-2"
-				bind:value={settings.pipeline}
-			>
-				<option value="upload">{$t('benchmarkUi.upload')}</option>
-				<option value="direct_vision">{$t('benchmarkUi.direct')}</option>
-				<option value="ocr" disabled={!ocrAvailable}>{$t('benchmarkUi.ocr')}</option>
-			</select>
-		</label>
 		<label class="text-sm"
 			>{$t('benchmarkUi.temperature')}
 			<input
@@ -52,11 +40,8 @@
 		{$t('benchmarkUi.classification')}</label
 	>
 	<p class="mt-2 text-xs text-on-surface-variant">
-		{$t('benchmarkUi.experimentHint')}
+		{$t('benchmarkForm.settingsHint')}
 	</p>
-	{#if !ocrAvailable}<p class="mt-2 text-xs text-on-surface-variant">
-			{$t('benchmarkUi.noOcr')}
-		</p>{/if}
 	{#if !thinkingControl}<p class="mt-2 text-xs text-on-surface-variant">
 			{$t('benchmarkUi.thinkingHint')}
 		</p>{/if}

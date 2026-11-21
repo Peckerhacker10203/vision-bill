@@ -4,21 +4,11 @@ import { loginAdmin } from '../helpers/auth';
 test.describe('benchmarks create form (admin)', () => {
 	test('lists the model and disables create without a selection', async ({ page, context }) => {
 		await loginAdmin(context);
-		const capabilityResponse = await context.request.get('/api/v1/benchmarks/capabilities');
-		expect(capabilityResponse.status()).toBe(200);
-		const capabilities = await capabilityResponse.json();
 		await page.goto('/benchmarks');
-		await expect(page.getByRole('checkbox', { name: 'e2e-vision' })).toBeChecked();
-		const models = page
-			.getByRole('group', {
-				name: capabilities.ocr_enabled ? 'OCR text formatter models' : 'Vision models',
-				exact: true
-			})
-			.getByRole('checkbox');
-		for (const model of await models.all()) {
-			await model.uncheck();
-			await expect(model).not.toBeChecked();
-		}
+		await expect(page.getByRole('radio', { name: 'Image directly to LLM' })).toBeChecked();
+		await expect(page.getByRole('checkbox', { name: 'e2e-vision' })).not.toBeChecked();
+		await page.getByText('Advanced receipt selection', { exact: true }).click();
+		await page.getByLabel('Use existing qualified references matching the filters').check();
 		await expect(page.getByRole('button', { name: 'Create benchmark' })).toBeDisabled();
 	});
 
@@ -28,6 +18,8 @@ test.describe('benchmarks create form (admin)', () => {
 		expect(before.status()).toBe(200);
 		const beforeIds = ((await before.json()) as { id: string }[]).map((run) => run.id);
 		await page.goto('/benchmarks');
+		await page.getByRole('checkbox', { name: 'e2e-vision' }).check();
+		await page.getByText('Advanced receipt selection', { exact: true }).click();
 		await page.getByPlaceholder('Comma-separated receipt UUIDs').fill('not-a-uuid');
 		await page.getByRole('button', { name: 'Create benchmark' }).first().click();
 		const validation = page.waitForResponse(

@@ -1,9 +1,19 @@
 <script lang="ts">
 	import type { IndividualResult } from '$lib/benchmark-experiments';
 	import { t } from '$lib/i18n';
-	let { results }: { results: IndividualResult[] } = $props();
+	let { results, names = {} }: { results: IndividualResult[]; names?: Record<string, string> } =
+		$props();
 	const percent = (value: number | null | undefined) =>
-		value == null ? '—' : `${(value * 100).toFixed(1)}%`;
+		value == null || !Number.isFinite(value) ? '—' : `${(value * 100).toFixed(1)}%`;
+	const editorLabels: Record<string, string> = {
+		merchant_name: 'merchant',
+		merchant_address: 'address',
+		receipt_number: 'number',
+		payment_method: 'paymentMethod',
+		discount_total: 'discount',
+		tax_total: 'taxTotal',
+		line_items: 'lineItems'
+	};
 	const json = (value: unknown) => JSON.stringify(value, null, 2);
 </script>
 
@@ -12,7 +22,7 @@
 		{@const enrichment = result.metadata?.classification_enrichment}
 		<details class="rounded-xl border border-outline-variant p-4">
 			<summary class="cursor-pointer text-sm">
-				<strong>{result.model_id}</strong> · {result.receipt_id} · {result.success
+				<strong>{result.model_id}</strong> · {names[result.receipt_id] ?? result.receipt_id} · {result.success
 					? $t('benchmarkResults.extraction', {
 							values: { score: percent(result.scores?.normalized) }
 						})
@@ -23,9 +33,17 @@
 						? $t('settings.dedicatedOcr.reasons.ocr_gpu_out_of_memory')
 						: result.error}
 				</p>{/if}
-			{#if result.version === '4'}
+			{#if result.version === '4' || result.version === '5'}
+				<p class="mt-3 text-sm">
+					{$t('benchmarkResults.confirmedFields')} · {result.scored_fields
+						.map((field) => $t('editor.' + (editorLabels[field] ?? field), { default: field }))
+						.join(', ')}
+				</p>
 				<dl class="mt-3 grid gap-3 text-sm sm:grid-cols-2 lg:grid-cols-3">
-					{@render diagnostic('fullyCorrectReceipt', result.full_receipt_correct)}
+					{@render diagnostic(
+						result.version === '5' ? 'confirmedCorrectReceipts' : 'fullyCorrectReceipt',
+						result.full_receipt_correct
+					)}
 					{@render diagnostic('exactAmounts', result.exact_amounts)}
 					{@render diagnostic('exactItemOrder', result.exact_item_order)}
 					{@render diagnostic('exactItemCount', result.exact_item_count)}
@@ -34,7 +52,7 @@
 					{@render diagnostic('itemMissing', result.item_fn)}
 					{@render diagnostic('itemPrecision', percent(result.precision))}
 					{@render diagnostic('itemRecall', percent(result.recall))}
-					{#if result.item_matches.length > 0}
+					{#if result.item_matches?.length > 0}
 						<div class="sm:col-span-2 lg:col-span-3">
 							<dt class="font-medium">{$t('benchmarkResults.itemPositions')}</dt>
 							<dd>
@@ -58,10 +76,16 @@
 			{/if}
 			{#if result.success}
 				<p class="mt-3 text-sm">
-					{$t('benchmarkResults.strict', { values: { score: percent(result.scores?.strict) } })}
-					· {$t('benchmarkResults.classificationScore', {
-						values: { score: percent(result.scores?.classification) }
-					})}
+					{#if result.version !== '5'}
+						{$t('benchmarkResults.strict', { values: { score: percent(result.scores?.strict) } })} ·
+					{/if}
+					{#if result.version === '5' && result.scores?.classification == null}
+						{$t('benchmarkResults.classificationUnscored')}
+					{:else}
+						{$t('benchmarkResults.classificationScore', {
+							values: { score: percent(result.scores?.classification) }
+						})}
+					{/if}
 					{#if result.rows}
 						· {$t('benchmarkResults.legacyMissingRows', { values: { count: result.rows.missing } })}
 						· {$t('benchmarkResults.legacyExtraRows', { values: { count: result.rows.extra } })}
@@ -118,6 +142,7 @@
 {#snippet diagnostic(
 	label:
 		| 'fullyCorrectReceipt'
+		| 'confirmedCorrectReceipts'
 		| 'exactAmounts'
 		| 'exactItemOrder'
 		| 'exactItemCount'
@@ -126,14 +151,14 @@
 		| 'itemMissing'
 		| 'itemPrecision'
 		| 'itemRecall',
-	value: boolean | number | string
+	value: boolean | number | string | null
 )}
 	<div>
 		<dt class="font-medium">{$t(`benchmarkResults.${label}`)}</dt>
 		<dd>
 			{typeof value === 'boolean'
 				? $t(value ? 'benchmarkResults.yes' : 'benchmarkResults.no')
-				: value}
+				: (value ?? $t('benchmarkResults.unavailable'))}
 		</dd>
 	</div>
 {/snippet}

@@ -10,6 +10,7 @@ import uuid
 from collections.abc import Sequence
 from hashlib import sha256
 from pathlib import Path
+from typing import Literal
 from uuid import UUID
 
 import magic
@@ -130,7 +131,8 @@ class ImageService:
         )
 
     def store_original(
-        self, content: bytes, submission_id: UUID, photo_index: int, media_type: str
+        self, content: bytes, submission_id: UUID, photo_index: int, media_type: str,
+        *, namespace: Literal["submissions", "benchmark_cases"] = "submissions",
     ) -> ImagePart:
         """Publish original bytes atomically without ever replacing an existing file.
 
@@ -149,7 +151,7 @@ class ImageService:
             raise UnsupportedImageTypeError(media_type)
         if photo_index < 0:
             raise ValueError("photo index must be nonnegative")
-        directory = self._save_dir / "submissions" / str(submission_id)
+        directory = self._save_dir / namespace / str(submission_id)
         directory.mkdir(parents=True, exist_ok=True)
         target = directory / f"{photo_index}.{extensions[media_type]}"
         with tempfile.NamedTemporaryFile(dir=directory, delete=False) as handle:

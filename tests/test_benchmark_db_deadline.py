@@ -409,4 +409,4 @@ async def test_benchmark_reads_include_current_receipt_scope():
         assert "jsonb_array_elements_text" in sql
         assert "FROM receipts" in sql and "r.user_id" in sql
     assert status_args == [run_id, False, owner]
-    assert list_args == [False, owner]
+    assert list_args == [False, owner, None, None, 0]

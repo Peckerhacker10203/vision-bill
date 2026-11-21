@@ -18,7 +18,7 @@ export async function setStubMode(mode: StubMode): Promise<void> {
 }
 
 export async function setStubScenario(
-	scenario: 'complete' | 'partial' | 'policy_unknown' | 'overlap'
+	scenario: 'complete' | 'partial' | 'policy_unknown' | 'overlap' | 'direct_merchant_mismatch'
 ): Promise<void> {
 	const response = await fetch(`${STUB_BASE}/__scenario`, {
 		method: 'POST',

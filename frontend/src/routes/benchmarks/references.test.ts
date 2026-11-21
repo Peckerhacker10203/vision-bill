@@ -21,6 +21,7 @@ it('requires unchecked explicit consent and sends the preview revision/hash exac
 	vi.stubGlobal(
 		'fetch',
 		vi.fn(async (url: string, init?: RequestInit) => {
+			if (url.endsWith('/benchmarks/cases') || url.includes('/receipts?')) return Response.json([]);
 			calls.push({ url, init });
 			if (url === '/api/v1/llm/models') return Response.json([{ id: 'model' }]);
 			if (url.endsWith('/capabilities'))
@@ -39,7 +40,7 @@ it('requires unchecked explicit consent and sends the preview revision/hash exac
 		})
 	);
 	render(Page);
-	await screen.findByText('model');
+	await fireEvent.click(await screen.findByLabelText('model'));
 	expect(screen.queryByLabelText(/council/i)).toBeNull();
 	expect(screen.getByLabelText('Request timeout (seconds)')).toBeTruthy();
 	await fireEvent.input(screen.getByLabelText('Explicit receipt IDs'), {
@@ -75,6 +76,7 @@ it('loads text formatter models for forced OCR and offers no misleading fallback
 	vi.stubGlobal(
 		'fetch',
 		vi.fn(async (url: string) => {
+			if (url.endsWith('/benchmarks/cases') || url.includes('/receipts?')) return Response.json([]);
 			calls.push(url);
 			if (url.endsWith('/capabilities'))
 				return Response.json({ ocr_available: true, ocr_enabled: false, thinking_control: false });
@@ -86,22 +88,23 @@ it('loads text formatter models for forced OCR and offers no misleading fallback
 	render(Page);
 	await screen.findByText('vision-model');
 	expect(screen.getByRole('group', { name: 'Vision models' })).not.toBeNull();
-	await fireEvent.change(screen.getByLabelText('Pipeline'), { target: { value: 'ocr' } });
+	await fireEvent.click(screen.getByRole('radio', { name: 'OCR + LLM' }));
 	await screen.findByText('text-only');
 	expect(screen.getByRole('group', { name: 'OCR text formatter models' })).not.toBeNull();
 	expect(calls).toContain('/api/v1/llm/models?capability=text');
 	expect(screen.queryByLabelText(/Allow direct vision fallback/)).toBeNull();
-	await fireEvent.change(screen.getByLabelText('Pipeline'), { target: { value: 'direct_vision' } });
+	await fireEvent.click(screen.getByRole('radio', { name: 'Image directly to LLM' }));
 	await screen.findByText('vision-model');
 	expect(screen.getByRole('group', { name: 'Vision models' })).not.toBeNull();
 });
 
-it('labels the default upload policy as a text formatter when OCR is enabled', async () => {
+it('defaults to direct images even when production OCR is enabled', async () => {
 	session.set({ id: 'owner', username: 'admin', is_admin: true, can_see_all: false });
 	const calls: string[] = [];
 	vi.stubGlobal(
 		'fetch',
 		vi.fn(async (url: string) => {
+			if (url.endsWith('/benchmarks/cases') || url.includes('/receipts?')) return Response.json([]);
 			calls.push(url);
 			if (url.endsWith('/capabilities'))
 				return Response.json({ ocr_available: true, ocr_enabled: true, thinking_control: false });
@@ -111,8 +114,11 @@ it('labels the default upload policy as a text formatter when OCR is enabled', a
 		})
 	);
 	render(Page);
-	await screen.findByText('upload-formatter');
-	expect(screen.getByRole('group', { name: 'OCR text formatter models' })).not.toBeNull();
+	await screen.findByText('vision-model');
+	expect(screen.getByRole('group', { name: 'Vision models' })).not.toBeNull();
+	expect(
+		(screen.getByRole('radio', { name: 'Image directly to LLM' }) as HTMLInputElement).checked
+	).toBe(true);
 	expect(calls).toContain('/api/v1/llm/models?capability=text');
 });
 
@@ -122,6 +128,7 @@ it('shows the localized GPU memory error when benchmark OCR qualification fails'
 	vi.stubGlobal(
 		'fetch',
 		vi.fn(async (url: string) => {
+			if (url.endsWith('/benchmarks/cases') || url.includes('/receipts?')) return Response.json([]);
 			if (url.endsWith('/capabilities'))
 				return Response.json({ ocr_available: true, ocr_enabled: true, thinking_control: false });
 			if (url === '/api/v1/benchmarks')
@@ -130,7 +137,14 @@ it('shows the localized GPU memory error when benchmark OCR qualification fails'
 		})
 	);
 	render(Page);
-	await screen.findByText('ocr-formatter');
+	await screen.findByLabelText('ocr-formatter');
+	const mode = screen.getByRole('radio', { name: 'OCR + LLM' }) as HTMLInputElement;
+	await fireEvent.click(mode);
+	expect(mode.checked).toBe(true);
+	await fireEvent.click(screen.getByLabelText('ocr-formatter'));
+	await fireEvent.input(screen.getByLabelText('Explizite Beleg-IDs'), {
+		target: { value: 'receipt' }
+	});
 	await fireEvent.click(screen.getByRole('button', { name: 'Benchmark anlegen' }));
 	await fireEvent.click(screen.getByRole('button', { name: 'Bestätigen und starten' }));
 	expect((await screen.findByRole('alert')).textContent).toBe(
@@ -153,6 +167,8 @@ it.each(['account change', 'view destruction'])(
 		vi.stubGlobal(
 			'fetch',
 			vi.fn(async (url: string, init?: RequestInit) => {
+				if (url.endsWith('/benchmarks/cases') || url.includes('/receipts?'))
+					return Response.json([]);
 				if (url.endsWith('/auth/login')) return Response.json(bob);
 				if (url.endsWith('/capabilities'))
 					return Response.json({
@@ -177,7 +193,7 @@ it.each(['account change', 'view destruction'])(
 			})
 		);
 		const view = render(Page);
-		await screen.findByText('model');
+		await fireEvent.click(await screen.findByLabelText('model'));
 		await fireEvent.input(screen.getByLabelText('Explicit receipt IDs'), {
 			target: { value: 'first,second' }
 		});
@@ -216,14 +232,16 @@ it('localizes creation and the selected references summary in German', async () 
 	vi.stubGlobal(
 		'fetch',
 		vi.fn(async (url: string) =>
-			url.endsWith('/capabilities')
-				? Response.json({ ocr_available: false, ocr_enabled: false, thinking_control: false })
-				: Response.json([{ id: 'model' }])
+			url.endsWith('/benchmarks/cases') || url.includes('/receipts?')
+				? Response.json([])
+				: url.endsWith('/capabilities')
+					? Response.json({ ocr_available: false, ocr_enabled: false, thinking_control: false })
+					: Response.json([{ id: 'model' }])
 		)
 	);
 	render(Page);
-	await screen.findByText('model');
-	expect(screen.getByLabelText('Verarbeitungskette')).toBeTruthy();
+	await fireEvent.click(await screen.findByLabelText('model'));
+	expect(screen.getByRole('group', { name: 'Verarbeitungskette' })).toBeTruthy();
 	await fireEvent.input(screen.getByLabelText('Explizite Beleg-IDs'), {
 		target: { value: 'first,second,first' }
 	});
@@ -233,4 +251,205 @@ it('localizes creation and the selected references summary in German', async () 
 	expect(screen.getByText('Explizite Referenzen: 2')).toBeTruthy();
 	await fireEvent.click(screen.getByRole('button', { name: 'Abbrechen' }));
 	expect(screen.queryByRole('dialog')).toBeNull();
+});
+
+it('submits one explicit paired request for the selected receipt and model after confirmation', async () => {
+	session.set({ id: 'owner', username: 'admin', is_admin: true, can_see_all: false });
+	const writes: RequestInit[] = [];
+	vi.stubGlobal(
+		'fetch',
+		vi.fn(async (url: string, init?: RequestInit) => {
+			if (url.endsWith('/capabilities'))
+				return Response.json({ ocr_available: true, ocr_enabled: true, thinking_control: false });
+			if (url.includes('/llm/models'))
+				return Response.json(
+					url.includes('capability=text')
+						? [{ id: 'vision-model' }, { id: 'text-only' }]
+						: [{ id: 'vision-model' }, { id: 'other-model' }]
+				);
+			if (url.includes('/receipts?'))
+				return Response.json([
+					{
+						id: 'receipt',
+						merchant_name: 'Corner shop',
+						date: '2026-01-12',
+						total: '2.00',
+						currency: 'EUR',
+						image_id: 'photo',
+						verified: true,
+						status: 'verified',
+						verification_source: 'human'
+					}
+				]);
+			if (url.endsWith('/benchmarks/cases'))
+				return Response.json([
+					{ id: 'case', name: 'Private shop', confirmed: true, photo_count: 2 }
+				]);
+			if (init?.method === 'POST') writes.push(init);
+			return Response.json({ id: 'new-run' });
+		})
+	);
+	render(Page);
+	const initial = await screen.findByRole('radio', { name: 'Image directly to LLM' });
+	expect((initial as HTMLInputElement).checked).toBe(true);
+	const model = await screen.findByLabelText('vision-model');
+	expect((model as HTMLInputElement).checked).toBe(false);
+	await fireEvent.click(model);
+	await fireEvent.click(screen.getByRole('radio', { name: 'OCR + LLM' }));
+	await waitFor(() =>
+		expect((screen.getByLabelText('vision-model') as HTMLInputElement).checked).toBe(true)
+	);
+	await fireEvent.click(screen.getByRole('radio', { name: 'Compare both' }));
+	await fireEvent.click(screen.getByLabelText('text-only'));
+	await fireEvent.click(await screen.findByRole('checkbox', { name: /Corner shop/ }));
+	await fireEvent.click(await screen.findByRole('checkbox', { name: /Private shop/ }));
+	await fireEvent.click(screen.getByRole('button', { name: 'Create benchmark' }));
+	expect(screen.getByText('Planned extractions: 6')).toBeTruthy();
+	expect(writes).toEqual([]);
+	await fireEvent.click(screen.getByRole('button', { name: 'Confirm and start' }));
+	await waitFor(() => expect(goto).toHaveBeenCalledWith('/benchmarks/results?run=new-run'));
+	expect(writes).toHaveLength(1);
+	expect(JSON.parse(writes[0].body as string)).toMatchObject({
+		comparison: true,
+		model_ids: ['vision-model', 'text-only'],
+		receipt_ids: ['receipt'],
+		case_ids: ['case'],
+		experiment: { pipeline: 'direct_vision' }
+	});
+});
+
+it('keeps selected receipts across searches, disables ineligible rows and reuses qualified Gold without a write', async () => {
+	session.set({ id: 'owner', username: 'admin', is_admin: true, can_see_all: false });
+	const selectedRow = {
+		id: 'receipt',
+		merchant_name: 'Corner shop',
+		date: '2026-01-12',
+		total: '2.00',
+		currency: 'EUR',
+		image_id: 'photo',
+		thumbnail_path: 'private.jpg',
+		verified: true,
+		status: 'verified',
+		verification_source: 'human'
+	};
+	const writes: string[] = [];
+	const queries: URLSearchParams[] = [];
+	vi.stubGlobal(
+		'fetch',
+		vi.fn(async (url: string, init?: RequestInit) => {
+			if (url.includes('/receipts?')) {
+				const params = new URL(url, 'http://localhost').searchParams;
+				queries.push(params);
+				if (params.get('search')) return Response.json([]);
+				if (params.get('offset') === '10')
+					return Response.json([
+						{ ...selectedRow, id: 'other', merchant_name: 'Online store', image_id: null }
+					]);
+				return Response.json([
+					selectedRow,
+					...Array.from({ length: 10 }, (_, index) => ({
+						...selectedRow,
+						id: 'auto-' + index,
+						merchant_name: 'Unreviewed ' + index,
+						verification_source: 'automatic_bypass'
+					}))
+				]);
+			}
+			if (url.endsWith('/capabilities'))
+				return Response.json({ ocr_available: false, ocr_enabled: false, thinking_control: false });
+			if (url.includes('/llm/models')) return Response.json([{ id: 'model' }]);
+			if (url.endsWith('/benchmarks/cases')) return Response.json([]);
+			if (url.endsWith('/references/stale'))
+				return Response.json({ detail: 'original_integrity_failed' }, { status: 409 });
+			if (url.endsWith('/references/receipt'))
+				return Response.json({
+					receipt_identity: 'receipt',
+					review_revision: 7,
+					document_sha256: 'a'.repeat(64),
+					scored_fields: ['total'],
+					expected: { total: '2.00' },
+					sources: [],
+					findings: [],
+					currently_qualified: true
+				});
+			if (init?.method === 'POST') writes.push(url);
+			return Response.json({ id: 'one' });
+		})
+	);
+	render(Page);
+	const filterOptIn = screen.getByLabelText(
+		'Use existing qualified references matching the filters'
+	) as HTMLInputElement;
+	await fireEvent.click(filterOptIn);
+	expect(filterOptIn.checked).toBe(true);
+	await fireEvent.click(await screen.findByRole('checkbox', { name: /Corner shop/ }));
+	expect(filterOptIn.checked).toBe(false);
+	expect(document.querySelector('img')?.getAttribute('src')).toContain(
+		'/images/photo/thumb?vb_expected_user=owner'
+	);
+	await fireEvent.click(screen.getByRole('button', { name: 'Preview reference for Corner shop' }));
+	await screen.findByText(/Current reference qualified/);
+	expect(
+		(screen.getByRole('checkbox', { name: /Unreviewed 0/ }) as HTMLInputElement).disabled
+	).toBe(true);
+	await fireEvent.click(screen.getByRole('button', { name: 'Next receipts' }));
+	expect(
+		((await screen.findByRole('checkbox', { name: /Online store/ })) as HTMLInputElement).disabled
+	).toBe(true);
+	await fireEvent.input(screen.getByRole('searchbox'), { target: { value: 'Absent shop' } });
+	await screen.findByText('No matching receipts.');
+	expect(queries.at(-1)?.get('offset')).toBe('0');
+	expect(queries.at(-1)?.get('search')).toBe('Absent shop');
+	expect(screen.getByRole('button', { name: 'Remove Corner shop' })).toBeTruthy();
+	await fireEvent.click(screen.getByLabelText('model'));
+	await fireEvent.input(screen.getByLabelText('Explicit receipt IDs'), {
+		target: { value: 'receipt,stale' }
+	});
+	await fireEvent.click(screen.getByRole('button', { name: 'Preview human references' }));
+	await screen.findByText(/original_integrity_failed/);
+	expect(screen.getByText(/Current reference qualified/)).toBeTruthy();
+	expect(
+		(screen.getByRole('button', { name: 'Create benchmark' }) as HTMLButtonElement).disabled
+	).toBe(true);
+	await fireEvent.click(screen.getByRole('button', { name: 'Remove stale' }));
+	await fireEvent.click(screen.getByRole('button', { name: 'Preview human references' }));
+	await screen.findByText(/Current reference qualified/);
+	expect(screen.queryByLabelText(/I checked these current receipts/)).toBeNull();
+	await fireEvent.click(screen.getByRole('button', { name: 'Create benchmark' }));
+	expect(writes).toEqual([]);
+	await fireEvent.click(screen.getByRole('button', { name: 'Confirm and start' }));
+	await waitFor(() => expect(goto).toHaveBeenCalledWith('/benchmarks/results?run=one'));
+	expect(writes).toEqual(['/api/v1/benchmarks']);
+});
+
+it('keeps the created run reachable when results navigation fails', async () => {
+	session.set({ id: 'owner', username: 'admin', is_admin: true, can_see_all: false });
+	const writes: string[] = [];
+	vi.mocked(goto).mockRejectedValueOnce(new Error('navigation failed'));
+	vi.stubGlobal(
+		'fetch',
+		vi.fn(async (url: string, init?: RequestInit) => {
+			if (url.endsWith('/capabilities'))
+				return Response.json({ ocr_available: false, ocr_enabled: false, thinking_control: false });
+			if (url.includes('/llm/models')) return Response.json([{ id: 'vision-model' }]);
+			if (init?.method === 'POST') {
+				writes.push(url);
+				return Response.json({ id: 'created' });
+			}
+			return Response.json([]);
+		})
+	);
+	render(Page);
+	await fireEvent.click(await screen.findByLabelText('vision-model'));
+	await fireEvent.input(screen.getByLabelText('Explicit receipt IDs'), {
+		target: { value: 'receipt' }
+	});
+	await fireEvent.click(screen.getByRole('button', { name: 'Create benchmark' }));
+	await fireEvent.click(screen.getByRole('button', { name: 'Confirm and start' }));
+	const result = await screen.findByRole('link', { name: 'Open the created run' });
+	expect(result.getAttribute('href')).toBe('/benchmarks/results?run=created');
+	expect(
+		(screen.getByRole('button', { name: 'Create benchmark' }) as HTMLButtonElement).disabled
+	).toBe(true);
+	expect(writes).toEqual(['/api/v1/benchmarks']);
 });

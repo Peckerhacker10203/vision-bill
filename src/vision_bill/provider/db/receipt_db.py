@@ -1206,7 +1206,7 @@ class ReceiptDB:
         sql = LIST_RECEIPTS_BASE_SQL
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += f" ORDER BY date DESC LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}"
+        sql += f" ORDER BY r.date DESC, r.id LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}"
         args.extend([limit, offset])
 
         async with self.pool.acquire() as conn:

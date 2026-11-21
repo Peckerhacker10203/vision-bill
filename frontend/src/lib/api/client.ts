@@ -48,7 +48,7 @@ import type {
 	UiConfig
 } from '$lib/types';
 
-const API_BASE = (import.meta.env.VITE_API_BASE ?? '/api/v1').replace(/\/$/, '');
+export const API_BASE = (import.meta.env.VITE_API_BASE ?? '/api/v1').replace(/\/$/, '');
 
 /**
  * Handler invoked on any 401 from a protected (non-`/auth/`) endpoint. Wired up
@@ -83,7 +83,7 @@ export class ApiError extends Error {
 	}
 }
 
-async function request<T>(
+export async function request<T>(
 	path: string,
 	init?: RequestInit,
 	actor = captureSessionActor()
@@ -268,8 +268,11 @@ export const api = {
 		);
 	},
 
-	listBenchmarks(actor: SessionActor): Promise<BenchmarkRun[]> {
-		return request<BenchmarkRun[]>('/benchmarks', undefined, actor);
+	listBenchmarks(
+		actor: SessionActor,
+		filters?: { comparison_id?: string; offset?: number }
+	): Promise<BenchmarkRun[]> {
+		return request<BenchmarkRun[]>('/benchmarks' + toQueryString(filters ?? {}), undefined, actor);
 	},
 
 	getBenchmarkStatus(id: string, actor: SessionActor): Promise<BenchmarkStatus> {
@@ -279,10 +282,16 @@ export const api = {
 	getBenchmarkResults(
 		id: string,
 		offset: number,
-		actor: SessionActor
+		actor: SessionActor,
+		selection?: { model: string; cases: string[] }
 	): Promise<IndividualResult[]> {
+		const query = new URLSearchParams({ limit: '50', offset: String(offset) });
+		if (selection) {
+			query.set('model_id', selection.model);
+			for (const id of selection.cases) query.append('receipt_id', id);
+		}
 		return request<IndividualResult[]>(
-			`/benchmarks/${encodeURIComponent(id)}/results?limit=50&offset=${offset}`,
+			`/benchmarks/${encodeURIComponent(id)}/results?${query}`,
 			undefined,
 			actor
 		);

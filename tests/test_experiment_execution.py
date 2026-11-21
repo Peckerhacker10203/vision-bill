@@ -668,7 +668,7 @@ async def test_unmanifested_benchmark_worker_terminalizes_without_inference(sett
     task = {"inference_attempt_count": 0, "inference_started": False}
     started = asyncio.get_running_loop().time()
     await service._execute_reserved(task, SimpleNamespace(), None, started, started + 600)
-    service._db.finish_task.assert_awaited_once_with(task, success=False, deadline=started + 600)
+    service._db.finish_task.assert_awaited_once_with(task, success=False, attempts=0, deadline=started + 600)
     service._db.retry_task.assert_not_awaited()
     service._provider.get_available_models.assert_not_awaited()
     service._provider.analyse_receipt_with_metadata.assert_not_awaited()

@@ -6,9 +6,10 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import asyncpg
 
@@ -36,17 +37,38 @@ _RUN_SCOPE = """(
             SELECT 1 FROM jsonb_array_elements_text(
                 CASE WHEN jsonb_typeof(b.receipt_ids)='array' THEN b.receipt_ids ELSE '[]'::jsonb END
             ) AS inputs(receipt_id)
-            WHERE NOT EXISTS (
+            WHERE CASE WHEN (b.experiment_manifest->'inputs') @>
+                jsonb_build_array(jsonb_build_object('input_kind','case','case_id',inputs.receipt_id))
+            THEN NOT EXISTS (
+                SELECT 1 FROM benchmark_cases c
+                WHERE c.id=CASE WHEN pg_input_is_valid(inputs.receipt_id,'uuid') THEN inputs.receipt_id::uuid END
+                  AND c.owner_id={owner}
+            ) ELSE NOT EXISTS (
                 SELECT 1 FROM receipts r
                 WHERE r.id=CASE WHEN pg_input_is_valid(inputs.receipt_id,'uuid') THEN inputs.receipt_id::uuid END
                   AND r.user_id={owner}
-            )
+            ) END
         )
     )
 )"""
 
 
+@dataclass(frozen=True)
+class QueuedArm:
+    model_ids: list[str]
+    manifest: dict[str, Any] | None
+
+
 class BenchmarkDB:
+    @staticmethod
+    async def _validate_case_inputs(
+        conn: asyncpg.Connection, case_inputs: list[dict[str, Any]], scope: AccessScope,
+    ) -> None:
+        from .benchmark_cases import BenchmarkCaseDB
+
+        for item in sorted(case_inputs, key=lambda entry: entry["case_id"]):
+            await BenchmarkCaseDB.validate_frozen(conn, item, scope)
+
     def __init__(self, pool: asyncpg.Pool, receipts: ReceiptDB | None = None,
                  *, worker: WorkerSettings | None = None):
         self._pool = pool
@@ -56,12 +78,23 @@ class BenchmarkDB:
     async def create_run(self, *, model_ids: list[str], receipt_ids: list[UUID], fingerprint: str,
                          model_digests: dict[str, str | None], timeout: int, policy: CouncilPolicy,
                          absolute: Any, relative: Any, apply_flags: bool, prompt_version: str,
-                         scoring_version: str, manifest: dict[str, Any] | None = None, owner_id: UUID | None = None, scope: AccessScope | None = None) -> BenchmarkRun:
+                         scoring_version: str, manifest: dict[str, Any] | None = None,
+                         ocr_arm: QueuedArm | None = None, owner_id: UUID | None = None,
+                         scope: AccessScope | None = None) -> BenchmarkRun:
+        inputs = (manifest or {}).get("inputs", [])
+        case_inputs = [item for item in inputs if "case_id" in item]
+        case_ids = {UUID(item["case_id"]) for item in case_inputs}
+        references = [item for item in inputs if "reference" in item and "case_id" not in item]
+        comparison_id = uuid4() if ocr_arm else None
+        arms = [QueuedArm(model_ids, manifest)]
+        if ocr_arm:
+            arms.append(ocr_arm)
         async with self._pool.acquire() as conn, conn.transaction():
-            references = [item for item in (manifest or {}).get("inputs", []) if "reference" in item]
-            if references:
+            if references or case_inputs:
                 if scope is None or scope.user_id != owner_id:
                     raise ValueError("reference_scope_required")
+                if case_inputs:
+                    await self._validate_case_inputs(conn, case_inputs, scope)
                 for item in sorted(references, key=lambda item: item["receipt_id"]):
                     current = await self._reference_preview(conn, UUID(item["receipt_id"]), scope)
                     reference = item["reference"]
@@ -69,24 +102,28 @@ class BenchmarkDB:
                         raise ValueError("reference_changed_before_run_creation")
                     if not await conn.fetchval("SELECT EXISTS(SELECT 1 FROM benchmark_references WHERE id=$1 AND receipt_id=$2 AND document_sha256=$3)", UUID(reference["id"]), UUID(item["receipt_id"]), current.document_sha256):
                         raise ValueError("reference_not_qualified")
-            row = await conn.fetchrow("""INSERT INTO benchmark_runs
-                (model_ids, receipt_ids, dataset_fingerprint, model_digests, request_timeout_seconds,
-                 council_policy, council_absolute_threshold, council_relative_threshold, apply_council_flags,
-                 prompt_version, scoring_version, experiment_manifest, owner_id)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *""",
-                json.dumps(model_ids),
-                json.dumps([str(receipt_id) for receipt_id in receipt_ids]),
-                fingerprint,
-                json.dumps(model_digests),
-                timeout,
-                policy.value,
-                absolute,
-                relative,
-                apply_flags, prompt_version, scoring_version,
-                json.dumps(manifest) if manifest is not None else None, owner_id)
-            await conn.executemany("INSERT INTO benchmark_tasks (run_id, model_id, receipt_id) VALUES ($1,$2,$3)", [(row["id"], m, r) for m in model_ids for r in receipt_ids])
-            await conn.executemany("INSERT INTO benchmark_summaries (run_id, model_id, model_digest) VALUES ($1,$2,$3)", [(row["id"], m, model_digests.get(m)) for m in model_ids])
-        return self._run(row)
+            runs = []
+            for arm in arms:
+                arm_name = arm.manifest["options"]["pipeline"] if comparison_id and arm.manifest else None
+                row = await conn.fetchrow("""INSERT INTO benchmark_runs
+                    (model_ids, receipt_ids, dataset_fingerprint, model_digests, request_timeout_seconds,
+                     council_policy, council_absolute_threshold, council_relative_threshold, apply_council_flags,
+                     prompt_version, scoring_version, experiment_manifest, owner_id, comparison_id, comparison_arm)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *""",
+                    json.dumps(arm.model_ids), json.dumps([str(i) for i in receipt_ids]), fingerprint,
+                    json.dumps({m: model_digests[m] for m in arm.model_ids if m in model_digests}),
+                    timeout, policy.value, absolute, relative, apply_flags, prompt_version, scoring_version,
+                    json.dumps(arm.manifest) if arm.manifest is not None else None, owner_id, comparison_id, arm_name)
+                await conn.executemany(
+                    "INSERT INTO benchmark_tasks (run_id, model_id, receipt_id, input_kind) VALUES ($1,$2,$3,$4)",
+                    [(row["id"], m, i, "case" if i in case_ids else "receipt") for m in arm.model_ids for i in receipt_ids],
+                )
+                await conn.executemany(
+                    "INSERT INTO benchmark_summaries (run_id, model_id, model_digest) VALUES ($1,$2,$3)",
+                    [(row["id"], m, model_digests.get(m)) for m in arm.model_ids],
+                )
+                runs.append(self._run(row))
+        return runs[0]
 
     async def run(self, run_id: UUID, *, scope: AccessScope | None = None, deadline: float | None = None) -> BenchmarkRun | None:
         async with connection(self._pool, deadline=deadline) as conn:
@@ -97,12 +134,15 @@ class BenchmarkDB:
             )
         return self._run(row) if row else None
 
-    async def runs(self, *, scope: AccessScope) -> list[BenchmarkRun]:
+    async def runs(self, *, scope: AccessScope, comparison_id: UUID | None = None,
+                   limit: int | None = None, offset: int = 0) -> list[BenchmarkRun]:
         async with self._pool.acquire() as conn:
             visible = _RUN_SCOPE.format(see_all="$1", owner="$2")
             rows = await conn.fetch(
-                f"SELECT b.* FROM benchmark_runs b WHERE {visible} ORDER BY b.created_at DESC, b.id DESC",
-                scope.can_see_all, scope.user_id,
+                f"""SELECT b.* FROM benchmark_runs b WHERE {visible}
+                    AND ($3::uuid IS NULL OR b.comparison_id=$3)
+                    ORDER BY b.created_at DESC, b.id DESC LIMIT $4 OFFSET $5""",
+                scope.can_see_all, scope.user_id, comparison_id, limit, offset,
             )
         return [self._run(r) for r in rows]
 
@@ -121,8 +161,8 @@ class BenchmarkDB:
                 FROM benchmark_summaries s JOIN benchmark_runs r ON r.id=s.run_id
                 WHERE s.run_id=$1 ORDER BY s.model_id""", run_id)
         return [BenchmarkSummary(
-            all_case_average_score=(r["total_score"] / r["completed"] if r["completed"] and r["scoring_version"] == "4" else None),
-            full_receipt_correct_rate=(r["full_correct"] / r["completed"] if r["completed"] and r["scoring_version"] == "4" else None),
+            all_case_average_score=(r["total_score"] / r["completed"] if r["completed"] and r["scoring_version"] in {"4", "5"} else None),
+            full_receipt_correct_rate=(r["full_correct"] / r["completed"] if r["completed"] and r["scoring_version"] in {"4", "5"} else None),
             model_id=r["model_id"], model_digest=r["model_digest"], completed=r["completed"], succeeded=r["succeeded"], failed=r["failed"], average_score=(r["total_score"] / r["succeeded"] if r["succeeded"] else None), average_confidence=(r["total_confidence"] / r["succeeded"] if r["succeeded"] else None), average_attempts=(r["total_attempts"] / r["completed"] if r["completed"] else None), average_latency_ms=(r["total_latency_ms"] / r["completed"] if r["completed"] else None), council_candidates=r["council_candidates"], council_findings=r["council_findings"]) for r in rows]
 
     async def lease_task(self) -> Mapping[str, Any] | None:
@@ -234,7 +274,12 @@ class BenchmarkDB:
         if isinstance(manifest, str):
             manifest = json.loads(manifest)
         experiment = {k: v for k, v in manifest.items() if k not in {"inputs", "tags"}} if manifest else None
-        return BenchmarkRun(experiment=experiment, id=row["id"], status=row["status"], model_ids=list(model_ids), receipt_ids=list(receipt_ids), dataset_fingerprint=row["dataset_fingerprint"], prompt_version=row["prompt_version"], scoring_version=row["scoring_version"], council_policy=row["council_policy"], apply_council_flags=row["apply_council_flags"], created_at=row["created_at"], completed_at=row["completed_at"])
+        case_inputs = [item for item in (manifest or {}).get("inputs", []) if "case_id" in item]
+        return BenchmarkRun(
+            comparison_id=row.get("comparison_id"), comparison_arm=row.get("comparison_arm"),
+            case_ids=[item["case_id"] for item in case_inputs],
+            case_names={item["case_id"]: item["name"] for item in case_inputs if "name" in item},
+            experiment=experiment, id=row["id"], status=row["status"], model_ids=list(model_ids), receipt_ids=list(receipt_ids), dataset_fingerprint=row["dataset_fingerprint"], prompt_version=row["prompt_version"], scoring_version=row["scoring_version"], council_policy=row["council_policy"], apply_council_flags=row["apply_council_flags"], created_at=row["created_at"], completed_at=row["completed_at"])
 
     async def manifest(self, run_id: UUID, *, deadline: float | None = None) -> dict[str, Any] | None:
         async with connection(self._pool, deadline=deadline) as conn:
@@ -247,11 +292,15 @@ class BenchmarkDB:
             raise TypeError("Invalid benchmark manifest")
         return dict(value)
 
-    async def results(self, run_id: UUID, *, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+    async def results(self, run_id: UUID, *, limit: int = 50, offset: int = 0,
+                      model_id: str | None = None, receipt_ids: list[UUID] | None = None) -> list[dict[str, Any]]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM benchmark_results WHERE run_id=$1 ORDER BY model_id, receipt_id LIMIT $2 OFFSET $3",
-                run_id, limit, offset)
+                """SELECT * FROM benchmark_results WHERE run_id=$1
+                   AND ($4::text IS NULL OR model_id=$4)
+                   AND ($5::uuid[] IS NULL OR receipt_id=ANY($5))
+                   ORDER BY model_id, receipt_id LIMIT $2 OFFSET $3""",
+                run_id, limit, offset, model_id, receipt_ids)
         return [{"model_id": row["model_id"], "receipt_id": str(row["receipt_id"]),
                  "success": row["success"],
                  **(json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"])}
@@ -373,11 +422,18 @@ class BenchmarkDB:
 
     async def reference_preview(self, receipt_id: UUID, *, scope: AccessScope) -> ReferencePreview:
         async with self._pool.acquire() as conn, conn.transaction():
-            return await self._reference_preview(conn, receipt_id, scope)
+            preview = await self._reference_preview(conn, receipt_id, scope)
+            preview.currently_qualified = await conn.fetchval(
+                """SELECT EXISTS(SELECT 1 FROM benchmark_references WHERE receipt_id=$1
+                   AND review_revision=$2 AND document_sha256=$3 AND ($4 OR owner_id=$5))""",
+                receipt_id, preview.review_revision, preview.document_sha256, scope.can_see_all, scope.user_id,
+            )
+            return preview
 
     @staticmethod
     def _reference(row: Mapping[str, Any]) -> GoldSnapshot:
-        values = dict(row)
+        # Callers select the immutable Gold row matching the live document at capture time.
+        values = {**row, "currently_qualified": True}
         for key in ('expected', 'scored_fields', 'sources', 'findings', 'acknowledgements'):
             if isinstance(values[key], str):
                 values[key] = json.loads(values[key])

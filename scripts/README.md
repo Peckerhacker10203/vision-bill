@@ -72,6 +72,10 @@ flags as legacy run metadata. They have no effect on scoring, model execution or
 receipt flags. See `--help` for supported CLI options and `BenchmarkCreate` for
 the full API contract.
 
+The web app also supports independent photo cases and paired direct/OCR runs.
+Use the admin benchmark form or the documented case and run endpoints for
+those workflows. [Benchmark walkthrough and API](../UPGRADE_AND_VERIFY.md#benchmarks-and-reproducibility)
+
 ## Standalone benchmark (no API)
 
 Requires a real application owner UUID and current explicitly qualified human Gold.
@@ -186,7 +190,7 @@ groups require admin/CREATEROLE first; then `make db-configure-roles` must use t
 actual Alembic owner for grants/default privileges on current/future tables and
 sequences. `MIGRATION_DATABASE_URL` is only this Make tool's connection; entrypoint
 Alembic uses `PG__*`. Runtime credentials cannot apply pending owner DDL. Stop/drain
-old workers, back up/restore-test DB and files, migrate to 0021 with owner credentials,
+old workers, back up/restore-test DB and files, migrate to 0023 with owner credentials,
 refresh grants and start only compatible workers. No automatic destructive backout.
 `bash scripts/pg-backup.sh --help` lists backup/restore options.
 

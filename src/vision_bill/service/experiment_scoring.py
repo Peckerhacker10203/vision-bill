@@ -1,14 +1,17 @@
 """Versioned extraction diagnostics; historical scoring remains untouched."""
 import unicodedata
+from collections.abc import Callable
 from datetime import time
 from decimal import Decimal
 from difflib import SequenceMatcher
+from operator import eq
 from typing import Any
 
 from ..model.receipt import Receipt
 
 DETAIL_SCORING_VERSION = "4"
 LEGACY_DETAIL_SCORING_VERSION = "3"
+MASKED_SCORING_VERSION = "5"
 HEADER = ("merchant_name", "merchant_address", "receipt_number", "date", "time", "currency", "payment_method")
 TOTALS = ("subtotal", "discount_total", "tax_total", "tip", "total")
 ITEM = ("description", "quantity", "unit_price", "total_price")
@@ -135,13 +138,14 @@ def _item_key(row: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _lcs(left: list[tuple[Any, ...]], right: list[tuple[Any, ...]]) -> list[list[int]]:
+def _lcs(left: list[tuple[Any, ...]], right: list[tuple[Any, ...]],
+         match: Callable[[tuple[Any, ...], tuple[Any, ...]], bool] = eq) -> list[list[int]]:
     """Maximum ordered exact matches, then lexicographically earliest index pairs."""
     n, m = len(left), len(right)
     lengths = [[0] * (m + 1) for _ in range(n + 1)]
     for i in range(n - 1, -1, -1):
         for j in range(m - 1, -1, -1):
-            lengths[i][j] = (1 + lengths[i + 1][j + 1] if left[i] == right[j]
+            lengths[i][j] = (1 + lengths[i + 1][j + 1] if match(left[i], right[j])
                              else max(lengths[i + 1][j], lengths[i][j + 1]))
     matches: list[list[int]] = []
     start_i = start_j = 0
@@ -150,7 +154,7 @@ def _lcs(left: list[tuple[Any, ...]], right: list[tuple[Any, ...]]) -> list[list
         found = False
         for i in range(start_i, n):
             for j in range(start_j, m):
-                if left[i] == right[j] and 1 + lengths[i + 1][j + 1] == remaining:
+                if match(left[i], right[j]) and 1 + lengths[i + 1][j + 1] == remaining:
                     matches.append([i, j])
                     start_i, start_j = i + 1, j + 1
                     remaining -= 1
@@ -221,3 +225,110 @@ def detailed_score(
         and equality['taxes'],
     )
     return result
+
+
+def _reference_value(field: str, value: Any) -> Any:
+    if value is None:
+        return None
+    if field in (*TOTALS, 'quantity', 'unit_price', 'total_price', 'rate', 'amount'):
+        return Decimal(str(value))
+    if field == 'description':
+        return _description(value)
+    if field == 'time':
+        return time.fromisoformat(value)
+    return normalized(value)
+
+
+def _confirmed_cells_match(expected: tuple[Any, ...], actual: tuple[Any, ...]) -> bool:
+    return all(e is None or e == a for e, a in zip(expected, actual, strict=True))
+
+
+def masked_reference_score(
+    expected: dict[str, Any], actual: Receipt | None, scored_fields: list[str], *,
+    classification: bool, missing_labels: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    """Score a frozen, possibly partial reference; unknown fields contribute no weight."""
+    from .benchmark_scoring import COMPONENT_WEIGHTS
+
+    if not scored_fields or set(scored_fields) - set(OBSERVABLE_FIELDS):
+        raise ValueError("Benchmark reference has no valid field mask")
+    right = actual.model_dump(mode='json') if actual is not None else {}
+    components: dict[str, list[bool | float]] = {group: [] for group in COMPONENT_WEIGHTS}
+    amounts: list[bool] = []
+    label_matches: list[bool] = []
+    differences: list[dict[str, Any]] = []
+    metrics: dict[str, Any] = {
+        "item_tp": None, "item_fp": None, "item_fn": None, "item_matches": [],
+        "precision": None, "recall": None, "exact_item_count": None, "exact_item_order": None,
+    }
+    if classification and expected.get("category") is not None:
+        label_matches.append(actual is not None and "category" not in missing_labels
+                             and expected["category"] == actual.category)
+
+    def difference(path: str, observed: Any, extracted: Any) -> None:
+        differences.append({"path": path, "expected": observed, "actual": extracted, "equivalent": False})
+
+    for field in scored_fields:
+        if field not in ('line_items', 'taxes'):
+            gold, found = expected[field], right.get(field)
+            matched = actual is not None and _reference_value(field, gold) == _reference_value(field, found)
+            if field in TOTALS:
+                amounts.append(matched)
+            group = 'totals' if field in TOTALS else 'header'
+            components[group].append(matched)
+            if not matched:
+                difference(field, gold, found)
+            continue
+
+        cells = ITEM if field == 'line_items' else TAX
+        gold_rows, actual_rows = expected[field], right.get(field, [])
+        left_keys, right_keys = [
+            [tuple(_reference_value(k, row.get(k)) for k in cells) for row in rows]
+            for rows in (gold_rows, actual_rows)
+        ]
+        matches = _lcs(left_keys, right_keys, _confirmed_cells_match)
+        match_map = {i: j for i, j in matches}
+        matched_actual = set(match_map.values())
+        count, n, m = len(matches), len(left_keys), len(right_keys)
+        # Ordered F1 counts separate charges, including repeated, missing and extra rows.
+        components[field].append(2 * count / (n + m) if n + m else 1)
+        for i, row in enumerate(gold_rows):
+            if i not in match_map:
+                difference(f"{field}[{i}]", row, None)
+            if field == "line_items" and classification:
+                actual_index = match_map.get(i)
+                paired = actual_rows[actual_index] if actual_index is not None else {}
+                label_path = f"line_items.{actual_index}"
+                if row.get("spending_category") not in (None, "unknown"):
+                    label_matches.append(f"{label_path}.spending_category" not in missing_labels
+                                         and row["spending_category"] == paired.get("spending_category"))
+                if row.get("tags") is not None:
+                    label_matches.append(actual_index is not None and f"{label_path}.tags" not in missing_labels
+                                         and set(row["tags"]) == set(paired.get("tags", [])))
+        for j, row in enumerate(actual_rows):
+            if j not in matched_actual:
+                difference(f"{field}[extra:{j}]", None, row)
+        if field == 'line_items':
+            metrics.update(item_tp=count, item_fp=m-count, item_fn=n-count, item_matches=matches,
+                           exact_item_count=actual is not None and n == m,
+                           exact_item_order=actual is not None and n == m == count,
+                           precision=count/m if m else float(actual is not None and not n),
+                           recall=count/n if n else float(actual is not None))
+        # The numeric columns follow the item description or tax name. Unknown cells stay unscored.
+        if any(any(v is not None for v in key[1:]) for key in left_keys):
+            amounts.append(actual is not None and n == m and all(
+                _confirmed_cells_match(e[1:], a[1:]) for e, a in zip(left_keys, right_keys, strict=True)
+            ))
+    scores: dict[str, Any] = {
+        group: (sum(values) / len(values) if actual is not None else 0.0) if values else None
+        for group, values in components.items()
+    }
+    assessed = [group for group, values in components.items() if values]
+    scores["normalized"] = sum(scores[g] * COMPONENT_WEIGHTS[g] for g in assessed) / sum(
+        COMPONENT_WEIGHTS[g] for g in assessed
+    )
+    scores["classification"] = _fraction(label_matches) if label_matches else None
+    return dict(version=MASKED_SCORING_VERSION, scored_fields=scored_fields, scores=scores, differences=differences,
+                extraction_failed=actual is None, exact_amounts=all(amounts) if amounts else None,
+                full_receipt_correct=actual is not None and all(scores[group] == 1 for group in assessed),
+                **metrics)

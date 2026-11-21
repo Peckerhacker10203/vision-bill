@@ -72,7 +72,9 @@ See [prepared cutover](distribution/README.md#stop-cut-over-and-recover) and
 
 Keep the existing app image/source identity, configuration, auth secret/pepper,
 PostgreSQL roles and ownership, original uploads (including legacy temporary
-paths), working artifacts and thumbnails. A database-only backup is insufficient.
+paths), working artifacts, thumbnails and the `benchmark_cases/` directory
+under the configured image save directory.
+A database-only backup is insufficient.
 Use protected storage and test restoration to an isolated database/filesystem
 before changing the installation. Freeze writes or take a consistent coordinated
 snapshot so DB references and files agree. Preserve existing exact amounts; this
@@ -149,7 +151,7 @@ Run from a prepared checkout/environment on a network that reaches the intended
 DB. Clear conflicting process/dotenv settings and use a private
 `VISION_BILL_CONFIG_PATH` as appropriate: process env > dotenv > YAML precedence
 still applies. No DSN/password needs to appear in public commands or shell history.
-The resulting head is **0021**. Before starting uvicorn with runtime credentials,
+The resulting head is **0023**. Before starting uvicorn with runtime credentials,
 complete owner migration and grants. The current image still executes Alembic at
 startup using the runtime `PG__*` identity; it can only check an already-current
 schema, not apply pending owner DDL. Future upgrades must repeat the owner step.
@@ -157,9 +159,9 @@ Do not temporarily leave the app serving as the owner to simplify migration.
 
 ### Fresh and legacy mapping
 
-Fresh installations apply 0001 through 0021. Existing supported 0010 installations
-apply migrations 0011–0021 for workflow, review, benchmark references,
-claim fencing, deletion, observation checkpoints and optional receipt values.
+Fresh installations apply 0001 through 0023. An installation at 0021 applies
+0022 and 0023. An installation at 0010 first applies 0011–0021 for workflow,
+review, benchmark references, claim fencing, cleanup and optional receipt values.
 Migration 0011 preserves linked receipts, verified flags, amounts and historical
 paths and marks their submissions analyzed; they are not re-OCRed. Receipt-free
 legacy failed/processing images become pending with attempt_count 0/max_attempts
@@ -170,6 +172,15 @@ cleanup. Migration 0019 keeps retry policy choice for replay-safe explicit adopt
 Migration 0020 adds durable observation checkpoints for completion-only recovery.
 Migration 0021 allows absent discounts, quantities and unit prices while preserving
 stored values. A downgrade to 0020 stops if those columns already contain nulls.
+Migration 0022 creates owner-scoped benchmark cases and distinguishes their
+tasks from ordinary receipt tasks. Existing tasks keep their receipt identity
+and deletion protection. Migration 0023 records the comparison group and
+pipeline on each paired run. Existing single runs retain their original history.
+
+A downgrade from 0023 to 0022 refuses if a comparison exists. A downgrade
+from 0022 to 0021 refuses if any case exists, including an unconfirmed draft.
+If either guard fires, keep the data and use a compatible app version, or
+restore the coordinated pre-upgrade backup into an isolated target.
 
 After head/grants, start only the compatible new application. Verify login and
 owner/admin scope, polling of a new synthetic upload, a preserved old receipt and
@@ -312,7 +323,12 @@ checks complement normal session and owner authorization.
 
 ## Benchmarks and reproducibility
 
-Admin reference preview/qualification lives at
+### Prepare the inputs
+
+In **Benchmarks**, search existing receipts by merchant or receipt number,
+select the intended entries, then open the reference preview. Check the
+expected values and the originals before confirming them. The picker respects
+the current administrator's receipt scope. Admin reference preview/qualification lives at
 `/api/v1/benchmarks/references/<receipt_id>` (GET then POST with
 `expected_review_revision` and `expected_document_sha256`). Gold requires current
 ordinary human verification, exact acknowledgements and complete available ordered
@@ -321,7 +337,53 @@ The immutable reference records observed-field mask, expected data, review/schem
 scoring versions, owner/actor identity and source evidence. Edits require current
 qualification; run creation checks the current reference again transactionally.
 
-Admin runs explicitly select models/receipts and freeze source/model digests,
+For a separate test photo, open **Upload photos and manage benchmark cases**
+in the benchmark form. Choose **New case**, enter a name and select one to ten
+photos in reading order, up to 20 MiB each. Uploading
+creates a private case immediately. It schedules zero OCR or LLM calls. The
+ordinary upload queue, receipt ledger and spending reports receive no entries.
+Enter the printed values you want to test. Leave unobserved amounts blank and
+enter a zero only when the reference should assert zero. Save a draft to
+continue later. Check the values against the displayed originals and confirm
+the reference before choosing **Use in benchmark**. Editing the reference
+requires confirming the new revision. Earlier runs keep their captured reference.
+
+The admin API accepts multipart `name` and repeated `photos` fields at
+`POST /api/v1/benchmarks/cases` (201 with Location). Read case detail at that
+location, and read each ordered original at `/photos/{zero-based index}`.
+`PATCH` the case with its current `expected_revision`, the `expected` draft
+and an explicit `confirm: true` for confirmation. A stale revision returns 409.
+
+### Choose and compare pipelines
+
+Choose a mode, then select the models to run. **Image directly to LLM** sends
+the originals to the selected vision models. **OCR + LLM** uses the dedicated
+OCR service and sends the resulting text and evidence to selected text-capable
+models. Each choice creates a single run. **Compare both** explicitly requests
+two linked runs over the same ordered inputs and frozen expectations. It needs
+OCR and at least one model that supports both paths. A selected text-only
+model participates on the OCR side, with the direct side marked inapplicable.
+Each model and input on the OCR side runs its own OCR step in the live worker.
+
+For an API run, send `POST /api/v1/benchmarks` with explicit `model_ids`,
+`receipt_ids` and/or `case_ids`, and `experiment.pipeline` set to
+`direct_vision` or `ocr`. To pair them, set `comparison: true` with
+`direct_vision`. The 202 response and Location identify the direct run.
+Read both entries with `GET /api/v1/benchmarks?comparison_id=<group UUID>`.
+A single-run API request that omits a pipeline follows the configured upload policy.
+
+Results show the average over all terminal cases for each eligible model and
+pipeline. A failed extraction counts as zero. Open cases make the average
+provisional. Once the matching model has finished both sides, the difference
+is the OCR average minus the direct average, in percentage points. A move from
+65% to 85% is +20 percentage points. Open individual results to inspect the
+expected and actual values, missing or extra items, errors and timing. Loading
+or refreshing results reads recorded work. Explicit reevaluation executes the
+selected model again. Runs containing independent cases use scoring version
+5 so a partial reference can score just its confirmed observations, such as
+the total. New receipt-only runs use version 4.
+
+Admin runs freeze source/model digests,
 profile/runtime, prompt/schema/source/output/context metadata and policy. Direct
 vision needs vision capability; OCR needs text formatting;
 normal upload follows frozen OCR configuration. Replay must match every ordered

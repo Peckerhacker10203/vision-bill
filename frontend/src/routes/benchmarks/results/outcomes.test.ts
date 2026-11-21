@@ -310,3 +310,38 @@ it('shows processing success as unavailable before any terminal cases', async ()
 	expect(card.textContent).not.toContain('NaN');
 	expect(card.textContent).not.toContain('Infinity');
 });
+
+it('identifies the confirmed fields and unscored diagnostics for a v5 case', async () => {
+	showResults({
+		version: '5',
+		details: [
+			{
+				version: '5',
+				model_id: 'model',
+				receipt_id: 'case-total',
+				success: true,
+				scored_fields: ['total'],
+				scores: { normalized: 1, classification: null },
+				extraction_failed: false,
+				full_receipt_correct: true,
+				exact_amounts: true,
+				exact_item_order: null,
+				exact_item_count: null,
+				item_fp: null,
+				item_fn: null,
+				item_tp: null,
+				item_matches: [],
+				precision: null,
+				recall: null
+			}
+		]
+	});
+	await fireEvent.click(await screen.findByRole('button', { name: 'Load individual results' }));
+	await fireEvent.click(await screen.findByText(/case-total/));
+	expect(screen.getByText('Scored fields · Total')).toBeTruthy();
+	expect(screen.getByText('Extra item occurrences').parentElement?.textContent).toContain(
+		'Unavailable'
+	);
+	expect(screen.getByText('Classification was not scored.')).toBeTruthy();
+	expect(screen.queryByText(/Strict:/)).toBeNull();
+});

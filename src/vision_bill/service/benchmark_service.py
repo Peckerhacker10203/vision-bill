@@ -24,11 +24,12 @@ from ..model.benchmark import (
     require_selected_models,
 )
 from ..model.experiment import ExperimentOptions, ExtractionPipeline
+from ..model.extraction import ExtractionDraft
 from ..model.handoff import HandoffStatus, HandoffWait
 from ..model.ocr_errors import OCR_RESULT_CODES, OcrWorkerFailure, raise_for_worker_reason
 from ..model.receipt import LineItem, Receipt, TaxLine
 from ..model.workflow import AccessScope
-from ..provider.db.benchmark_db import BenchmarkDB
+from ..provider.db.benchmark_db import BenchmarkDB, QueuedArm
 from ..provider.db.deadline import connection
 from ..provider.llm.base import LLMProvider
 from ..provider.llm.errors import UnreadableReceiptError
@@ -44,7 +45,13 @@ from .experiment_execution import (
     ocr_fingerprint,
     pipeline_identity,
 )
-from .experiment_scoring import DETAIL_SCORING_VERSION, detailed_score, detailed_score_v3
+from .experiment_scoring import (
+    DETAIL_SCORING_VERSION,
+    MASKED_SCORING_VERSION,
+    detailed_score,
+    detailed_score_v3,
+    masked_reference_score,
+)
 from .extraction_pipeline import OcrRuntimeChangedError, OriginalSourceChangedError
 from .gpu_handoff import ModelHandoff, admission_deadline, handoff_resource_identity
 from .receipt_service import ReceiptService
@@ -87,46 +94,88 @@ class BenchmarkService:
 
     async def create_run(self, request: BenchmarkCreate, *, scope: AccessScope) -> BenchmarkRun:
         selected_models = require_selected_models(getattr(request, "model_ids", None))
-        use_ocr = request.experiment.pipeline == ExtractionPipeline.OCR or (
-            request.experiment.pipeline == ExtractionPipeline.UPLOAD and self._receipts._ocr_settings.enabled
-        )
+        pipeline = request.experiment.pipeline
+        if request.comparison and pipeline == ExtractionPipeline.OCR:
+            raise ValueError("An OCR-only pipeline conflicts with comparison mode")
+        explicit_ocr = request.comparison or pipeline == ExtractionPipeline.OCR
+        use_ocr = explicit_ocr or (pipeline == ExtractionPipeline.UPLOAD and self._receipts._ocr_settings.enabled)
         models = await self._provider.get_available_models(capability="text" if use_ocr else "vision")
         available = {m.id: m for m in models}
         unknown = set(selected_models) - set(available)
         if unknown:
             raise ValueError(f"Selected model(s) unavailable: {', '.join(sorted(unknown))}")
-        selected_ids = await self._select_receipts(request, scope=scope)
-        if not selected_ids:
-            raise ValueError("No current qualified references match the selection")
+        primary_models = selected_models
+        if request.comparison:
+            vision = await self._provider.get_available_models(capability="vision")
+            pairable = {m.id: m for m in vision if {"vision", "multimodal"}.intersection(m.capabilities or [])}
+            primary_models = [model for model in selected_models if model in pairable]
+            if not primary_models:
+                raise ValueError("Select at least one vision-capable model for a comparison")
+            if any(available[m].digest != pairable[m].digest for m in primary_models):
+                raise ValueError("Selected model digest changed during discovery; create a new run")
         if request.experiment.think is not None and not self._provider.supports_thinking_control:
             raise ValueError("Thinking override is supported only by the Ollama provider")
-        if request.experiment.pipeline == ExtractionPipeline.OCR and not self.capabilities()["ocr_available"]:
+        if explicit_ocr and not self.capabilities()["ocr_available"]:
             raise ValueError("OCR extension is unavailable; managed OCR requires production OCR enabled with model lifecycle management")
+
+        receipt_ids = await self._select_receipts(request, scope=scope)
+        case_ids = request.case_ids or []
+        if set(receipt_ids).intersection(case_ids):
+            raise ValueError("A receipt and a benchmark case cannot share the same input ID")
+        selected_ids = [*receipt_ids, *case_ids]
+        if not selected_ids:
+            raise ValueError("No current qualified references match the selection")
+        inputs = [await self._capture_input(receipt_id, scope=scope) for receipt_id in receipt_ids]
+        inputs.extend([await self._capture_case(case_id, scope=scope) for case_id in case_ids])
         tags = await self._receipts.list_tags()
-        inputs = [await self._capture_input(receipt_id, scope=scope) for receipt_id in selected_ids]
-        expected = [Receipt.model_validate(item["expected"]) for item in inputs]
-        probe = self._provider.for_experiment(request.experiment)
-        options = probe.experiment_options or request.experiment
-        counts = {len(item["images"]) for item in inputs}
-        for item in inputs:
-            item["pipeline"] = options.pipeline.value
-        self._managed_coordinator(
-            effective_policy(self._receipts, options)[1], direct=options.pipeline == ExtractionPipeline.DIRECT,
-        )
-        manifest = {"identity": await pipeline_identity(self._receipts, options, qualify=True, managed_model_ids=selected_models), "options": options.model_dump(mode="json"), "tags": tags, "inputs": inputs,
-                    "provider": type(self._provider).__name__,
-                    "endpoint_fingerprint": endpoint_fingerprint(self._provider),
-                    "ocr_fingerprint": ocr_fingerprint(getattr(self._receipts, "_ocr_provider", None)),
-                    "prompt_hashes": {str(count): sha256(probe.build_prompt(tags, image_count=count).encode()).hexdigest() for count in counts},
-                    "validation_schema_sha256": sha256(json.dumps(Receipt.model_json_schema(), sort_keys=True).encode()).hexdigest(),
-                    "thinking_default": "server-controlled" if options.think is None else "explicit"}
+        options = request.experiment
+        if request.comparison:
+            options = options.model_copy(update={"pipeline": ExtractionPipeline.DIRECT})
+        manifest = await self._freeze_manifest(options, primary_models, inputs, tags)
+        ocr_arm = None
+        if request.comparison:
+            # Use the primary arm's already-resolved provider defaults.
+            ocr_options = ExperimentOptions.model_validate(manifest["options"]).model_copy(
+                update={"pipeline": ExtractionPipeline.OCR},
+            )
+            ocr_manifest = await self._freeze_manifest(ocr_options, selected_models, inputs, tags)
+            ocr_arm = QueuedArm(selected_models, ocr_manifest)
+        if case_ids:
+            # Both Gold formats bind expected values, field masks and ordered original hashes.
+            documents = sorted((item["receipt_id"], item["reference"]["document_sha256"]) for item in inputs)
+            fingerprint = sha256(json.dumps(documents).encode()).hexdigest()
+        else:
+            fingerprint = dataset_fingerprint([Receipt.model_validate(item["expected"]) for item in inputs])
         return await self._db.create_run(
-            model_ids=selected_models, receipt_ids=selected_ids, fingerprint=dataset_fingerprint(expected),
+            model_ids=primary_models, receipt_ids=selected_ids, fingerprint=fingerprint,
             model_digests={model_id: available[model_id].digest for model_id in selected_models}, timeout=request.request_timeout_seconds,
             policy=request.council_policy, absolute=request.council_absolute_threshold,
             relative=request.council_relative_threshold, apply_flags=request.apply_council_flags,
-            prompt_version=PROMPT_VERSION, scoring_version=DETAIL_SCORING_VERSION, manifest=manifest, owner_id=scope.user_id, scope=scope,
+            prompt_version=PROMPT_VERSION, scoring_version=MASKED_SCORING_VERSION if case_ids else DETAIL_SCORING_VERSION,
+            manifest=manifest, ocr_arm=ocr_arm, owner_id=scope.user_id, scope=scope,
         )
+
+    async def _freeze_manifest(
+        self, options: ExperimentOptions, models: list[str], inputs: list[dict[str, Any]], tags: list[str],
+    ) -> dict[str, Any]:
+        probe = self._provider.for_experiment(options)
+        options = probe.experiment_options or options
+        counts = {len(item["images"]) for item in inputs}
+        self._managed_coordinator(
+            effective_policy(self._receipts, options)[1], direct=options.pipeline == ExtractionPipeline.DIRECT,
+        )
+        return {
+            **({"scoring_version": MASKED_SCORING_VERSION} if any("case_id" in item for item in inputs) else {}),
+            "identity": await pipeline_identity(self._receipts, options, qualify=True, managed_model_ids=models),
+            "options": options.model_dump(mode="json"), "tags": tags,
+            "inputs": [{**item, "pipeline": options.pipeline.value} for item in inputs],
+            "provider": type(self._provider).__name__,
+            "endpoint_fingerprint": endpoint_fingerprint(self._provider),
+            "ocr_fingerprint": ocr_fingerprint(getattr(self._receipts, "_ocr_provider", None)),
+            "prompt_hashes": {str(count): sha256(probe.build_prompt(tags, image_count=count).encode()).hexdigest() for count in counts},
+            "validation_schema_sha256": sha256(json.dumps(Receipt.model_json_schema(), sort_keys=True).encode()).hexdigest(),
+            "thinking_default": "server-controlled" if options.think is None else "explicit",
+        }
 
     async def get_status(self, run_id: UUID, *, scope: AccessScope) -> BenchmarkStatus | None:
         run = await self._db.run(run_id, scope=scope)
@@ -135,8 +184,9 @@ class BenchmarkService:
         counts = await self._db.task_counts(run_id)
         return BenchmarkStatus(run=run, summaries=await self._db.summaries(run_id), **counts)
 
-    async def list_runs(self, *, scope: AccessScope) -> list[BenchmarkRun]:
-        return await self._db.runs(scope=scope)
+    async def list_runs(self, *, scope: AccessScope, comparison_id: UUID | None = None,
+                        limit: int | None = None, offset: int = 0) -> list[BenchmarkRun]:
+        return await self._db.runs(scope=scope, comparison_id=comparison_id, limit=limit, offset=offset)
 
     async def reevaluate(self, run_id: UUID, receipt_id: UUID, model_id: str, *, scope: AccessScope) -> dict[str, Any]:
         """Transient inspection: extraction and field diff are returned, never stored."""
@@ -158,7 +208,7 @@ class BenchmarkService:
                         manifest, receipt_id, model_id, managed_model_ids=run.model_ids,
                         inference_deadline=monotonic() + budget,
                     )
-            detail = self._score(manifest, receipt_id, expected, result.receipt)
+            detail = await asyncio.to_thread(self._score, manifest, receipt_id, expected, result.receipt, result.metadata)
             item = next(item for item in manifest["inputs"] if item["receipt_id"] == str(receipt_id))
             return {"receipt_id": receipt_id, "model_id": model_id, **detail,
                     "expected": item["expected"] if item.get("reference") else expected.model_dump(mode="json"),
@@ -181,6 +231,8 @@ class BenchmarkService:
                     raise ValueError("Explicit receipt is unavailable or not verified")
                 result.append(receipt_id)
             return result
+        if request.case_ids is not None:
+            return []
         candidates = await self._db.reference_candidates(
             scope=scope, category=request.category, max_source_confidence=request.max_source_confidence,
         )
@@ -285,6 +337,7 @@ class BenchmarkService:
         if updated is None:
             raise _StaleClaim
         task.update(updated)
+        logger.info("Benchmark inference started run=%s attempt=%s", task["run_id"], task["inference_attempt_count"])
 
     @staticmethod
     def _retryable(exc: BaseException) -> bool:
@@ -320,18 +373,23 @@ class BenchmarkService:
 
     async def _finish_failure(self, task: dict[str, Any], manifest: dict[str, Any] | None,
                               exc: Exception, started: float, deadline: float) -> None:
+        # With no call trace, retain the historical one-call estimate only for dispatched work.
+        dispatched = int(task["inference_attempt_count"] > 0)
         if not manifest:
-            await self._db.finish_task(task, success=False, deadline=deadline)
+            await self._db.finish_task(task, success=False, attempts=dispatched, deadline=deadline)
             return
         metadata = dict(exc.metadata) if isinstance(exc, ExperimentFailure) else {"options": manifest["options"]}
         elapsed = (asyncio.get_running_loop().time() - started) * 1000
         metadata.update(self._attempt_metadata(task))
         metadata.update(elapsed_ms=elapsed, requested_pipeline=manifest["options"]["pipeline"])
         item = next(x for x in manifest["inputs"] if x["receipt_id"] == str(task["receipt_id"]))
-        failure_score = self._score(manifest, task["receipt_id"], Receipt.model_validate(item["expected"]), None) if "reference" in item else {}
-        await self._db.finish_task(task, success=False, latency_ms=elapsed,
-            attempts=len(metadata.get("calls", [])) or 1,
+        failure_score = self._score(manifest, task["receipt_id"], self._reference_document(item), None) if "reference" in item else {}
+        finished = await self._db.finish_task(task, success=False, latency_ms=elapsed,
+            attempts=len(metadata.get("calls", [])) or dispatched,
             result={**failure_score, "error": str(exc) or type(exc).__name__, "metadata": metadata}, deadline=deadline)
+        if finished:
+            logger.info("Benchmark case failed run=%s pipeline=%s error_type=%s elapsed_ms=%.0f",
+                        task["run_id"], manifest["options"]["pipeline"], type(exc).__name__, elapsed)
 
     async def _run_digests(self, run: BenchmarkRun, *, deadline: float | None = None) -> dict[str, str | None]:
         async with connection(self._receipts.pool, deadline=deadline) as conn:
@@ -353,10 +411,11 @@ class BenchmarkService:
                 "ocr_enabled": self._receipts._ocr_settings.enabled,
                 "thinking_control": self._provider.supports_thinking_control}
 
-    async def results(self, run_id: UUID, *, limit: int, offset: int, scope: AccessScope) -> list[dict[str, Any]]:
+    async def results(self, run_id: UUID, *, limit: int, offset: int, scope: AccessScope,
+                      model_id: str | None = None, receipt_ids: list[UUID] | None = None) -> list[dict[str, Any]]:
         if await self._db.run(run_id, scope=scope) is None:
             raise ValueError("Benchmark run not found")
-        return await self._db.results(run_id, limit=limit, offset=offset)
+        return await self._db.results(run_id, limit=limit, offset=offset, model_id=model_id, receipt_ids=receipt_ids)
 
     async def reference_preview(self, receipt_id: UUID, *, scope: AccessScope) -> ReferencePreview:
         return await self._db.reference_preview(receipt_id, scope=scope)
@@ -371,6 +430,17 @@ class BenchmarkService:
         return {"receipt_id": str(receipt_id), "expected": reference.expected,
                 "images": reference.sources, "reference": reference.model_dump(mode="json"),
                 "scored_fields": reference.scored_fields}
+
+    async def _capture_case(self, case_id: UUID, *, scope: AccessScope) -> dict[str, Any]:
+        from ..provider.db.benchmark_cases import BenchmarkCaseDB
+
+        return await BenchmarkCaseDB(self._receipts.pool).freeze(case_id, scope=scope)
+
+    @staticmethod
+    def _reference_document(item: dict[str, Any]) -> Receipt | ExtractionDraft:
+        if item.get("input_kind") == "case":
+            return ExtractionDraft.model_validate(item["expected"])
+        return Receipt.model_validate(item["expected"])
 
     def _managed_coordinator(self, settings: OcrSettings, *, direct: bool = False) -> ModelHandoff | None:
         if direct and not settings.shared_gpu:
@@ -387,7 +457,7 @@ class BenchmarkService:
         self, manifest: dict[str, Any], receipt_id: UUID, model_id: str, *,
         before_inference: Callable[[], Awaitable[None]] | None = None,
         inference_deadline: float, managed_model_ids: Sequence[str],
-    ) -> tuple[Receipt, ExperimentResult]:
+    ) -> tuple[Receipt | ExtractionDraft, ExperimentResult]:
         item = next((x for x in manifest["inputs"] if x["receipt_id"] == str(receipt_id)), None)
         if item is None:
             raise ValueError("Receipt is absent from the frozen benchmark inputs")
@@ -507,7 +577,7 @@ class BenchmarkService:
         if current_prompt != manifest["prompt_hashes"][str(len(paths))]:
             raise ValueError("Extraction prompt changed since run creation; create a new run")
         options = options.model_copy(update={"pipeline": ExtractionPipeline(item["pipeline"])})
-        expected = Receipt.model_validate(item["expected"])
+        expected = self._reference_document(item)
         capability = "text" if uses_ocr else "vision"
         try:
             models = await self._provider.get_available_models(capability=capability)
@@ -570,9 +640,15 @@ class BenchmarkService:
         return expected, result
 
     @staticmethod
-    def _score(manifest: dict[str, Any], receipt_id: UUID, expected: Receipt, actual: Receipt | None) -> dict[str, Any]:
+    def _score(manifest: dict[str, Any], receipt_id: UUID, expected: Receipt | ExtractionDraft,
+               actual: Receipt | None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         item = next(x for x in manifest["inputs"] if x["receipt_id"] == str(receipt_id))
-        if "reference" not in item and actual is not None:
+        if manifest.get("scoring_version") == MASKED_SCORING_VERSION:
+            missing_labels = (metadata or {}).get("classification_enrichment", {}).get("missing_fields", ())
+            return masked_reference_score(item["expected"], actual, item["scored_fields"],
+                                          classification=manifest["options"]["include_classification"],
+                                          missing_labels=frozenset(missing_labels))
+        if "reference" not in item and actual is not None and isinstance(expected, Receipt):
             return detailed_score_v3(expected, actual, classification=manifest["options"]["include_classification"])
         return detailed_score(item["expected"], actual, classification=manifest["options"]["include_classification"],
                               scored_fields=item.get("scored_fields"))
@@ -587,11 +663,15 @@ class BenchmarkService:
             manifest, task["receipt_id"], task["model_id"], before_inference=begin,
             inference_deadline=inference_deadline, managed_model_ids=managed_model_ids,
         )
-        detail = self._score(manifest, task["receipt_id"], expected, result.receipt)
+        detail = await asyncio.to_thread(self._score, manifest, task["receipt_id"], expected, result.receipt, result.metadata)
         result.metadata.update(self._attempt_metadata(task))
         payload = {**detail, "expected": next(x["expected"] for x in manifest["inputs"] if x["receipt_id"] == str(task["receipt_id"])),
-                   "actual": result.receipt.model_dump(mode="json"), "metadata": result.metadata,
-                   "legacy_scores": score_receipts(expected, result.receipt)}
-        await self._db.finish_task(task, success=True, score=detail["scores"]["normalized"],
+                   "actual": result.receipt.model_dump(mode="json"), "metadata": result.metadata}
+        if isinstance(expected, Receipt) and detail.get("version") != MASKED_SCORING_VERSION:
+            payload["legacy_scores"] = score_receipts(expected, result.receipt)
+        finished = await self._db.finish_task(task, success=True, score=detail["scores"]["normalized"],
                                    confidence=result.receipt.confidence, attempts=result.attempts,
                                    latency_ms=result.elapsed_ms, result=payload, deadline=deadline)
+        if finished:
+            logger.info("Benchmark case completed run=%s pipeline=%s elapsed_ms=%.0f",
+                        task["run_id"], manifest["options"]["pipeline"], result.elapsed_ms)

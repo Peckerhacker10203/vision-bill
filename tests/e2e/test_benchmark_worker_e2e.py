@@ -99,7 +99,8 @@ async def test_unmanifested_history_fails_before_discovery_or_new_inference(work
     service._provider.get_available_models.assert_not_awaited()
     inference.assert_not_awaited()
     assert await service._db.lease_task() is None
-    assert (await service._db.summaries(run.id))[0].failed == 1
+    summary = (await service._db.summaries(run.id))[0]
+    assert summary.failed == 1 and summary.average_attempts == 0
     assert await service._db.results(run.id) == []
 
 
@@ -189,7 +190,8 @@ async def test_expired_third_attempt_terminalizes_even_without_discovery(workflo
     await service._execute(recovery)
     await service._execute(recovery)
     assert await claims.saved(w, run.id) is None
-    assert (await service._db.summaries(run.id))[0].failed == 1
+    summary = (await service._db.summaries(run.id))[0]
+    assert summary.failed == 1 and summary.average_attempts == 1
     assert inference.await_count == 0
     if kind == "manifest":
         result = (await service._db.results(run.id))[0]
@@ -215,7 +217,8 @@ async def test_frozen_preflight_violations_are_terminal_without_inference(workfl
             await conn.execute("UPDATE benchmark_runs SET experiment_manifest=$2 WHERE id=$1", run.id, json.dumps(manifest))
     await service._execute(dict(await service._db.lease_task()))
     assert inference.await_count == 0
-    assert (await service._db.summaries(run.id))[0].failed == 1
+    summary = (await service._db.summaries(run.id))[0]
+    assert summary.failed == 1 and summary.average_attempts == 0
     result = (await service._db.results(run.id))[0]
     assert result["metadata"]["inference_attempt_count"] == 0
     assert result["scores"]["normalized"] == 0
@@ -228,7 +231,8 @@ async def test_unreadable_output_is_permanent_after_one_attempt(workflow_db, tmp
     service, run, _, _, inference, _ = await prepare(w, scope, tmp_path, kind=kind)
     inference.side_effect = UnreadableReceiptError("unreadable")
     await service._execute(dict(await service._db.lease_task()))
-    assert (await service._db.summaries(run.id))[0].failed == 1
+    summary = (await service._db.summaries(run.id))[0]
+    assert summary.failed == 1 and summary.average_attempts == 1
     assert inference.await_count == 1 and await service._db.lease_task() is None
 
 

@@ -576,11 +576,13 @@ async def test_public_human_null_completion_remains_observed_in_gold(workflow_db
         preview = await client.get(f'/benchmarks/references/{receipt_id}')
         assert preview.status_code == 200, preview.text
         current = preview.json()
+        assert current['currently_qualified'] is False
         assert {'currency','discount_total'} <= set(current['scored_fields'])
         assert (await client.get(f'/benchmarks/references/{receipt_id}')).json()['document_sha256'] == current['document_sha256']
         qualified = await client.post(f'/benchmarks/references/{receipt_id}',json={'expected_review_revision':current['review_revision'],'expected_document_sha256':current['document_sha256']})
         assert qualified.status_code == 200, qualified.text
-        assert (await client.get(f'/benchmarks/references/{receipt_id}')).json() == current
+        assert qualified.json()['currently_qualified'] is True
+        assert (await client.get(f'/benchmarks/references/{receipt_id}')).json() == {**current, 'currently_qualified': True}
     gold = await benchmarks._db.current_reference(receipt_id,scope=scope)
     assert str(gold.id) == qualified.json()['id'] and gold.scored_fields == current['scored_fields']
     expected = Receipt.model_validate(gold.expected)

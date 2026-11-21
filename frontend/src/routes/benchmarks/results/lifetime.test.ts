@@ -118,18 +118,18 @@ it('coalesces timer ticks until a slow refresh has delivered its result', async 
 	);
 	fetchMock.mockClear();
 	poll();
-	await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+	await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
 	poll();
 	poll();
 	await tick();
-	expect(fetchMock).toHaveBeenCalledTimes(2);
+	expect(fetchMock).toHaveBeenCalledTimes(1);
 	slow.resolve(Response.json(status('A', 'slow result')));
 	await screen.findByText(/Scoring version: slow result/);
 	poll();
-	await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4));
+	await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
 });
 
-it('clears the removed run and fences its pending details when polling selects a successor', async () => {
+it('clears the removed run and fences its pending details when history refresh selects a successor', async () => {
 	const fetchMock = await setup(),
 		late = deferred<Response>();
 	fetchMock.mockImplementation(async (url) =>
@@ -140,7 +140,7 @@ it('clears the removed run and fences its pending details when polling selects a
 				: Response.json(status('B'))
 	);
 	await fireEvent.click(screen.getByRole('button', { name: 'Load individual results' }));
-	poll();
+	await fireEvent.click(screen.getByRole('button', { name: 'Refresh runs' }));
 	await screen.findByText(/Scoring version: B/);
 	late.resolve(Response.json([{ model_id: 'A-private', receipt_id: 'a', success: false }]));
 	await tick();
@@ -149,4 +149,62 @@ it('clears the removed run and fences its pending details when polling selects a
 	expect(
 		(screen.getByRole('button', { name: 'Load individual results' }) as HTMLButtonElement).disabled
 	).toBe(false);
+});
+
+it('retains live status through a transient poll failure and retries the active run', async () => {
+	const fetchMock = await setup();
+	fetchMock.mockResolvedValueOnce(new Response('', { status: 503 }));
+	poll();
+	await screen.findByRole('alert');
+	expect(screen.getByText(/Scoring version: A/)).toBeTruthy();
+	fetchMock.mockResolvedValueOnce(Response.json(status('A', 'recovered')));
+	poll();
+	await screen.findByText(/Scoring version: recovered/);
+	expect(screen.queryByRole('alert')).toBeNull();
+});
+
+it('drops previous status after the run becomes inaccessible', async () => {
+	const fetchMock = await setup();
+	fetchMock.mockResolvedValueOnce(new Response('', { status: 404 }));
+	poll();
+	await screen.findByRole('alert');
+	expect(screen.queryByText(/Scoring version: A/)).toBeNull();
+});
+
+it('refreshes the open single-run detail page when progress changes during its request', async () => {
+	const fetchMock = await setup();
+	const late = deferred<Response>();
+	let secondPageRequests = 0;
+	const rows = Array.from({ length: 50 }, (_, index) => ({
+		model_id: 'm',
+		receipt_id: String(index),
+		success: false
+	}));
+	fetchMock.mockImplementation(async (path) => {
+		if (path.endsWith('offset=0')) return Response.json(rows);
+		if (path.endsWith('offset=50')) {
+			secondPageRequests++;
+			if (secondPageRequests === 1) return late.promise;
+			return Response.json([
+				{ model_id: 'final model', receipt_id: 'completed-case', success: false }
+			]);
+		}
+		return Response.json({
+			...status('A', 'finished'),
+			run: { ...run('A'), status: 'completed', scoring_version: 'finished' },
+			terminal: 52
+		});
+	});
+	await fireEvent.click(screen.getByText('Load individual results', { selector: 'button' }));
+	await waitFor(() =>
+		expect(
+			(screen.getByText('Next 50', { selector: 'button' }) as HTMLButtonElement).disabled
+		).toBe(false)
+	);
+	await fireEvent.click(screen.getByText('Next 50', { selector: 'button' }));
+	poll();
+	await screen.findByText(/Scoring version: finished/);
+	late.resolve(Response.json([]));
+	await screen.findByText('final model');
+	expect(secondPageRequests).toBe(2);
 });

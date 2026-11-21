@@ -1,7 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
@@ -29,8 +29,10 @@ class BenchmarkCreate(BaseModel):
     """A durable, local-only benchmark request."""
 
     experiment: ExperimentOptions = Field(default_factory=ExperimentOptions)
+    comparison: bool = False
     model_ids: list[str] = Field(min_length=1)
     receipt_ids: list[UUID] | None = None
+    case_ids: list[UUID] | None = None
     category: str | None = None
     max_source_confidence: int | None = Field(default=None, ge=0, le=100)
     limit: int | None = Field(default=None, ge=1)
@@ -40,7 +42,7 @@ class BenchmarkCreate(BaseModel):
     council_relative_threshold: Decimal | None = Field(default=None, ge=0)
     apply_council_flags: bool = False
 
-    @field_validator("receipt_ids")
+    @field_validator("receipt_ids", "case_ids")
     @classmethod
     def unique_receipt_selection(cls, receipt_ids: list[UUID] | None) -> list[UUID] | None:
         return list(dict.fromkeys(receipt_ids)) if receipt_ids is not None else None
@@ -53,9 +55,13 @@ class BenchmarkCreate(BaseModel):
 
 class BenchmarkRun(BaseModel):
     id: UUID
+    comparison_id: UUID | None = None
+    comparison_arm: Literal["direct_vision", "ocr"] | None = None
     status: str
     model_ids: list[str]
     receipt_ids: list[UUID]
+    case_ids: list[UUID] = Field(default_factory=list)
+    case_names: dict[UUID, str] = Field(default_factory=dict)
     dataset_fingerprint: str
     prompt_version: str
     scoring_version: str
@@ -98,6 +104,7 @@ class ReferenceConfirmation(BaseModel):
 
 
 class ReferencePreview(BaseModel):
+    currently_qualified: bool = False
     receipt_identity: UUID
     owner_id: UUID | None
     review_revision: int

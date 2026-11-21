@@ -4,6 +4,7 @@
 	import { page } from '$app/state';
 	import { resolve } from '$app/paths';
 	import { t, translate } from '$lib/i18n';
+	import { session } from '$lib/auth';
 	import { api, ApiError } from '$lib/api/client';
 	import { captureSessionActor, isCurrentSessionActor } from '$lib/session-lifetime';
 	import { queryClient } from '$lib/query/client';
@@ -74,6 +75,15 @@
 		() => queryClient
 	);
 
+	async function copyId() {
+		const view = activeView;
+		try {
+			await navigator.clipboard.writeText(id);
+			if (isCurrentView(view)) snackbar.notify('success', translate('benchmarkForm.copied'));
+		} catch {
+			if (isCurrentView(view)) snackbar.notify('info', translate('benchmarkForm.copyManually'));
+		}
+	}
 	let notFound = $derived(
 		!uuidPattern.test(id) ||
 			(detail.status === 'error' && detail.error instanceof ApiError && detail.error.status === 404)
@@ -336,6 +346,20 @@
 				>
 					{$t('receipt.verified')}
 				</span>
+			{/if}
+		</div>
+
+		<div class="my-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-on-surface-variant">
+			<span>{$t('benchmarkForm.receiptId')} <code class="select-all break-all">{id}</code></span>
+			<button type="button" class="text-primary underline" onclick={copyId}
+				>{$t('benchmarkForm.copyId')}</button
+			>
+			{#if $session && $session !== 'loading' && $session.is_admin}
+				<a
+					class="text-primary underline"
+					href={resolve(`/benchmarks?receipt=${encodeURIComponent(id)}`)}
+					>{$t('benchmarkForm.useReceipt')}</a
+				>
 			{/if}
 		</div>
 

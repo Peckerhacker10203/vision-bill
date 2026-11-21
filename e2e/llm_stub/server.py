@@ -70,7 +70,7 @@ def _extract_image_hash(body: dict[str, Any]) -> str | None:
 
 def configure_scenario(body: dict[str, Any]) -> None:
     scenario = body.get("scenario", "complete")
-    if scenario not in ("complete", "partial", "policy_unknown", "overlap"):
+    if scenario not in ("complete", "partial", "policy_unknown", "overlap", "direct_merchant_mismatch"):
         raise ValueError("unknown scenario")
     state["scenario"] = scenario
     state["broken"] = set()
@@ -140,6 +140,7 @@ def _content_for(body: dict[str, Any]) -> str:
     scenario = state.get("scenario", "complete")
     entry = {
         "kind": kind,
+        "model": body.get("model"),
         "scenario": scenario,
         "fixture": names,
         "ordered_sources": [
@@ -177,6 +178,8 @@ def _content_for(body: dict[str, Any]) -> str:
         )
     reply = "partial" if scenario == "partial" else "complete"
     payload = json.loads((REPLIES_DIR / f"{names[0]}.{reply}.json").read_text())
+    if scenario == "direct_merchant_mismatch" and kind == "direct":
+        payload["merchant_name"] = "Misread test merchant"
     if scenario == "policy_unknown":
         payload.pop("amount_policy")
     if scenario == "overlap":
