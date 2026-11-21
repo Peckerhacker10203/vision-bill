@@ -1016,8 +1016,8 @@ def deploy(
     ):
         raise ValueError("Reuse requires a local source-build tag for the selected accelerator")
     managed = state / "compose.local.json"
-    if upgrade and (restart or reuse_native_image is not None):
-        raise ValueError("Upgrade builds the selected source checkout")
+    if upgrade and restart:
+        raise ValueError("Choose either --restart or --upgrade")
     if restart:
         trusted_file(managed)
         overlay = json.loads(managed.read_bytes())
@@ -1147,7 +1147,7 @@ def deploy(
             except subprocess.CalledProcessError:
                 command("make", "ocr-lock-cuda")
                 command(*lock, capture=True)
-            if previous is not None:
+            if previous is not None and reuse_native_image is None:
                 # Older source builds may have the exact wheel in the previous image's pip cache.
                 command(
                     *lock,
@@ -1279,7 +1279,7 @@ def main() -> int:
         action="store_true",
         help="build updated images for the original, drained Compose project",
     )
-    mode.add_argument(
+    parser.add_argument(
         "--reuse-native-image",
         metavar="SOURCE_BUILD_TAG",
         help="verify and use a local OCR candidate from an earlier source build",
@@ -1290,6 +1290,8 @@ def main() -> int:
         help="during --upgrade, reconcile a pending local OCR-only handoff after verified shutdown",
     )
     args = parser.parse_args()
+    if args.restart and args.reuse_native_image is not None:
+        parser.error("--restart and --reuse-native-image cannot be combined")
     if args.recover_stopped_ocr and not args.upgrade:
         parser.error("--recover-stopped-ocr requires --upgrade")
     if args.approved_inputs is not None and args.restart:

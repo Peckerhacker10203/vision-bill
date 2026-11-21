@@ -1,6 +1,19 @@
 # Assemble public offline manuals using the same Python image as the API.
 FROM python:3.12-slim AS operator-guides
-RUN --mount=type=bind,target=/repo python /repo/frontend/scripts/operator_guides.py /guides.zip
+WORKDIR /repo
+# Keep source paths explicit so BuildKit can prune unrelated checkout trees.
+COPY README.md AGENTS.md MULTI_IMAGE_RECEIPTS.md OPENAI_COMPATIBLE.md RELEASES.md UPGRADE_AND_VERIFY.md ./
+COPY .github/workflows/distribution-inputs.yml .github/workflows/distribution-release.yml .github/workflows/
+COPY distribution/README.md distribution/artifacts.schema.json distribution/
+COPY frontend/README.md frontend/
+COPY frontend/patches/README.md frontend/patches/
+COPY frontend/scripts/operator_guides.py frontend/scripts/
+COPY paddleocr-service/README.md paddleocr-service/profile.json paddleocr-service/release-bundle.schema.json paddleocr-service/
+COPY paddleocr-service/first-run-fixtures/README.md paddleocr-service/first-run-fixtures/
+COPY scripts/README.md scripts/distribution.mjs scripts/receipt_split_experiment.md scripts/receipt_split_results.md scripts/
+COPY scripts/ocr_harness/README.md scripts/ocr_harness/BENCHMARK_RESULTS.md scripts/ocr_harness/
+COPY tests/e2e/data/README.md tests/e2e/data/
+RUN python frontend/scripts/operator_guides.py /guides.zip
 
 # ── Stage 1: build the SvelteKit SPA ──────────────────────────────────────
 # The built frontend is a git-ignored artifact, so a bare `git clone` has no

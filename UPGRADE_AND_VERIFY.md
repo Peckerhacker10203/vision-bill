@@ -53,7 +53,9 @@ For a source installation created with `ocr_source_up.py`, use the original
 checkout and the documented `--upgrade` procedure after backup and drain.
 A stopped, settled original deployment with its records, release and volumes intact
 can rebuild deleted app or OCR images through `--upgrade`. The read-only handoff
-check uses a separate pinned CPU image. `--restart` needs the recorded images. [Source upgrade steps](paddleocr-service/README.md#upgrade-an-existing-source-installation)
+check uses a separate pinned CPU image. `--restart` needs the recorded images.
+If the native build succeeded before the app build failed, retry the upgrade
+with the saved native image tag. [Source upgrade and retry steps](paddleocr-service/README.md#upgrade-an-existing-source-installation)
 
 For a prepared upgrade, keep the old Compose project name and volume mounts.
 Use a schema-v2 bundle for the new installation. Changing the extraction directory

@@ -75,6 +75,10 @@ distribution/**
 !distribution/artifacts.schema.json
 frontend/static/vision-bill-operator-guides.zip
 
+# Operator-owned runtime data can contain unreadable bind mounts.
+server_data
+server_data/**
+
 # Local test output and runtime configuration are not build inputs.
 frontend/test-results
 frontend/test-results/**

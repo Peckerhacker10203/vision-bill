@@ -1,6 +1,9 @@
 """Use actual BuildKit matching on synthetic files, never operator context data."""
+import runpy
+import shutil
 import subprocess
 from pathlib import Path
+from zipfile import ZipFile
 import pytest
 
 pytestmark = pytest.mark.e2e
@@ -54,3 +57,38 @@ def test_native_context_admits_contract_and_build_inputs_without_app_or_private_
     assert result.returncode == 0, result.stderr
     assert all((output / name).is_file() for name in admitted)
     assert not [name for name in excluded if (output / name).exists()]
+
+
+def test_operator_guide_build_skips_unreadable_runtime_data(tmp_path):
+    context, output = tmp_path / "context", tmp_path / "output"
+    context.mkdir()
+    shutil.copy(ROOT / ".dockerignore", context)
+    script = "frontend/scripts/operator_guides.py"
+    public_files = runpy.run_path(str(ROOT / script))["PUBLIC_FILES"]
+    for name in (*public_files, script):
+        destination = context / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / name, destination)
+
+    recipe = (ROOT / "Dockerfile").read_text()
+    (context / "Dockerfile").write_text(
+        recipe + "\nFROM scratch AS guides-export\nCOPY --from=operator-guides /guides.zip /guides.zip\n"
+    )
+    private = context / "server_data/config"
+    private.mkdir(parents=True)
+    (private / "private-marker").write_text("synthetic runtime data")
+    private.chmod(0)
+    try:
+        result = subprocess.run(
+            ["docker", "buildx", "build", "--target", "guides-export", "--network=none",
+             "--progress=plain", "--output", f"type=local,dest={output}", str(context)],
+            capture_output=True, text=True, timeout=120,
+        )
+    finally:
+        private.chmod(0o700)
+
+    assert result.returncode == 0, result.stderr
+    with ZipFile(output / "guides.zip") as archive:
+        assert set(archive.namelist()) == set(public_files)
+        for name in public_files:
+            assert archive.read(name) == (ROOT / name).read_bytes()

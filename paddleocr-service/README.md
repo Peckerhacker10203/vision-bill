@@ -208,6 +208,8 @@ python3 scripts/ocr_source_up.py cuda --restart
 If the native image finished building before initial preparation was interrupted,
 use `--reuse-native-image` with the local `source-build-…` tag printed by the launcher.
 It checks the selected image against this checkout and continues preparing the app.
+An interrupted first installation uses this flag without `--upgrade`. For an
+existing installation, follow the [upgrade procedure](#upgrade-an-existing-source-installation).
 
 ### Read the logs for a receipt
 
@@ -308,6 +310,28 @@ If you originally selected a custom project name, use that same `-p NAME` on
 the stop command. For ROCm use `rocm` in the overlay name, directory and launcher
 argument. On ROCm WSL, include `-f docker-compose.rocm-wsl.yml` between the
 ROCm overlay and the generated `compose.local.json`.
+
+**If the native build finished but the app build failed on `server_data/config`**,
+keep that directory's private permissions. The app image builds from repository
+inputs and excludes `server_data/`. Update the original checkout to the revision
+with the build-context fix. Leave the old project stopped and retain its volumes,
+private `.env`, deployment record and release directory.
+
+Find the completed native tag in the failed build's output. To check which
+CUDA tags still exist on the same Docker engine, run
+`docker image ls --filter 'reference=vision-bill-ocr-cuda:source-build-*'`.
+Replace the placeholder below with the 32 hexadecimal characters from that
+specific build. For ROCm, use `rocm` in both the accelerator and image name.
+
+```bash
+python3 scripts/ocr_source_up.py cuda --upgrade \
+  --reuse-native-image 'vision-bill-ocr-cuda:source-build-<saved-build-uuid>'
+```
+
+The launcher verifies the native candidate against the checkout and selected
+GPU, then builds the app. The usual project ownership and handoff checks still
+apply. If the tag is missing or its sources no longer match, use the ordinary
+`--upgrade` command above to rebuild from the current checkout.
 
 **If the old app or OCR image was deleted**, use the same `--upgrade` command.
 Keep the stopped original project, its volumes and ownership claim, the

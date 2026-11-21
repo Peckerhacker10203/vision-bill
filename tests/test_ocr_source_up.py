@@ -99,8 +99,9 @@ def test_rocm_qualification_rejects_remapped_or_extra_render_devices(
 
 
 @pytest.mark.parametrize("accelerator", ["cuda", "rocm"])
+@pytest.mark.parametrize("retry", [False, True])
 def test_source_command_prepares_default_inputs(
-    accelerator: str, monkeypatch: pytest.MonkeyPatch
+    accelerator: str, retry: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from scripts import ocr_source_up
 
@@ -117,10 +118,24 @@ def test_source_command_prepares_default_inputs(
     ) -> None:
         calls.append((chosen, inputs, restart, reuse_native_image, upgrade, recover_stopped_ocr))
 
-    monkeypatch.setattr(sys, "argv", [str(SCRIPT), accelerator])
+    candidate = f"vision-bill-ocr-{accelerator}:source-build-" + "a" * 32
+    flags = ["--upgrade", "--reuse-native-image", candidate] if retry else []
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), accelerator, *flags])
     monkeypatch.setattr(ocr_source_up, "bootstrap", bootstrap)
     assert ocr_source_up.main() == 0
-    assert calls == [(accelerator, None, False, None, False, False)]
+    assert calls == [(accelerator, None, False, candidate if retry else None, retry, False)]
+
+
+def test_source_command_rejects_restart_with_reuse_before_bootstrap(monkeypatch, capsys):
+    from scripts import ocr_source_up
+
+    candidate = "vision-bill-ocr-cuda:source-build-" + "a" * 32
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "cuda", "--restart", "--reuse-native-image", candidate])
+    monkeypatch.setattr(ocr_source_up, "bootstrap", lambda *args, **kwargs: pytest.fail("bootstrap called"))
+    with pytest.raises(SystemExit) as exc:
+        ocr_source_up.main()
+    assert exc.value.code == 2
+    assert "--restart and --reuse-native-image cannot be combined" in capsys.readouterr().err
 
 
 def test_source_command_rejects_supplied_inputs_with_restart() -> None:
@@ -1103,8 +1118,9 @@ def test_source_upgrade_channel_only_changes_on_explicit_selection(
 
 
 @pytest.mark.parametrize("failure", [None, "build", "pending_ocr", "volume_mismatch", "late_pending"])
+@pytest.mark.parametrize("reuse", [True, False])
 def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
-    tmp_path, managed_release, monkeypatch, failure
+    tmp_path, managed_release, monkeypatch, failure, reuse
 ):
     from scripts import ocr_source_up as source
 
@@ -1151,6 +1167,13 @@ def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
         "OCR_ACTIVATION_HANDOFF_LOCK_PATH": "/coord/gpu-handoff.lock",
     }
 
+    candidate = "vision-bill-ocr-cuda:source-build-" + "a" * 32 if reuse else None
+
+    def deploy():
+        source.deploy(
+            ("docker", "compose"), tmp_path, "cuda", None, upgrade=True, reuse_native_image=candidate
+        )
+
     def docker(*args, capture=False):
         commands.append(args)
         if (
@@ -1180,7 +1203,7 @@ def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
         if "--check" in args:
             assert args[args.index("--channel") + 1] == "cu126"
             if "--wheel-context" in args:
-                assert args[-2:] == ("--prior-image", config_id)
+                assert not reuse and args[-2:] == ("--prior-image", config_id)
             return ""
         if "config" in args:
             assert args[args.index("--project-name") + 1] == project
@@ -1196,7 +1219,12 @@ def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
             return new_id
         if args[:2] == ("docker", "run"):
             staged = Path(args[args.index("--volume") + 1].removesuffix(":/release:ro"))
-            return (staged / "bundle.json").read_text()
+            manifest = json.loads((staged / "bundle.json").read_text())
+            if reuse:
+                expected = json.loads(args[args.index("-c") + 5])
+                assert expected == source.checkout_sources()
+                manifest["source_files"] = expected
+            return json.dumps(manifest)
         if "build" in args and failure == "build":
             raise subprocess.CalledProcessError(2, args)
         if "tag" in args or "build" in args or "up" in args:
@@ -1217,7 +1245,7 @@ def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
     if failure in {"pending_ocr", "volume_mismatch"}:
         expected = "gpu-handoff.ocr-only.json" if failure == "pending_ocr" else "coordination volume"
         with pytest.raises(ValueError, match=expected):
-            source.deploy(("docker", "compose"), tmp_path, "cuda", None, upgrade=True)
+            deploy()
         assert json.loads(managed.read_bytes()) == prior
         assert list(tmp_path.glob("release-*")) == [old_release]
         assert not any(
@@ -1226,7 +1254,7 @@ def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
         return
     if failure == "late_pending":
         with pytest.raises(ValueError, match="gpu-handoff.ocr-only.json"):
-            source.deploy(("docker", "compose"), tmp_path, "cuda", None, upgrade=True)
+            deploy()
         assert json.loads(managed.read_bytes()) == prior
         assert source.was_admitted(managed)
         assert list(tmp_path.glob("release-*")) == [old_release]
@@ -1234,11 +1262,11 @@ def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
         return
     if failure == "build":
         with pytest.raises(subprocess.CalledProcessError):
-            source.deploy(("docker", "compose"), tmp_path, "cuda", None, upgrade=True)
+            deploy()
         assert json.loads(managed.read_bytes()) == prior
         assert list(tmp_path.glob("release-*")) == [old_release]
     else:
-        source.deploy(("docker", "compose"), tmp_path, "cuda", None, upgrade=True)
+        deploy()
         saved = json.loads(managed.read_bytes())["x-vision-bill-source"]
         assert (
             saved["project"] == project
@@ -1249,6 +1277,7 @@ def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
         assert saved["claim_origin"]["release"] == old_release.name
         assert "--no-build" in commands[-1] and project in commands[-1]
     assert source.was_admitted(managed)
+    assert (("make", "ocr-build-cuda") in commands) is (not reuse)
     assert all("rm" not in args and "down" not in args for args in commands)
 
 
