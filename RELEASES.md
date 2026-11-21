@@ -10,9 +10,15 @@ a separate release run. The app-image workflow below publishes the app image.
 
 ## Unreleased package
 
-Durable 202 uploads/retries, source-preserving receipt review, exact money, explicit
-Gold/v4 diagnostics, strict optional OCR, independent native OCR candidates and external-only LLM distribution are integrated in this package. The update also
-includes account and view isolation and completion-only receipt recovery. Dedicated
+This package includes durable asynchronous uploads and retries, review of original
+receipt evidence, exact monetary values, and recovery of completed observations.
+Benchmarks offer a direct image run, an OCR-plus-LLM run, and an opt-in comparison
+using the same frozen references. Admins can select existing receipts or upload
+independent photo cases. Receipt-only runs use scoring version 4. Runs containing
+independent cases use version 5 across the dataset and score confirmed observations.
+Migrations 0022 and 0023 preserve existing runs and add private cases and paired
+run identity. Back up the database and image store together before upgrading.
+The update also includes account and view isolation. Dedicated
 OCR downloads and verifies its three pinned models when enabled. Its first prediction
 uses the first submitted receipt. The source launcher supports upgrading the admitted
 installation in place. Pending uploads bind their formatter endpoint, and migrated

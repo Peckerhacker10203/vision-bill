@@ -66,7 +66,7 @@ async def upload_image(
         for index, upload in enumerate(receipt):
             content = await upload.read(APP_SOURCE_MAX_BYTES + 1)
             if len(content) > APP_SOURCE_MAX_BYTES:
-                raise HTTPException(status_code=413, detail="Each photo must be at most 20 MB")
+                raise HTTPException(status_code=413, detail="Each photo must be at most 20 MiB")
             try:
                 info = image_service.validate_and_inspect(content)
             except UnsupportedImageTypeError as exc:

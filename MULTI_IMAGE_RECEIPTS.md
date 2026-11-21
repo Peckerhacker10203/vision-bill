@@ -98,7 +98,8 @@ fills labels. [Review and financial contract](UPGRADE_AND_VERIFY.md#review-and-f
 Only model-proposed ordered suffix/prefix overlaps between adjacent photos may be
 removed. `helper/duplicates.py::verify_duplicate` checks description, quantity and
 line total (exact defaults, normalized case/whitespace in descriptions). Every pair
-must pass. No global deduplication or blanket image splitting is applied.
+must pass, and both quantities must be observed. If either quantity is missing,
+the pair stays in the receipt. No global deduplication or blanket image splitting is applied.
 
 Original bytes, hashes and photo/part identities are retained. Working PNGs have
 their own IDs, dimensions, hashes and transform metadata. EXIF normalization is

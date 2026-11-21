@@ -1,8 +1,10 @@
 # First-run OCR fixtures
 
 These project-authored English documents contain fictional transactions and no
-personal data. The first-run installer packages the tracked PNG bytes using
-`fixtures.json`. The files are licensed under AGPL-3.0-or-later.
+personal data. The source launcher packages the tracked PNGs listed in
+`fixtures.json` for explicit physical qualification. Enabling Dedicated OCR
+verifies model files and leaves the worker parked. Only qualification runs
+the fixture corpus. The files are licensed under AGPL-3.0-or-later.
 
 | Input | Document |
 | --- | --- |

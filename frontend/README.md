@@ -41,11 +41,27 @@ bound to their originating account and view. Backend ownership remains authorita
 Verification uses the revision of the displayed receipt. Receipts awaiting a human
 re-review require a fresh preview. Gold selection requires explicit human
 qualification of the current document and sources. Existing benchmark runs retain
-their frozen references. Choose exact model IDs for benchmark runs. Direct vision
-requires vision input capability, while the OCR pipeline uses text formatting.
-V4 results show full-receipt correctness and the all-case score over completed
-cases, including failures. Historical averages over successful cases appear
-separately.
+their frozen references.
+
+In the admin **Benchmarks** form, select existing qualified receipts or open
+**Benchmark cases** to upload ordered photos outside the receipt ledger and
+analysis queue. Confirm expected values against the originals. Leave unknown
+fields blank and enter zero or confirm empty lists only when observed.
+
+Choose **Image directly to LLM**, **OCR + LLM**, or **Compare both** and
+select exact model IDs. The OCR options require configured OCR. A comparison
+runs both pipelines on the same inputs for vision-capable models and runs
+text-only models on the OCR arm. Runs containing dedicated cases use v5 to
+score confirmed fields. Receipt-only v4 results also show full-receipt
+correctness. The all-case score includes failures at zero, and the historical
+success-only average is displayed separately.
+
+Admin **Settings** includes a GPU setup and recovery guide for Dedicated OCR.
+Download and extract the offline operator guides ZIP to follow local links
+between manuals. The individual Markdown guides are also available. Local
+frontend builds and the dev server use Python 3 to assemble the ZIP. Edit the [source guide](../paddleocr-service/README.md)
+and [bundle guide](../distribution/README.md) and rebuild the frontend to
+refresh the downloads.
 
 Keep private receipts, traces, Playwright outputs and local dotenv files out of Git
 and builds. `.dockerignore` excludes generated test reports and credentials;

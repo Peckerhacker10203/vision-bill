@@ -165,8 +165,10 @@ fence leases/begin/retry/finish. Data/reference changes are checked transactiona
 Single direct and single OCR requests schedule one pipeline. An explicit
 `comparison: true` creates two linked runs against the same captured inputs.
 Include text-only models only in the OCR arm. History and result reads never
-dispatch inference. Use scoring version 5 for runs with dedicated test cases
-so their partial references score only confirmed observations. V4 exact full-receipt,
+dispatch inference. Use scoring version 5 for every input in a run containing
+dedicated test cases, including any qualified receipts in that run. Score only the
+confirmed observations and report optional classification separately. New
+receipt-only runs use version 4. V4 exact full-receipt,
 occurrence-aware items, amounts/taxes and all-case denominators supplement the
 separately named historical success-only averages/v3 scores. Do not redefine old
 results or leak expected values into inference. Standalone benchmarks require

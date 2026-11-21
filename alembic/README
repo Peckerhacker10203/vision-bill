@@ -5,6 +5,10 @@ Run `uv run alembic upgrade head` with the genuine schema owner PG__* settings.
 Alembic/entrypoint does not consume MIGRATION_DATABASE_URL; that variable belongs
 only to `make db-configure-roles`. Drain old analysis/benchmark workers first.
 
-Read ../UPGRADE_AND_VERIFY.md for backup/restore, role bootstrap/grants, supported
-0010 upgrade mapping, runtime-credential startup and compatible recovery. Do not
-start old workers on the new queue or automate a destructive downgrade.
+Revision 0022 adds private benchmark cases and preserves the receipt deletion
+fence. Revision 0023 records paired benchmark runs. The respective downgrade
+refuses to discard existing private cases or links between runs. Back up both
+PostgreSQL and the configured image store, including benchmark_cases/ originals.
+
+Read ../UPGRADE_AND_VERIFY.md for the upgrade sequence from 0010 or 0021,
+role bootstrap/grants, runtime-credential startup and compatible recovery.

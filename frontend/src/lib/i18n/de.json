@@ -98,7 +98,7 @@
 	},
 	"submission": {
 		"captureHint": "Langer Beleg? Füge bis zu 10 scharfe Nahaufnahmen desselben Belegs hinzu. Ordne sie von oben nach unten mit einigen überlappenden Zeilen an. Kopf und Gesamtbetrag müssen enthalten sein.",
-		"limits": "Maximal 10 Fotos mit jeweils höchstens 20 MB.",
+		"limits": "Maximal 10 Fotos mit jeweils höchstens 20 MiB.",
 		"moveUp": "Foto nach oben verschieben",
 		"moveDown": "Foto nach unten verschieben",
 		"pending": "Warte auf Beleganalyse",
@@ -629,6 +629,8 @@
 			"prerequisites": "Erfordert ein vorbereitetes CUDA- oder ROCm-GPU-Profil auf dem Server. Der Browser kann keine GPU-Treiber oder Laufzeitumgebungen installieren; folgen Sie der Einrichtungsanleitung.",
 			"setupGuide": "GPU-Einrichtung und Wiederherstellung",
 			"guide": {
+				"archive": "Betriebsanleitungen zur Offline-Nutzung herunterladen",
+				"extract": "Entpacken Sie die ZIP-Datei und öffnen Sie paddleocr-service/README.md oder distribution/README.md. Behalten Sie die Ordnerstruktur bei, damit die Links zwischen den Anleitungen funktionieren.",
 				"setupTitle": "Dedizierte OCR einschalten",
 				"topology": "Wählen Sie eine CUDA- oder ROCm-Installation. Läuft Ihr LLM auf einem anderen Server, deaktivieren Sie „LLM und OCR teilen sich eine GPU“ und speichern Sie die GPU-Konfiguration. Bei gemeinsamer GPU bestätigen Sie, dass der dedizierte Endpunkt keine Anfragen bearbeitet und seine Modelle entladen sind.",
 				"firstReceipt": "Schalten Sie die dedizierte OCR ein. Die Einrichtung prüft die Modelldateien und lässt OCR im Ruhezustand. Laden Sie einen Beleg hoch, um den Worker zu starten und das Ergebnis zu prüfen.",

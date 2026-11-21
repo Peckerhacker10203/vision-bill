@@ -45,8 +45,8 @@ keeping your edits.
 
 ## Processing and review
 
-Every upload (one to ten ordered photos, at most 20 MB each) returns committed
-`202 Accepted`, a durable ID and `Location` for authenticated status polling.
+A successful receipt upload (one to ten ordered photos, at most 20 MiB each)
+returns `202 Accepted`, a durable job ID and a `Location` for authenticated status polling.
 The worker waits for usable capabilities before claiming an attempt, extracts
 printed observations, retains partial drafts, checks source/amount/overlap evidence,
 and applies classification downstream. A complete saved observation can finish
@@ -80,8 +80,10 @@ and files to be owned by the app container's effective user. The admin Settings
 page reports sources and lets an admin edit formatter provider, endpoint, model
 and temperature, including safe fields initially supplied by environment defaults.
 An explicit save adopts changed fields into persistent settings. Model, temperature
-and registration changes apply immediately; provider and endpoint changes require
-a restart. Credentials remain in operator configuration and are not exposed there.
+and registration changes apply immediately. Restart the app after changing the
+provider, endpoint or effective authentication. For OpenAI-compatible endpoints,
+an admin can save a Bearer key bound to the endpoint origin. Settings shows only
+the credential status.
 Formatter output
 defaults to 8192 tokens; OCR's 4096-token cap and model context capacity are separate.
 Unknown context stays unknown. Managed same-GPU OCR/LLM work requires verified
@@ -94,8 +96,8 @@ In **Benchmarks**, admins can pick human-verified receipts or upload separate
 test cases. A case stores its photos without running OCR or an LLM and stays
 outside the receipt ledger and spending reports. Confirm its expected values,
 then choose an image-model run, an OCR-plus-LLM run, or both. In a paired run,
-results show each model's scores side by side and their difference in percentage
-points. [Benchmark walkthrough and API](UPGRADE_AND_VERIFY.md#benchmarks-and-reproducibility)
+results show each model’s scores side by side. Models that finish both pipelines
+on the same inputs also show the difference in percentage points. [Benchmark walkthrough and API](UPGRADE_AND_VERIFY.md#benchmarks-and-reproducibility)
 
 Receipt references require explicit qualification of the current document and
 sources. Runs freeze the expected values, source hashes and execution identity. See

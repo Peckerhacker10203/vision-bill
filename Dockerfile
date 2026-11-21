@@ -1,3 +1,7 @@
+# Assemble public offline manuals using the same Python image as the API.
+FROM python:3.12-slim AS operator-guides
+RUN --mount=type=bind,target=/repo python /repo/frontend/scripts/operator_guides.py /guides.zip
+
 # ── Stage 1: build the SvelteKit SPA ──────────────────────────────────────
 # The built frontend is a git-ignored artifact, so a bare `git clone` has no
 # static files. We compile it here at image-build time so the image is
@@ -14,7 +18,9 @@ RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
 COPY frontend/ ./
 COPY paddleocr-service/README.md /build/paddleocr-service/README.md
 COPY distribution/README.md /build/distribution/README.md
-RUN npm run build
+COPY --from=operator-guides /guides.zip ./static/vision-bill-operator-guides.zip
+# The Python stage above already ran the prebuild step.
+RUN npm --ignore-scripts run build
 
 # ── Stage 2: Python API ────────────────────────────────────────────────────
 FROM python:3.12-slim

@@ -96,8 +96,10 @@ authenticated endpoint. Fresh credentialless OpenAI installs can omit the key or
 use `none`. Ollama ignores it. On restored installations, a private empty runtime
 file takes its values from the saved configuration. Admin Settings can adopt
 changed safe formatter fields from environment defaults through an explicit save.
-Provider and endpoint changes require an app restart; model and temperature
-changes apply live. Credentials stay in operator configuration.
+Model and temperature changes apply live. Restart the app after changing the
+provider, endpoint or effective authentication. An admin can save a replacement
+Bearer key in Settings for the chosen OpenAI-compatible endpoint origin.
+The UI shows the credential status. [Endpoint authentication](../OPENAI_COMPATIBLE.md)
 
 For external OCR, a nonblank `OCR__ENDPOINT` selects its endpoint and an explicit
 blank value starts with OCR Off. In a prepared combined profile the browser
@@ -361,7 +363,7 @@ commit, platform, image references, separate config digests, asset hashes and
 sizes, and app-check evidence. Native variants add their release
 bundle, raw image config, full successful qualification, seal and CUDA attestation
 where applicable. The [native bundle schema](../paddleocr-service/release-bundle.schema.json)
-defines exact three-model archive trees, five real fixture cases, licenses, provenance,
+defines exact three-model archive trees, five fixture cases, licenses, provenance,
 source/profile identities and actual target proof. Use actual artifact bytes and
 qualification evidence. Schema-v1 manifests and the retired `combined-*` variant
 names are rejected. Version 2 ships no LLM server or LLM weights.
@@ -499,9 +501,9 @@ CUDA 12.6.
 OCI registry **manifest** digest identifies transport/pull bytes; local Docker image
 `.Id` identifies the config blob. Neither substitutes for the other. The producer
 records both, verifies raw config hashes, source/revision labels, model digests,
-package hashes and actual device results. Curated licensed real models, redistributable
-fixtures, immutable base images and physical runners remain external prerequisites;
-the producer code is shipped, those proofs are not. Software stubs/PID1 tests never
+package hashes and actual device results. The repository includes five licensed
+synthetic fixtures. Release production also requires approved model assets,
+immutable base images and physical GPU runners. Software stubs/PID1 tests never
 certify native model accuracy, speed, VRAM usage or universal AMD support.
 
 The older app-only image release is documented in [RELEASES.md](../RELEASES.md);

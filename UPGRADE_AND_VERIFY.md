@@ -374,14 +374,18 @@ A single-run API request that omits a pipeline follows the configured upload pol
 
 Results show the average over all terminal cases for each eligible model and
 pipeline. A failed extraction counts as zero. Open cases make the average
-provisional. Once the matching model has finished both sides, the difference
-is the OCR average minus the direct average, in percentage points. A move from
+provisional. The difference appears when the model finishes every input on both
+sides, both runs have the same dataset fingerprint and scoring version, and
+neither run has failed. It is the OCR average minus the direct average, in percentage points. A move from
 65% to 85% is +20 percentage points. Open individual results to inspect the
 expected and actual values, missing or extra items, errors and timing. Loading
 or refreshing results reads recorded work. Explicit reevaluation executes the
 selected model again. Runs containing independent cases use scoring version
-5 so a partial reference can score just its confirmed observations, such as
-the total. New receipt-only runs use version 4.
+5 for every input, including qualified receipts in the same run. For example,
+a reference containing only a total gives that total the entire extraction score.
+When a reference includes item rows, missing or extra rows count even if some
+cells were left blank. Optional classification has a separate score. New
+receipt-only runs use version 4.
 
 Admin runs freeze source/model digests,
 profile/runtime, prompt/schema/source/output/context metadata and policy. Direct
@@ -409,7 +413,7 @@ native qualification/geometry. See the [harness guide](scripts/ocr_harness/READM
 
 ## Verification evidence
 
-The reviewed runtime source is `2ab3efe6a7ee765c0c2b61f89c4426e822eb397b`.
+The following historical verification covers runtime source `2ab3efe6a7ee765c0c2b61f89c4426e822eb397b`.
 These are local software results. Public CI for the published commit is separate.
 Repeated executions of the same case are not added to the counts below.
 

@@ -577,10 +577,11 @@ native Paddle distribution. No dependency identities are hand-entered.
 `fixtures.toml` must have exactly five `[[cases]]` entries, one each with `kind`
 `upright`, `rotated`, `warped`, `table`, `formula`; each entry specifies `path`
 (relative to the TOML file or an absolute container path) and the actual original
-file `sha256`. Use five distinct real inputs. For `table` and `formula`, also set
+file `sha256`. Use five distinct inputs. For `table` and `formula`, also set
 `required_labels = ["table"]` or `["formula"]`. Their native results must contain
-that structure. Keep the upright input at `fixtures/upright.png` for the default
-startup path, or explicitly change `OCR_QUALIFICATION_IMAGE_PATH`.
+that structure. During physical qualification, the qualifier selects the
+`upright` case from this manifest for its cold smoke test. Normal worker
+startup performs no fixture inference.
 
 Use the supervised source Make targets for the explicit offline hardware gate.
 Drain analysis, benchmark and standalone clients. Stop the source app and sidecar
@@ -754,17 +755,22 @@ when only the local OCR worker and its matching journal need recovery.
 
 ## Internal model ownership
 
-With `OCR__MANAGE_MODEL_LIFECYCLE=true` (default), Linux app processes, uploads,
-benchmarks including direct vision, and supported standalone clients share one
-advisory lock with topology-specific durable journals. `OCR__COORDINATION_PATH` defaults to
+With `OCR__MANAGE_MODEL_LIFECYCLE=true` (default), managed OCR uploads,
+OCR benchmarks and supported managed standalone clients coordinate through one
+advisory lock with topology-specific durable journals. Direct-vision benchmarks
+use the coordinator when the LLM and OCR share a GPU. On separate devices,
+direct-vision benchmarks run independently of the OCR worker.
+`OCR__COORDINATION_PATH` defaults to
 `gpu-handoff.lock` beside `VISION_BILL_CONFIG_PATH`; Compose uses its existing
-`/app/config` bind mount. Every process must use the **same underlying file**, even when host/container
+`/app/config` bind mount. Every participating process must use the **same underlying file**, even when host/container
 paths differ, and agree on the OCR resource identity. Shared-GPU processes also
 agree on the LLM identity. Keep the directory private to Vision Bill and use
-local storage supporting flock. Before work on a
-shared GPU is admitted, explicitly adopt the configured pair and selected models with
-the operator CLI. The binding requires a dedicated endpoint and disabled eager
-loads. See the [adoption and endpoint instructions](../OPENAI_COMPATIBLE.md).
+local storage supporting flock. For a shared GPU, activating Dedicated OCR in
+Settings adopts the configured pair and selected model after the administrator
+confirms the handoff conditions. For a separately managed OCR endpoint sharing
+the LLM's GPU, adopt the pair and selected models with the operator CLI.
+Shared-GPU adoption requires a dedicated LLM endpoint with eager loading disabled.
+[Adoption and endpoint instructions](../OPENAI_COMPATIBLE.md)
 
 One owner loads OCR, processes every receipt photo, parks OCR and confirms native
 child exit before formatting, repairs and classification. On a shared GPU, that

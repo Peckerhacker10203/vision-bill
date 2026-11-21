@@ -294,8 +294,9 @@ test.describe('browser session actor', () => {
 				if (request.method() === 'POST' && path === '/api/v1/benchmarks')
 					subsequentPosts.push(path);
 			});
-			await page.goto('/benchmarks');
-			await page.getByPlaceholder('Comma-separated receipt UUIDs').fill(receipt);
+			await page.getByRole('link', { name: 'Use this receipt in a benchmark' }).click();
+			await expect(page).toHaveURL(new RegExp('\\?receipt=' + receipt + '$'));
+			await page.getByRole('checkbox', { name: 'e2e-vision', exact: true }).check();
 			await page.getByRole('button', { name: 'Preview human references' }).click();
 			await page
 				.getByRole('checkbox', {
@@ -309,6 +310,9 @@ test.describe('browser session actor', () => {
 			await page.getByRole('button', { name: 'Confirm and start' }).click();
 			await first;
 			await qualified;
+			const persisted = await context.request.get(reference);
+			expect(persisted.status()).toBe(200);
+			expect((await persisted.json()).currently_qualified).toBe(true);
 
 			// Starting closes confirmation so account controls remain available while
 			// the committed qualification response is still pending.

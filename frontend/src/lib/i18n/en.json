@@ -98,7 +98,7 @@
 	},
 	"submission": {
 		"captureHint": "Long receipt? Add up to 10 clear close-up photos of the same receipt. Arrange them from top to bottom, with a few overlapping rows. Include the header and total.",
-		"limits": "Use at most 10 photos, each no larger than 20 MB.",
+		"limits": "Use at most 10 photos, each no larger than 20 MiB.",
 		"moveUp": "Move photo up",
 		"moveDown": "Move photo down",
 		"pending": "Waiting for receipt analysis",
@@ -629,6 +629,8 @@
 			"prerequisites": "Requires a prepared CUDA or ROCm GPU profile on the server. The browser cannot install GPU drivers or runtimes; follow the setup guide.",
 			"setupGuide": "GPU setup and recovery guide",
 			"guide": {
+				"archive": "Download offline operator guides",
+				"extract": "Extract the ZIP and open paddleocr-service/README.md or distribution/README.md. Keep the folders together to follow links between guides.",
 				"setupTitle": "Enable Dedicated OCR",
 				"topology": "Select a CUDA or ROCm deployment. If your LLM runs on a separate server, clear “LLM and OCR share a GPU” and save the GPU configuration. If they share a GPU, confirm that the dedicated endpoint is idle and its models are unloaded.",
 				"firstReceipt": "Turn on Dedicated OCR. Setup verifies the model files and leaves OCR parked. Upload a receipt to load the worker and check the result.",

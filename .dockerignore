@@ -38,11 +38,42 @@ paddleocr-service/**
 paddleocr-service/ocr_contract/**
 !paddleocr-service/ocr_contract/*.py
 
-# The Settings recovery guide ships these two public manuals with the SPA.
+# Public files linked by the offline Settings manuals.
+!README.md
+!AGENTS.md
+!MULTI_IMAGE_RECEIPTS.md
+!OPENAI_COMPATIBLE.md
+!RELEASES.md
+!UPGRADE_AND_VERIFY.md
+!.github/
+.github/**
+!.github/workflows/
+!.github/workflows/distribution-inputs.yml
+!.github/workflows/distribution-release.yml
+!scripts/
+scripts/**
+!scripts/README.md
+!scripts/distribution.mjs
+!scripts/receipt_split_experiment.md
+!scripts/receipt_split_results.md
+!scripts/ocr_harness/
+!scripts/ocr_harness/README.md
+!scripts/ocr_harness/BENCHMARK_RESULTS.md
+!tests/
+tests/**
+!tests/e2e/
+!tests/e2e/data/
+!tests/e2e/data/README.md
+!paddleocr-service/first-run-fixtures/
+!paddleocr-service/first-run-fixtures/README.md
+!paddleocr-service/profile.json
+!paddleocr-service/release-bundle.schema.json
 !paddleocr-service/README.md
 !distribution/
 distribution/**
 !distribution/README.md
+!distribution/artifacts.schema.json
+frontend/static/vision-bill-operator-guides.zip
 
 # Local test output and runtime configuration are not build inputs.
 frontend/test-results

@@ -15,8 +15,8 @@ Rules:
 - Your own receipts are gitignored (PII stays local). A synthetic, PII-free
   seed pair (`seed_receipt.png` / `seed_receipt.json`) and deposit/refund pair
   (`deposit_refund.png` / `deposit_refund.json`) are tracked mandatory fixtures.
-- Every registered, valid pair becomes one parametrized e2e test case
-  (tests/e2e/test_pipeline_e2e.py). Optional invalid private entries are skipped with a warning;
+- Every registered, valid pair exercises both ordinary review and bypass review
+  in `tests/e2e/test_pipeline_e2e.py`. Optional invalid private entries are skipped with a warning;
   invalid mandatory fixtures fail preparation.
 
 The strict stub maps explicitly registered original/normalized image hashes to

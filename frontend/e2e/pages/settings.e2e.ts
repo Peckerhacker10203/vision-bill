@@ -24,6 +24,13 @@ test.describe('settings (admin)', () => {
 		await page.getByRole('link', { name: 'GPU setup and recovery guide' }).click();
 		await expect(page).toHaveURL(/\/settings\/ocr-guide\/?$/);
 		await expect(page.getByRole('heading', { name: 'Recover a failed setup' })).toBeVisible();
+		const archive = page.getByRole('link', { name: 'Download offline operator guides (.zip)' });
+		const downloadEvent = page.waitForEvent('download');
+		await archive.click();
+		const download = await downloadEvent;
+		expect(download.suggestedFilename()).toBe('vision-bill-operator-guides.zip');
+		expect(await download.failure()).toBeNull();
+
 		const manual = await page
 			.getByRole('link', { name: 'Source installation (.md)' })
 			.evaluate((link) => (link as HTMLAnchorElement).href);
