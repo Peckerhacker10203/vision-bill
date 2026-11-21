@@ -10,13 +10,12 @@ receipt fixtures belong in Git or the Docker build context.
 Each photo goes through the native PaddleOCR-VL-1.6 pipeline once. Vision
 Bill runs batch size 1 with internal queues off. The pinned PaddleX
 pipeline enables layout analysis and leaves document preprocessing off by
-default. Vision Bill enables both preprocessing models for photographed
-receipts. [Official pipeline configuration](https://github.com/PaddlePaddle/PaddleX/blob/ffb64904d23708863ff5b8da312a5cbd52a7f462/paddlex/configs/pipelines/PaddleOCR-VL-1.6.yaml) · [Installed receipt profile](profile.json)
+default. Vision Bill enables the orientation classifier for photographed
+receipts and leaves geometric document unwarping off. [Official pipeline configuration](https://github.com/PaddlePaddle/PaddleX/blob/ffb64904d23708863ff5b8da312a5cbd52a7f462/paddlex/configs/pipelines/PaddleOCR-VL-1.6.yaml) · [Installed receipt profile](profile.json)
 
 | Stage | What it does for a receipt |
 | --- | --- |
 | Orientation | After applying the photo's EXIF metadata, PP-LCNet_x1_0_doc_ori reads the page content and predicts a quarter-turn (0°, 90°, 180° or 270°). [Model guide](https://github.com/PaddlePaddle/PaddleX/blob/ffb64904d23708863ff5b8da312a5cbd52a7f462/docs/module_usage/tutorials/ocr_modules/doc_img_orientation_classification.en.md) |
-| Unwarping | UVDoc corrects geometric distortion such as curled paper or perspective. Its output supplies both the layout model and the working image used for review. [Model guide](https://github.com/PaddlePaddle/PaddleX/blob/ffb64904d23708863ff5b8da312a5cbd52a7f462/docs/module_usage/tutorials/ocr_modules/text_image_unwarping.en.md) |
 | Layout | PP-DocLayoutV3 locates 25 types of document regions and predicts their reading order. PaddleX crops the regions and can merge adjacent blocks before recognition. [Model guide](https://github.com/PaddlePaddle/PaddleX/blob/ffb64904d23708863ff5b8da312a5cbd52a7f462/docs/module_usage/tutorials/ocr_modules/layout_analysis.en.md) |
 | Recognition | PaddleOCR-VL-1.6-0.9B transcribes eligible crops with prompts for text, tables or formulas. The receipt profile leaves chart and seal recognition off. [Pipeline guide](https://github.com/PaddlePaddle/PaddleX/blob/ffb64904d23708863ff5b8da312a5cbd52a7f462/docs/pipeline_usage/tutorials/ocr_pipelines/PaddleOCR-VL.en.md) |
 
@@ -30,9 +29,9 @@ has a separate output budget and model context. [PaddleX region sizing and gener
 
 The CUDA worker uses BF16 for the VLM text decoder on a selected GPU with
 compute capability 8.0 or higher. Turing (SM 7.5) and ROCm use FP32.
-The visual encoder, projector, orientation, unwarping and layout models retain
+The visual encoder, projector, orientation and layout models retain
 FP32. Precision selection leaves the region and token limits unchanged. The model guides report
-individual inference timings on Tesla T4 (orientation and UVDoc) and A100
+individual inference timings on Tesla T4 (orientation) and A100
 (layout), excluding pre- and postprocessing. They supply no end-to-end timing
 for this receipt profile on a desktop GPU. [Pinned native predictor](https://github.com/PaddlePaddle/PaddleX/blob/ffb64904d23708863ff5b8da312a5cbd52a7f462/paddlex/inference/models/doc_vlm/predictor.py#L55-L78)
 
@@ -40,7 +39,8 @@ Original bytes/hash/photo identity survive first-frame/EXIF conversion and
 white RGB transparency composition (`white-document-rgb-v2`). Actual preprocessor
 pixels become a separately hashed working PNG with transform metadata. Native v2
 responses contain this PNG and recognized blocks in **working coordinates**.
-No inverse UVDoc transform is fabricated (`inverse_mapping=null`). Raw diagnostic
+The transform records the observed rotation angle, working coordinates and
+`unwarping_model=null`. Its `inverse_mapping` field remains `null`. Raw diagnostic
 responses can contain receipt text/pixels and belong only in private artifacts.
 
 The app accepts up to 20 MiB per source photo and the native service up to 25 MiB.
@@ -53,7 +53,7 @@ Readers validate lengths, dimensions, PNG integrity and hashes before accepting
 working artifacts. The 2 MP setting still applies to VLM regions.
 
 The OCR container hosts the complete PaddleOCR/PaddleX pipeline with the native
-PaddlePaddle inference engine. Layout, orientation, unwarping and VLM recognition
+PaddlePaddle inference engine. Layout, orientation and VLM recognition
 execute in its disposable native worker. Vision Bill uses its private HTTP API.
 The operator's separate text or vision LLM endpoint, including a remote
 llama.cpp server, formats the completed OCR text. PaddleX also offers an
@@ -174,8 +174,8 @@ installed model ID. Keep your LLM endpoint reachable from the app container.
 Sign in as an administrator and open **Settings → Dedicated OCR**. For an LLM
 on another GPU or server, clear **LLM and OCR share a GPU**, save the GPU
 configuration and leave the LLM running. Turn **Dedicated OCR** On.
-The controller checks the image, GPU and package metadata, provisions the four
-pinned model directories (about 2.1 GB) and publishes the verified installation.
+The controller checks the image, GPU and package metadata, provisions the three
+pinned model directories and publishes the verified installation.
 The service starts parked. Uploading a receipt loads the pipeline and the first
 prediction uses that receipt. Enabling OCR, polling readiness, restarting and
 loading the worker do not process a sample image. On a clean setup failure,
@@ -261,7 +261,9 @@ or failure. The worker generation identifies the process that ran the stages. Af
 In the OCR log, `ocr_worker_request` identifies admission, native execution
 and result reading. Compare the phase, elapsed time and remaining budget.
 After a failure, `cleanup_safe` reports whether cleanup was confirmed.
-`ocr_receipt_stage` follows normalization, orientation, unwarping, layout,
+During handoff, `ocr_worker_park` records the request, the start of worker
+teardown after acquiring the locks, and the final parked or failed state.
+`ocr_receipt_stage` follows normalization, orientation, layout,
 VLM crops, conversion and publication. At INFO look for the first VLM call,
 progress every 16 completed regions and the final `regions_completed` count.
 DEBUG adds each crop's start and finish. `worker_peak_rss_kib` measures peak
@@ -370,6 +372,17 @@ the backed-up `server_data/ocr-source/<accelerator>/` directory, including
 Restore the matching configuration, OCR activation, coordination and model
 state, database, original uploads and working files from the same recovery
 point before starting the old generation. [Compatible backout](../UPGRADE_AND_VERIFY.md#backup-and-upgrade-order)
+
+Older profiles used UVDoc to unwarp pages.
+A source upgrade accepts the existing four-model approved directory or a
+current three-model directory. It binds the three active model records to the
+new candidate, retaining their approved sources, package pins and fixture
+archive. The original release manifest, digest and UVDoc assets remain
+available for recovery. Keep the original photos, stored working PNGs and OCR
+observations. New runs retain the 2,000,000-pixel cap per recognition region.
+For a before/after comparison, submit the same original photo and
+compare each extraction with its own stored working view. Historical latency
+or accuracy measurements describe the profile that produced them.
 
 When upgrading a failed initial
 installation, switch **Dedicated OCR** on again in Settings. An installation
@@ -534,7 +547,7 @@ Unknown compile/API/kernel/probe failures are failures, never downgrades.
 
 Use ignored `server_data/ocr-runtime/` for the private corpus, model directories,
 and outputs; `server_data/ocr-cache/` is the actual `PADDLE_PDX_CACHE_HOME` mount.
-Provision the four exact approved model directories separately into private
+Provision the three exact approved model directories separately into private
 `server_data/ocr-runtime/models/` before qualification (Compose exposes them under
 `/var/lib/ocr/models/`). This repository has no automatic model-download Make target;
 copy/provision the intended model bytes using the official model distribution on
@@ -543,11 +556,10 @@ is not a substitute for complete explicit model directories:
 
 - `PP-DocLayoutV3`
 - `PP-LCNet_x1_0_doc_ori`
-- `UVDoc`
 - `PaddleOCR-VL-1.6-0.9B`
 
 Create `candidate.runtime.json` matching `ocr_service.profile.RuntimeSettings`:
-`accelerator`, `gpu_index` (inside the container), all four `model_dirs` using
+`accelerator`, `gpu_index` (inside the container), all three `model_dirs` using
 absolute container paths, `cache_dir: /var/cache/paddlex`,
 `qualification_manifest: /var/lib/ocr/static-manifest.json`,
 `expected_packages: {}` for initial sealing,
@@ -613,7 +625,7 @@ artifact inspector subprocesses → exact unsealed native construction and hooks
 seal → fresh instrumented `build_pipeline` → `adapter.qualify` → gated `predict`.
 No fabricated coverage enters construction. Exported DenseTensor inventory is
 CPU artifact evidence; actual compiled device/FP32 evidence comes from native
-hooks. Static Layout/Orientation/UVDoc are audited separately and every floating
+hooks. The static layout and orientation models are audited separately and every floating
 exported parameter must bind by its exact preserved name to an observed GPU
 input. Shape matching, arbitrary zipping and many-to-one binding are forbidden.
 
@@ -624,8 +636,8 @@ coverage, missing callbacks or unstable fresh-process identifiers fail the gate.
 Two independent fresh workers replay each case, first qualifying the sealed
 upright smoke through the qualification adapter. Reports distinguish startup, actual
 cold smoke, first case **after smoke**, and warm case timings; they do not claim
-cold case inference after warming with smoke. Dynamic VL parameters and all three
-static models must pass FP32/device checks on each replay.
+cold case inference after warming with smoke. Dynamic VLM parameters must pass their component precision and device checks.
+Both static models must pass FP32/device checks on each replay.
 
 Only a full pass publishes `qualification.runtime.json` and a successful report.
 Publication errors keep qualification false and remove stale or partially written

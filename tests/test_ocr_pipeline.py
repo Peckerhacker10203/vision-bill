@@ -427,6 +427,7 @@ def test_adapter_uses_exact_predict_limits_and_real_output(tmp_path):
             calls.append(kwargs)
             yield {
                 "doc_preprocessor_res": {
+                    "model_settings": {"use_doc_orientation_classify": True, "use_doc_unwarping": False},
                     "output_img": np.zeros((8, 3, 3), dtype=np.uint8),
                     "angle": 90,
                 },
@@ -445,7 +446,7 @@ def test_adapter_uses_exact_predict_limits_and_real_output(tmp_path):
         )
     # An empty audit inventory must never qualify production; focused output tests use the
     # conversion helper, which is independently exercised by the adapter after auditing.
-    with pytest.raises(ValueError, match="three static"):
+    with pytest.raises(ValueError, match="two static"):
         adapter.qualify(source)
     response = adapter.convert_result(
         next(Native().predict(str(source))),
@@ -461,7 +462,7 @@ def test_adapter_uses_exact_predict_limits_and_real_output(tmp_path):
     assert response.working_image.inverse_mapping is None
     assert adapter.predict_kwargs == {
         "use_doc_orientation_classify": True,
-        "use_doc_unwarping": True,
+        "use_doc_unwarping": False,
         "use_queues": False,
         "min_pixels": 112896,
         "max_pixels": 2000000,
@@ -559,7 +560,7 @@ def native_runtime(tmp_path, monkeypatch):
                 "model_content": {
                     name: factory.tree_identity(directory) for name, directory in model_dirs.items()
                 },
-                "static_artifacts": {name: manifests[name] for name in MODEL_NAMES[:3]},
+                "static_artifacts": {name: manifests[name] for name in MODEL_NAMES[:-1]},
             }
         )
     )
@@ -636,14 +637,12 @@ def native_runtime(tmp_path, monkeypatch):
             prep = config["SubPipelines"]["DocPreprocessor"]["SubModules"]
             self.doc_preprocessor_pipeline = SimpleNamespace(
                 doc_ori_classify_model=self.create_model(prep["DocOrientationClassify"]),
-                doc_unwarping_model=self.create_model(prep["DocUnwarping"]),
             )
 
         def predict(self, image, **kwargs):
             calls.append(kwargs)
             for model in [
                 self.doc_preprocessor_pipeline.doc_ori_classify_model,
-                self.doc_preprocessor_pipeline.doc_unwarping_model,
                 self.layout_det_model,
             ]:
                 assert model.process(image) is image
@@ -654,6 +653,7 @@ def native_runtime(tmp_path, monkeypatch):
                 assert self.vl_rec_model.process(image) is image
             yield {
                 "doc_preprocessor_res": {
+                    "model_settings": {"use_doc_orientation_classify": True, "use_doc_unwarping": False},
                     "output_img": np.zeros((8, 3, 3), dtype=np.uint8),
                     "angle": 0,
                 },
@@ -711,7 +711,7 @@ def test_factory_bootstraps_then_requires_real_forward_for_all_models(
     assert adapter.qualified is False
     assert [call for call in calls if "loader_dtype" in call] == [{"loader_dtype": "bfloat16"}]
     evidence = adapter.qualify(source)
-    assert {item["model_name"] for item in evidence} == set(MODEL_NAMES[:3])
+    assert {item["model_name"] for item in evidence} == set(MODEL_NAMES[:-1])
     response = adapter.predict(
         source,
         request_id=uuid4(),
@@ -723,7 +723,7 @@ def test_factory_bootstraps_then_requires_real_forward_for_all_models(
     assert calls[-1] == adapter.predict_kwargs
     assert response.profile_id != response.runtime_fingerprint
     # A later unexecuted static model invalidates qualification again.
-    adapter.pipeline.doc_preprocessor_pipeline.doc_unwarping_model.runner.input = lambda *args: None
+    adapter.pipeline.doc_preprocessor_pipeline.doc_ori_classify_model.runner.input = lambda *args: None
     with pytest.raises(ValueError, match="coverage"):
         adapter.predict(
             source,
@@ -805,8 +805,6 @@ def test_serving_load_leaves_first_forward_to_real_receipt(
         ["stage=normalize", "state=done"],
         ["stage=orientation", "state=start"],
         ["stage=orientation", "state=done"],
-        ["stage=unwarp", "state=start"],
-        ["stage=unwarp", "state=done"],
         ["stage=layout", "state=start"],
         ["stage=layout", "state=done"],
         ["stage=vlm_region", "state=start"],
@@ -825,7 +823,7 @@ def test_serving_load_leaves_first_forward_to_real_receipt(
     assert [call for call in calls if "max_pixels" in call] == [
         {
             "use_doc_orientation_classify": True,
-            "use_doc_unwarping": True,
+            "use_doc_unwarping": False,
             "use_queues": False,
             "min_pixels": 112896,
             "max_pixels": 2000000,
@@ -849,9 +847,9 @@ def test_prepared_serving_refuses_identity_drift_before_loading(native_runtime, 
         device_identity=device.copy(),
     )
     if drift == "model":
-        (runtime.model_dirs["UVDoc"] / "extra").write_bytes(b"changed")
+        (runtime.model_dirs["PP-LCNet_x1_0_doc_ori"] / "extra").write_bytes(b"changed")
     elif drift == "symlink":
-        directory = runtime.model_dirs["UVDoc"]
+        directory = runtime.model_dirs["PP-LCNet_x1_0_doc_ori"]
         moved = directory.rename(directory.with_name("unowned"))
         directory.symlink_to(moved, target_is_directory=True)
     else:
@@ -1121,7 +1119,7 @@ def test_debug_stage_logs_count_each_region_and_hide_native_error(monkeypatch, c
     model = Predictor()
     native = SimpleNamespace(
         doc_preprocessor_pipeline=SimpleNamespace(
-            doc_ori_classify_model=Predictor(), doc_unwarping_model=Predictor(),
+            doc_ori_classify_model=Predictor(),
         ),
         layout_det_model=Predictor(), vl_rec_model=model,
     )

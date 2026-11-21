@@ -6,7 +6,10 @@ the software baseline and component carry boundaries. See
 [backend setup, ownership and changes](OPENAI_COMPATIBLE.md). The original PR14 optional
 OCR integration informed this package. PR15's splitting experiments and
 historical results remain separate evidence. The native profile uses document
-orientation, unwarping and a 2,000,000-pixel per-region maximum.
+orientation classification with geometric unwarping disabled and a 2,000,000-pixel
+maximum per recognition region. Previous installations could unwarp photos.
+Retain their stored originals, working images, OCR outputs and model assets.
+Each saved working view and its coordinates describe the run that produced it.
 
 ## Resulting processing order
 

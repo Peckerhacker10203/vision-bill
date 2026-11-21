@@ -140,6 +140,9 @@ def test_llm_stub_stock_wire_behavior_without_opt_in(monkeypatch):
 
 def test_exact_ocr_v2_and_same_bytes_distinct_photo_plans():
     server = module("ocr_stub_test", "e2e/ocr_stub/server.py")
+    assert server.PROFILE["use_doc_unwarping"] is False
+    assert server.PROFILE["max_pixels"] == 2_000_000
+    assert server.PROFILE == json.loads((ROOT / "paddleocr-service/profile.json").read_text())
     raw = (ROOT / "e2e/llm_stub/fixtures/a.png").read_bytes()
     digest = hashlib.sha256(raw).hexdigest()
     state = server.Scenario()
@@ -155,6 +158,7 @@ def test_exact_ocr_v2_and_same_bytes_distinct_photo_plans():
         assert parsed.blocks[0].id == f"photo-{index}-merchant"
         assert parsed.working_image.width == 320
         assert parsed.working_image.height == 480
+        assert parsed.working_image.transforms[-1]["unwarping_model"] is None
     blank = OcrResponse.model_validate(server.page(raw, str(uuid4()), 1, digest, blank=True))
     assert blank.text == "" and blank.blocks == []
     assert base64.b64decode(blank.working_image.png_base64).startswith(b"\x89PNG")

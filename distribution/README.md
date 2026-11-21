@@ -20,7 +20,7 @@ environment template and the selected assets and evidence under `release/`.
 | `app-ocr-rocm` | App, PostgreSQL and an idle Dedicated OCR controller | Compatible selected AMD device and a compatible LLM endpoint/model. |
 
 Provision the chosen model on your own Ollama or OpenAI-compatible endpoint.
-Installation starts the listed services. Combined bundles fetch the four model
+Installation starts the listed services. Combined bundles fetch the three model
 snapshots or archives from pinned HTTPS sources after setup is requested.
 Benchmarking is a separate operator action.
 Native read-only routes and lifecycle control belong on trusted private networks.
@@ -152,7 +152,7 @@ server, clear this setting and save the GPU configuration. Its models can stay
 loaded. [llama.cpp router setup](../OPENAI_COMPATIBLE.md#configure-a-dedicated-llamacpp-router)
 
 Confirm the shared-GPU conditions if applicable and turn **Dedicated OCR** On.
-The controller verifies the image, device, packages and four pinned models. It
+The controller verifies the image, device, packages and three pinned models. It
 downloads missing model files and starts the service parked. No sample images
 run during installation or worker startup. The first real receipt loads the
 models and runs OCR. Images stay with local OCR, and the formatter receives
@@ -361,7 +361,7 @@ commit, platform, image references, separate config digests, asset hashes and
 sizes, and app-check evidence. Native variants add their release
 bundle, raw image config, full successful qualification, seal and CUDA attestation
 where applicable. The [native bundle schema](../paddleocr-service/release-bundle.schema.json)
-defines exact four-model archive trees, five real fixture cases, licenses, provenance,
+defines exact three-model archive trees, five real fixture cases, licenses, provenance,
 source/profile identities and actual target proof. Use actual artifact bytes and
 qualification evidence. Schema-v1 manifests and the retired `combined-*` variant
 names are rejected. Version 2 ships no LLM server or LLM weights.
@@ -374,7 +374,7 @@ or stage approved alternatives. They exercise the native workflow on the selecte
 device. Representative accuracy measurements use a separate evaluation dataset.
 [Project fixtures](../paddleocr-service/first-run-fixtures/README.md)
 
-To refresh the complete metadata from the four immutable official repositories,
+To refresh the complete metadata from the three immutable official repositories,
 use the following command on a networked maintainer machine. The revision-specific
 sources allow the controller to reconstruct and verify the original archives.
 Use the generated `models.json` with the shipped fixture manifest in the next
@@ -392,10 +392,10 @@ the parent directories first and choose fresh output directories. Allow
 several gigabytes for the downloaded files and generated model archives.
 
 Prepare deterministic tar archives from the pinned original Paddle files for
-`PP-DocLayoutV3`, `PP-LCNet_x1_0_doc_ori`, `UVDoc` and `PaddleOCR-VL-1.6-0.9B`.
+`PP-DocLayoutV3`, `PP-LCNet_x1_0_doc_ori` and `PaddleOCR-VL-1.6-0.9B`.
 Provide the approved HTTPS base URL where you will serve those exact tar
 files. Replace the example URL with one reachable by the OCR container at
-activation. The command writes four `.tar` files and `models.json` with their
+activation. The command writes three `.tar` files and `models.json` with their
 verified identities, licenses and upstream provenance. Host the archives at
 the recorded URLs before attempting activation or release qualification.
 

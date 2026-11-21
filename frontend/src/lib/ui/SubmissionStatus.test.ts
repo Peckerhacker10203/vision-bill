@@ -106,7 +106,7 @@ describe('SubmissionStatus', () => {
 						height: 480,
 						sha256: 'df40cf0ccfd9dc1dca83eed23414fe64f6969d3e2a8fd02ee2b8c9be4cd0b43b',
 						url: '/api/v1/images/job/views/working',
-						transforms: [{ operation: 'test_fixture_unwarp' }],
+						transforms: [{ operation: 'test_fixture_rotation', angle: 0, unwarping_model: null }],
 						inverse_mapping: null
 					}
 				]

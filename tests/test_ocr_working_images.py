@@ -51,22 +51,31 @@ def test_actual_preprocessor_bgr_output_becomes_rgb_png():
     import numpy as np
     from ocr_service.images import working_image
 
-    pixels = np.zeros((8, 3, 3), dtype=np.uint8)
-    pixels[:, :, 2] = 255
-    view = working_image({"output_img": pixels, "angle": 90}, [{"input": "RGB"}])
+    original_bgr = np.arange(3 * 8 * 3, dtype=np.uint8).reshape(3, 8, 3)
+    pixels = np.rot90(original_bgr)
+    result = {
+        "output_img": pixels,
+        "input_img": original_bgr,
+        "angle": 90,
+        "model_settings": {"use_doc_orientation_classify": True, "use_doc_unwarping": False},
+    }
+    view = working_image(result, [{"input": "RGB"}])
     image = Image.open(BytesIO(base64.b64decode(view.png_base64)))
     assert image.size == (view.width, view.height) == (3, 8)
-    assert image.getpixel((0, 0)) == (255, 0, 0)
+    assert image.tobytes() == pixels[:, :, ::-1].tobytes()
     assert view.sha256 == hashlib.sha256(base64.b64decode(view.png_base64)).hexdigest()
     assert view.inverse_mapping is None
     assert view.transforms[-1] == {
         "operation": "doc_preprocessor",
         "angle": 90,
         "orientation_model": "PP-LCNet_x1_0_doc_ori",
-        "unwarping_model": "UVDoc",
+        "unwarping_model": None,
         "coordinate_space": "working",
         "inverse_mapping": None,
     }
+    result["model_settings"]["use_doc_unwarping"] = True
+    with pytest.raises(ValueError, match="orientation-only"):
+        working_image(result, [])
 
 
 def test_working_image_requires_actual_native_output():
@@ -162,7 +171,13 @@ async def test_accepted_seeded_12mp_jpeg_round_trips_full_resolution_working_png
     with Image.open(BytesIO(source)) as decoded:
         expected_rgb = decoded.convert("RGB").tobytes()
     expected_pixels = np.frombuffer(expected_rgb, dtype=np.uint8).reshape(3000, 4000, 3)
-    view = working_image({"output_img": expected_pixels[:, :, ::-1], "angle": 0}, [])
+    view = working_image(
+        {
+            "output_img": expected_pixels[:, :, ::-1], "angle": 0,
+            "model_settings": {"use_doc_orientation_classify": True, "use_doc_unwarping": False},
+        },
+        [],
+    )
     png = base64.b64decode(view.png_base64)
     assert len(png) > 25 * 1024 * 1024
     print(f"source={len(source)} bytes, working PNG={len(png)} bytes")

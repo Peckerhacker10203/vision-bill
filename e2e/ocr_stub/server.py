@@ -90,7 +90,7 @@ def page(raw: bytes, request_id: str, photo_index: int, source_sha256: str, *, b
             "height": 480,
             "sha256": hashlib.sha256(working).hexdigest(),
             "png_base64": base64.b64encode(working).decode(),
-            "transforms": [{"operation": "test_fixture_unwarp"}],
+            "transforms": [{"operation": "test_fixture_rotation", "angle": 0, "unwarping_model": None}],
             "inverse_mapping": None,
         },
         "telemetry": {"test_cpu_fixture": True},

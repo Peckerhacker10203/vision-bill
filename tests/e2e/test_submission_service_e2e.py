@@ -77,7 +77,7 @@ async def setup(w, scope, settings, tmp_path, *, ocr=True):
 
 @pytest.mark.parametrize(
     "change",
-    ["none", "runtime", "corrupt", "source", "race", "malformed_page", "malformed_manifest"],
+    ["none", "runtime", "profile", "corrupt", "source", "race", "malformed_page", "malformed_manifest"],
 )
 async def test_checkpoint_reload_reuses_only_exact_prefix(workflow_db, settings, tmp_path, change):
     w, scope = workflow_db
@@ -100,6 +100,8 @@ async def test_checkpoint_reload_reuses_only_exact_prefix(workflow_db, settings,
     saved = await w.get_ocr_checkpoint(claim)
     if change == "runtime":
         native.get_capabilities.return_value.runtime_fingerprint = "new-runtime"
+    if change == "profile":
+        native.get_capabilities.return_value.profile_id = "rotation-only-profile"
     if change == "race":
         old = native.get_capabilities.return_value.model_copy()
         new = old.model_copy(update={"runtime_fingerprint": "new-runtime"})
@@ -150,6 +152,8 @@ async def test_checkpoint_reload_reuses_only_exact_prefix(workflow_db, settings,
         result = await original_extract(*args, **kwargs)
         if change in {"runtime", "race"}:
             result.runtime_fingerprint = "new-runtime"
+        if change == "profile":
+            result.profile_id = "rotation-only-profile"
         return result
 
     native.extract_page = AsyncMock(side_effect=page)
@@ -177,6 +181,8 @@ async def test_checkpoint_reload_reuses_only_exact_prefix(workflow_db, settings,
     status = await w.get_submission(image.id, scope=scope)
     extraction = await w.get_extraction(image.id, status.latest_extraction_id, scope=scope)
     assert len(extraction["envelope"]["ocr_pages"]) == 2
+    if change == "profile":
+        assert all(page["profile_id"] == "rotation-only-profile" for page in extraction["envelope"]["ocr_pages"])
     assert "artifact_path" not in str(extraction) and "png_base64" not in str(extraction)
     assert status.source_views
     async with w.pool.acquire() as conn:

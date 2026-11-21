@@ -63,13 +63,6 @@ MODELS = {
         "inference.pdiparams",
         "e8d6e7c5d264507e40e58a655779059d616b20d7441ea22047d829eb3931989c",
     ),
-    "UVDoc": Model(
-        "UVDoc",
-        "16c3f0ea9c2f0c6a57e24160f7eeaa7574613fa3",
-        (*STATIC_FILES, "config.json"),
-        "inference.pdiparams",
-        "810488899520e0da843b9bd9769ba4949f1c81e357f0eceb12d4a7da459c3eca",
-    ),
     "PaddleOCR-VL-1.6-0.9B": Model(
         "PaddleOCR-VL-1.6",
         "132c45f52c0a26ed5a6b2f6bd8e3985794cc27dd",

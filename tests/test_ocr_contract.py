@@ -35,7 +35,7 @@ def test_native_source_imports_without_application(tmp_path):
         assert content_identity(OcrResponse.model_json_schema()) == '86aa8a10686ac01547bba6ef80d85bc0a39d193e6911b4df99d7145ff178701b'
         assert content_identity(SourceRef.model_json_schema()) == '6473c0469cb3b365dca0629f7d2f1202f12a4d6ebaf5cd0c1fa1c5c417210b00'
         config = effective_pipeline_config(load_profile(Path(sys.argv[1]) / 'profile.json'))
-        assert content_identity(config) == 'ea5ead7b3e204670985765cd359511db31c077b5308cc1c22e5c083dbdb7239f'
+        assert content_identity(config) == '490492272e1a7d40ade25b976392bebedceb4b039701f6e57ab087b2b415c212'
         assert NORMALIZER_VERSION == 'white-document-rgb-v2'
         assert document_rgb(Image.new('RGBA', (1, 1), (0, 0, 0, 0))).getpixel((0, 0)) == (255, 255, 255)
         assert not any(name == 'vision_bill' or name.startswith('vision_bill.') for name in sys.modules)

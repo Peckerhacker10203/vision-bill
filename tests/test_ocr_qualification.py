@@ -586,7 +586,7 @@ def successful_qualification(tmp_path, monkeypatch):
             return {"parameters": ["actual-inspection"]}
         if name == "collect":
             assert not runtime.qualification_manifest.exists()
-            assert len(payload["inventory"]) == 3
+            assert len(payload["inventory"]) == 2
             return {
                 "static_artifacts": {"collected": "coverage"},
                 "device": {"name": "actual-device", "component_precision": {key: "float32" for key in ("text", "mlp_AR", "visual", "static")}},
@@ -604,7 +604,7 @@ def successful_qualification(tmp_path, monkeypatch):
             "dynamic_components": {key: {"parameters": 1, "dtype": "float32"} for key in ("text", "mlp_AR", "visual")},
             "static_audits": [
                 {"model_name": name, "input_count": 1, "output_count": 1, "floating_parameters": 1}
-                for name in MODEL_NAMES[:3]
+                for name in MODEL_NAMES[:-1]
             ],
         }
 
@@ -621,7 +621,7 @@ def test_coordinator_inspects_then_collects_then_seals_then_fresh_replays(
     )
     assert report.qualified and len(report.cases) == 10
     assert json.loads(runtime.qualification_manifest.read_text())["qualified_target"]["name"] == "actual-device"
-    assert stages == ["inspect"] * 3 + ["collect"] + ["replay"] * 10
+    assert stages == ["inspect"] * 2 + ["collect"] + ["replay"] * 10
     assert (tmp_path / "qualification.runtime.json").exists()
 
 

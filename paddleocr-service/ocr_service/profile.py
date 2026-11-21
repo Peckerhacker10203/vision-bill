@@ -17,12 +17,11 @@ from .vlm_precision import component_precision, requires_host_assembly
 
 ADAPTER_VERSION = "native-selective-v1"
 NORMALIZER_VERSION = document_image.NORMALIZER_VERSION
-MODEL_NAMES = (
+STATIC_MODEL_NAMES = (
     "PP-DocLayoutV3",
     "PP-LCNet_x1_0_doc_ori",
-    "UVDoc",
-    "PaddleOCR-VL-1.6-0.9B",
 )
+MODEL_NAMES = (*STATIC_MODEL_NAMES, "PaddleOCR-VL-1.6-0.9B")
 
 
 class InvalidReceiptOutput(ValueError):
@@ -47,7 +46,7 @@ class OcrProfile(BaseModel):
     max_new_tokens: Literal[4096]
     batch_size: Literal[1]
     use_doc_orientation_classify: Literal[True]
-    use_doc_unwarping: Literal[True]
+    use_doc_unwarping: Literal[False]
     use_queues: Literal[False]
     use_chart_recognition: Literal[False]
     use_seal_recognition: Literal[False]
@@ -87,7 +86,7 @@ class PreparedRuntimeSettings(NativeRuntimeSettings):
     @model_validator(mode="after")
     def complete_installation(self) -> Self:
         if set(self.model_dirs) != set(MODEL_NAMES) or set(self.model_content) != set(MODEL_NAMES):
-            raise ValueError("Prepared installation requires all four native model identities")
+            raise ValueError("Prepared installation requires all three native model identities")
         if (
             self.device_identity.get("accelerator") != self.accelerator
             or self.device_identity.get("gpu_index") != self.gpu_index
@@ -345,18 +344,13 @@ _PIPELINE_TEMPLATE: dict[str, Any] = {
             "pipeline_name": "doc_preprocessor",
             "batch_size": 8,
             "use_doc_orientation_classify": True,
-            "use_doc_unwarping": True,
+            "use_doc_unwarping": False,
             "SubModules": {
                 "DocOrientationClassify": {
                     "module_name": "doc_text_orientation",
                     "model_name": "PP-LCNet_x1_0_doc_ori",
                     "model_dir": None,
                     "batch_size": 8,
-                },
-                "DocUnwarping": {
-                    "module_name": "image_unwarping",
-                    "model_name": "UVDoc",
-                    "model_dir": None,
                 },
             },
         }

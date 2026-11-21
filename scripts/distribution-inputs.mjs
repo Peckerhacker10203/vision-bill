@@ -16,7 +16,11 @@ import {
   releaseRequest,
   validateReleaseInputs,
 } from "./distribution-release.mjs";
-import { fileIdentity, isHttpsAssetSource } from "./distribution.mjs";
+import {
+  activeModelArchives,
+  fileIdentity,
+  isHttpsAssetSource,
+} from "./distribution.mjs";
 export const PRODUCER_WORKFLOW = ".github/workflows/distribution-inputs.yml";
 const STAGING_ROOT = "/var/lib/vision-bill/distribution-inputs";
 const SYSTEM_OWNER = lstatSync("/").uid;
@@ -92,19 +96,10 @@ function approvedFiles(directory, request) {
     const name = `${accelerator}/bundle.json`,
       bundle = read(trusted(join(directory, name), true));
     check(
-      bundle.schema_version === 1 &&
-        bundle.accelerator === accelerator &&
-        equal(
-          Object.keys(bundle.models ?? {}).sort(),
-          [
-            "PP-DocLayoutV3",
-            "PP-LCNet_x1_0_doc_ori",
-            "PaddleOCR-VL-1.6-0.9B",
-            "UVDoc",
-          ].sort(),
-        ),
+      bundle.schema_version === 1 && bundle.accelerator === accelerator,
       "Incomplete selected native input bundle",
     );
+    const activeModels = activeModelArchives(bundle.models);
     files.set(name, null);
     for (const [name, archive] of Object.entries({
       ...bundle.models,
@@ -123,7 +118,9 @@ function approvedFiles(directory, request) {
           !appOcr || name === "fixtures",
           "Dedicated OCR model assets require HTTPS",
         );
-        files.set(`${accelerator}/${safe(archive.source)}`, {
+        const path = safe(archive.source);
+        if (name !== "fixtures" && !Object.hasOwn(activeModels, name)) continue;
+        files.set(`${accelerator}/${path}`, {
           sha256: archive.sha256,
           size_bytes: archive.size_bytes,
         });

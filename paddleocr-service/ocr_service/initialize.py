@@ -518,7 +518,7 @@ def prepare_installation(
     repair: bool = False,
     standalone: bool = False,
 ) -> Path:
-    """Install the four verified model trees. This is not a physical qualification."""
+    """Install the verified model trees for the active profile."""
     MaintenanceIntent(maintenance_intent)
     with maintenance_handoff(handoff_lock), managed_installation("initializer", lock_path()):
         bundle, device = _prepared_inputs(bundle_path, image_config, image_id, standalone=standalone)

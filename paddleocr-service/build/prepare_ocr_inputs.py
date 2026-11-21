@@ -93,13 +93,14 @@ def require_public_https(source: str) -> None:
 
 def model_records(path: Path) -> dict[str, Archive]:
     models = read_json(path)
-    if set(models) != set(MODEL_NAMES):
-        raise ValueError("Exactly the four approved model identities are required")
+    if set(models) not in (set(MODEL_NAMES), {*MODEL_NAMES, "UVDoc"}):
+        raise ValueError("Expected the approved model identities for the current or previous profile")
     records = {name: Archive.model_validate(model) for name, model in models.items()}
     for model in records.values():
         require_public_https(model.source)
         require_public_https(model.provenance.url)
-    return records
+    # Previously approved inputs also describe UVDoc. Keep the original approval intact.
+    return {name: records[name] for name in MODEL_NAMES}
 
 
 def read_png(path: Path) -> bytes:

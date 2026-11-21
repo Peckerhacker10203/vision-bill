@@ -120,6 +120,21 @@ def test_checkpoint_preserves_complete_observations_without_bytes(ocr):
     assert workflow.ObservationCheckpoint.model_validate_json(serialized) == checkpoint
 
 
+@pytest.mark.parametrize("unwarping_model", ["UVDoc", None], ids=["legacy-unwarp", "rotation-only"])
+def test_ocr_checkpoint_recovery_retains_recorded_working_transform(unwarping_model):
+    payload = observation_payload(ocr=True)
+    transform = {"operation": "doc_preprocessor", "angle": 90, "unwarping_model": unwarping_model}
+    # The persisted page and standalone working view both refer to these exact pixels.
+    for page, view in zip(payload["envelope"]["ocr_pages"], payload["persisted_views"], strict=True):
+        page["working_image"]["transforms"] = [transform]
+        view["metadata"]["transforms"] = [transform]
+    checkpoint = workflow.ObservationCheckpoint.model_validate(payload)
+    restored = workflow.ObservationCheckpoint.model_validate_json(checkpoint.model_dump_json())
+    for page in restored.recovered_envelope().ocr_pages:
+        assert page.working_image.transforms == [transform]
+        assert page.profile_id == checkpoint.envelope.provenance.profile_id
+
+
 @pytest.mark.parametrize(
     ("corruption", "message"),
     [

@@ -1,4 +1,4 @@
-"""Prepare sealed records and optional archives for the four official Paddle models."""
+"""Prepare sealed records and optional archives for the active Paddle models."""
 
 import argparse
 import json

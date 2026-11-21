@@ -27,6 +27,7 @@ from .profile import (
     ADAPTER_VERSION,
     MODEL_NAMES,
     NORMALIZER_VERSION,
+    STATIC_MODEL_NAMES,
     InvalidReceiptOutput,
     NativeRuntimeSettings,
     OcrProfile,
@@ -151,7 +152,6 @@ def trace_receipt_stages(native: Any, gpu_index: int) -> Iterator[None]:
     preprocessor = native.doc_preprocessor_pipeline
     stages = (
         ("orientation", preprocessor.doc_ori_classify_model),
-        ("unwarp", preprocessor.doc_unwarping_model),
         ("layout", native.layout_det_model),
         ("vlm_region", native.vl_rec_model),
     )
@@ -225,8 +225,8 @@ class ReceiptPipeline:
     @property
     def predict_kwargs(self) -> dict[str, Any]:
         return {
-            "use_doc_orientation_classify": True,
-            "use_doc_unwarping": True,
+            "use_doc_orientation_classify": self.profile.use_doc_orientation_classify,
+            "use_doc_unwarping": self.profile.use_doc_unwarping,
             "use_queues": False,
             "min_pixels": self.profile.min_pixels,
             "max_pixels": self.profile.max_pixels,
@@ -337,10 +337,10 @@ class PipelineAdapter(ReceiptPipeline):
     def qualify(self, image: Path) -> list[dict[str, Any]]:
         """Execute fresh native forward without going through the serving gate."""
         self.qualified = False
-        if len(self.static_audits) != 3 or {
+        if len(self.static_audits) != len(STATIC_MODEL_NAMES) or {
             s.artifact.model_name for s in self.static_audits
-        } != set(MODEL_NAMES[:3]):
-            raise ValueError("Qualification requires three static model audits")
+        } != set(STATIC_MODEL_NAMES):
+            raise ValueError("Qualification requires two static model audits")
         digest = hashlib.sha256(image.read_bytes()).hexdigest()
         if not self.smoke_sha256 or digest != self.smoke_sha256:
             raise ValueError("Qualification image hash differs from sealed smoke coverage")
@@ -382,7 +382,7 @@ def construct_native(
     os.environ["PADDLE_PDX_DISABLE_DEVICE_FALLBACK"] = "1"
     os.environ["PADDLE_PDX_CACHE_HOME"] = str(runtime.cache_dir)
     if set(runtime.model_dirs) != set(MODEL_NAMES):
-        raise ValueError("All four explicit native model directories are required")
+        raise ValueError("All three explicit native model directories are required")
     paddle = importlib.import_module("paddle")
     paddlex = importlib.import_module("paddlex")
     normalize_engine_config = importlib.import_module(
@@ -478,7 +478,7 @@ def verified_qualification_manifest(
         name: StaticArtifact.model_validate(value)
         for name, value in manifest["static_artifacts"].items()
     }
-    if set(artifacts) != set(MODEL_NAMES[:3]):
+    if set(artifacts) != set(STATIC_MODEL_NAMES):
         raise ValueError("Qualification manifest must cover every enabled static model")
     model_content = {name: tree_identity(path) for name, path in runtime.model_dirs.items()}
     if model_content != manifest["model_content"]:
@@ -533,9 +533,8 @@ def build_serving_pipeline(
     models = (
         native.layout_det_model,
         preprocessor.doc_ori_classify_model,
-        preprocessor.doc_unwarping_model,
     )
-    for name, model in zip(MODEL_NAMES[:3], models, strict=True):
+    for name, model in zip(STATIC_MODEL_NAMES, models, strict=True):
         runner = model.runner
         if (
             not isinstance(runner, runner_type)
@@ -564,7 +563,6 @@ def build_pipeline(profile: OcrProfile, runtime: RuntimeSettings) -> PipelineAda
     models = (
         native.layout_det_model,
         preprocessor.doc_ori_classify_model,
-        preprocessor.doc_unwarping_model,
     )
     audits = [
         begin_static_audit(
@@ -575,7 +573,7 @@ def build_pipeline(profile: OcrProfile, runtime: RuntimeSettings) -> PipelineAda
             runner_type=PaddleStaticRunner,
             inspector_identity=inspector,
         )
-        for name, model in zip(MODEL_NAMES[:3], models, strict=True)
+        for name, model in zip(STATIC_MODEL_NAMES, models, strict=True)
     ]
     profile_id = content_identity(
         {

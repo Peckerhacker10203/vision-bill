@@ -1182,6 +1182,32 @@ def test_final_gpu_memory_reply_survives_receive_timeout_before_child_exit(
         worker.stop()
 
 
+def test_park_logs_only_confirmed_teardown_and_keeps_owner_private(caplog, monkeypatch):
+    from ocr_service.worker import OcrWorkerError, OcrWorkerManager
+
+    worker = OcrWorkerManager(mp_context=FakeContext())
+    owner = "1:private-test-owner"
+    worker.claim(owner)
+    caplog.set_level("INFO", logger="ocr_service.worker")
+    worker.park(owner)
+    assert [message.split()[1] for message in caplog.messages] == [
+        "state=requested", "state=teardown", "state=parked",
+    ]
+    caplog.clear()
+
+    def failed_teardown():
+        raise OcrWorkerError("ocr_worker_unstoppable", 503, cleanup_safe=False)
+
+    monkeypatch.setattr(worker, "_teardown", failed_teardown)
+    with pytest.raises(OcrWorkerError, match="ocr_worker_unstoppable"):
+        worker.park(owner)
+    assert [message.split()[1] for message in caplog.messages] == [
+        "state=requested", "state=teardown", "state=failed",
+    ]
+    assert "ocr_worker_unstoppable" in caplog.messages[-1]
+    assert owner not in caplog.text
+
+
 def test_park_waits_for_the_managers_preload_probe(monkeypatch):
     from types import SimpleNamespace
 

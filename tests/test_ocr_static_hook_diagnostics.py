@@ -51,7 +51,7 @@ def test_full_qualification_carries_static_hook_failure_without_publishing(tmp_p
     )
     row = qualify.QualificationCase(kind="upright", path=Path("image"), sha256="a" * 64)
     diagnostic = {
-        "model_name": "UVDoc",
+        "model_name": "PP-LCNet_x1_0_doc_ori",
         "reason_code": "hook_input_missing",
         "input_count": 0,
         "output_count": 3,
@@ -105,14 +105,14 @@ def test_native_collection_emits_the_failing_models_safe_diagnostic(tmp_path, mo
                 "enable_cinn": False,
             },
         ))
-        for name in MODEL_NAMES[:3]
+        for name in MODEL_NAMES[:-1]
     }
 
     def predict(*_args, **_kwargs):
         for name, model in models.items():
             place = SimpleNamespace(
-                is_cpu_place=lambda name=name: name == "UVDoc",
-                is_gpu_place=lambda name=name: name != "UVDoc",
+                is_cpu_place=lambda name=name: name == "PP-LCNet_x1_0_doc_ori",
+                is_gpu_place=lambda name=name: name != "PP-LCNet_x1_0_doc_ori",
                 gpu_device_id=lambda: 0,
             )
             tensor = SimpleNamespace(dtype="paddle.float32", place=place)
@@ -123,7 +123,6 @@ def test_native_collection_emits_the_failing_models_safe_diagnostic(tmp_path, mo
     native = SimpleNamespace(
         doc_preprocessor_pipeline=SimpleNamespace(
             doc_ori_classify_model=models[MODEL_NAMES[1]],
-            doc_unwarping_model=models[MODEL_NAMES[2]],
         ),
         layout_det_model=models[MODEL_NAMES[0]],
         vl_rec_model=SimpleNamespace(infer=object()),
@@ -163,7 +162,7 @@ def test_native_collection_emits_the_failing_models_safe_diagnostic(tmp_path, mo
     text = output.read_text()
     assert "private" not in text
     assert json.loads(text)["static_hook_failure"] == {
-        "model_name": "UVDoc",
+        "model_name": "PP-LCNet_x1_0_doc_ori",
         "reason_code": "hook_cpu_float",
         "input_count": 1,
         "output_count": 1,
@@ -186,7 +185,7 @@ def test_static_hook_failure_reader_rejects_nonregular_paths_without_blocking(tm
             "stage": "native_collection",
             "failure": "static_hook_collection_failed",
             "static_hook_failure": {
-                "model_name": "UVDoc",
+                "model_name": "PP-LCNet_x1_0_doc_ori",
                 "reason_code": "hook_cpu_float",
                 "input_count": 1,
                 "output_count": 1,

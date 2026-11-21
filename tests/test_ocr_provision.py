@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 SERVICE = Path(__file__).parents[1] / "paddleocr-service"
-NAMES = ("PP-DocLayoutV3", "PP-LCNet_x1_0_doc_ori", "UVDoc", "PaddleOCR-VL-1.6-0.9B")
+NAMES = ("PP-DocLayoutV3", "PP-LCNet_x1_0_doc_ori", "PaddleOCR-VL-1.6-0.9B")
 KINDS = ("upright", "rotated", "warped", "table", "formula")
 
 
@@ -374,20 +374,29 @@ def test_existing_model_directory_symlink_is_rejected(tmp_path, release):
 def test_prepared_installation_reuses_legacy_model_trees_when_archives_were_removed(
     tmp_path, release
 ):
-    from ocr_service.provision import provision_bundle, provision_models
+    from ocr_service.provision import Archive, extract_archive, provision_bundle, provision_models
 
     bundle = load(release)
     state = tmp_path / "state"
     legacy = provision_bundle(bundle, state)
+    previous = bundle.model_dump(mode="json")
+    retired = archive(tmp_path, "UVDoc", {"weights": b"old UVDoc", "LICENSE": b"CC0 test"})
+    previous["models"]["UVDoc"] = retired
+    old_root = legacy.root.rename(state / "bundles" / identity(previous))
+    retired_tree = old_root / "models" / "UVDoc"
+    retired_tree.mkdir()
+    extract_archive(Path(retired["source"]), retired_tree, Archive.model_validate(retired))
+    Path(retired["source"]).unlink()
     for asset in bundle.models.values():
         (state / "archives" / asset.sha256).unlink()
         Path(asset.source).unlink()
 
     models = provision_models(bundle, state)
+    assert set(models) == set(NAMES)
     for name in NAMES:
-        assert (models[name] / "weights").read_bytes() == (
-            legacy.model_dirs[name] / "weights"
-        ).read_bytes()
+        assert (models[name] / "weights").samefile(old_root / "models" / name / "weights")
+    assert not (state / "models" / retired["tree_sha256"]).exists()
+    assert (retired_tree / "weights").read_bytes() == b"old UVDoc"
     assert models == provision_models(bundle, state)
 
 

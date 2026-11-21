@@ -33,7 +33,7 @@ from .paddle_distribution import native_paddle_distribution
 logger = logging.getLogger(__name__)
 
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
-MODEL_NAMES = ("PP-DocLayoutV3", "PP-LCNet_x1_0_doc_ori", "UVDoc", "PaddleOCR-VL-1.6-0.9B")
+MODEL_NAMES = tuple(paddle_snapshots.MODELS)
 KINDS = {"upright", "rotated", "warped", "table", "formula"}
 SERVICE = Path(__file__).resolve().parents[1]
 
@@ -186,7 +186,7 @@ class ReleaseBundle(Record):
     @model_validator(mode="after")
     def complete(self) -> Self:
         if set(self.models) != set(MODEL_NAMES):
-            raise ValueError("Exactly the four approved model identities are required")
+            raise ValueError("Exactly the three active model identities are required")
         for name, asset in self.models.items():
             if paddle_snapshots.is_snapshot_reference(asset.source):
                 verify_snapshot_record(name, asset)

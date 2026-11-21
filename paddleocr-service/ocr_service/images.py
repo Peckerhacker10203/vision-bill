@@ -68,6 +68,13 @@ def working_image(preprocessor: Any, transforms: list[dict[str, Any]]) -> Workin
         or output.dtype != np.uint8
     ):
         raise ValueError("DocPreprocessor output_img must contain uint8 BGR pixels")
+    settings = preprocessor.get("model_settings", {})
+    if (
+        not isinstance(settings, dict)
+        or settings.get("use_doc_orientation_classify") is not True
+        or settings.get("use_doc_unwarping") is not False
+    ):
+        raise ValueError("Working image requires orientation-only document preprocessing")
     angle = preprocessor.get("angle")
     if angle not in {0, 90, 180, 270}:
         raise ValueError("Enabled document orientation requires a recognized rotation angle")
@@ -79,7 +86,7 @@ def working_image(preprocessor: Any, transforms: list[dict[str, Any]]) -> Workin
         "operation": "doc_preprocessor",
         "angle": int(angle),
         "orientation_model": "PP-LCNet_x1_0_doc_ori",
-        "unwarping_model": "UVDoc",
+        "unwarping_model": None,
         "coordinate_space": "working",
         "inverse_mapping": None,
     }

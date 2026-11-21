@@ -436,7 +436,7 @@ def test_prepared_worker_reports_parked_identity_without_loading(tmp_path, monke
             assert len(identity["profile_id"]) == len(identity["runtime_fingerprint"]) == 64
         assert worker._proc is None
 
-    runtime["model_content"].pop("UVDoc")
+    runtime["model_content"].pop("PP-DocLayoutV3")
     with pytest.raises(ValidationError):
         PreparedRuntimeSettings.model_validate(runtime)
 

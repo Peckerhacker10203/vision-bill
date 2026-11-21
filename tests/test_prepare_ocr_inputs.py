@@ -80,6 +80,20 @@ def prepare(
     )
 
 
+def test_legacy_model_records_only_prepare_the_three_active_models(tmp_path, approved):
+    models, fixtures, _ = approved
+    records = json.loads(models.read_bytes())
+    records["UVDoc"] = dict(records["PP-DocLayoutV3"], source="https://example.org/UVDoc.tar")
+    models.write_text(json.dumps(records))
+    output = tmp_path / "prepared"
+    result = prepare(models, fixtures, output)
+    assert result.returncode == 0, result.stderr
+    assert set(json.loads((output / "bundle.json").read_bytes())["models"]) == {
+        "PP-DocLayoutV3", "PP-LCNet_x1_0_doc_ori", "PaddleOCR-VL-1.6-0.9B"
+    }
+    assert json.loads(models.read_bytes()) == records
+
+
 def test_prepares_deterministic_archive_and_round_trips_provisioning(
     tmp_path: Path, approved: tuple[Path, Path, dict[str, Any]]
 ) -> None:

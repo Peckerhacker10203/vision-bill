@@ -84,8 +84,8 @@ it never overrides explicit contrary metadata. Output/context limits still apply
 this setting does not give a text model vision support.
 
 The normal formatter output cap is 8192 tokens. Native PaddleOCR-VL 1.6 uses
-4096 output tokens, a 2,000,000-pixel region limit, document orientation and
-unwarping. The lifecycle API is independent of the GPU backend selected when
+up to 4096 output tokens and 2,000,000 input pixels per region. Document
+orientation is enabled and geometric unwarping is disabled. The lifecycle API is independent of the GPU backend selected when
 deploying llama.cpp.
 
 ## Adopt the managed pair

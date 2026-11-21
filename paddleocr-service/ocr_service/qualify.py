@@ -40,6 +40,7 @@ from .pipeline import PipelineAdapter, build_pipeline, construct_native, tree_id
 from .precision import ParameterRecord, StaticArtifact
 from .profile import (
     MODEL_NAMES,
+    STATIC_MODEL_NAMES,
     NativeRuntimeSettings,
     RuntimeSettings,
     file_digest,
@@ -68,6 +69,7 @@ class QualificationCase(BaseModel):
 
 class StaticHookFailure(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    # Prior on-disk failure reports can identify the retired UVDoc predictor.
     model_name: Literal["PP-DocLayoutV3", "PP-LCNet_x1_0_doc_ori", "UVDoc"]
     reason_code: HookFailureReason
     input_count: int = Field(ge=0, le=2**63 - 1)
@@ -295,10 +297,9 @@ def collect(payload: dict[str, Any]) -> dict[str, Any]:
     models = [
         native.layout_det_model,
         preprocessor.doc_ori_classify_model,
-        preprocessor.doc_unwarping_model,
     ]
     collectors = []
-    for name, model in zip(MODEL_NAMES[:3], models, strict=True):
+    for name, model in zip(STATIC_MODEL_NAMES, models, strict=True):
         runner = model.runner
         expected = {
             "run_mode": "paddle_fp32",
@@ -356,13 +357,13 @@ def collect(payload: dict[str, Any]) -> dict[str, Any]:
                     forwards[index].append(collector.finish())
                 except HookCollectionError as exc:
                     raise StaticHookCollectionFailed(StaticHookFailure.model_validate({
-                        "model_name": MODEL_NAMES[index],
+                        "model_name": STATIC_MODEL_NAMES[index],
                         "reason_code": exc.reason_code,
                         "input_count": exc.input_count,
                         "output_count": exc.output_count,
                     })) from None
     artifacts = {}
-    for index, name in enumerate(MODEL_NAMES[:3]):
+    for index, name in enumerate(STATIC_MODEL_NAMES):
         coverage = common_coverage(forwards[index])
         inventory = payload["inventory"][name]
         bindings = parameter_bindings(
@@ -424,8 +425,8 @@ def validate_replay(result: dict[str, Any], precision: dict[str, str]) -> None:
     components = result.get("dynamic_components", {})
     if (
         result.get("passed") is not True
-        or len(audits) != 3
-        or {row.get("model_name") for row in audits} != set(MODEL_NAMES[:3])
+        or len(audits) != len(STATIC_MODEL_NAMES)
+        or {row.get("model_name") for row in audits} != set(STATIC_MODEL_NAMES)
         or set(components) != {"visual", "mlp_AR", "text"}
         or any(
             record.get("dtype") != precision.get(key) or record.get("parameters", 0) <= 0
@@ -477,7 +478,7 @@ def qualify_runtime(runtime: RuntimeSettings, cases: Path, output: Path) -> Qual
             report.stage = "artifact_inspection"
             inventory = {
                 name: run_stage("inspect", {**base, "model_name": name}, directory)
-                for name in MODEL_NAMES[:3]
+                for name in STATIC_MODEL_NAMES
             }
             report.stage = "native_collection"
             collected = run_stage("collect", {**base, "inventory": inventory}, directory)

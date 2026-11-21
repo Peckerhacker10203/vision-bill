@@ -816,7 +816,7 @@ def test_failed_collection_logs_only_a_bounded_static_hook_diagnostic(
             "failure": "static_hook_collection_failed",
             "qualified": False,
             "static_hook_failure": {
-                "model_name": private_text if invalid == "unknown_model" else "UVDoc",
+                "model_name": private_text if invalid == "unknown_model" else "PP-DocLayoutV3",
                 "reason_code": "hook_cpu_float",
                 "input_count": 7,
                 "output_count": 5,
@@ -830,7 +830,7 @@ def test_failed_collection_logs_only_a_bounded_static_hook_diagnostic(
         initialize_release(tmp_path, release)
 
     messages = [r.getMessage() for r in caplog.records]
-    expected = "static_hook_collection_failed model=UVDoc reason=hook_cpu_float input=7 output=5"
+    expected = "static_hook_collection_failed model=PP-DocLayoutV3 reason=hook_cpu_float input=7 output=5"
     assert (expected in messages) == (invalid is None)
     assert private_text not in caplog.text
     assert not (tmp_path / "state" / "selected").exists()

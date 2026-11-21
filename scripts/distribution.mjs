@@ -56,6 +56,22 @@ const fail = (message) => {
 const check = (condition, message) => {
   if (!condition) fail(message);
 };
+// Previous profiles also declared UVDoc. Only active archives enter a new image's bundle.
+export function activeModelArchives(models) {
+  const names = [
+    "PP-DocLayoutV3",
+    "PP-LCNet_x1_0_doc_ori",
+    "PaddleOCR-VL-1.6-0.9B",
+  ];
+  const supplied = Object.keys(models ?? {});
+  check(
+    names.every((name) => supplied.includes(name)) &&
+      supplied.every((name) => names.includes(name) || name === "UVDoc"),
+    "Incomplete or unexpected native model inventory",
+  );
+  return Object.fromEntries(names.map((name) => [name, models[name]]));
+}
+
 function schemaCheck(value, rule, path = "manifest", root = schema) {
   if (rule.$ref)
     return schemaCheck(
@@ -692,18 +708,8 @@ function verifyEvidence(manifest, variant, contents) {
     ),
   );
   schemaCheck(bundle, nativeSchema, "native bundle", nativeSchema);
-  check(
-    JSON.stringify(Object.keys(bundle.models).sort()) ===
-      JSON.stringify(
-        [
-          "PP-DocLayoutV3",
-          "PP-LCNet_x1_0_doc_ori",
-          "PaddleOCR-VL-1.6-0.9B",
-          "UVDoc",
-        ].sort(),
-      ),
-    "Exactly four approved model identities required",
-  );
+  // A historical release must retain every model covered by its original evidence.
+  activeModelArchives(bundle.models);
   check(
     bundle.expected_packages.paddleocr === "3.7.0" &&
       bundle.expected_packages.paddlex === "3.7.2",

@@ -27,7 +27,13 @@ const image = (name) => ({
   reference: `ghcr.io/maintainer/vision-bill-${name}@${digest(name)}`,
   config_digest: digest(`${name}-config`),
 });
-function fixture({ cudaChannel, attestation = {}, lock, measuredLock } = {}) {
+function fixture({
+  cudaChannel,
+  attestation = {},
+  lock,
+  measuredLock,
+  legacyUnwarping = false,
+} = {}) {
   const cuda = {
     index: `https://www.paddlepaddle.org.cn/packages/stable/${cudaChannel ?? "cu126"}/paddlepaddle-gpu/`,
     index_sha256: hash("index"),
@@ -134,7 +140,7 @@ function fixture({ cudaChannel, attestation = {}, lock, measuredLock } = {}) {
       [
         "PP-DocLayoutV3",
         "PP-LCNet_x1_0_doc_ori",
-        "UVDoc",
+        ...(legacyUnwarping ? ["UVDoc"] : []),
         "PaddleOCR-VL-1.6-0.9B",
       ].map((name) => [name, archive(name)]),
     );
@@ -811,13 +817,45 @@ test("same-hash evidence with wrong config or incomplete hardware qualification 
   }
 });
 
+test("previously qualified four-model releases retain their complete model inventory", (t) => {
+  const directory = temp(t);
+  const { manifest, bytes } = fixture({ legacyUnwarping: true });
+  seed(directory, bytes);
+  writeBundle(manifest, "ocr-rocm", join(directory, "output"), directory);
+  assert.deepEqual(
+    readFileSync(
+      join(directory, "output", "release", manifest.native.rocm.bundle),
+    ),
+    Buffer.from(bytes[manifest.native.rocm.bundle]),
+  );
+  const path = manifest.native.rocm.seal;
+  const seal = JSON.parse(bytes[path]);
+  delete seal.model_content.UVDoc;
+  bytes[path] = JSON.stringify(seal);
+  manifest.assets[path] = {
+    sha256: hash(bytes[path]),
+    size_bytes: Buffer.byteLength(bytes[path]),
+  };
+  seed(directory, bytes);
+  assert.throws(
+    () =>
+      writeBundle(
+        manifest,
+        "ocr-rocm",
+        join(directory, "incomplete"),
+        directory,
+      ),
+    /model inventory differs/,
+  );
+});
+
 test("external native bundle requires complete model, fixture and licensed archive inventories", (t) => {
   for (const mutate of [
-    (b) => delete b.models.UVDoc,
-    (b) => delete b.models.UVDoc.license,
-    (b) => (b.models.UVDoc.tree_sha256 = hash("wrong-tree")),
+    (b) => delete b.models["PP-DocLayoutV3"],
+    (b) => delete b.models["PP-DocLayoutV3"].license,
+    (b) => (b.models["PP-DocLayoutV3"].tree_sha256 = hash("wrong-tree")),
     (b) =>
-      (b.models.UVDoc.files["../unsafe"] = {
+      (b.models["PP-DocLayoutV3"].files["../unsafe"] = {
         sha256: hash("unsafe"),
         size_bytes: 1,
       }),
@@ -902,11 +940,11 @@ test("combined materialization requires pinned HTTPS model sources and permits o
   );
   assert.doesNotMatch(
     readFileSync(join(accepted, "SHA256SUMS"), "utf8"),
-    /UVDoc\.tar/,
+    /PP-DocLayoutV3\.tar/,
   );
 
   const modelBytes = "sealed synthetic model archive";
-  setAsset("rocm/UVDoc.tar", modelBytes);
+  setAsset("rocm/PP-DocLayoutV3.tar", modelBytes);
   seed(directory, bytes);
   const extra = join(directory, "extra");
   assert.throws(
@@ -914,9 +952,9 @@ test("combined materialization requires pinned HTTPS model sources and permits o
     /unexpected.+asset/i,
   );
 
-  bundle.models.UVDoc.source = "UVDoc.tar";
-  bundle.models.UVDoc.sha256 = hash(modelBytes);
-  bundle.models.UVDoc.size_bytes = Buffer.byteLength(modelBytes);
+  bundle.models["PP-DocLayoutV3"].source = "PP-DocLayoutV3.tar";
+  bundle.models["PP-DocLayoutV3"].sha256 = hash(modelBytes);
+  bundle.models["PP-DocLayoutV3"].size_bytes = Buffer.byteLength(modelBytes);
   setAsset(bundlePath, JSON.stringify(bundle));
   seed(directory, bytes);
   const local = join(directory, "local");
@@ -1441,9 +1479,9 @@ test("qualification evidence cannot be reused for internally consistent replacem
       report = JSON.parse(bytes[native.qualification]),
       seal = JSON.parse(bytes[native.seal]);
     if (replace === "model") {
-      const model = bundle.models.UVDoc;
+      const model = bundle.models["PP-DocLayoutV3"];
       model.sha256 = hash("different-archive");
-      model.files.UVDoc.sha256 = hash("different-weights");
+      model.files["PP-DocLayoutV3"].sha256 = hash("different-weights");
       model.tree_sha256 = hash(
         JSON.stringify(
           Object.fromEntries(
@@ -1476,9 +1514,9 @@ test("qualification evidence cannot be reused for internally consistent replacem
       report.qualified_targets = ["gfx1031"];
     }
     if (replace === "report-model")
-      report.model_content.UVDoc = hash("wrong-report-model");
+      report.model_content["PP-DocLayoutV3"] = hash("wrong-report-model");
     if (replace === "seal-model") {
-      delete seal.model_content.UVDoc;
+      delete seal.model_content["PP-DocLayoutV3"];
       report.manifest_sha256 = hash(JSON.stringify(seal));
     }
     for (const [path, value] of [
@@ -1613,7 +1651,7 @@ test("producer stages only approved exact-version inputs and consumer verifies a
   );
   writeFileSync(join(selected, "release-inputs.json"), JSON.stringify(plan));
   const localBundle = JSON.parse(bytes["rocm/bundle.json"]);
-  localBundle.models.UVDoc.source = "../../private-extra.txt";
+  localBundle.models["PP-DocLayoutV3"].source = "../../private-extra.txt";
   writeFileSync(
     join(selected, "rocm/bundle.json"),
     JSON.stringify(localBundle),
@@ -1626,10 +1664,11 @@ test("producer stages only approved exact-version inputs and consumer verifies a
       join(directory, "traversal"),
     ),
   );
-  localBundle.models.UVDoc.source = "model.tar";
+  localBundle.models["PP-DocLayoutV3"].source = "model.tar";
   const localBytes = "synthetic local archive transport";
-  localBundle.models.UVDoc.sha256 = hash(localBytes);
-  localBundle.models.UVDoc.size_bytes = Buffer.byteLength(localBytes);
+  localBundle.models["PP-DocLayoutV3"].sha256 = hash(localBytes);
+  localBundle.models["PP-DocLayoutV3"].size_bytes =
+    Buffer.byteLength(localBytes);
   writeFileSync(join(selected, "rocm/model.tar"), localBytes);
   writeFileSync(
     join(selected, "rocm/bundle.json"),
@@ -1658,6 +1697,44 @@ test("producer stages only approved exact-version inputs and consumer verifies a
     "rocm/bundle.json": JSON.stringify(localBundle),
     "rocm/model.tar": localBytes,
   });
+  // An old offline approval retains its original bytes and can omit the retired archive.
+  const legacyBundle = JSON.parse(
+    fixture({ legacyUnwarping: true }).bytes["rocm/bundle.json"],
+  );
+  legacyBundle.models.UVDoc.source = "UVDoc-not-present.tar";
+  const legacyBytes = JSON.stringify(legacyBundle);
+  const bundlePath = join(standalone, "rocm/bundle.json");
+  writeFileSync(bundlePath, legacyBytes);
+  const migrated = join(directory, "migrated");
+  stageInputs(
+    standaloneRequest,
+    { actor: "maintainer", role: "maintain" },
+    sourceRoot,
+    migrated,
+  );
+  verifyStagedInputs(migrated, standaloneRequest, {
+    actor: "maintainer",
+    run: "123",
+  });
+  assert.deepEqual(readdirSync(join(migrated, "rocm")), ["bundle.json"]);
+  assert.equal(
+    readFileSync(join(migrated, "rocm/bundle.json"), "utf8"),
+    legacyBytes,
+  );
+  legacyBundle.models.UVDoc.source =
+    "https://user:password@example.invalid/unused";
+  writeFileSync(bundlePath, JSON.stringify(legacyBundle));
+  assert.throws(
+    () =>
+      stageInputs(
+        standaloneRequest,
+        { actor: "maintainer", role: "maintain" },
+        sourceRoot,
+        join(directory, "rejected"),
+      ),
+    /Credential-bearing/,
+  );
+  writeFileSync(bundlePath, JSON.stringify(localBundle));
   const localOutput = join(directory, "standalone-local-artifact");
   stageInputs(
     standaloneRequest,

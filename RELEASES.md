@@ -13,7 +13,7 @@ a separate release run. The app-image workflow below publishes the app image.
 Durable 202 uploads/retries, source-preserving receipt review, exact money, explicit
 Gold/v4 diagnostics, strict optional OCR, independent native OCR candidates and external-only LLM distribution are integrated in this package. The update also
 includes account and view isolation and completion-only receipt recovery. Dedicated
-OCR downloads and verifies its four pinned models when enabled. Its first prediction
+OCR downloads and verifies its three pinned models when enabled. Its first prediction
 uses the first submitted receipt. The source launcher supports upgrading the admitted
 installation in place. Pending uploads bind their formatter endpoint, and migrated
 unverified receipts can be reviewed using their current findings. Historical split/CPU results retain

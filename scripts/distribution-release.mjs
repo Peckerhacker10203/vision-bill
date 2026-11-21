@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import {
+  activeModelArchives,
   validateArtifacts,
   cudaChannels,
   cudaLockDigestLabel,
@@ -612,6 +613,7 @@ function build(request, inputs, output) {
         bundle.accelerator === accelerator && bundle.gpu_index === 0,
         "Prepared single-device bundle must use gpu_index zero",
       );
+      bundle.models = activeModelArchives(bundle.models);
       bundle.image_identity = manifest.images[name].reference;
       bundle.image_config_sha256 = hash(config);
       const { expected_packages, source_files } = candidateBundleEvidence(

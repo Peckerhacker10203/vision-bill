@@ -42,7 +42,9 @@ from pathlib import Path
 from ocr_service.bootstrap import bind_approved_dependencies
 from ocr_service.device_inventory import inspect_device_identity
 from ocr_service.initialize import verify_image
-from ocr_service.provision import ReleaseBundle, file_digest, source_identities, verify_sources
+from ocr_service.paddle_snapshots import is_snapshot_reference
+from ocr_service.profile import content_identity
+from ocr_service.provision import Archive, MODEL_NAMES, ReleaseBundle, file_digest, source_identities, verify_sources
 
 image_id, config_id, release, expected_sources, *verification = sys.argv[1:]
 root = Path(release)
@@ -52,6 +54,16 @@ if expected_sources and sources != json.loads(expected_sources):
     raise ValueError('Reused OCR image sources, profile or runtime lock differ from this checkout')
 manifest.update(image_identity=image_id, image_config_sha256=config_id[7:],
                 profile_sha256=sources['profile.json'], source_files=sources)
+# Migrate only the staged, approved four-model input. Existing deployment
+# records keep their exact contents and image-specific verification on restart.
+models = manifest['models']
+if 'UVDoc' not in MODEL_NAMES and set(models) == set(MODEL_NAMES) | {'UVDoc'}:
+    retired = Archive.model_validate(models.pop('UVDoc'))
+    # The previous published snapshot manifest sealed this entire UVDoc record.
+    if is_snapshot_reference(retired.source) and content_identity(retired.model_dump(mode='json')) != (
+        '0ac3019fae2929a39bb9cac71c04ea0e78e3d4ea06ec6358f3cfc96dc3a6c614'
+    ):
+        raise ValueError('Legacy official UVDoc snapshot differs from the approved record')
 # Validate in the bind before emitting the final manifest, without touching assets.
 bundle = ReleaseBundle.model_validate(manifest)
 verify_sources(bundle)

@@ -451,22 +451,22 @@ def test_prepare_and_restore_use_verified_models_without_qualification_or_fixtur
             child.terminate()
             child.wait(timeout=5)
     assert old.smoke_path.is_file()
-    (Path(runtime["model_dirs"]["UVDoc"]) / "weights").write_bytes(b"corrupt")
+    (Path(runtime["model_dirs"]["PP-DocLayoutV3"]) / "weights").write_bytes(b"corrupt")
     with pytest.raises(ValueError):
         initialize.check_prepared_installation(*args)
 
     # A failed replacement preserves the existing selection and every valid model.
-    archive = inputs.state_dir / "archives" / raw["models"]["UVDoc"]["sha256"]
+    archive = inputs.state_dir / "archives" / raw["models"]["PP-DocLayoutV3"]["sha256"]
     good_archive = archive.read_bytes()
     archive.write_bytes(b"bad cached archive")
     requests = []
 
     class Response(io.BytesIO):
         def geturl(self):
-            return raw["models"]["UVDoc"]["source"]
+            return raw["models"]["PP-DocLayoutV3"]["source"]
 
     def replacement(url, *, timeout):
-        assert url == raw["models"]["UVDoc"]["source"]
+        assert url == raw["models"]["PP-DocLayoutV3"]["source"]
         requests.append(url)
         return Response(b"bad download" if len(requests) == 1 else good_archive)
 
@@ -489,7 +489,7 @@ def test_prepare_and_restore_use_verified_models_without_qualification_or_fixtur
     assert initialize.check_prepared_installation(*args) == repaired
     assert len(requests) == 2
     assert archive.read_bytes() == good_archive
-    assert (Path(runtime["model_dirs"]["UVDoc"]) / "weights").read_bytes() == b"UVDoc"
+    assert (Path(runtime["model_dirs"]["PP-DocLayoutV3"]) / "weights").read_bytes() == b"PP-DocLayoutV3"
 
     # A redirected cache root can present perfectly matching bytes outside native ownership.
     models = inputs.state_dir / "models"

@@ -17,8 +17,9 @@ and an external LLM. Every app variant uses your endpoint. The combined CUDA
 bundle includes a Windows launcher for Docker Desktop. Combined CUDA and ROCm
 bundles also include a Linux launcher. The OCR controller starts idle
 and downloads the pinned Paddle models when an admin first turns **Dedicated
-OCR** On or explicitly requests setup in the configuration. The four model
-downloads total about 2.1 GB. The controller verifies their hashes and parks.
+OCR** On or explicitly requests setup in the configuration. The controller verifies the three active models
+for orientation, layout and recognition, then parks. Geometric unwarping is off.
+Each recognition region can use up to 2,000,000 pixels.
 The first receipt loads PaddleOCR-VL 1.6 and runs the first prediction. Setup,
 restart and the Settings connection check do not process sample images. In an
 independent OCR bundle, run the explicit model preparation command once.

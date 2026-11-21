@@ -19,11 +19,12 @@ def test_profile_is_exact():
         4096,
     )
     assert profile.use_doc_orientation_classify is True
-    assert profile.use_doc_unwarping is True
+    assert profile.use_doc_unwarping is False
     assert profile.use_queues is False
     config = effective_pipeline_config(profile)
     assert config["use_doc_preprocessor"] is True
-    assert config["SubPipelines"]["DocPreprocessor"]["use_doc_unwarping"] is True
+    assert config["SubPipelines"]["DocPreprocessor"]["use_doc_unwarping"] is False
+    assert "DocUnwarping" not in config["SubPipelines"]["DocPreprocessor"]["SubModules"]
     assert config["SubPipelines"]["DocPreprocessor"]["use_doc_orientation_classify"] is True
     assert config["SubModules"]["VLRecognition"]["genai_config"] == {"backend": "native"}
     assert config["SubModules"]["LayoutDetection"]["model_name"] == "PP-DocLayoutV3"
@@ -48,7 +49,7 @@ def test_profile_is_exact():
     [
         ("max_pixels", 1605632),
         ("precision", "bfloat16"),
-        ("use_doc_unwarping", False),
+        ("use_doc_unwarping", True),
         ("use_doc_orientation_classify", False),
         ("use_queues", True),
     ],

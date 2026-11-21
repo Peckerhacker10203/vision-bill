@@ -87,9 +87,11 @@ must pass. No global deduplication or blanket image splitting is applied.
 
 Original bytes, hashes and photo/part identities are retained. Working PNGs have
 their own IDs, dimensions, hashes and transform metadata. EXIF normalization is
-independent of orientation classification/unwarping; transparency is composited on
-white (`white-document-rgb-v2`). OCR boxes are in the actual working image's
-coordinates. An inverse unwarp mapping is unknown (`null`), never invented.
+independent of learned orientation classification. Transparent pixels are composited
+on white (`white-document-rgb-v2`). New extractions leave geometric unwarping off.
+OCR boxes use the stored working image’s coordinates. Older extractions may
+contain an unwarped working image. Review them with their original transform
+metadata and geometry. The inverse mapping field remains `null`.
 Authenticated `/file?part=N` serves originals; `/views/<view_id>` serves validated
 working PNGs with private/no-store caching. Review displays both. The app and
 native service share bounded PNG, JSON and text handling for photos up to

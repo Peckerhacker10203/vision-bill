@@ -115,7 +115,7 @@ findings cannot be waived. Local time supports valid seconds and microseconds.
 
 `ImageService` preserves original bytes/hash, creates thumbnails nonfatally and
 saves exact validated working PNG artifacts. Shared white RGB composition is
-`white-document-rgb-v2`; EXIF correction and native orientation/unwarp are distinct.
+`white-document-rgb-v2`; EXIF correction and native orientation are distinct. Geometric unwarping is off.
 Working geometry stays in working coordinates and inverse mapping remains null.
 Shared source limits are 20 MiB for the app and 25 MiB for the native service
 with 40,000,000 pixels, a derived RGB8 PNG bound and bounded metadata/response
@@ -136,9 +136,10 @@ build profile (`OCR_AMDGPU_TARGETS`) separately from physical qualification.
 Never claim universal AMD support or GPU qualification from CPU tests.
 
 Fixed PaddleOCR-VL-1.6/v1.6, PP-DocLayoutV3, native Paddle, batch 1 everywhere,
-queues/chart/seal off, orientation/unwarp on, min 112896/max 2000000 **per VLM region**
+queues/chart/seal off, orientation on, unwarping off, min 112896/max 2000000 **per VLM region**
 including tables, OCR 4096. Official upstream grid alignment is not a whole-photo
-2MP resize. Only the VLM text decoder uses BF16 on selected CUDA SM80+ devices.
+2 MP resize. Active models are orientation, layout and VLM. Preserve earlier
+UVDoc assets and saved working views with the installation that produced them. Only the VLM text decoder uses BF16 on selected CUDA SM80+ devices.
 Turing, ROCm, static models and visual/projector layers use FP32. Keep the
 backend, pixel and token policy fixed. EXIF applies independently. Formatter output defaults
 8192; discovered context capacity remains separate and may be unknown.

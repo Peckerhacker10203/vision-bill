@@ -575,15 +575,28 @@ class OcrWorkerManager:
             self._owner_load_allowed = True
 
     def park(self, owner: str) -> None:
+        started = time.monotonic()
+        logger.info("ocr_worker_park state=requested")
         with self._active, self._control:
             if self._owner != owner:
+                logger.info("ocr_worker_park state=rejected reason=ocr_stale_owner")
                 raise OcrWorkerError("ocr_stale_owner", 409)
             # Revoke before teardown, including a failed reap. A delayed load
             # HTTP request must never resurrect this phase after park returns.
             self._owner_load_allowed = False
             self._parked = True
-            self._teardown()
+            logger.info("ocr_worker_park state=teardown generation=%d lock_wait_ms=%d",
+                        self._generation, round((time.monotonic() - started) * 1000))
+            try:
+                self._teardown()
+            except (OcrWorkerError, OSError, ValueError) as exc:
+                logger.warning("ocr_worker_park state=failed generation=%d reason=%s elapsed_ms=%d",
+                               self._generation, exc.code if isinstance(exc, OcrWorkerError) else type(exc).__name__,
+                               round((time.monotonic() - started) * 1000))
+                raise
             self._set_unready("ocr_parked")
+            logger.info("ocr_worker_park state=parked generation=%d elapsed_ms=%d",
+                        self._generation, round((time.monotonic() - started) * 1000))
 
     @staticmethod
     def _check_request(deadline_monotonic: float, cancel_event: threading.Event | None) -> None:

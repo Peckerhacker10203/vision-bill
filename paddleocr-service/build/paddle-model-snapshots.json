@@ -160,51 +160,5 @@
     "source": "https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6/resolve/132c45f52c0a26ed5a6b2f6bd8e3985794cc27dd",
     "tree_sha256": "117f0156b809e45c54cfc1d2ca5845a1cc63adfe55d73a21db4687b683e05cbb",
     "unpacked_bytes": 1930310157
-  },
-  "UVDoc": {
-    "files": {
-      "LICENSE": {
-        "sha256": "accc36c817ac5ede473d05732e14afc11cb6e55ef5919bc826b653f631165043",
-        "size_bytes": 11325
-      },
-      "LICENSE-PROVENANCE.txt": {
-        "sha256": "aeb8ed366f7cea59fe7a596f2df10bfabb26cfd51cbb3cfcef9c06296794b7da",
-        "size_bytes": 339
-      },
-      "README.md": {
-        "sha256": "a20104a3a6d1e4c3311e0e1b8f9913a3faf181752376f901fb3f09336dec756f",
-        "size_bytes": 4463
-      },
-      "config.json": {
-        "sha256": "0ffdb1f399eee3eb7816fb79b1380f97f89039b955eee2e60d3f7336f6f30875",
-        "size_bytes": 1489
-      },
-      "inference.json": {
-        "sha256": "2c2bc3e0f15e782cf8f2ad411b5033d99ca504fe88648f8054a5e925ba2336e0",
-        "size_bytes": 190986
-      },
-      "inference.pdiparams": {
-        "sha256": "810488899520e0da843b9bd9769ba4949f1c81e357f0eceb12d4a7da459c3eca",
-        "size_bytes": 32054311
-      },
-      "inference.yml": {
-        "sha256": "be83d537b358f3ff87740e77e14a83ee9e9a7bb215c33d091b69e8bd5904fe39",
-        "size_bytes": 330
-      }
-    },
-    "license": {
-      "redistribution_allowed": true,
-      "spdx": "Apache-2.0",
-      "text_file": "LICENSE"
-    },
-    "provenance": {
-      "revision": "16c3f0ea9c2f0c6a57e24160f7eeaa7574613fa3",
-      "url": "https://huggingface.co/PaddlePaddle/UVDoc"
-    },
-    "sha256": "3055177d4129739e734c537af3d4dd3f3f2de724f0ef7c60ffabaad6aacb21c3",
-    "size_bytes": 32276480,
-    "source": "https://huggingface.co/PaddlePaddle/UVDoc/resolve/16c3f0ea9c2f0c6a57e24160f7eeaa7574613fa3",
-    "tree_sha256": "d0560e8b2cfbaa71ee99390d9ad042842ea0e93132f60a6e73532068c61559c7",
-    "unpacked_bytes": 32263243
   }
 }

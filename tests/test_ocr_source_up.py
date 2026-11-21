@@ -432,7 +432,9 @@ def test_failed_candidate_cannot_create_restart_record(
     assert not list(state.iterdir())
 
 
-@pytest.mark.parametrize("altered", [None, "lock", "sources"])
+@pytest.mark.parametrize(
+    "altered", [None, "lock", "sources", "legacy", "bad_retired", "wrong_snapshot", "unexpected", "missing"]
+)
 def test_native_binding_uses_full_exact_package_closure(
     ocr_release: tuple[Path, dict[str, Any], Path],  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
@@ -447,8 +449,25 @@ def test_native_binding_uses_full_exact_package_closure(
     from scripts.ocr_source_up import BIND_BUNDLE
 
     path, manifest, image_config = ocr_release
+    current_models = dict(manifest["models"])
+    for name, record in current_models.items():
+        record["source"] = f"https://example.org/approved/{name}.tar"
+    if altered in {"legacy", "bad_retired", "wrong_snapshot", "unexpected", "missing"}:
+        retired = dict(current_models["PP-DocLayoutV3"], source="https://example.org/approved-uvdoc.tar")
+        if altered == "bad_retired":
+            retired["tree_sha256"] = "f" * 64
+        if altered == "wrong_snapshot":
+            retired["source"] = "https://huggingface.co/PaddlePaddle/PP-DocLayoutV3/resolve/" + "f" * 40
+        manifest["models"]["UVDoc"] = retired
+        if altered == "unexpected":
+            manifest["models"]["unsigned-extra"] = retired
+        if altered == "missing":
+            del manifest["models"]["PP-DocLayoutV3"]
     approved = manifest["expected_packages"]
-    closure = {**approved, "numpy": "2.4.0", "pydantic": "2.12.0"}
+    approved["numpy"] = "2.4.0"
+    path.write_text(json.dumps(manifest, indent=2))
+    original = path.read_bytes()
+    closure = {**approved, "pydantic": "2.12.0"}
     config_id = "sha256:" + hashlib.sha256(image_config.read_bytes()).hexdigest()
     image_id = "sha256:" + "d" * 64
     sources = provision.source_identities()
@@ -493,12 +512,19 @@ def test_native_binding_uses_full_exact_package_closure(
         with pytest.raises(ValueError, match="Reused OCR image sources"):
             runpy.run_path(str(binder))
         return
+    if altered in {"bad_retired", "wrong_snapshot", "unexpected", "missing"}:
+        with pytest.raises(ValueError):
+            runpy.run_path(str(binder))
+        assert path.read_bytes() == original
+        return
     runpy.run_path(str(binder))
+    assert path.read_bytes() == original
     bound = json.loads(capsys.readouterr().out)
     assert bound["expected_packages"] == closure
     assert bound["image_identity"] == image_id
     assert bound["image_config_sha256"] == config_id[7:]
-    assert bound["models"] == manifest["models"]
+    assert bound["models"] == current_models
+    assert bound["fixtures"] == manifest["fixtures"]
 
 
 @pytest.fixture
@@ -511,7 +537,10 @@ def managed_release(tmp_path: Path) -> tuple[Path, str, str]:
         {
             "accelerator": "cuda",
             "gpu_index": 0,
-            "models": {"model": {"source": "https://example.org/model.tar"}},
+            "models": {
+                name: {"source": f"https://example.org/{name}.tar"}
+                for name in ("PP-DocLayoutV3", "PP-LCNet_x1_0_doc_ori", "UVDoc", "PaddleOCR-VL-1.6-0.9B")
+            },
             "fixtures": {"source": "https://example.org/fixtures.tar"},
         }
     ).encode()
