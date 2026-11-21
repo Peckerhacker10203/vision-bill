@@ -9,6 +9,7 @@ application's artifact cleanup, but never a partially committed receipt.
 
 import asyncio
 import json
+import logging
 import re
 from collections.abc import Callable, Sequence
 from hashlib import sha256
@@ -30,7 +31,7 @@ from ...model.extraction import (
 )
 from ...model.handoff import HANDOFF_WAIT_REASONS
 from ...model.ocr import OcrPageMetadata, Sha256, SourceRef, WorkingImageMetadata
-from ...model.ocr_errors import OCR_RESULT_CODES
+from ...model.ocr_errors import OCR_READINESS_CODES
 from ...model.review import AmountPolicy, OriginalAvailability, ReviewEvaluation, SourceView
 from ...model.workflow import (
     AccessScope,
@@ -62,11 +63,13 @@ from ...service.receipt_review import evaluate_receipt, persistent_findings, rec
 from .deadline import connection
 from .receipt_db import OriginalChecker, ReceiptDB
 
+logger = logging.getLogger(__name__)
+
 OBSERVATION_RECOVERY_WAIT = "observation_recovery_required"
 COMPLETION_WAIT_REASONS = HANDOFF_WAIT_REASONS | {
     OBSERVATION_RECOVERY_WAIT, "observation_checkpoint_invalid", "source_integrity_failed",
 }
-READINESS_WAIT_REASONS = HANDOFF_WAIT_REASONS | OCR_RESULT_CODES | {
+READINESS_WAIT_REASONS = HANDOFF_WAIT_REASONS | OCR_READINESS_CODES | {
     "provider_unavailable",
     "vision_model_unavailable",
     "formatter_model_unavailable",
@@ -870,6 +873,8 @@ class WorkflowDB:
                 image.id, image.generation, image.status, reason, image.claim_token, image.claim_purpose,
                 image.observations_available, image.unmanaged_classification_unsettled,
             )
+        if row is not None and image.wait_reason != reason:
+            logger.info("analysis_readiness generation=%d reason=%s", image.generation, reason or "ready")
         return row is not None
 
     async def delete_resource(

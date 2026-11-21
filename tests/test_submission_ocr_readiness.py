@@ -163,8 +163,19 @@ async def test_ready_unmanaged_service_including_legacy_missing_mode_is_eligible
     llm.get_available_models.assert_awaited_once_with(capability="text")
 
 
-@pytest.mark.parametrize("code", ["ocr_gpu_out_of_memory", "ocr_model_load_failed", "ocr_runtime_identity_mismatch"])
-async def test_readiness_exposes_typed_native_error_without_claiming_receipt(settings, monkeypatch, tmp_path, code):
+@pytest.mark.parametrize("code,status,ready,expected", [
+    ("ocr_gpu_out_of_memory", 503, False, "ocr_gpu_out_of_memory"),
+    ("ocr_model_load_failed", 503, False, "ocr_model_load_failed"),
+    ("ocr_runtime_identity_mismatch", 503, False, "ocr_runtime_identity_mismatch"),
+    ("ocr_starting", 503, False, "ocr_starting"),
+    ("ocr_cancelled", 503, False, "ocr_cancelled"),
+    ("ocr_starting", 200, False, "ocr_unavailable"),
+    ("ocr_cancelled", 503, "false", "ocr_unavailable"),
+    ("unknown_status", 503, False, "ocr_unavailable"),
+])
+async def test_readiness_exposes_typed_native_error_without_claiming_receipt(
+    settings, monkeypatch, tmp_path, code, status, ready, expected,
+):
     from vision_bill.provider.db.workflow_db import READINESS_WAIT_REASONS
 
     service, _receipts, llm, image, waits, claims = await submission_context(
@@ -176,8 +187,8 @@ async def test_readiness_exposes_typed_native_error_without_claiming_receipt(set
         if request.url.path == "/info":
             return httpx.Response(200, json={"contract_version": 2, "profile": {}})
         assert request.url.path == "/ready"
-        return httpx.Response(503, json={
-            "ready": False, "generation": 1, "reason_code": code,
+        return httpx.Response(status, json={
+            "ready": ready, "generation": 1, "reason_code": code,
         })
 
     monkeypatch.setattr(
@@ -185,7 +196,7 @@ async def test_readiness_exposes_typed_native_error_without_claiming_receipt(set
         lambda **kwargs: original_client(**kwargs, transport=httpx.MockTransport(server)),
     )
     assert not await service.ready_for(image)
-    assert waits == [code] and waits[0] in READINESS_WAIT_REASONS
+    assert waits == [expected] and waits[0] in READINESS_WAIT_REASONS
     assert claims == [] and image.attempt_count == 0
     llm.get_available_models.assert_not_awaited()
 

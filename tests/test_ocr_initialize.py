@@ -174,8 +174,7 @@ def test_upgrade_preserves_explicit_qualification_and_installs_without_native_wo
     assert (old / "qualification.json").is_file()
     assert not (new / "qualification.json").exists()
     assert module.check_prepared_installation(*args) == new
-    with pytest.raises(module.InitializationFailed):
-        module.check_installation(*args)
+    assert module.check_installation(*args) == new
 
 
 @pytest.mark.usefixtures("native_pid1")
@@ -375,6 +374,104 @@ def test_cache_miss_never_qualifies_on_check(tmp_path, release, monkeypatch):
     assert not (tmp_path / "state").exists()
 
 
+def test_standalone_prepare_cli_installs_local_models_without_loading_or_fixtures(
+    tmp_path, release, monkeypatch,
+):
+    from contextlib import nullcontext
+
+    from ocr_service import initialize as module
+
+    bundle_path, bundle, config = release
+    state = tmp_path / "state"
+    for model in bundle["models"].values():
+        model["source"] = Path(model["source"]).name
+    Path(bundle["fixtures"]["source"]).unlink()
+    bundle_path.write_text(json.dumps(bundle))
+    args = (bundle_path, state, config, "sha256:" + sha(config.read_bytes()))
+    monkeypatch.setenv("OCR_INSTALLATION_LOCK_PATH", str(tmp_path / "installation.lock"))
+    monkeypatch.setattr(module, "verify_package_pins", lambda bundle: None)
+    # The coordinator's real PID1/lock lifecycle runs in its separate container suite.
+    if os.getpid() != 1:
+        monkeypatch.setattr(module, "managed_installation", lambda *args: nullcontext())
+    monkeypatch.setattr(module, "owned_qualification_process", lambda *_: pytest.fail("qualified"))
+    monkeypatch.setattr(sys, "argv", [
+        "ocr-init", "prepare", "--bundle", str(bundle_path), "--state-dir", str(state),
+        "--image-config", str(config), "--image-id", args[3],
+        "--maintenance-intent", "separate-ocr-device",
+    ])
+    module.main()
+    selected = (state / "selected").resolve(strict=True)
+    assert {p.name for p in selected.iterdir()} == {"complete.json", "runtime.json"}
+    assert not (state / "archives" / bundle["fixtures"]["sha256"]).exists()
+    for asset in bundle["models"].values():
+        (bundle_path.parent / asset["source"]).unlink()
+    assert module.check_installation(*args) == selected
+    module.main()
+    assert (state / "selected").resolve(strict=True) == selected
+    assert module.cached_installation(state, module.load_release_bundle(bundle_path), args[3], DEVICE) is None
+    with pytest.raises(module.PreparationFailed, match="native_activation_inputs_invalid"):
+        module.check_prepared_installation(*args)
+    damaged = state / "models" / bundle["models"][NAMES[0]]["tree_sha256"] / "weights"
+    damaged.write_bytes(b"damaged")
+    with pytest.raises(module.PreparationFailed, match="native_model_integrity_failed"):
+        module.check_installation(*args)
+    module.main()
+    assert damaged.read_bytes() == NAMES[0].encode()
+    assert module.check_installation(*args) == (state / "selected").resolve()
+
+
+@pytest.mark.usefixtures("native_pid1")
+def test_file_only_prepare_retains_existing_qualified_standalone_selection(tmp_path, release, monkeypatch):
+    from ocr_contract.activation import MaintenanceIntent
+    from ocr_service import initialize as module
+
+    path, bundle, config = release
+    for model in bundle["models"].values():
+        model["source"] = Path(model["source"]).name
+    path.write_text(json.dumps(bundle))
+    monkeypatch.setenv("OCR_INSTALLATION_LOCK_PATH", str(tmp_path / "installation.lock"))
+    external_qualifier(monkeypatch)
+    qualified = initialize_release(tmp_path, release)
+    args = (path, tmp_path / "state", config, "sha256:" + sha(config.read_bytes()))
+    monkeypatch.setattr(module, "verify_package_pins", lambda bundle: None)
+    monkeypatch.setattr(module, "provision_models", lambda *_args, **_kwargs: pytest.fail("reinstalled"))
+    assert module.prepare_installation(
+        *args, maintenance_intent=MaintenanceIntent.SEPARATE_OCR_DEVICE, handoff_lock=None,
+        standalone=True,
+    ) == qualified
+    assert module.check_installation(*args) == qualified
+    completion = qualified / "complete.json"
+    completion.write_text(json.dumps({**json.loads(completion.read_bytes()), "schema_version": 99}))
+    with pytest.raises(ValueError, match="Unknown installed"):
+        module.check_installation(*args)
+
+
+@pytest.mark.parametrize("operation", ["check", "prepare", "maintain", "sources", "invalid_option"])
+def test_initializer_cli_hides_private_input_values(tmp_path, release, monkeypatch, operation):
+    path, bundle, config = release
+    canary = "private-initializer-canary"
+    bundle["models"][NAMES[0]]["size_bytes"] = "https://user:" + canary + "@example.invalid/model"
+    path.write_text(json.dumps(bundle))
+    monkeypatch.setenv("OCR_INSTALLATION_LOCK_PATH", str(tmp_path / "installation.lock"))
+    monkeypatch.setenv("OCR_SOURCE_LOCK_PATH", str(tmp_path / canary))
+    monkeypatch.setenv("PYTHONPATH", str(Path(__file__).parents[1] / "paddleocr-service"), prepend=os.pathsep)
+    args = [operation, "--bundle", str(path), "--image-config", str(config),
+            "--image-id", "sha256:" + sha(config.read_bytes())]
+    if operation in {"prepare", "maintain"}:
+        args.extend(["--maintenance-intent", "separate-ocr-device"])
+    if operation == "sources":
+        args = ["--print-source-identities"]
+    if operation == "invalid_option":
+        args = ["--maintenance-intent", canary]
+    result = subprocess.run([sys.executable, "-m", "ocr_service.initialize", *args],
+                            capture_output=True, check=False, text=True)
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert canary not in result.stderr
+    assert str(tmp_path) not in result.stderr
+    assert "Traceback" not in result.stderr
+
+
 def test_maintenance_intent_bound_to_invocation(tmp_path, release, monkeypatch):
     from ocr_service.initialize import initialize
 
@@ -425,6 +522,7 @@ def test_metadata_probe_uses_driver_only(tmp_path, monkeypatch, accelerator):
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", no_native_import)
+    monkeypatch.setattr(Path, "is_char_device", lambda path: False)
     expected = {**DEVICE, "accelerator": accelerator}
     if accelerator == "rocm":
         expected = {key: value for key, value in expected.items() if key != "compute_capability"}
@@ -475,12 +573,38 @@ def test_metadata_probe_uses_driver_only(tmp_path, monkeypatch, accelerator):
     assert device_inventory.inspect_device_identity(accelerator, 0) == expected
 
 
+def test_wsl_probe_binds_driver_metadata_and_host_shim(monkeypatch):
+    from ocr_service import device_inventory
+
+    metadata = {key: value for key, value in DEVICE.items() if key != "compute_capability"}
+    metadata.update(accelerator="rocm", gfx_target="gfx1101", uuid=b"0123456789abcdef".hex())
+    probe = Mock(return_value=SimpleNamespace(stdout=json.dumps(metadata)))
+    monkeypatch.setattr(device_inventory.subprocess, "run", probe)
+    monkeypatch.setattr(Path, "is_char_device", lambda path: str(path) == "/dev/dxg")
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "2")
+    digest = Mock(return_value="a" * 64)
+    monkeypatch.setattr(device_inventory, "file_digest", digest)
+    assert device_inventory.inspect_device_identity("rocm", 0) == {
+        **metadata, "transport": "wsl-dxg", "dxcore_sha256": "a" * 64,
+    }
+    assert probe.call_args.args[0] == ["/opt/ocr/bin/hip-device-info", "0", "--wsl"]
+    digest.assert_called_once_with(Path("/usr/lib/libdxcore.so"))
+    for selected, index in [("", 0), ("1,2", 0), ("0", 1), ("1025", 0)]:
+        monkeypatch.setenv("HIP_VISIBLE_DEVICES", selected)
+        with pytest.raises(device_inventory.DeviceIdentityUnavailable):
+            device_inventory.inspect_device_identity("rocm", index)
+    assert probe.call_count == 1
+
+
 @pytest.mark.parametrize(
     "uuid", [b"XX" + b"\0" * 14, b"0" * 16], ids=["gpu-xx-sentinel", "zero-id"]
 )
-def test_rocm_metadata_rejects_unavailable_uuid(monkeypatch, uuid):
+@pytest.mark.parametrize("wsl", [False, True])
+def test_rocm_metadata_rejects_unavailable_uuid(monkeypatch, uuid, wsl):
     from ocr_service import device_inventory
 
+    monkeypatch.setattr(Path, "is_char_device", lambda path: wsl)
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0")
     metadata = {key: value for key, value in DEVICE.items() if key != "compute_capability"}
     metadata.update(accelerator="rocm", gfx_target="gfx1030", uuid=uuid.hex())
     monkeypatch.setattr(
@@ -640,8 +764,9 @@ def test_maintenance_holds_both_locks_through_drain_and_bound_publication(
         )
 
 
+@pytest.mark.parametrize("operation", ["maintain", "prepare"])
 def test_paired_maintenance_requires_explicit_original_handoff_path(
-    tmp_path, release, monkeypatch, capsys
+    tmp_path, release, monkeypatch, capsys, operation
 ):
     from ocr_service import initialize as module
 
@@ -652,7 +777,7 @@ def test_paired_maintenance_requires_explicit_original_handoff_path(
         "argv",
         [
             "ocr-init",
-            "maintain",
+            operation,
             "--bundle",
             str(bundle),
             "--image-config",

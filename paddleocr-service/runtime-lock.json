@@ -6,9 +6,9 @@
   "flash_attention": false,
   "hipblaslt_empty_target_fallback": "gfx1100",
   "input_sha256": {
-    "build/hip-device-info.cpp": "a56d4111b7117bc540f7d88fefc2455db112bb8725dd0d6ef0d0825d851f1204",
+    "build/hip-device-info.cpp": "9a7afcb81666d1515d0f4da6a85f6251c0f2c08fd3991c16cee10841ceae978a",
     "build/hip-rdna2-v1.patch": "017f955eb5a9d2adec5e416ab0dc17b58a9fd128e4665da28af2e730eba6306a",
-    "ocr_contract/__init__.py": "45fa19d68ff3ff9124fe8ef3b9928cf93c2829134fa5f709158ba3361d014f90",
+    "ocr_contract/__init__.py": "d6c8a07a17e325de2f7a5741fec132146501cbd4a1bfab810a3b2c1e752fee16",
     "ocr_contract/activation.py": "e3bbc6b0fc47c244402834db5d84e8bafa8cc49de0e011046c49fe79a2fa24c2",
     "ocr_contract/document_image.py": "7af9acad1c00b5d99ca3c1d83e4cce938ba7374e8f5709112d9cb7e2d86e1deb",
     "ocr_contract/limits.py": "e8a3516793c6ddd3f8af037f96edbdde458377f0ab648cf3a0e0a5cacaa2ffa4",
@@ -38,8 +38,10 @@
     "paddleocr": "b03f46425e8ff4442b268ce449e3eef758146cd4",
     "paddlex": "ffb64904d23708863ff5b8da312a5cbd52a7f462",
     "therock": "b324869fb3116353ac7eec5e6926aa3d452ac987",
-    "therock_rocm_systems_gitlink": "7da43026e4f2ef7600433c38c820732f7a205d22"
+    "therock_rocm_systems_gitlink": "7da43026e4f2ef7600433c38c820732f7a205d22",
+    "win32metadata": "a40ed3186943620f304649a077b78f8271034736"
   },
+  "wkmi_dvc_md5": "53126f6263d5ca1381b84e8a637e6a1e",
   "ubuntu_snapshot": "20261101T000000Z",
   "upstream_optional_target_exclusions": [
     "hipBLASLt",

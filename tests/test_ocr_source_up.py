@@ -52,6 +52,28 @@ def test_rocm_qualification_preserves_selected_render_device(
     }
 
 
+def test_wsl_rocm_binding_uses_only_dxg_and_one_hip_ordinal(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts import ocr_source_up
+
+    monkeypatch.setattr(Path, "is_char_device", lambda path: str(path) == "/dev/dxg")
+    monkeypatch.setattr(Path, "is_file", lambda path: str(path) == "/usr/lib/wsl/lib/libdxcore.so")
+    native = {
+        "devices": [{"source": "/dev/dxg", "target": "/dev/dxg"}],
+        "environment": {"HIP_VISIBLE_DEVICES": "2"},
+    }
+    arguments, environment = ocr_source_up.gpu_args("rocm", native)
+    assert arguments == [
+        "--device", "/dev/dxg:/dev/dxg", "--mount",
+        "type=bind,source=/usr/lib/wsl/lib/libdxcore.so,target=/usr/lib/libdxcore.so,readonly",
+        "--env", "HIP_VISIBLE_DEVICES=2",
+    ]
+    assert environment == {"OCR_ROCM_DEVICE_ID": "2"}
+    for selection in ("1,2", "-1", "all", "1025"):
+        native["environment"] = {"HIP_VISIBLE_DEVICES": selection}
+        with pytest.raises(ValueError, match="one AMD WSL GPU"):
+            ocr_source_up.gpu_args("rocm", native)
+
+
 @pytest.mark.parametrize(
     "renders",
     [
@@ -977,6 +999,38 @@ def test_upgrade_verifies_the_admitted_original_before_reusing_volumes(
     state.update(claim=True, running="old-container")
     with pytest.raises(ValueError, match="compose down"):
         source.deploy(("docker", "compose"), tmp_path, "cuda", None, upgrade=True)
+
+
+@pytest.mark.parametrize(("configured", "expected"), [("", "2"), ("0", "0"), ("1", "1")])
+def test_wsl_upgrade_resolves_explicit_adapter_before_rebinding(
+    configured, expected, tmp_path, managed_release, monkeypatch
+):
+    from scripts import ocr_source_up as source
+
+    release, image_id, _ = managed_release
+    bundle = release / "bundle.json"
+    manifest = json.loads(bundle.read_bytes())
+    manifest["accelerator"] = "rocm"
+    bundle.write_text(json.dumps(manifest))
+    overlay = source.managed_overlay(
+        "rocm", release, image_id, image_id, "saved", {"OCR_ROCM_DEVICE_ID": "2"},
+        source.path_digest(bundle), config_id=image_id,
+    )
+    managed = tmp_path / "compose.local.json"
+    managed.write_text(json.dumps(overlay))
+    source.record_admission(managed)
+    monkeypatch.setattr(source, "has_project_claim", lambda *args: True)
+    monkeypatch.delenv("OCR_ROCM_DEVICE_ID", raising=False)
+
+    def command(*args, capture=False):
+        if args[-2:] == ("config", "--environment"):
+            return f"OCR_ROCM_DEVICE_ID={configured}"
+        assert "ps" in args and os.environ["OCR_ROCM_DEVICE_ID"] == expected
+        return "running"
+
+    monkeypatch.setattr(source, "command", command)
+    with pytest.raises(ValueError, match="compose down"):
+        source.deploy(("docker", "compose"), tmp_path, "rocm", None, upgrade=True)
 
 
 def test_cutover_keeps_admission_if_interrupted_before_or_after_pointer_change(tmp_path):

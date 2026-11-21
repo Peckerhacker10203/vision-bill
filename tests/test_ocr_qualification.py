@@ -426,7 +426,7 @@ def test_qualification_rejects_success_shaped_but_incomplete_fresh_replay(tmp_pa
     module = qualification()
     assert hasattr(module, "validate_replay"), "replay evidence validator missing"
     with pytest.raises(ValueError):
-        module.validate_replay({"passed": True, "static_audits": [{"model_name": "one"}]})
+        module.validate_replay({"passed": True, "static_audits": [{"model_name": "one"}]}, {})
 
 
 def test_native_compute_probe_requires_device_fp32_and_checked_math():
@@ -524,6 +524,7 @@ def test_fresh_replay_checks_native_formula_and_reports_actual_timings(
         qualify=lambda image: None,
         predict=lambda *a, **k: SimpleNamespace(blocks=[SimpleNamespace(label=native_label)]),
         evidence=[],
+        text_dtype="float32",
         profile_id="profile",
         runtime_fingerprint="runtime",
         pipeline=SimpleNamespace(vl_rec_model=SimpleNamespace(infer=object())),
@@ -588,7 +589,7 @@ def successful_qualification(tmp_path, monkeypatch):
             assert len(payload["inventory"]) == 3
             return {
                 "static_artifacts": {"collected": "coverage"},
-                "device": {"name": "actual-device"},
+                "device": {"name": "actual-device", "component_precision": {key: "float32" for key in ("text", "mlp_AR", "visual", "static")}},
             }
         assert runtime.qualification_manifest.exists()
         return {
@@ -600,7 +601,7 @@ def successful_qualification(tmp_path, monkeypatch):
             "cold_smoke_seconds": 1,
             "first_case_seconds": 1,
             "warm_case_seconds": 1,
-            "dynamic_fp32_parameters": 3,
+            "dynamic_components": {key: {"parameters": 1, "dtype": "float32"} for key in ("text", "mlp_AR", "visual")},
             "static_audits": [
                 {"model_name": name, "input_count": 1, "output_count": 1, "floating_parameters": 1}
                 for name in MODEL_NAMES[:3]
@@ -619,7 +620,7 @@ def test_coordinator_inspects_then_collects_then_seals_then_fresh_replays(
         runtime, tmp_path / "cases.toml", tmp_path / "qualification.json"
     )
     assert report.qualified and len(report.cases) == 10
-    assert json.loads(runtime.qualification_manifest.read_text())["qualified_target"] == {"name":"actual-device"}
+    assert json.loads(runtime.qualification_manifest.read_text())["qualified_target"]["name"] == "actual-device"
     assert stages == ["inspect"] * 3 + ["collect"] + ["replay"] * 10
     assert (tmp_path / "qualification.runtime.json").exists()
 

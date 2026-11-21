@@ -148,8 +148,7 @@ using the same coordination path and dedicated endpoint as the app. It treats em
 transcription as failure even with HTTP200. Current native v2 JSON includes text,
 working-coordinate blocks, profile/runtime identity and actual working PNG payload;
 raw output can contain pixels and receipt text. `--quiet` suppresses raw console
-output, but `--output` is still private. Rebuild the selected image after native
-source changes and rerun qualification: a checkout does not update a running image.
+output, but `--output` is still private. Use the [source upgrade procedure](../paddleocr-service/README.md#dedicated-ocr-from-source) after changing native source. Maintainers qualify the exact image and device before publication.
 No production CPU fallback or `--timeout 900` smoke recipe is supported.
 
 ## Thumbnails and optional stitcher

@@ -34,7 +34,6 @@ from .bootstrap import (
     seal_dependencies,
 )
 from .device_inventory import execution_target, inspect_device_identity
-from .fp32 import audit_dynamic_model, floating_dtype, require_gpu
 from .gpu_memory import GPU_OOM_CODE, GPU_OOM_EXIT, GpuOutOfMemory, is_gpu_out_of_memory
 from .images import normalize_source
 from .pipeline import PipelineAdapter, build_pipeline, construct_native, tree_identity
@@ -48,6 +47,7 @@ from .profile import (
     verify_dependencies,
 )
 from .supervision import qualification_is_supervised
+from .vlm_precision import audit_dynamic_model, floating_dtype, require_gpu
 
 PROFILE = Path(__file__).resolve().parents[1] / "profile.json"
 KINDS = {"upright", "rotated", "warped", "table", "formula"}
@@ -350,7 +350,7 @@ def collect(payload: dict[str, Any]) -> dict[str, Any]:
                 )
             if not has_required_labels(case, response):
                 raise ValueError("Required recognized structure absent")
-            audit_dynamic_model(native.vl_rec_model.infer, runtime.gpu_index)
+            audit_dynamic_model(native.vl_rec_model.infer, runtime.gpu_index, device["component_precision"]["text"])
             for index, collector in enumerate(collectors):
                 try:
                     forwards[index].append(collector.finish())
@@ -411,21 +411,26 @@ def replay(payload: dict[str, Any]) -> dict[str, Any]:
         "warm_case_seconds": timings[1],
         "passed": True,
         "static_audits": adapter.evidence,
-        "dynamic_fp32_parameters": audit_dynamic_model(
-            adapter.pipeline.vl_rec_model.infer, runtime.gpu_index
+        "dynamic_components": audit_dynamic_model(
+            adapter.pipeline.vl_rec_model.infer, runtime.gpu_index, adapter.text_dtype
         ),
         "profile_id": adapter.profile_id,
         "runtime_fingerprint": adapter.runtime_fingerprint,
     }
 
 
-def validate_replay(result: dict[str, Any]) -> None:
+def validate_replay(result: dict[str, Any], precision: dict[str, str]) -> None:
     audits = result.get("static_audits", [])
+    components = result.get("dynamic_components", {})
     if (
         result.get("passed") is not True
         or len(audits) != 3
         or {row.get("model_name") for row in audits} != set(MODEL_NAMES[:3])
-        or result.get("dynamic_fp32_parameters", 0) <= 0
+        or set(components) != {"visual", "mlp_AR", "text"}
+        or any(
+            record.get("dtype") != precision.get(key) or record.get("parameters", 0) <= 0
+            for key, record in components.items()
+        )
     ):
         raise ValueError("Native replay evidence is incomplete")
     for row in audits:
@@ -500,7 +505,7 @@ def qualify_runtime(runtime: RuntimeSettings, cases: Path, output: Path) -> Qual
                         {**base, "smoke": str(smoke.path), "case": case.model_dump(mode="json")},
                         directory,
                     )
-                    validate_replay(result)
+                    validate_replay(result, report.device["component_precision"])
                     if report.profile_id is not None and (
                         result["profile_id"] != report.profile_id
                         or result["runtime_fingerprint"] != report.runtime_fingerprint

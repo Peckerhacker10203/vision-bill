@@ -14,6 +14,8 @@ OCR_HTTP_ERRORS = {
 }
 OCR_RESULT_STATUS = {code: status for status, codes in OCR_HTTP_ERRORS.items() for code in codes}
 OCR_RESULT_CODES = frozenset(OCR_RESULT_STATUS)
+# Startup and cancellation may also be reported while admission is waiting.
+OCR_READINESS_CODES = OCR_RESULT_CODES | {"ocr_starting", "ocr_cancelled"}
 
 
 class OcrWorkerFailure(RuntimeError):

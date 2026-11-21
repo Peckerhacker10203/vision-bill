@@ -68,7 +68,7 @@ if bundle.accelerator == 'rocm':
     kernels = json.loads(Path('/opt/ocr/build-evidence/kernels.json').read_bytes())
     targets = validate_profile(kernels['target_profile'])['candidate_targets']
     if device['gfx_target'] not in targets:
-        raise ValueError('Render device GFX target missing from OCR_AMDGPU_TARGETS')
+        raise ValueError('Selected GPU GFX target missing from OCR_AMDGPU_TARGETS')
 print(json.dumps(bundle.model_dump(mode='json'), sort_keys=True, indent=2))
 """
 
@@ -396,9 +396,7 @@ def need_host(accelerator: str, *, build: bool, automatic_inputs: bool) -> None:
     if sys.version_info < (3, 12):
         raise ValueError("Python 3.12 or later is required on the host")
     if platform.system() != "Linux" or platform.machine() != "x86_64":
-        raise ValueError("Run this command on Linux x86_64 or in Windows WSL 2 x86_64 for CUDA")
-    if accelerator == "rocm" and "microsoft" in platform.release().lower():
-        raise ValueError("The ROCm source overlay requires native Linux")
+        raise ValueError("Run this command on Linux x86_64 or in Windows WSL 2 x86_64")
     tools = ["docker"]
     if build and accelerator == "cuda":
         tools.append("make")
@@ -409,6 +407,19 @@ def need_host(accelerator: str, *, build: bool, automatic_inputs: bool) -> None:
             raise ValueError(f"Required executable is missing: {tool}")
     if not (ROOT / ".env").is_file():
         raise ValueError("Set up the stable configuration file .env before running this command")
+    # Freeze the effective daemon choice before querying or modifying it. The CLI
+    # gives an explicit context priority over DOCKER_HOST.
+    endpoint = os.environ.get("DOCKER_HOST")
+    context = os.environ.get("DOCKER_CONTEXT")
+    if context or not endpoint:
+        context = context or command("docker", "context", "show", capture=True).strip()
+        endpoint = command(
+            "docker", "context", "inspect", context, "--format", "{{.Endpoints.docker.Host}}",
+            capture=True,
+        ).strip()
+        os.environ["DOCKER_CONTEXT"] = context
+    if not endpoint or not endpoint.startswith("unix:///"):
+        raise ValueError("Use a local Docker engine with host bind mounts and GPU access")
     engine = command(
         "docker", "info", "--format", "{{.OSType}}/{{.Architecture}}", capture=True
     ).strip()
@@ -417,13 +428,6 @@ def need_host(accelerator: str, *, build: bool, automatic_inputs: bool) -> None:
     command("docker", "compose", "version", capture=True)
     if build:
         command("docker", "buildx", "version", capture=True)
-    context = command(
-        "docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}", capture=True
-    ).strip()
-    if not context.startswith("unix://") or not (
-        os.environ.get("DOCKER_HOST") or "unix://"
-    ).startswith("unix://"):
-        raise ValueError("Use a local Docker engine with host bind mounts and GPU access")
 
 
 def bootstrap(
@@ -446,7 +450,7 @@ def bootstrap(
             or details.st_mode & 0o077
         ):
             raise ValueError("Source deployment state must be a private operator-owned directory")
-    compose = (
+    compose: tuple[str, ...] = (
         "docker",
         "compose",
         "--profile",
@@ -456,6 +460,8 @@ def bootstrap(
         "-f",
         f"docker-compose.{accelerator}.yml",
     )
+    if accelerator == "rocm" and "microsoft" in platform.release().lower():
+        compose += ("-f", "docker-compose.rocm-wsl.yml")
     lock = deployment / "deploy.lock"
     with lock.open("a") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -480,6 +486,21 @@ def gpu_args(accelerator: str, native: dict[str, Any]) -> tuple[list[str], dict[
 
     entries = native.get("devices", [])
     devices = {entry["target"]: entry["source"] for entry in entries}
+    if devices.get("/dev/dxg") == "/dev/dxg":
+        if len(entries) != 1 or not Path("/dev/dxg").is_char_device():
+            raise ValueError("WSL 2 ROCm requires the /dev/dxg character device")
+        index = native["environment"]["HIP_VISIBLE_DEVICES"]
+        if not re.fullmatch(r"(?:0|[1-9][0-9]{0,3})", index) or int(index) > 1024:
+            raise ValueError("Select one AMD WSL GPU by numeric index in OCR_ROCM_DEVICE_ID")
+        library = "/usr/lib/wsl/lib/libdxcore.so"
+        if not Path(library).is_file():
+            raise ValueError(f"Missing Windows WSL driver library: {library}")
+        return [
+            "--device", "/dev/dxg:/dev/dxg",
+            "--mount", f"type=bind,source={library},target=/usr/lib/libdxcore.so,readonly",
+            "--env", f"HIP_VISIBLE_DEVICES={index}",
+        ], {"OCR_ROCM_DEVICE_ID": index}
+
     kfd = "/dev/kfd"
     render = next((target for target in devices if target != kfd), "")
     if (
@@ -965,7 +986,16 @@ def deploy(
             raise ValueError("Upgrade requires the original admitted Compose project")
         previous_digest = path_digest(managed)
         compose = (*compose, "--project-name", previous["project"])
-        os.environ.update(previous["device_environment"])
+        device_settings = dict(previous["device_environment"])
+        if "OCR_ROCM_DEVICE_ID" in device_settings:
+            # Restart always reuses the admitted ordinal. During an explicit
+            # upgrade a newly configured ordinal goes through the bind again.
+            environment = command(*compose, "config", "--environment", capture=True)
+            for line in environment.splitlines():
+                if line.startswith("OCR_ROCM_DEVICE_ID=") and line.partition("=")[2]:
+                    device_settings["OCR_ROCM_DEVICE_ID"] = line.partition("=")[2]
+                    break
+        os.environ.update(device_settings)
         if command(*compose, "ps", "--all", "--quiet", "vision_bill", NATIVE, capture=True).strip():
             raise ValueError(
                 "Drain jobs, then run docker compose down with the original overlays and keep all volumes"
@@ -996,7 +1026,9 @@ def deploy(
     os.environ.update(device_environment)
     if accelerator == "rocm" and reuse_native_image is None:
         configured_targets = candidate["build"]["args"]["AMDGPU_TARGETS"]
-        if not configured_targets:
+        # WSL has no KFD topology. An empty argument uses the image's Radeon
+        # candidate profile; the metadata bind checks the actual selected GFX.
+        if not configured_targets and "OCR_RENDER_NODE" in device_environment:
             configured_targets = rocm_render_target(Path(device_environment["OCR_RENDER_NODE"]))
         os.environ["OCR_AMDGPU_TARGETS"] = configured_targets
     native_image = reuse_native_image or candidate["image"]

@@ -194,7 +194,7 @@ class ImageService:
         Returns ``(original_path, thumbnail_path)``; either is ``None`` when absent.
         """
         if not tmp_path.exists():
-            logger.warning("Tmp image %s does not exist - nothing to store", tmp_path)
+            logger.warning("Temporary image missing during storage")
             return (None, None)
 
         destination = self._save_dir / f"receipt_{receipt_id}{tmp_path.suffix}"
@@ -222,14 +222,14 @@ class ImageService:
         if not image_path:
             return False
         if not image_path.exists():
-            logger.warning("Image file %s does not exist - nothing to delete", image_path)
+            logger.warning("Image missing during deletion")
             return False
         image_path.unlink()
-        logger.info("Deleted image file %s", image_path)
+        logger.info("Deleted image file")
         thumb = self._thumb_for(image_path)
         if thumb.exists():
             thumb.unlink()
-            logger.info("Deleted thumbnail %s", thumb)
+            logger.debug("Deleted thumbnail")
         return True
 
     @staticmethod
@@ -256,7 +256,7 @@ class ImageService:
             img.save(dest, format="WEBP", quality=self._quality)
             return dest
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Thumbnail generation failed for %s: %s", src_path, exc)
+            logger.warning("Thumbnail generation failed error_type=%s", type(exc).__name__)
             return None
 
     def _working_path(self, image_id: UUID, view_id: UUID) -> Path:

@@ -23,6 +23,7 @@ import {
   legacyCudaChannel,
   validateCudaLock,
   renderBundle,
+  wslDriverMount,
   writeBundle,
   fileIdentity,
 } from "./distribution.mjs";
@@ -102,6 +103,21 @@ export function cudaQualificationGpuArgs(deviceId = "0") {
   );
   return ["--gpus", `device=${deviceId}`];
 }
+export function rocmQualificationGpuArgs(rocm) {
+  if (Object.hasOwn(rocm, "wsl_device_id")) {
+    return [
+      "--device", "/dev/dxg:/dev/dxg",
+      "--mount", `type=bind,src=${wslDriverMount.source},dst=${wslDriverMount.target},readonly`,
+      "--env", `HIP_VISIBLE_DEVICES=${rocm.wsl_device_id}`,
+    ];
+  }
+  return [
+    "--device", "/dev/kfd:/dev/kfd",
+    "--device", rocm.render_node,
+    ...(rocm.render_gid === undefined ? [] : ["--group-add", String(rocm.render_gid)]),
+    ...(rocm.video_gid === undefined ? [] : ["--group-add", String(rocm.video_gid)]),
+  ];
+}
 export function validateReleaseInputs(plan, request) {
   check(variants.includes(request.variant), "Unknown distribution variant");
   const app =
@@ -143,7 +159,7 @@ export function validateReleaseInputs(plan, request) {
     check(
       plan.rocm &&
         Object.keys(plan.rocm).every((key) =>
-          ["targets", "render_node", "render_gid", "video_gid"].includes(key),
+          ["targets", "render_node", "render_gid", "video_gid", "wsl_device_id"].includes(key),
         ),
       "Explicit AMD build/device selection required",
     );
@@ -154,13 +170,22 @@ export function validateReleaseInputs(plan, request) {
         new Set(plan.rocm.targets).size === plan.rocm.targets.length,
       "Actual AMD target list required",
     );
-    check(
-      /^\/dev\/dri\/renderD[0-9]+$/.test(plan.rocm.render_node) &&
-        [plan.rocm.render_gid, plan.rocm.video_gid]
-          .filter((id) => id !== undefined)
-          .every((id) => Number.isSafeInteger(id) && id >= 0),
-      "Selected AMD render node/groups required",
-    );
+    if (Object.hasOwn(plan.rocm, "wsl_device_id")) {
+      check(
+        Number.isSafeInteger(plan.rocm.wsl_device_id) &&
+          plan.rocm.wsl_device_id >= 0 && plan.rocm.wsl_device_id <= 1024 &&
+          !["render_node", "render_gid", "video_gid"].some((key) => Object.hasOwn(plan.rocm, key)),
+        "Select one WSL AMD GPU by numeric index without Linux render devices",
+      );
+    } else {
+      check(
+        /^\/dev\/dri\/renderD[0-9]+$/.test(plan.rocm.render_node) &&
+          [plan.rocm.render_gid, plan.rocm.video_gid]
+            .filter((id) => id !== undefined)
+            .every((id) => Number.isSafeInteger(id) && id >= 0),
+        "Selected AMD render node/groups required",
+      );
+    }
   }
   return plan;
 }
@@ -672,18 +697,7 @@ function qualify(request, output, env) {
     const gpu =
       accelerator === "cuda"
         ? cudaQualificationGpuArgs(plan.cuda_device_id)
-        : [
-            "--device",
-            "/dev/kfd:/dev/kfd",
-            "--device",
-            plan.rocm.render_node,
-            ...(plan.rocm.render_gid === undefined
-              ? []
-              : ["--group-add", String(plan.rocm.render_gid)]),
-            ...(plan.rocm.video_gid === undefined
-              ? []
-              : ["--group-add", String(plan.rocm.video_gid)]),
-          ];
+        : rocmQualificationGpuArgs(plan.rocm);
     let primary;
     try {
       withOwnedVolumes(
@@ -954,7 +968,7 @@ async function publish(request, output, env) {
         const notes = join(output, "release-notes.txt");
         writeFileSync(
           notes,
-          `Prebuilt ${request.variant} installation for ${request.repository}@${request.sha}.\nQualification applies only to the device recorded in release metadata. Initial installation independently verifies and qualifies its actual device.\n`,
+          `Prebuilt ${request.variant} installation for ${request.repository}@${request.sha}.\n${request.variant === "app" ? "This app connects to your configured LLM endpoint." : "Physical qualification applies to the device recorded in this release. Installation verifies the selected GPU and model files. Running hardware qualification locally is optional."}\n`,
         );
         run(
           "gh",

@@ -129,16 +129,18 @@ verified model downloads and a versioned prepared installation. Ordinary
 installation, restart and worker creation must make zero model predictions.
 The explicit release qualifier owns all fixture inference. Default OCR Dockerfile
 requires a selected accelerator.
-Linux x86_64 candidates target CUDA and native ROCm, including intended consumer
-RX6000+/RDNA2. RDNA2 default gfx1030/1031/1032/1034 is distinct from a selected
-build-only candidate profile (`OCR_AMDGPU_TARGETS`) and actual per-board qualification.
+Linux x86_64 containers target NVIDIA Turing/RTX 20+ and AMD RDNA2/RX 6000+
+on native Linux and WSL 2. AMD driver support is board- and host-specific. The broad default profile includes
+RDNA2, RDNA3 and RDNA4 discrete Radeon build targets. Record a selected
+build profile (`OCR_AMDGPU_TARGETS`) separately from physical qualification.
 Never claim universal AMD support or GPU qualification from CPU tests.
 
-Fixed PaddleOCR-VL-1.6/v1.6, PP-DocLayoutV3, native Paddle FP32, batch 1 everywhere,
+Fixed PaddleOCR-VL-1.6/v1.6, PP-DocLayoutV3, native Paddle, batch 1 everywhere,
 queues/chart/seal off, orientation/unwarp on, min 112896/max 2000000 **per VLM region**
 including tables, OCR 4096. Official upstream grid alignment is not a whole-photo
-2MP resize. No platform-dependent precision/backend/pixel/token substitutions or
-extra sampling parameters. EXIF applies independently. Formatter output defaults
+2MP resize. Only the VLM text decoder uses BF16 on selected CUDA SM80+ devices.
+Turing, ROCm, static models and visual/projector layers use FP32. Keep the
+backend, pixel and token policy fixed. EXIF applies independently. Formatter output defaults
 8192; discovered context capacity remains separate and may be unknown.
 
 `/health` is liveness. `/ready` is worker readiness and `/info` carries the
@@ -213,8 +215,8 @@ and copies static assets. Do not change locks/dependencies as a prose edit.
 
 Prepared bundles are the end-user path; source Compose is advanced development.
 See [distribution maintenance](distribution/README.md) for five external-LLM
-variants, private app bootstrap, paired file-only preparation, standalone cache
-checks, explicit maintenance,
+variants, private app bootstrap, paired and standalone file-only preparation, passive
+standalone checks of prepared or qualified state, optional explicit physical qualification,
 retained PID1 crash fences and exact-source artifact gates. Native source contexts
 are independent of the app. The [native guide](paddleocr-service/README.md#local-qualification-inputs)
 documents guarded source qualification.

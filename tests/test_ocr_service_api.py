@@ -1,9 +1,11 @@
+import asyncio
 import hashlib
 import threading
 import time
 from io import BytesIO
 from uuid import uuid4
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -29,6 +31,83 @@ def test_feature_requires_lifecycle_api():
     import importlib.util
 
     assert importlib.util.find_spec("ocr_service.api") is not None, "lifecycle API missing"
+
+
+@pytest.mark.parametrize("operation", ["load", "page"])
+@pytest.mark.parametrize("interrupt", ["disconnect", "cancel", "deadline"])
+@pytest.mark.asyncio
+async def test_interrupted_managed_http_operation_reaps_before_cleanup(operation, interrupt):
+    from ocr_service.api import create_app
+    from ocr_service.worker import OcrWorkerManager
+
+    context = FakeContext("hang", init_blocked=operation == "load")
+    worker = OcrWorkerManager(mp_context=context, startup_timeout=0.5)
+    app = create_app(mode="managed", worker_factory=lambda: worker)
+    disconnected = asyncio.Event()
+
+    async def connection(scope, receive, send):
+        body_finished = False
+
+        async def receive_after_upload():
+            nonlocal body_finished
+            if body_finished:
+                await disconnected.wait()
+                return {"type": "http.disconnect"}
+            message = await receive()
+            if message["type"] == "http.request" and not message.get("more_body"):
+                # The next read follows multipart parsing; disconnect independently
+                # of the response completing, as a real network connection can.
+                body_finished = True
+            return message
+
+        await app(scope, receive_after_upload, send)
+
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=connection), base_url="http://ocr"
+        ) as client,
+    ):
+        owner = {"owner_token": "1:managed"}
+        async with asyncio.timeout(2):
+            while (await client.get("/ready")).json().get("reason_code") == "ocr_starting":
+                await asyncio.sleep(0)
+            assert (await client.post("/lifecycle/claim", json=owner)).status_code == 200
+            timeout_ms = 150 if interrupt == "deadline" else 4000
+            if operation == "load":
+                task = asyncio.create_task(client.post(
+                    "/lifecycle/load", json=owner | {"timeout_ms": timeout_ms},
+                ))
+                assert await asyncio.to_thread(context.started.wait, 1)
+            else:
+                assert (await client.post("/lifecycle/load", json=owner)).status_code == 200
+                raw = png()
+                task = asyncio.create_task(client.post(
+                    "/ocr", files={"image": ("receipt.png", raw, "image/png")},
+                    data=fields(raw) | owner | {"timeout_ms": str(timeout_ms)},
+                ))
+                assert await asyncio.to_thread(context.entered.wait, 1)
+            if interrupt == "disconnect":
+                disconnected.set()
+                reply = await task
+                assert (reply.status_code, reply.json()["detail"]) == (499, "ocr_cancelled")
+            elif interrupt == "deadline":
+                reply = await task
+                assert (reply.status_code, reply.json()["detail"]) == (504, "ocr_deadline_exceeded")
+            else:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        assert worker.readiness().reason_code == (
+            "ocr_deadline_exceeded" if interrupt == "deadline" else "ocr_cancelled"
+        )
+        assert worker.readiness().can_claim_after_failed_load
+        assert len(context.processes) == 1
+        assert not context.processes[0].is_alive()
+        if operation == "page":
+            assert not context.requests[0].original_path.exists()
+        else:
+            assert not context.requests
 
 
 def test_park_fences_delayed_load_http_until_new_claim_without_starting_child():
@@ -171,6 +250,29 @@ def test_timeout_terminates_before_http_removes_input():
         assert result.status_code == 504
         assert result.json()["detail"] == "ocr_deadline_exceeded"
         assert not context.requests[0].original_path.exists()
+
+
+def test_response_encoding_obeys_deadline_without_reaping_a_finished_page(monkeypatch):
+    from types import SimpleNamespace
+
+    from ocr_service import api
+
+    worker = manager(FakeContext())
+    offset = 0
+    validate = api.validate_result
+
+    def validate_after_budget(result):
+        nonlocal offset
+        validate(result)
+        offset = 30
+
+    monkeypatch.setattr(api, "validate_result", validate_after_budget)
+    monkeypatch.setattr(api, "time", SimpleNamespace(monotonic=lambda: time.monotonic() + offset))
+    with TestClient(api.create_app(worker_factory=lambda: worker)) as client:
+        raw = png()
+        response = client.post("/ocr", files={"image": ("x.png", raw, "image/png")}, data=fields(raw))
+        assert (response.status_code, response.json()["detail"]) == (504, "ocr_deadline_exceeded")
+        assert worker.readiness().ready
 
 
 def test_shutdown_does_not_block_event_loop():
@@ -375,7 +477,7 @@ def test_original_ingress_preserves_raw_identity_and_real_normalization(source_f
         def readiness(self):
             return WorkerReadiness(ready=True, generation=1)
 
-        def infer(self, request, *, deadline_monotonic, owner=None):
+        def infer(self, request, *, deadline_monotonic, owner=None, cancel_event=None):
             seen.append(request.original_path.read_bytes())
             with normalize_source(request.original_path, request.source_sha256) as normalized:
                 derived = normalized.path.read_bytes()

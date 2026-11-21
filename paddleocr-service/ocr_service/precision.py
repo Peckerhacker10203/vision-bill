@@ -11,8 +11,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .fp32 import floating_dtype
 from .profile import content_identity, file_digest
+from .vlm_precision import floating_dtype
 
 # Paddle 3.3.1 on Linux x86_64 emits a pointer followed by epoch nanoseconds.
 _PIR_VARIABLE = re.compile(r"(0x[0-9a-f]{1,16}[1-9][0-9]{18})_inner_var_(0|[1-9][0-9]*)")

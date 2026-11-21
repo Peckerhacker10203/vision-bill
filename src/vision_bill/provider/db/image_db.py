@@ -140,7 +140,7 @@ class ImageDB:
         model_id: str | None = None,
     ) -> ImageRow:
         """Insert a new images row (default status ``pending``) and return it."""
-        logger.info("Storing image row for %s (status=%s)", image_path, status)
+        logger.info("Storing image row (status=%s)", status)
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 INSERT_IMAGE_SQL,
@@ -223,7 +223,7 @@ class ImageDB:
 
     async def mark_failed(self, image_id: UUID, error: str) -> None:
         """Mark an image failed, recording the error for the next retry."""
-        logger.warning("Marking image %s failed: %s", image_id, error)
+        logger.warning("Marking image %s failed", image_id)
         async with self.pool.acquire() as conn:
             await conn.execute(MARK_FAILED_SQL, image_id, error)
 

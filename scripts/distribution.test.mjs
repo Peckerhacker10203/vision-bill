@@ -330,6 +330,11 @@ test("bundles are deterministic, isolated, immutable and contain only prebuilt i
       assert.equal(compose.services.app, undefined);
       assert.equal(compose.services.ollama, undefined);
       assert.equal(compose.services["ocr-init"].command[0], "check");
+      const prepare = compose.services["ocr-prepare"];
+      assert.deepEqual(prepare?.profiles, ["ocr-prepare"]);
+      assert.deepEqual(prepare.command, ["prepare", ...compose.services["ocr-init"].command.slice(1)]);
+      assert.deepEqual(prepare.volumes, compose.services["ocr-init"].volumes);
+      assert.deepEqual(prepare.environment, compose.services["ocr-init"].environment);
       const maintenance = compose.services["ocr-maintenance"];
       assert.deepEqual(maintenance.profiles, ["ocr-maintenance"]);
       assert.equal(maintenance.depends_on, undefined);
@@ -466,6 +471,33 @@ test("materialization verifies raw OCI config and qualification before atomic co
     /identity|hash|digest/i,
   );
   assert.ok(!readdirSync(directory).includes("failed"));
+});
+
+test("WSL bundles replace native KFD on every ROCm service and retain all release mounts", () => {
+  const { manifest } = fixture();
+  for (const variant of variants) {
+    const files = renderBundle(manifest, variant).files;
+    if (!variant.endsWith("rocm")) {
+      assert.equal(files["compose.wsl.yaml"], undefined);
+      continue;
+    }
+    const linux = JSON.parse(files["compose.yaml"]);
+    const wsl = JSON.parse(files["compose.wsl.yaml"]);
+    for (const [name, service] of Object.entries(wsl.services)) {
+      const original = linux.services[name];
+      if (!name.startsWith("ocr")) {
+        assert.deepEqual(service, original);
+        continue;
+      }
+      assert.deepEqual(service.devices, ["/dev/dxg:/dev/dxg"]);
+      assert.equal(service.environment.HIP_VISIBLE_DEVICES, "${OCR_ROCM_DEVICE_ID:-0}");
+      assert.deepEqual(service.volumes.slice(0, -1), original.volumes);
+      assert.deepEqual(service.volumes.at(-1), {
+        type: "bind", source: "/usr/lib/wsl/lib/libdxcore.so", target: "/usr/lib/libdxcore.so",
+        read_only: true, bind: { create_host_path: false },
+      });
+    }
+  }
 });
 
 test("only the combined CUDA distribution ships a checksummed Windows launcher", (t) => {
@@ -930,7 +962,7 @@ test("CLI generates every variant and Docker Compose validates effective config 
       [
         "compose",
         "--profile",
-        "ocr-maintenance",
+        "ocr-maintenance", "--profile", "ocr-prepare",
         "-f",
         join(output, "compose.yaml"),
         "config",
@@ -942,9 +974,18 @@ test("CLI generates every variant and Docker Compose validates effective config 
     assert.equal(composed.status, 0, composed.stderr);
     const effective = JSON.parse(composed.stdout);
     if (variant.endsWith("-rocm")) {
-      for (const name of ["ocr", "ocr-init", "ocr-maintenance"]) {
+      const wsl = spawnSync("docker", [
+        "compose", "--profile", "ocr-maintenance", "--profile", "ocr-prepare", "-f",
+        join(output, "compose.wsl.yaml"), "config", "--format", "json",
+      ], { encoding: "utf8", env: { ...env, OCR_ROCM_DEVICE_ID: "2" } });
+      assert.equal(wsl.status, 0, wsl.stderr);
+      const wslServices = JSON.parse(wsl.stdout).services;
+      for (const name of ["ocr", "ocr-init", "ocr-maintenance", "ocr-prepare"]) {
         const service = effective.services[name];
         if (!service) continue;
+        assert.equal(wslServices[name].environment.HIP_VISIBLE_DEVICES, "2");
+        assert.deepEqual(wslServices[name].devices.map(({ source, target }) => [source, target]),
+          [["/dev/dxg", "/dev/dxg"]]);
         assert.deepEqual(
           service.devices.map(({ source, target }) => [source, target]),
           [
@@ -1058,6 +1099,18 @@ test("maintainer request rejects foreign forks, events, mutable source and missi
   assert.throws(() =>
     release.validateReleaseInputs({ ...plan, cuda_channel: "cu129" }, request),
   );
+  const wslPlan = { ...plan, rocm: { targets: ["gfx1201"], wsl_device_id: 1 } };
+  assert.equal(release.validateReleaseInputs(wslPlan, request), wslPlan);
+  assert.deepEqual(release.rocmQualificationGpuArgs(wslPlan.rocm), [
+    "--device", "/dev/dxg:/dev/dxg", "--mount",
+    "type=bind,src=/usr/lib/wsl/lib/libdxcore.so,dst=/usr/lib/libdxcore.so,readonly",
+    "--env", "HIP_VISIBLE_DEVICES=1",
+  ]);
+  for (const selection of [{ render_node: "/dev/dri/renderD128" }, { wsl_device_id: "0,1" }, { wsl_device_id: -1 }]) {
+    assert.throws(() => release.validateReleaseInputs(
+      { ...wslPlan, rocm: { ...wslPlan.rocm, ...selection } }, request,
+    ));
+  }
   const cudaRequest = { ...request, variant: "app-ocr-cuda" };
   const { rocm, ...cudaPlan } = plan;
   assert.equal(release.validateReleaseInputs(cudaPlan, cudaRequest), cudaPlan);

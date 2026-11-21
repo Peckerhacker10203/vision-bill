@@ -28,7 +28,7 @@ from ..model.extraction import (
 )
 from ..model.handoff import HandoffStatus, HandoffWait
 from ..model.ocr import OcrPageMetadata, OcrResponse, SourceRef, WorkingImage, WorkingImageMetadata
-from ..model.ocr_errors import OCR_RESULT_CODES
+from ..model.ocr_errors import OCR_READINESS_CODES, OCR_RESULT_CODES
 from ..model.receipt import Receipt
 from ..model.review import OriginalAvailability
 from ..model.workflow import (
@@ -211,7 +211,7 @@ class SubmissionService:
                 if not (
                     capabilities.ready or (ocr.manage_model_lifecycle and capabilities.can_load)
                 ):
-                    return capabilities.reason_code if capabilities.reason_code in OCR_RESULT_CODES else "ocr_unavailable"
+                    return capabilities.reason_code if capabilities.reason_code in OCR_READINESS_CODES else "ocr_unavailable"
                 capability = "text"
             models = await self.receipts.get_available_models(capability=capability)
             if self._initial_model(models, selected, vision=capability == "vision") is not None:
@@ -225,6 +225,8 @@ class SubmissionService:
     async def process_claim(self, claim: AnalysisClaim) -> CommitResult:
         if claim.purpose != "inference":
             return CommitResult(stale=True)
+        logger.info("analysis_attempt generation=%d attempt=%d budget_s=%d",
+                    claim.generation, claim.attempt_number, self.worker.attempt_timeout_seconds)
         deadline = monotonic() + self.worker.attempt_timeout_seconds
         # Convert once: asyncio loop time need not share monotonic()'s epoch.
         loop = asyncio.get_running_loop()
@@ -623,7 +625,7 @@ class SubmissionService:
             capabilities = await self.receipts.ocr_capabilities(ocr)
             if ocr.enabled and not (capabilities.ready or capabilities.can_load):
                 reason = capabilities.reason_code
-                raise ReadinessHoldError(reason if reason in OCR_RESULT_CODES else "ocr_unavailable")
+                raise ReadinessHoldError(reason if reason in OCR_READINESS_CODES else "ocr_unavailable")
             if (
                 not ocr.enabled
                 or not capabilities.runtime_fingerprint

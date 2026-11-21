@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import logging
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import nullcontext
 from pathlib import Path
@@ -28,6 +29,8 @@ from ..provider.ocr.base import OcrProvider, compact_ocr_text
 from .activation_admission import inference_admission
 from .gpu_handoff import ModelHandoff, admission_deadline, current_llm_owner, current_owner
 from .observation_admission import admit_observations
+
+logger = logging.getLogger(__name__)
 
 UnmanagedClassificationEvent = Callable[[Literal["started", "settled"]], Awaitable[None]]
 
@@ -293,6 +296,9 @@ class ExtractionPipeline:
                     if model is None:
                         return self._failed(result, "formatter_model_unavailable", started)
                     result.provenance.model_digest = model.digest
+                    format_started = perf_counter()
+                    logger.info("ocr_formatter state=start pages=%d budget_ms=%d",
+                                len(result.ocr_pages), int(max(0, deadline - monotonic()) * 1000))
                     formatted = await provider.extract_observations(
                         model_id,
                         ReceiptInput(
@@ -307,6 +313,8 @@ class ExtractionPipeline:
                         tags=tags,
                         deadline=deadline,
                     )
+                    logger.info("ocr_formatter state=finished elapsed_ms=%d",
+                                int((perf_counter() - format_started) * 1000))
                     formatted.telemetry.context_window_tokens = model.context_window_tokens
                     return await self._finish(
                         provider, formatted, result, started, tags, deadline, observation_checkpoint,

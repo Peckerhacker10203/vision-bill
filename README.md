@@ -10,7 +10,8 @@ owner-scoped data and an optional admin-wide view support multiple users.
 ## Install a prepared bundle
 
 The intended end-user installation is a **downloaded, verified prebuilt bundle**,
-then `docker compose up -d` from its extracted directory. Choose app with an external
+started from its extracted directory with the launcher or manual Compose
+commands for your host. Choose app with an external
 LLM, independent CUDA/ROCm OCR, or app with optional Dedicated OCR on CUDA/ROCm
 and an external LLM. Every app variant uses your endpoint. The combined CUDA
 bundle includes a Windows launcher for Docker Desktop. Combined CUDA and ROCm
@@ -19,7 +20,10 @@ and downloads the pinned Paddle models when an admin first turns **Dedicated
 OCR** On or explicitly requests setup in the configuration. The four model
 downloads total about 2.1 GB. The controller verifies their hashes and parks.
 The first receipt loads PaddleOCR-VL 1.6 and runs the first prediction. Setup,
-restart and the Settings connection check do not process sample images.
+restart and the Settings connection check do not process sample images. In an
+independent OCR bundle, run the explicit model preparation command once.
+Subsequent startup checks the cache. Physical qualification is optional on the
+operator’s device.
 [Installation guide](distribution/README.md)
 
 **Status: Unreleased.** Source candidates and release tooling are available.
@@ -113,8 +117,11 @@ Base Compose starts the app and PostgreSQL. To try a local Dedicated OCR
 candidate, prepare the GPU profile once and then enable it from admin Settings.
 The admin settings include the LLM authentication mode and the choice of a shared
 or separate OCR GPU.
-Use CUDA on Linux or WSL 2 with Docker Desktop and NVIDIA, or ROCm on native
-Linux with a selected Radeon. [Source GPU setup](paddleocr-service/README.md#dedicated-ocr-from-source)
+The source profiles target NVIDIA Turing (RTX 20 series) and later with CUDA,
+and AMD RDNA2 (RX 6000 series) and later with ROCm, on native Linux or Windows
+with WSL 2. NVIDIA uses Docker Desktop on Windows. AMD uses the WSL GPU bridge
+and Docker Engine inside Ubuntu. Check the exact Radeon board and driver
+against AMD’s OS-specific compatibility table. [Source GPU setup](paddleocr-service/README.md#dedicated-ocr-from-source) · [Receipt logs in PowerShell or Linux](paddleocr-service/README.md#read-the-logs-for-a-receipt)
 
 `make lint`, `make test`, `make fe-verify`, `make release-test`,
 `make distribution-test`, `make distribution-pid1-test`, `make compose-check`,

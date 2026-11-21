@@ -707,6 +707,7 @@
 			"vision_fallback_unavailable": "Für den ausdrücklich erlaubten Vision-Fallback ist kein geeignetes Modell verfügbar.",
 			"ocr_unavailable": "Es wird gewartet, bis der OCR-Dienst bereit ist.",
 			"ocr_disabled": "OCR ist in der aktuellen Konfiguration deaktiviert.",
+			"ocr_cancelled": "Die OCR-Anfrage wurde abgebrochen. Es wird gewartet, bis der OCR-Dienst wieder bereit ist.",
 			"ocr_starting": "Die OCR-Laufzeit lädt ihr Modell.",
 			"ocr_stopped": "Die OCR-Laufzeit ist gestoppt.",
 			"ocr_not_ready": "Die OCR-Laufzeit ist noch nicht bereit für Aufträge.",

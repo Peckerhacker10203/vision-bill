@@ -6,7 +6,11 @@ import re
 from pathlib import Path
 from typing import Any
 
-DEFAULT_TARGETS = ("gfx1030", "gfx1031", "gfx1032", "gfx1034")
+DEFAULT_TARGETS = (
+    "gfx1030", "gfx1031", "gfx1032", "gfx1034",  # RX 6000
+    "gfx1100", "gfx1101", "gfx1102",  # RX 7000
+    "gfx1200", "gfx1201",  # RX 9000
+)
 _TARGET = re.compile(r"gfx[0-9a-f]{3,8}")
 
 

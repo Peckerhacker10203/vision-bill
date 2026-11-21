@@ -1,6 +1,7 @@
 """Single native process with bounded admission and request-owned deadlines."""
 
 import json
+import logging
 import math
 import multiprocessing as mp
 import os
@@ -10,6 +11,8 @@ import stat
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,6 +31,8 @@ from .profile import (
     load_profile,
     serving_identity,
 )
+
+logger = logging.getLogger(__name__)
 
 MAX_CONTROL_BYTES = 4096
 
@@ -123,6 +128,9 @@ def _worker_main(
     runtime: PreparedRuntimeSettings | RuntimeSettings | None,
     reply_directory: Path,
 ) -> None:
+    from .logging_config import configure_native_logging
+
+    configure_native_logging()
     # No exception text or receipt content crosses the general error/log boundary.
     try:
         from .pipeline import build_serving_pipeline
@@ -154,6 +162,8 @@ def _worker_main(
             "generation": generation,
             "request_id": request.request_id,
         }
+        logger.info("ocr_worker_request phase=native state=start generation=%d request_id=%s",
+                    generation, request.request_id)
         try:
             result = adapter.predict(
                 request.original_path,
@@ -162,7 +172,11 @@ def _worker_main(
                 source_sha256=request.source_sha256,
             )
             try:
+                publish_started = time.monotonic()
+                logger.info("ocr_receipt_stage stage=publish state=start")
                 artifact = publish_result(result, reply_directory)
+                logger.info("ocr_receipt_stage stage=publish state=done elapsed_ms=%d blocks=%d",
+                            round((time.monotonic() - publish_started) * 1000), len(result.blocks))
             except (ValueError, TypeError, AttributeError) as exc:
                 raise InvalidReceiptOutput("Invalid OCR response artifact") from exc
             message.update(kind="result", artifact=artifact)
@@ -402,6 +416,9 @@ class OcrWorkerManager:
                         message = self._out_q.get(timeout=0)
                     if message.get("generation") != self._generation:
                         continue
+                    if reason := interruption(time.monotonic()):
+                        self._set_unready(reason)
+                        break
                     if message.get("kind") == "ready" and not child_exited:
                         with self._state:
                             self._ready = not self._stopped.is_set()
@@ -458,14 +475,30 @@ class OcrWorkerManager:
             self._reply_directory.cleanup()
             self._reply_directory = None
 
+    def _allow_fresh_claim_if_reaped(self) -> None:
+        # The lifecycle lock serializes child ownership and reap confirmation.
+        if self._proc is None and not self._standalone_session:
+            with self._state:
+                self._parked = True
+                self._can_claim_after_failed_load = True
+
     def _recover(self, reason: str, *, restart: bool = True) -> None:
         with self._control:
             generation = self._generation
+            retire_owner = (
+                self._owner is not None and not self._standalone_session
+                and reason in ("ocr_deadline_exceeded", "ocr_cancelled", GPU_OOM_CODE)
+            )
+            if retire_owner:
+                self._owner_load_allowed = False
+                restart = False
             if not restart:
                 # A readiness poll may already have queued recovery for this child.
                 self._recovery_attempted_generation = generation
             self._set_unready(reason, keep_preload=reason == GPU_OOM_CODE)
             self._teardown()
+            if retire_owner:
+                self._allow_fresh_claim_if_reaped()
         if not restart:
             return
         # A replacement loads the runtime without replaying the failed request.
@@ -489,6 +522,22 @@ class OcrWorkerManager:
             self._owner_generation = generation
             self._owner_load_allowed = True
 
+    @contextmanager
+    def _request_control(
+        self, deadline: float, cancelled: threading.Event | None,
+    ) -> Iterator[None]:
+        # Startup holds this lock while loading models. A waiting caller owns
+        # neither the startup nor its child and can safely leave on its own budget.
+        while True:
+            self._check_request(deadline, cancelled)
+            if self._control.acquire(timeout=min(0.05, max(0, deadline - time.monotonic()))):
+                break
+        try:
+            self._check_request(deadline, cancelled)
+            yield
+        finally:
+            self._control.release()
+
     def load(
         self,
         owner: str,
@@ -496,11 +545,15 @@ class OcrWorkerManager:
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event | None = None,
     ) -> None:
-        with self._control:
+        deadline = deadline_monotonic if deadline_monotonic is not None else math.inf
+        with self._request_control(deadline, cancel_event):
             if self._owner != owner:
                 raise OcrWorkerError("ocr_stale_owner", 409)
             if not self._owner_load_allowed:
                 raise OcrWorkerError("ocr_owner_phase_closed", 409)
+            if self.readiness().ready:
+                self._check_request(deadline, cancel_event)
+                return
             # If startup or its teardown fails, only a fresh generation may load.
             self._owner_load_allowed = False
             self.start(deadline_monotonic=deadline_monotonic, cancel_event=cancel_event)
@@ -508,15 +561,17 @@ class OcrWorkerManager:
             if not ready.ready:
                 # A client may have exhausted its deadline before it could park.
                 # Publish reclaimability only after this load no longer owns a child.
-                if (not self._standalone_session and self._proc is None
-                        and ready.reason_code in MANAGED_LOAD_FAILURES):
-                    with self._state:
-                        self._parked = True
-                        self._can_claim_after_failed_load = True
+                if ready.reason_code in MANAGED_LOAD_FAILURES:
+                    self._allow_fresh_claim_if_reaped()
                 raise OcrWorkerError(
                     ready.reason_code or "ocr_not_ready",
-                    504 if ready.reason_code == "ocr_deadline_exceeded" else 503,
+                    {"ocr_deadline_exceeded": 504, "ocr_cancelled": 499}.get(ready.reason_code or "", 503),
                 )
+            try:
+                self._check_request(deadline, cancel_event)
+            except OcrWorkerError as exc:
+                self._recover(exc.code, restart=False)
+                raise
             self._owner_load_allowed = True
 
     def park(self, owner: str) -> None:
@@ -605,22 +660,28 @@ class OcrWorkerManager:
         cancel_event: threading.Event | None = None,
         recover: bool = True,
     ) -> OcrResponse:
-        if time.monotonic() >= deadline_monotonic:
-            raise OcrWorkerError("ocr_deadline_exceeded", 504)
-        with self._state:
-            if self._admitted >= 5:
-                raise OcrWorkerError("ocr_queue_full", 429)
-            self._admitted += 1
-        acquired = False
+        started = time.monotonic()
+        phase = "admission"
+        generation: int | None = None
+        admitted = acquired = False
         try:
-            acquired = self._active.acquire(timeout=max(0, deadline_monotonic - time.monotonic()))
-            if not acquired or time.monotonic() >= deadline_monotonic:
-                # Waiting callers do not own the worker and cannot terminate its owner.
-                raise OcrWorkerError("ocr_deadline_exceeded", 504)
+            self._check_request(deadline_monotonic, cancel_event)
+            with self._state:
+                if self._admitted >= 5:
+                    raise OcrWorkerError("ocr_queue_full", 429)
+                self._admitted += 1
+                admitted = True
+            # Waiting callers may abandon their own request without touching the active child.
+            while not acquired:
+                self._check_request(deadline_monotonic, cancel_event)
+                acquired = self._active.acquire(
+                    timeout=min(0.05, max(0, deadline_monotonic - time.monotonic()))
+                )
+            self._check_request(deadline_monotonic, cancel_event)
             ready = self.readiness()
             if not ready.ready:
                 raise OcrWorkerError(ready.reason_code or "ocr_not_ready", 503)
-            with self._control:
+            with self._request_control(deadline_monotonic, cancel_event):
                 # The earlier readiness observation is advisory. This check and
                 # dispatch share ownership with stop's channel/process retirement.
                 if self._owner != owner:
@@ -630,6 +691,7 @@ class OcrWorkerManager:
                 ready = self.readiness()
                 if not ready.ready:
                     raise OcrWorkerError(ready.reason_code or "ocr_not_ready", 503)
+                self._check_request(deadline_monotonic, cancel_event)
                 generation, proc, in_q, out_q = (
                     self._generation,
                     self._proc,
@@ -640,6 +702,13 @@ class OcrWorkerManager:
                 reply_directory = Path(self._reply_directory.name)
                 try:
                     in_q.put(request, block=False)
+                    phase = "native"
+                    logger.info(
+                        "ocr_worker_request phase=native state=dispatched generation=%d request_id=%s "
+                        "wait_ms=%d remaining_ms=%d", generation, request.request_id,
+                        round((time.monotonic() - started) * 1000),
+                        round((deadline_monotonic - time.monotonic()) * 1000),
+                    )
                 except (OSError, ValueError, queue.Full):
                     self._recover("ocr_worker_crashed", restart=recover)
                     raise OcrWorkerError("ocr_worker_crashed", 503) from None
@@ -688,6 +757,7 @@ class OcrWorkerManager:
                 if message.get("kind") != "result":
                     raise OcrWorkerError("ocr_inference_failed", 502)
                 try:
+                    phase = "result_read"
                     result = read_result(reply_directory, message["artifact"])
                     if (
                         result.request_id != request.request_id
@@ -702,15 +772,31 @@ class OcrWorkerManager:
                         raise OcrWorkerError("ocr_stopped", 503) from None
                     self._recover("ocr_invalid_result", restart=recover)
                     raise OcrWorkerError("ocr_invalid_result", 502) from None
-                if time.monotonic() >= deadline_monotonic:
-                    self._recover("ocr_deadline_exceeded", restart=recover)
-                    raise OcrWorkerError("ocr_deadline_exceeded", 504)
+                try:
+                    self._check_request(deadline_monotonic, cancel_event)
+                except OcrWorkerError as exc:
+                    self._recover(exc.code, restart=recover)
+                    raise
+                logger.info(
+                    "ocr_worker_request phase=result_read state=done generation=%d request_id=%s "
+                    "elapsed_ms=%d remaining_ms=%d", generation, request.request_id, round((time.monotonic() - started) * 1000),
+                    round((deadline_monotonic - time.monotonic()) * 1000),
+                )
                 return result
+        except OcrWorkerError as exc:
+            logger.warning(
+                "ocr_worker_request phase=%s state=failed generation=%s request_id=%s reason=%s "
+                "elapsed_ms=%d budget_ms=%d cleanup_safe=%s",
+                phase, generation if generation is not None else "unassigned", request.request_id, exc.code, round((time.monotonic() - started) * 1000),
+                round((deadline_monotonic - started) * 1000), exc.cleanup_safe,
+            )
+            raise
         finally:
             if acquired:
                 self._active.release()
-            with self._state:
-                self._admitted -= 1
+            if admitted:
+                with self._state:
+                    self._admitted -= 1
 
     def stop(self) -> None:
         self._stopped.set()

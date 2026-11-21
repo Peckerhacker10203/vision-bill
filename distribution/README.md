@@ -14,10 +14,10 @@ environment template and the selected assets and evidence under `release/`.
 | Variant | Included services | Operator supplies |
 | --- | --- | --- |
 | `app` | Config initializer, PostgreSQL, app | External LLM endpoint and explicit model ID. Optional OCR endpoint. |
-| `ocr-cuda` | Cache gate, maintenance and independent OCR | Qualified NVIDIA device and approved OCR assets. |
-| `ocr-rocm` | Cache gate, maintenance and independent OCR | Qualified selected AMD device and approved OCR assets. |
-| `app-ocr-cuda` | App, PostgreSQL and an idle Dedicated OCR controller | Qualified NVIDIA device and a compatible LLM endpoint/model. |
-| `app-ocr-rocm` | App, PostgreSQL and an idle Dedicated OCR controller | Qualified selected AMD device and a compatible LLM endpoint/model. |
+| `ocr-cuda` | Cache check, model preparation and independent OCR | Compatible NVIDIA device and approved OCR assets. |
+| `ocr-rocm` | Cache check, model preparation and independent OCR | Compatible selected AMD device and approved OCR assets. |
+| `app-ocr-cuda` | App, PostgreSQL and an idle Dedicated OCR controller | Compatible NVIDIA device and a compatible LLM endpoint/model. |
+| `app-ocr-rocm` | App, PostgreSQL and an idle Dedicated OCR controller | Compatible selected AMD device and a compatible LLM endpoint/model. |
 
 Provision the chosen model on your own Ollama or OpenAI-compatible endpoint.
 Installation starts the listed services. Combined bundles fetch the four model
@@ -52,8 +52,9 @@ policy for this PowerShell process. [Enable Dedicated OCR](#enable-dedicated-ocr
 
 Extract the verified combined bundle for CUDA or ROCm on a Linux GPU host.
 Use the NVIDIA driver and Container Toolkit for CUDA. For ROCm, the selected
-Linux device and render node must be available to Docker. Start from the
-extracted bundle directory.
+native Linux KFD and render nodes must be available to Docker. On AMD WSL 2,
+run the launcher inside the supported Ubuntu distro with its own Docker Engine
+and WSL GPU bridge. Start from the extracted bundle directory.
 
 ```bash
 ./start-linux.sh
@@ -115,15 +116,30 @@ available for Compose interpolation. Independent OCR defaults to
 Generated ROCm bundles run the native service as container root. The source
 launcher derives device group IDs from the host. Linux AMD
 target selection starts with RX 6000/RDNA2 candidates. Qualify the exact device
-before relying on it. [ROCm source setup](../paddleocr-service/README.md#amd-rocm-on-native-linux)
+for release publication. On AMD WSL 2, use the AMD-compatible Windows driver,
+Docker Engine inside Ubuntu and `OCR_ROCM_DEVICE_ID` (default `0`). Start a
+combined ROCm bundle with `./start-linux.sh` inside Ubuntu.
+For manual bundle commands below, set `compose_file=compose.wsl.yaml` for ROCm
+on WSL and `compose_file=compose.yaml` for the other hosts. Set it again in a
+new shell alongside the original project name. The Compose check only validates
+the file. Each subsequent command must select it as well.
+[ROCm setup and AMD board compatibility](../paddleocr-service/README.md#amd-rocm-on-linux-or-windows-with-wsl-2)
 
 ```bash
+compose_file=compose.yaml
+if [ -f compose.wsl.yaml ] && grep -qi microsoft /proc/sys/kernel/osrelease; then
+  compose_file=compose.wsl.yaml
+fi
 sh ./check-compose.sh
-docker compose up -d
 ```
 
-For a standalone `ocr-cuda` or `ocr-rocm` installation, complete the native
-maintenance step below before `up`.
+For a standalone `ocr-cuda` or `ocr-rocm` installation, complete
+[model preparation](#native-cache-check-and-maintenance) before starting
+the service. For an app bundle, or a prepared standalone cache, run:
+
+```bash
+docker compose -f "$compose_file" up -d
+```
 
 ### Enable Dedicated OCR
 
@@ -161,34 +177,81 @@ separate GPUs for normal receipt processing, save **LLM and OCR share a GPU**
 as off in Settings. Startup consent records one durable request. Fixing a failed
 generation requires an explicit retry.
 
+Use the [PowerShell and Linux log commands](../paddleocr-service/README.md#read-the-logs-for-a-receipt) to follow a receipt across the app and OCR containers.
+
 ### Native cache check and maintenance
 
-In a standalone OCR bundle, `ocr-init` checks the complete qualified cache.
-On a cold or changed installation, it reports that explicit maintenance is
-required. It cannot start qualification or load models. The profiled
-`ocr-maintenance` service verifies the release and runs full qualification
-before publishing complete selected state.
+In a standalone `ocr-cuda` or `ocr-rocm` bundle, run **model preparation**
+once before the first start. It verifies the selected image and GPU, obtains
+the approved model files and records their verified identities. It processes
+zero images. Later starts run the passive `ocr-init` cache check, which accepts
+either this prepared state or a previously qualified state. For a fresh
+selection, run `prepare`. If the selected schema-2 installation has intact
+metadata and ordinary model files are damaged in its owned cache, repeating
+`prepare` can restore verified model bytes.
 
-Stop participating app, OCR, benchmark and standalone owners. Reconcile
-outstanding work and ensure the external LLM is quiesced or OCR has its own GPU.
-Use one truthful invocation-local maintenance intent. The commands below use
-the CUDA example and read its config digest from `release.json`. For ROCm use
-`ocr-rocm` instead. `jq` is used only to read that metadata field.
+If the runtime metadata, qualified evidence or selection is corrupt, or the
+schema is unknown, file-only preparation stops. Drain the service and preserve
+the original state and volume before recovery. Restore a verified backup of
+the matching installation, including its selection, model assets and original
+configuration, then run the passive check with that configuration. Investigate
+unknown formats and unsafe paths before selecting state to serve.
+
+For a known legacy qualified installation with a damaged qualification
+certificate, an alternative is the explicit `maintain --force` procedure below
+after the GPU handoff is settled. It skips reuse of the old certificate and
+runs full physical qualification. If the referenced asset tree is damaged,
+restore its exact pinned bytes first. Only a successful qualification replaces
+the selection. A failed attempt leaves the previous selection in place.
+
+Stop participating clients and services. Reconcile outstanding work and choose
+the maintenance intent that matches your GPU arrangement. For a dedicated OCR
+GPU, use `separate-ocr-device` as shown below. If the device is shared, first
+quiesce the external LLM and use `external-llm-quiesced`. For a managed pair,
+also pass the original shared `--handoff-lock`.
+
+**ROCm on WSL 2.** In the extracted bundle inside Ubuntu, keep the original
+Compose project name. `jq` reads the config digest of the OCR image.
+
+```bash
+image_id=$(jq -er '.images["ocr-rocm"].config_digest' release.json)
+docker compose -f compose.wsl.yaml --profile ocr-prepare run --rm --no-deps ocr-prepare \
+  prepare --bundle /release/bundle.json --state-dir /var/lib/ocr \
+  --image-config /release/image-config.json --image-id "$image_id" \
+  --maintenance-intent separate-ocr-device &&
+  docker compose -f compose.wsl.yaml up -d
+```
+
+**CUDA or native Linux ROCm.** For native ROCm change the image key below from
+`ocr-cuda` to `ocr-rocm`.
 
 ```bash
 image_id=$(jq -er '.images["ocr-cuda"].config_digest' release.json)
-docker compose --profile ocr-maintenance run --rm --no-deps ocr-maintenance \
-  maintain --bundle /release/bundle.json --state-dir /var/lib/ocr \
+docker compose -f compose.yaml --profile ocr-prepare run --rm --no-deps ocr-prepare \
+  prepare --bundle /release/bundle.json --state-dir /var/lib/ocr \
   --image-config /release/image-config.json --image-id "$image_id" \
-  --maintenance-intent external-llm-quiesced
+  --maintenance-intent separate-ocr-device &&
+  docker compose -f compose.yaml up -d
 ```
 
-With physically separate hardware use `--maintenance-intent separate-ocr-device`.
-Use `--force` for a deliberate rerun of physical qualification. The initializer
-retains its crash and ownership fences.
+After preparation, the first submitted receipt runs the first prediction.
+**Optional physical qualification** exercises the fixture corpus. To request
+it, stop and drain the service and reuse the image digest and truthful
+maintenance intent from preparation. On AMD WSL 2 use:
+
+```bash
+docker compose -f compose.wsl.yaml --profile ocr-maintenance run --rm --no-deps ocr-maintenance \
+  maintain --bundle /release/bundle.json --state-dir /var/lib/ocr \
+  --image-config /release/image-config.json --image-id "$image_id" \
+  --maintenance-intent separate-ocr-device
+```
+
+For CUDA and native Linux ROCm use `-f compose.yaml` with the same command.
+Add `--force` to repeat a completed qualification. Maintainers use the
+physical gate to publish an OCR variant.
 
 For a combined bundle, sign in and use the Dedicated OCR controls described
-above. If an installed service is unavailable, check `docker compose logs ocr`
+above. If an installed service is unavailable, check `docker compose -f "$compose_file" logs ocr`
 and restart its original project with its volumes intact. If a prior handoff
 is unresolved, follow the [recovery procedure](#stop-cut-over-and-recover)
 before retrying. A combined installation obtains its serving metadata through
@@ -213,7 +276,7 @@ original credentials instead of generating replacements. After startup, read the
 initial admin credentials only in your private terminal.
 
 ```bash
-docker compose exec app cat /app/config/initial-admin.yaml
+docker compose -f "$compose_file" exec app cat /app/config/initial-admin.yaml
 ```
 
 Sign in with that administrator. Self-registration, when enabled, creates ordinary
@@ -267,13 +330,13 @@ the LLM can remain loaded. For a return to a shared GPU, prepare the dedicated
 LLM endpoint for the shared-mode idle and ownership checks before activation.
 
 ```bash
-docker compose run --rm --no-deps --entrypoint sh app -ec '
+docker compose -f "$compose_file" run --rm --no-deps --entrypoint sh app -ec '
   dir=/activation/request/direct-calls
   if [ -d "$dir" ]; then
     archive=$(mktemp -d /activation/request/reconciled.XXXXXX)
     mv "$dir" "$archive/calls"
   fi'
-docker compose up -d
+docker compose -f "$compose_file" up -d
 ```
 
 For source installs, use `vision_bill` in place of `app` and keep the same
@@ -421,7 +484,9 @@ uv and adequate build/archive capacity. Labels are `vision-bill-cuda` and
 `vision-bill-rocm`. Native release qualification requires explicit
 `DISTRIBUTION_MAINTENANCE_INTENT` for the runner's actual LLM quiescence or separate
 OCR device. ROCm selected targets must agree with compile inputs, kernel
-inventory and the actual qualified AMD device. For CUDA, `release-inputs.json`
+inventory and the actual qualified AMD device. For a ROCm WSL 2 release runner,
+set `rocm.wsl_device_id` to the selected zero-based device index alongside
+`rocm.targets` in the release inputs. For CUDA, `release-inputs.json`
 defaults to `cu129` for new candidates. Set `"cuda_channel": "cu126"` to select
 CUDA 12.6 explicitly. On multi-GPU runners set `cuda_device_id` to the physical
 GPU index as a string or to the NVIDIA GPU UUID. It defaults to `"0"`. Only

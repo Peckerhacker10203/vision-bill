@@ -12,10 +12,10 @@ from typing import Any, Literal
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 
-from .fp32 import floating_dtype
 from .paddle_distribution import installed_native_paddle, native_paddle_distribution
 from .precision import HookRecord, HookVariableNames, ParameterRecord
 from .profile import dependency_identity, file_digest
+from .vlm_precision import floating_dtype
 
 INSPECTOR_VERSION = "pinned-export-inventory-v1"
 

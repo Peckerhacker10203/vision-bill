@@ -536,7 +536,8 @@ async def test_endpoint_change_during_preparation_refunds_claim_before_extractio
     db.finish_attempt.assert_not_awaited()
 
 
-async def test_resume_preserves_pages_while_native_identity_is_temporarily_unreachable(settings, tmp_path):
+@pytest.mark.parametrize("reason", ["ocr_unavailable", "ocr_starting", "ocr_cancelled"])
+async def test_resume_preserves_pages_while_native_identity_is_temporarily_unreachable(settings, tmp_path, reason):
     from time import monotonic
 
     from vision_bill.model.ocr import OcrCapabilities
@@ -545,9 +546,9 @@ async def test_resume_preserves_pages_while_native_identity_is_temporarily_unrea
     service, receipts, db, claim, part = context(settings, tmp_path)
     db.get_ocr_checkpoint.return_value = SimpleNamespace(ordered_source_sha256=[part.source_sha256])
     receipts.ocr_capabilities = AsyncMock(return_value=OcrCapabilities(
-        enabled=True, configured=True, reachable=False, ready=False, reason_code="ocr_unavailable",
+        enabled=True, configured=True, reachable=reason != "ocr_unavailable", ready=False, reason_code=reason,
     ))
-    with pytest.raises(ReadinessHoldError, match="ocr_unavailable"):
+    with pytest.raises(ReadinessHoldError, match=reason):
         await service._resume(claim, [part], OcrSettings(enabled=True), monotonic() + 5,
                               db_deadline=asyncio.get_running_loop().time() + 5)
     db.clear_ocr_checkpoint.assert_not_awaited()

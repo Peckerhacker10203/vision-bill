@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import logging
 import os
 import tempfile
 import threading
@@ -10,7 +11,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
 from io import BytesIO
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, TypeVar
 from uuid import UUID
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -24,6 +25,8 @@ from pydantic import BaseModel, Field, TypeAdapter
 from .profile import PreparedRuntimeSettings, RuntimeSettings, load_profile
 from .worker import OcrRequest, OcrWorkerError, OcrWorkerManager
 
+logger = logging.getLogger(__name__)
+
 SOURCE_FORMATS = {
     "image/jpeg": "JPEG",
     "image/png": "PNG",
@@ -35,6 +38,7 @@ SOURCE_FORMATS = {
 
 
 class LifecycleRequest(BaseModel):
+    timeout_ms: int | None = Field(default=None, gt=0, le=600000)
     owner_token: str = Field(pattern=r"^[1-9][0-9]*:[a-zA-Z0-9-]+$", max_length=100)
 
 
@@ -81,6 +85,48 @@ def validate_result(result: OcrResponse) -> None:
         validate_working_png(decode_working_png(view.png_base64), view)
     except (TypeError, ValueError):
         raise HTTPException(502, "ocr_invalid_result") from None
+
+
+T = TypeVar("T")
+
+
+async def run_until_disconnect(
+    http_request: Request, cancel_event: threading.Event, operation: Callable[[], T],
+) -> T:
+    task = asyncio.create_task(asyncio.to_thread(operation))
+
+    async def observe_disconnect() -> None:
+        # FastAPI has consumed the body before the operation starts.
+        # A disconnect therefore belongs to this admitted request only.
+        while True:
+            message = await http_request.receive()
+            if message["type"] == "http.disconnect":
+                cancel_event.set()
+                return
+
+    observer = asyncio.create_task(observe_disconnect())
+    try:
+        result = await asyncio.shield(task)
+        if cancel_event.is_set():
+            raise HTTPException(499, "ocr_cancelled")
+        return result
+    except asyncio.CancelledError:
+        cancel_event.set()
+        # Drain native ownership before closing an upload or ending lifespan.
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:  # noqa: BLE001 - drain failure while preserving cancellation
+                break
+        if task.done() and not task.cancelled():
+            task.exception()
+        raise
+    finally:
+        observer.cancel()
+        with suppress(asyncio.CancelledError):
+            await observer
 
 
 def create_app(
@@ -195,9 +241,23 @@ def create_app(
                     cancel_event=cancel_event,
                 )
             else:
-                result = worker.infer(request, deadline_monotonic=deadline, owner=owner_token)
+                result = worker.infer(
+                    request,
+                    deadline_monotonic=deadline,
+                    owner=owner_token,
+                    cancel_event=cancel_event,
+                )
+            encoding_started = time.monotonic()
             validate_result(result)
-            return Response(result.dump_checked_wire(), media_type="application/json")
+            response = Response(result.dump_checked_wire(), media_type="application/json")
+            if time.monotonic() >= deadline:
+                # The request no longer owns a predictor. A later page may already
+                # be active, so rejecting this late response must never reap it.
+                logger.warning("ocr_worker_request phase=response_encode state=failed "
+                               "reason=ocr_deadline_exceeded request_id=%s elapsed_ms=%d",
+                               request_id, round((time.monotonic() - encoding_started) * 1000))
+                raise HTTPException(504, "ocr_deadline_exceeded")
+            return response
         except OcrWorkerError as exc:
             cleanup_safe = exc.cleanup_safe
             raise HTTPException(exc.status_code, exc.code) from None
@@ -217,56 +277,14 @@ def create_app(
     ) -> Response:
         deadline = time.monotonic() + timeout_ms / 1000
         cancel_event = threading.Event()
-        task = asyncio.create_task(
-            asyncio.to_thread(
-                process_request,
-                image,
-                request_id,
-                photo_index,
-                source_sha256,
-                deadline,
-                owner_token,
-                cancel_event,
-            )
+        return await run_until_disconnect(
+            http_request, cancel_event,
+            lambda: process_request(image, request_id, photo_index, source_sha256,
+                                    deadline, owner_token, cancel_event),
         )
 
-        async def observe_disconnect() -> None:
-            # Multipart parsing has consumed the body before this route starts.
-            # A disconnect therefore belongs to this admitted request only.
-            while True:
-                message = await http_request.receive()
-                if message["type"] == "http.disconnect":
-                    cancel_event.set()
-                    return
-
-        observer = asyncio.create_task(observe_disconnect()) if mode == "standalone" else None
-        try:
-            result = await asyncio.shield(task)
-            if cancel_event.is_set():
-                raise HTTPException(499, "ocr_cancelled")
-            return result
-        except asyncio.CancelledError:
-            cancel_event.set()
-            # The native thread retains its original until park confirms death.
-            # Drain it before FastAPI closes the upload or lifespan shuts down.
-            while not task.done():
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    continue
-                except Exception:  # noqa: BLE001 - drain failure while preserving cancellation
-                    break
-            if task.done() and not task.cancelled():
-                task.exception()
-            raise
-        finally:
-            if observer is not None:
-                observer.cancel()
-                with suppress(asyncio.CancelledError):
-                    await observer
-
     @app.post("/lifecycle/{action}")
-    def lifecycle(action: str, body: LifecycleRequest) -> dict[str, object]:
+    async def lifecycle(action: str, body: LifecycleRequest, http_request: Request) -> dict[str, object]:
         if mode == "standalone":
             raise HTTPException(403, "ocr_standalone_lifecycle_owned")
         if worker is None or closing:
@@ -274,7 +292,17 @@ def create_app(
         if action not in ("claim", "load", "park"):
             raise HTTPException(404, "ocr_unknown_lifecycle_action")
         try:
-            getattr(worker, action)(body.owner_token)
+            if action == "load":
+                manager = worker
+                cancel_event = threading.Event()
+                deadline = time.monotonic() + body.timeout_ms / 1000 if body.timeout_ms else None
+                await run_until_disconnect(
+                    http_request, cancel_event,
+                    lambda: manager.load(body.owner_token, deadline_monotonic=deadline,
+                                         cancel_event=cancel_event),
+                )
+            else:
+                await asyncio.to_thread(getattr(worker, action), body.owner_token)
         except OcrWorkerError as exc:
             raise HTTPException(exc.status_code, exc.code) from None
         return worker.readiness().model_dump(exclude={"runtime_identity"})

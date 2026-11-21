@@ -66,7 +66,7 @@ async def register(
         raise HTTPException(status_code=409, detail="Username is already taken")
     hashed = hash_password(body.password, settings.auth)
     user = await user_db.create_user(body.username, hashed, is_admin=False)
-    logger.info("Registered new user '%s' (id=%s)", user.username, user.id)
+    logger.info("Registered user id=%s", user.id)
     _set_session_cookie(response, user.id)
     return user
 

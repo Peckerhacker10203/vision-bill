@@ -1,15 +1,18 @@
 """Official Paddle model revisions and their reproducible archive recipe."""
 
 import hashlib
+import logging
 import re
 import tarfile
 from collections.abc import Mapping
 from http.client import HTTPMessage
 from pathlib import Path
+from time import monotonic
 from typing import IO, NamedTuple
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+logger = logging.getLogger(__name__)
 MIB = 1024**2
 APACHE_LICENSE_HEADER = b"Apache License\nVersion 2.0, January 2004"
 COMPANION_LICENSE_URL = (
@@ -125,12 +128,20 @@ def download(url: str, destination: Path, limit: int) -> None:
             expected = int(digits)
 
         remaining = limit
+        started = monotonic()
+        next_progress = started + 15
         with destination.open("xb") as output:
             while chunk := response.read(min(MIB, remaining + 1)):
                 remaining -= len(chunk)
                 if remaining < 0:
                     raise ValueError(f"Official asset exceeds size bound for {destination.name}")
                 output.write(chunk)
+                now = monotonic()
+                if now >= next_progress:
+                    received = limit - remaining
+                    logger.info("ocr_model_download received_bytes=%d elapsed_s=%.1f mean_mbit_s=%.2f",
+                                received, now - started, 8 * received / (now - started) / 1_000_000)
+                    next_progress = now + 15
         received = limit - remaining
         if expected is not None and received != expected:
             raise ValueError(f"Official asset has unexpected length for {destination.name}")

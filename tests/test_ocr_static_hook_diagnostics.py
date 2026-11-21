@@ -145,7 +145,7 @@ def test_native_collection_emits_the_failing_models_safe_diagnostic(tmp_path, mo
     monkeypatch.setattr(qualify, "verify_dependencies", lambda *args, **kwargs: None)
     monkeypatch.setattr(qualify, "construct_native", lambda *a, **k: (native, None, SimpleNamespace))
     monkeypatch.setattr(qualify, "inspect_device_identity", lambda *args: {})
-    monkeypatch.setattr(qualify, "device_identity", lambda *args, **kw: {})
+    monkeypatch.setattr(qualify, "device_identity", lambda *args, **kw: {"component_precision": {"text": "float32"}})
     monkeypatch.setattr(qualify, "audit_dynamic_model", lambda *args: None)
     normalized = SimpleNamespace(path=row.path, transforms=[], findings=[])
     monkeypatch.setattr(qualify, "normalize_source", lambda *_args: nullcontext(normalized))

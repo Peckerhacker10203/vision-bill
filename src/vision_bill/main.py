@@ -34,7 +34,7 @@ from .service.image_service import ImageService
 from .service.receipt_service import ReceiptService
 from .service.submission_service import SubmissionService
 
-setup_logging()
+setup_logging(settings.api.log_level)
 
 logger = logging.getLogger(__name__)
 
@@ -58,10 +58,10 @@ async def bootstrap_admin(user_db: UserDB, settings: Settings) -> None:
             username, hash_password(password, settings.auth), is_admin=True
         )
     except asyncpg.UniqueViolationError:
-        logger.info("Bootstrap user '%s' already exists - skipping", username)
+        logger.info("Bootstrap user already exists")
         return
     await user_db.set_owner_of_orphan_rows(admin.id)
-    logger.info("Bootstrapped first admin user '%s' (id=%s)", username, admin.id)
+    logger.info("Bootstrapped first admin id=%s", admin.id)
 
 
 # ── Startup / shutdown handlers ──────────────────────────────────────
@@ -90,14 +90,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     try:
         await receipt_service.init_db()
-    except Exception:
-        logger.exception("Failed to initialise database - continuing without it")
+    except Exception as exc:  # noqa: BLE001 - keep credentials and SQL out of diagnostics
+        logger.error("Database initialization failed error_type=%s", type(exc).__name__)
 
     if receipt_service.db_ready:
         try:
             await bootstrap_admin(receipt_service.user_db, settings)
-        except Exception:
-            logger.exception("Failed to run authentication bootstrap")
+        except Exception as exc:  # noqa: BLE001 - keep credentials and SQL out of diagnostics
+            logger.error("Authentication bootstrap failed error_type=%s", type(exc).__name__)
 
     image_service = ImageService(settings.images)
     submission_service = SubmissionService(settings, receipt_service, image_service)
@@ -150,8 +150,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await benchmark_service.stop()
         try:
             await app.state.receipt_service.destroy_db()
-        except Exception:
-            logger.exception("Error while closing database pool")
+        except Exception as exc:  # noqa: BLE001 - keep credentials and SQL out of diagnostics
+            logger.error("Closing database pool failed error_type=%s", type(exc).__name__)
 
 
 app = FastAPI(title="Receipt Tracker API", lifespan=lifespan)

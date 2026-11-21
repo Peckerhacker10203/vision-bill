@@ -1,11 +1,13 @@
 """Native VLM substitution with an explicit loader dtype and parameter audit."""
 
+import logging
 import platform
-import sys
 from collections.abc import Callable, Sequence
 from importlib import import_module
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
+
+logger = logging.getLogger(__name__)
 
 
 def floating_dtype(dtype: Any) -> str | None:
@@ -22,19 +24,41 @@ def require_gpu(tensor: Any, gpu_index: int) -> None:
         raise ValueError("Tensor is on a different GPU index")
 
 
-def audit_dynamic_model(model: Any, gpu_index: int) -> int:
-    inspected = 0
-    for weight in model.parameters():
+def component_precision(accelerator: str, capability: Sequence[int] | None) -> dict[str, str]:
+    # HIP's CUDA-compatible API does not report an NVIDIA SM generation.
+    bf16 = accelerator == "cuda" and capability is not None and tuple(capability) >= (8, 0)
+    return {
+        "text": "bfloat16" if bf16 else "float32",
+        "visual": "float32",
+        "mlp_AR": "float32",
+        "static": "float32",
+    }
+
+
+class ComponentAudit(TypedDict):
+    dtype: str
+    parameters: int
+
+
+def audit_dynamic_model(model: Any, gpu_index: int, text_dtype: str) -> dict[str, ComponentAudit]:
+    groups: dict[str, ComponentAudit] = {
+        key: {"dtype": dtype, "parameters": 0}
+        for key, dtype in (("text", text_dtype), ("visual", "float32"), ("mlp_AR", "float32"))
+    }
+    components = {"model": "text", "lm_head": "text", "visual": "visual", "mlp_AR": "mlp_AR"}
+    for name, weight in model.named_parameters():
+        require_gpu(weight, gpu_index)
         precision = floating_dtype(weight.dtype)
         if precision is None:
             continue
-        if precision != "float32":
-            raise ValueError("Native dynamic floating parameter precision must be FP32")
-        require_gpu(weight, gpu_index)
-        inspected += 1
-    if inspected == 0:
-        raise ValueError("Native dynamic model has no verified floating parameters")
-    return inspected
+        root = name.split(".", 1)[0]
+        component = components.get(root)
+        if component is None or precision != groups[component]["dtype"]:
+            raise ValueError("Native dynamic parameter precision or component mismatch")
+        groups[component]["parameters"] += 1
+    if any(not record["parameters"] for record in groups.values()):
+        raise ValueError("Native dynamic component has no verified floating parameters")
+    return groups
 
 
 def requires_host_assembly(accelerator: str, capability: Sequence[int] | None) -> bool:
@@ -44,20 +68,19 @@ def requires_host_assembly(accelerator: str, capability: Sequence[int] | None) -
     return ("microsoft" in release and "wsl2" in release) or Path("/dev/dxg").exists()
 
 
-def fp32_predictor_class(
+def native_predictor_class(
     upstream: type[Any],
     gpu_index: int,
     *,
+    text_dtype: str,
     assemble_on_host: bool = False,
 ) -> type[Any]:
-    class ExplicitFp32Predictor(upstream):  # type: ignore[misc]
+    class SelectivePrecisionPredictor(upstream):  # type: ignore[misc]
         def _build(self, **kwargs: Any) -> Any:
             # The pinned upstream constructor chooses BF16 immediately before _build.
-            self.dtype = "float32"
-            path = "host_fp32" if assemble_on_host else "native_gpu"
-            print(
-                f"ocr_vlm_checkpoint_load path={path} stage=assemble", file=sys.stderr, flush=True
-            )
+            self.dtype = text_dtype
+            path = "host" if assemble_on_host else "native_gpu"
+            logger.info("ocr_vlm_checkpoint_load path=%s dtype=%s stage=assemble", path, text_dtype)
             if assemble_on_host:
                 model_type = import_module(
                     "paddlex.inference.models.doc_vlm.modeling"
@@ -74,28 +97,22 @@ def fp32_predictor_class(
                             dtype=self.dtype,
                             convert_from_hf=True,
                         )
-                    print(
-                        f"ocr_vlm_checkpoint_load path={path} stage=transfer",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                    logger.info("ocr_vlm_checkpoint_load path=%s stage=transfer", path)
                     # Paddle Layer.to moves existing parameter storage and all registered
                     # buffers in-place, including shared objects and nonpersistent buffers.
                     model.to(device=self.device, blocking=True)
-                for param in model.parameters():
-                    require_gpu(param, gpu_index)
                 for buffer in model.buffers():
                     require_gpu(buffer, gpu_index)
-                    if floating_dtype(buffer.dtype) not in (None, "float32"):
-                        raise ValueError("Native floating buffer precision must be FP32")
+                    if floating_dtype(buffer.dtype) not in (None, "float32", text_dtype):
+                        raise ValueError("Unexpected native floating buffer precision")
                 built = model, processor
             else:
                 built = super()._build(**kwargs)
-            audit_dynamic_model(built[0], gpu_index)
-            print(f"ocr_vlm_checkpoint_load path={path} stage=ready", file=sys.stderr, flush=True)
+            audit_dynamic_model(built[0], gpu_index, text_dtype)
+            logger.info("ocr_vlm_checkpoint_load path=%s stage=ready", path)
             return built
 
-    return ExplicitFp32Predictor
+    return SelectivePrecisionPredictor
 
 
 def native_pipeline_class(

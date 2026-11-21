@@ -8,9 +8,9 @@ import subprocess
 from pathlib import Path
 from typing import Any, Literal
 
-from .fp32 import requires_host_assembly
 from .profile import content_identity, file_digest
 from .targets import validate_profile
+from .vlm_precision import component_precision, requires_host_assembly
 
 
 class DeviceIdentityUnavailable(RuntimeError):
@@ -70,11 +70,22 @@ def inspect_device_identity(accelerator: Literal["cuda", "rocm"], gpu_index: int
             raise ValueError("Invalid native device selection")
         if os.environ.get("HSA_OVERRIDE_GFX_VERSION"):
             raise ValueError("Architecture spoofing is forbidden")
+        wsl = accelerator == "rocm" and Path("/dev/dxg").is_char_device()
         if accelerator == "cuda":
             result = _cuda_identity(gpu_index)
         else:
+            command = ["/opt/ocr/bin/hip-device-info", str(gpu_index)]
+            if wsl:
+                selected = os.environ.get("HIP_VISIBLE_DEVICES", "")
+                if (
+                    not re.fullmatch(r"0|[1-9][0-9]{0,3}", selected)
+                    or int(selected) > 1024
+                    or gpu_index != 0
+                ):
+                    raise ValueError("WSL requires one HIP-visible adapter mapped to GPU 0")
+                command.append("--wsl")
             completed = subprocess.run(
-                ["/opt/ocr/bin/hip-device-info", str(gpu_index)],
+                command,
                 capture_output=True,
                 text=True,
                 check=True,
@@ -134,6 +145,9 @@ def inspect_device_identity(accelerator: Literal["cuda", "rocm"], gpu_index: int
             or any(type(value) is not int or value < 0 for value in result["compute_capability"])
         ):
             raise ValueError("Malformed CUDA capability")
+        if wsl:
+            result["transport"] = "wsl-dxg"
+            result["dxcore_sha256"] = file_digest(Path("/usr/lib/libdxcore.so"))
         return result
     except (OSError, ValueError, AttributeError, subprocess.SubprocessError) as exc:
         raise DeviceIdentityUnavailable(
@@ -145,9 +159,10 @@ def execution_target(paddle: Any, device: dict[str, Any], accelerator: str) -> d
     """Bind the loader to the selected driver, build and installed HIP kernels without compute."""
     result = dict(device)
     result["paddle_build"] = str(paddle.version.full_version)
+    result["component_precision"] = component_precision(accelerator, device.get("compute_capability"))
     if requires_host_assembly(accelerator, device.get("compute_capability")):
         # Explicit qualification and replay must exercise the same checkpoint loader.
-        result["vlm_checkpoint_loader"] = "host-fp32-v1"
+        result["vlm_checkpoint_loader"] = "host-selective-v1"
     if accelerator == "rocm":
         target = result["gfx_target"]
         kernels = json.loads(Path("/opt/ocr/build-evidence/kernels.json").read_text())

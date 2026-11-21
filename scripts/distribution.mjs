@@ -230,6 +230,25 @@ const device = (accelerator) =>
         ],
       };
 
+export const wslDriverMount = {
+  type: "bind",
+  source: "/usr/lib/wsl/lib/libdxcore.so",
+  target: "/usr/lib/libdxcore.so",
+  read_only: true,
+  bind: { create_host_path: false },
+};
+
+function wslCompose(compose) {
+  const wsl = structuredClone(compose);
+  for (const service of Object.values(wsl.services)) {
+    if (!service.devices) continue;
+    service.devices = ["/dev/dxg:/dev/dxg"];
+    service.volumes = [...service.volumes, wslDriverMount];
+    service.environment.HIP_VISIBLE_DEVICES = "${OCR_ROCM_DEVICE_ID:-0}";
+  }
+  return wsl;
+}
+
 const composeCheck = `#!/bin/sh
 set -eu
 version=$(docker compose version --short) || exit 1
@@ -247,12 +266,17 @@ if [ -e "$runtime" ] && { [ -L "$runtime" ] || [ "$(stat -c %a "$runtime")" != "
   echo 'runtime.env must be a regular private file with mode 0600; run chmod 0600 runtime.env.' >&2
   exit 1
 fi
-exec docker compose -f "$(dirname "$0")/compose.yaml" config --quiet
+compose="$(dirname "$0")/compose.yaml"
+if [ -f "$(dirname "$0")/compose.wsl.yaml" ] && grep -qi microsoft /proc/sys/kernel/osrelease; then
+  compose="$(dirname "$0")/compose.wsl.yaml"
+fi
+exec docker compose -f "$compose" config --quiet
 `;
 function runtimeExample(activation) {
   return `# Requires Docker Compose >=2.30 (raw env_file support).
 # Copy to runtime.env and chmod 0600 runtime.env before running check-compose.sh.
 # Values are literal: do not add quoting, export, or shell interpolation.
+# API__LOG_LEVEL=INFO
 # Set COMPOSE_PROJECT_NAME separately in the shell or .env; reuse the old project
 # name and volumes for upgrades, even when moving or renaming this bundle folder.
 # Fresh config requires all three explicit values below. Restored config needs no seeds.
@@ -414,6 +438,7 @@ export function renderBundle(manifest, variant) {
     );
     const lock = {
       OCR_INSTALLATION_LOCK_PATH: "/coord/installation.lock",
+      OCR_LOG_LEVEL: "${OCR_LOG_LEVEL:-INFO}",
       OCR_STATE_DIR: "/var/lib/ocr",
     };
     if (appOcr) {
@@ -450,6 +475,11 @@ export function renderBundle(manifest, variant) {
         environment: lock,
         volumes: mounts,
         ...device(accelerator),
+      });
+      service("ocr-prepare", `ocr-${accelerator}`, {
+        ...services["ocr-init"],
+        profiles: ["ocr-prepare"],
+        command: ["prepare", ...services["ocr-init"].command.slice(1)],
       });
       service("ocr-maintenance", `ocr-${accelerator}`, {
         ...services["ocr-init"],
@@ -497,14 +527,16 @@ export function renderBundle(manifest, variant) {
       [...assets].sort().map((path) => [path, manifest.assets[path]]),
     ),
   };
+  const compose = {
+    name: "${COMPOSE_PROJECT_NAME:?Set a stable project name and reuse it for upgrades}",
+    services,
+    volumes,
+    ...(appOcr ? { networks: { default: { labels: installationLabel } } } : {}),
+  };
   return {
     files: {
-      "compose.yaml": json({
-        name: "${COMPOSE_PROJECT_NAME:?Set a stable project name and reuse it for upgrades}",
-        services,
-        volumes,
-        ...(appOcr ? { networks: { default: { labels: installationLabel } } } : {}),
-      }),
+      "compose.yaml": json(compose),
+      ...(accelerator === "rocm" ? { "compose.wsl.yaml": json(wslCompose(compose)) } : {}),
       "runtime.env.example": runtimeExample(appOcr),
       "check-compose.sh": composeCheck,
       "release.json": json(metadata),

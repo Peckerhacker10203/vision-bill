@@ -19,8 +19,39 @@ def tensor(dtype="float32", gpu=0):
     )
 
 
-def test_fp32_override_precedes_single_loader_even_on_bf16_device():
-    from ocr_service.fp32 import fp32_predictor_class
+def dynamic_model(text_dtype="float32", gpu=0):
+    weights = [(name + ".weight", tensor(dtype, gpu)) for name, dtype in (
+        ("model", text_dtype), ("visual", "float32"), ("mlp_AR", "float32")
+    )]
+    return SimpleNamespace(named_parameters=lambda: weights)
+
+
+@pytest.mark.parametrize(("accelerator", "capability", "text_dtype"), [
+    ("cuda", [7, 5], "float32"), ("cuda", [8, 0], "bfloat16"),
+    ("cuda", [8, 9], "bfloat16"), ("cuda", [12, 0], "bfloat16"),
+    ("rocm", None, "float32"), ("rocm", [9, 0], "float32"),
+])
+def test_selected_device_component_precision(accelerator, capability, text_dtype):
+    from ocr_service.vlm_precision import component_precision
+
+    assert component_precision(accelerator, capability) == {
+        "text": text_dtype, "visual": "float32", "mlp_AR": "float32", "static": "float32"
+    }
+
+
+@pytest.mark.parametrize("component", ["model", "visual", "mlp_AR", "unexpected"])
+def test_mixed_checkpoint_requires_exact_component_parameters(component):
+    from ocr_service.vlm_precision import audit_dynamic_model
+
+    model = dynamic_model("bfloat16")
+    weights = model.named_parameters()
+    weights.append((component + ".extra", tensor("float32" if component == "model" else "bfloat16")))
+    with pytest.raises(ValueError, match="component mismatch"):
+        audit_dynamic_model(model, 0, "bfloat16")
+
+
+def test_fp32_selection_precedes_single_loader_even_if_upstream_default_is_bf16():
+    from ocr_service.vlm_precision import native_predictor_class
 
     calls = []
 
@@ -31,25 +62,26 @@ def test_fp32_override_precedes_single_loader_even_on_bf16_device():
 
         def _build(self, **kwargs):
             calls.append(self.dtype)
-            return SimpleNamespace(parameters=lambda: [tensor()]), object()
+            return dynamic_model(self.dtype), object()
 
-    predictor = fp32_predictor_class(Upstream, 0)()
+    predictor = native_predictor_class(Upstream, 0, text_dtype="float32")()
     assert calls == ["float32"]
     assert predictor.dtype == "float32"
 
 
-def test_wsl_cuda_checkpoint_assembled_on_cpu_transferred_and_audited(monkeypatch, capsys):
+def test_wsl_cuda_checkpoint_assembled_on_cpu_transferred_and_audited(monkeypatch, caplog):
     from contextlib import contextmanager
 
-    from ocr_service import fp32
+    from ocr_service import vlm_precision
 
+    caplog.set_level("INFO", logger="ocr_service.vlm_precision")
     calls = []
     current = "gpu:3"
     processor = object()
     config = object()
-    tied = tensor()
-    buffer = tensor("int64")
-    model = SimpleNamespace(parameters=lambda: [tied], buffers=lambda: [buffer])
+    buffer = tensor("int64", gpu=None)
+    model = dynamic_model("bfloat16", gpu=None)
+    model.buffers = lambda: [buffer]
 
     @contextmanager
     def device_guard(device):
@@ -70,7 +102,8 @@ def test_wsl_cuda_checkpoint_assembled_on_cpu_transferred_and_audited(monkeypatc
 
     def transfer(*, device, blocking):
         calls.append(("transfer", current, device, blocking))
-        tied.place = tensor(gpu=3).place
+        for _, param in model.named_parameters():
+            param.place = tensor(gpu=3).place
         buffer.place = tensor("int64", gpu=3).place
         return model
 
@@ -79,7 +112,7 @@ def test_wsl_cuda_checkpoint_assembled_on_cpu_transferred_and_audited(monkeypatc
         config_class=SimpleNamespace(from_pretrained=configure), from_pretrained=assemble
     )
     monkeypatch.setattr(
-        fp32,
+        vlm_precision,
         "import_module",
         {
             "paddlex.utils.device": SimpleNamespace(TemporaryDeviceChanger=device_guard),
@@ -101,7 +134,7 @@ def test_wsl_cuda_checkpoint_assembled_on_cpu_transferred_and_audited(monkeypatc
         def _build(self, **kwargs):
             pytest.fail("targeted load invoked default GPU weight assembly")
 
-    predictor = fp32.fp32_predictor_class(Upstream, 3, assemble_on_host=True)()
+    predictor = vlm_precision.native_predictor_class(Upstream, 3, text_dtype="bfloat16", assemble_on_host=True)()
     assert predictor._build() == (model, processor)
     assert current == predictor.device == "gpu:3"
     assert calls == [
@@ -111,20 +144,21 @@ def test_wsl_cuda_checkpoint_assembled_on_cpu_transferred_and_audited(monkeypatc
             "assemble",
             "cpu",
             "/verified/vlm",
-            {"config": config, "dtype": "float32", "convert_from_hf": True},
+            {"config": config, "dtype": "bfloat16", "convert_from_hf": True},
         ),
         ("transfer", "gpu:3", "gpu:3", True),
     ]
-    assert [line.split()[-1] for line in capsys.readouterr().err.splitlines()] == [
+    assert [line.split()[-1] for line in caplog.messages] == [
         "stage=assemble",
         "stage=transfer",
         "stage=ready",
     ]
+    caplog.clear()
     model.to = lambda **kw: model
     buffer.place = tensor("int64", gpu=None).place
     with pytest.raises(ValueError, match="GPU"):
         predictor._build()
-    assert "stage=ready" not in capsys.readouterr().err
+    assert "stage=ready" not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -142,36 +176,36 @@ def test_wsl_cuda_checkpoint_assembled_on_cpu_transferred_and_audited(monkeypatc
 def test_host_assembly_selection(monkeypatch, release, dxg, accelerator, capability, expected):
     import platform
 
-    from ocr_service import fp32
+    from ocr_service import vlm_precision
 
     monkeypatch.setattr(platform, "release", lambda: release)
     monkeypatch.setattr(Path, "exists", lambda path: str(path) == "/dev/dxg" and dxg)
-    assert fp32.requires_host_assembly(accelerator, capability) is expected
+    assert vlm_precision.requires_host_assembly(accelerator, capability) is expected
 
 
 @pytest.mark.parametrize(
     "dtype,gpu", [("bfloat16", 0), ("float16", 0), ("float32", None), ("float32", 1)]
 )
 def test_dynamic_audit_rejects_wrong_precision_or_place(dtype, gpu):
-    from ocr_service.fp32 import fp32_predictor_class
+    from ocr_service.vlm_precision import native_predictor_class
 
     class Upstream:
         def _build(self, **kwargs):
-            return SimpleNamespace(parameters=lambda: [tensor(dtype, gpu)]), object()
+            return dynamic_model(dtype, gpu), object()
 
     with pytest.raises(ValueError):
-        fp32_predictor_class(Upstream, 0)()._build()
+        native_predictor_class(Upstream, 0, text_dtype="float32")()._build()
 
 
 def test_dynamic_audit_rejects_empty_parameters():
-    from ocr_service.fp32 import audit_dynamic_model
+    from ocr_service.vlm_precision import audit_dynamic_model
 
     with pytest.raises(ValueError, match="floating parameters"):
-        audit_dynamic_model(SimpleNamespace(parameters=list), 0)
+        audit_dynamic_model(SimpleNamespace(named_parameters=list), 0, "float32")
 
 
 def test_local_pipeline_only_substitutes_vl_and_normalizes_engine(tmp_path):
-    from ocr_service.fp32 import native_pipeline_class
+    from ocr_service.vlm_precision import native_pipeline_class
 
     seen = []
 
@@ -517,7 +551,8 @@ def native_runtime(tmp_path, monkeypatch):
                     name: {"version": version, "content_sha256": "a" * 64}
                     for name, version in dependency_versions.items()
                 },
-                "qualified_target": {**cuda_metadata, "paddle_build": "3.3.1"},
+                "qualified_target": {**cuda_metadata, "paddle_build": "3.3.1",
+                    "component_precision": {"text": "bfloat16", "visual": "float32", "mlp_AR": "float32", "static": "float32"}},
                 "image_identity": "image-sha256",
                 "paddle_identity": "paddle:commit-331",
                 "smoke_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
@@ -577,11 +612,21 @@ def native_runtime(tmp_path, monkeypatch):
 
         def _build(self, **kwargs):
             calls.append({"loader_dtype": self.dtype})
-            return SimpleNamespace(parameters=lambda: [tensor()]), object()
+            return dynamic_model(self.dtype), object()
+
+        def process(self, batch):
+            return batch
+
+    class StaticPredictor:
+        def __init__(self, config):
+            self.runner = Runner(config)
+
+        def process(self, batch):
+            return batch
 
     class Base:
         def create_model(self, config, **kwargs):
-            return SimpleNamespace(runner=Runner(config))
+            return StaticPredictor(config)
 
     class Pipeline(Base):
         def __init__(self, config, **kwargs):
@@ -597,13 +642,16 @@ def native_runtime(tmp_path, monkeypatch):
         def predict(self, image, **kwargs):
             calls.append(kwargs)
             for model in [
-                self.layout_det_model,
                 self.doc_preprocessor_pipeline.doc_ori_classify_model,
                 self.doc_preprocessor_pipeline.doc_unwarping_model,
+                self.layout_det_model,
             ]:
+                assert model.process(image) is image
                 if hasattr(model.runner, "input"):
                     model.runner.input("conv2d", "compiled_w", tensor())
                     model.runner.output("conv2d", "result", tensor())
+            for _ in range(20):
+                assert self.vl_rec_model.process(image) is image
             yield {
                 "doc_preprocessor_res": {
                     "output_img": np.zeros((8, 3, 3), dtype=np.uint8),
@@ -646,8 +694,10 @@ def native_runtime(tmp_path, monkeypatch):
     return runtime, source, cuda_metadata, calls
 
 
-@pytest.mark.parametrize("target_change", ["name", "architecture", "override", "missing_seal"])
-def test_factory_bootstraps_then_requires_real_forward_for_all_models(native_runtime, monkeypatch, target_change):
+@pytest.mark.parametrize("target_change", ["name", "architecture", "override", "missing_seal", "legacy_precision"])
+def test_factory_bootstraps_then_requires_real_forward_for_all_models(
+    native_runtime, monkeypatch, target_change
+):
     import json
 
     import ocr_service.pipeline as factory
@@ -659,7 +709,7 @@ def test_factory_bootstraps_then_requires_real_forward_for_all_models(native_run
         load_profile(Path(__file__).parents[1] / "paddleocr-service/profile.json"), runtime
     )
     assert adapter.qualified is False
-    assert [call for call in calls if "loader_dtype" in call] == [{"loader_dtype": "float32"}]
+    assert [call for call in calls if "loader_dtype" in call] == [{"loader_dtype": "bfloat16"}]
     evidence = adapter.qualify(source)
     assert {item["model_name"] for item in evidence} == set(MODEL_NAMES[:3])
     response = adapter.predict(
@@ -690,7 +740,10 @@ def test_factory_bootstraps_then_requires_real_forward_for_all_models(native_run
         monkeypatch.setenv("HSA_OVERRIDE_GFX_VERSION", "10.3.0")
     else:
         manifest = json.loads(manifest_path.read_text())
-        manifest.pop("qualified_target")
+        if target_change == "legacy_precision":
+            manifest["qualified_target"].pop("component_precision")
+        else:
+            manifest.pop("qualified_target")
         manifest_path.write_text(json.dumps(manifest))
     expected_error = "spoofing" if target_change == "override" else "qualified target"
     previous_calls = calls.copy()
@@ -702,7 +755,9 @@ def test_factory_bootstraps_then_requires_real_forward_for_all_models(native_run
 
 
 @pytest.mark.parametrize("prepared", [False, True], ids=["qualified-offline", "prepared"])
-def test_serving_load_leaves_first_forward_to_real_receipt(native_runtime, monkeypatch, prepared):
+def test_serving_load_leaves_first_forward_to_real_receipt(
+    native_runtime, monkeypatch, prepared, caplog
+):
     import json
 
     from ocr_service import pipeline
@@ -722,8 +777,13 @@ def test_serving_load_leaves_first_forward_to_real_receipt(native_runtime, monke
         "begin_static_audit",
         lambda *a, **kw: pytest.fail("serving attached a diagnostic hook"),
     )
+    # Spawned workers configure an isolated namespace in production.
+    monkeypatch.setattr(pipeline.logger, "handlers", [caplog.handler])
+    monkeypatch.setattr(pipeline.logger, "propagate", False)
+    caplog.set_level("INFO", logger=pipeline.__name__)
     adapter = pipeline.build_serving_pipeline(profile, runtime)
     assert not any("min_pixels" in call for call in calls)
+    assert "ocr_receipt_stage" not in caplog.text
     if prepared:
         identity = serving_identity(profile, runtime, runtime.model_content, device)
         assert (adapter.profile_id, adapter.runtime_fingerprint) == (
@@ -737,6 +797,30 @@ def test_serving_load_leaves_first_forward_to_real_receipt(native_runtime, monke
         source_sha256=hashlib.sha256(receipt.read_bytes()).hexdigest(),
     )
     assert page.text == "SHOP"
+    trace = "\n".join(caplog.messages)
+    assert [
+        line.split()[1:3] for line in trace.splitlines() if line.startswith("ocr_receipt_stage")
+    ] == [
+        ["stage=normalize", "state=start"],
+        ["stage=normalize", "state=done"],
+        ["stage=orientation", "state=start"],
+        ["stage=orientation", "state=done"],
+        ["stage=unwarp", "state=start"],
+        ["stage=unwarp", "state=done"],
+        ["stage=layout", "state=start"],
+        ["stage=layout", "state=done"],
+        ["stage=vlm_region", "state=start"],
+        ["stage=vlm_region", "state=done"],
+        ["stage=vlm_regions", "state=continue"],
+        ["stage=vlm_regions", "state=done"],
+        ["stage=convert", "state=start"],
+        ["stage=convert", "state=done"],
+    ]
+    assert "regions_completed=20" in trace
+    assert "worker_peak_rss_kib=" in trace and "worker_cpu_ms=" in trace
+    assert "elapsed_ms=" in trace
+    assert str(receipt) not in trace and page.text not in trace
+    assert "process" not in vars(adapter.pipeline.vl_rec_model)
     assert "precision_audits" not in page.telemetry
     assert [call for call in calls if "max_pixels" in call] == [
         {
@@ -801,6 +885,11 @@ def test_wsl_checkpoint_loader_bound_to_cache_and_explicit_qualification(
     profile = load_profile(Path(__file__).parents[1] / "paddleocr-service/profile.json")
     monkeypatch.setattr(platform, "release", lambda: "6.8-generic")
     direct = serving_identity(profile, prepared, prepared.model_content, device)
+    turing = serving_identity(
+        profile, prepared, prepared.model_content, {**device, "compute_capability": [7, 5]}
+    )
+    assert direct["profile_id"] != turing["profile_id"]
+    assert direct["runtime_fingerprint"] != turing["runtime_fingerprint"]
     monkeypatch.setattr(platform, "release", lambda: "6.6-microsoft-standard-WSL2")
     staged = serving_identity(profile, prepared, prepared.model_content, device)
     assert direct["profile_id"] != staged["profile_id"]
@@ -809,17 +898,17 @@ def test_wsl_checkpoint_loader_bound_to_cache_and_explicit_qualification(
     with pytest.raises(ValueError, match="qualified target"):
         pipeline.build_pipeline(profile, legacy)
     assert calls == []
-    manifest["qualified_target"]["vlm_checkpoint_loader"] = "host-fp32-v1"
+    manifest["qualified_target"]["vlm_checkpoint_loader"] = "host-selective-v1"
     legacy.qualification_manifest.write_text(json.dumps(manifest))
     loaders = []
-    original = pipeline.fp32_predictor_class
+    original = pipeline.native_predictor_class
 
-    def observe(upstream, index, *, assemble_on_host):
+    def observe(upstream, index, *, assemble_on_host, text_dtype):
         loaders.append(assemble_on_host)
         # Real Paddle construction is covered separately. Record each factory's selected policy.
-        return original(upstream, index)
+        return original(upstream, index, text_dtype=text_dtype)
 
-    monkeypatch.setattr(pipeline, "fp32_predictor_class", observe)
+    monkeypatch.setattr(pipeline, "native_predictor_class", observe)
     pipeline.build_pipeline(profile, legacy)
     page_adapter = pipeline.build_serving_pipeline(profile, prepared)
     assert loaders == [True, True]
@@ -1017,3 +1106,36 @@ def test_factory_rejects_dependency_identity_drift_before_heavy_imports(
         factory.build_pipeline(
             load_profile(Path(__file__).parents[1] / "paddleocr-service/profile.json"), runtime
         )
+
+
+def test_debug_stage_logs_count_each_region_and_hide_native_error(monkeypatch, caplog):
+    from types import SimpleNamespace
+
+    from ocr_service import pipeline
+
+    class Predictor:
+        def process(self, fail=False):
+            if fail:
+                raise RuntimeError("private receipt text")
+
+    model = Predictor()
+    native = SimpleNamespace(
+        doc_preprocessor_pipeline=SimpleNamespace(
+            doc_ori_classify_model=Predictor(), doc_unwarping_model=Predictor(),
+        ),
+        layout_det_model=Predictor(), vl_rec_model=model,
+    )
+    gpu = SimpleNamespace(memory_allocated=lambda index: 1234 if index == 2 else 0)
+    monkeypatch.setitem(pipeline.sys.modules, "paddle", SimpleNamespace(device=SimpleNamespace(cuda=gpu)))
+    monkeypatch.setattr(pipeline.logger, "handlers", [caplog.handler])
+    monkeypatch.setattr(pipeline.logger, "propagate", False)
+    caplog.set_level("DEBUG", logger=pipeline.__name__)
+    with pytest.raises(RuntimeError, match="private receipt"):
+        with pipeline.trace_receipt_stages(native, 2):
+            model.process()
+            model.process(fail=True)
+    assert any("stage=vlm_region state=start regions_completed=1" in msg for msg in caplog.messages)
+    assert any("stage=vlm_region state=failed regions_completed=1" in msg for msg in caplog.messages)
+    assert any("gpu_allocated_bytes=1234" in msg for msg in caplog.messages)
+    assert not any("private receipt" in msg for msg in caplog.messages)
+    assert "process" not in vars(model)

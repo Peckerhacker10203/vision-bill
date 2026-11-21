@@ -61,7 +61,7 @@ verify_bundle() {
     digest=${BASH_REMATCH[1]}
     path=${BASH_REMATCH[2]}
     case "$path" in
-      compose.yaml|release.json|runtime.env.example|check-compose.sh|start-linux.sh|start-windows.ps1|release/*) ;;
+      compose.yaml|compose.wsl.yaml|release.json|runtime.env.example|check-compose.sh|start-linux.sh|start-windows.ps1|release/*) ;;
       *) fail "Unexpected path in SHA256SUMS: $path" ;;
     esac
     [[ ! ${files[$path]+present} ]] || fail "Repeated checksum path: $path"
@@ -276,7 +276,14 @@ claim=${project}-vision-bill-launcher-owner
 unset COMPOSE_FILE COMPOSE_ENV_FILES COMPOSE_PROFILES COMPOSE_COMPATIBILITY COMPOSE_REMOVE_ORPHANS
 export COMPOSE_DISABLE_ENV_FILE=1 COMPOSE_PROJECT_NAME="$project" VISION_BILL_INSTALLATION_ID="$token"
 export APP_BIND_ADDRESS=127.0.0.1 APP_PORT="$port"
-compose=(docker compose --file "$bundle/compose.yaml" --project-name "$project")
+compose_file="$bundle/compose.yaml"
+if grep -Fxq '  "variant": "app-ocr-rocm",' release.json && grep -qi microsoft /proc/sys/kernel/osrelease; then
+  [[ -c /dev/dxg && -f /usr/lib/wsl/lib/libdxcore.so ]] || fail 'Install the AMD Windows WSL driver and enable GPU access in this WSL 2 distro.'
+  [[ ${OCR_ROCM_DEVICE_ID:-0} =~ ^(0|[1-9][0-9]{0,3})$ ]] && (( ${OCR_ROCM_DEVICE_ID:-0} <= 1024 )) ||
+    fail 'Select one AMD WSL GPU by numeric index in OCR_ROCM_DEVICE_ID.'
+  compose_file="$bundle/compose.wsl.yaml"
+fi
+compose=(docker compose --file "$compose_file" --project-name "$project")
 sh ./check-compose.sh || fail 'Update Docker Compose to 2.30 or later and check the bundle configuration.'
 declare -A volumes=() services=()
 load_compose_resources

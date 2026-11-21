@@ -66,6 +66,9 @@ def test_rocm_exact_pins_full_sdk_targets_and_no_spoofing():
     assert lock["rdna2_targets"] == ["gfx1030", "gfx1031", "gfx1032", "gfx1034"]
     sdk = (SERVICE / "build/build_therock.sh").read_text()
     assert "THEROCK_ENABLE_ALL=ON" in sdk and "--target dist-rocm" in sdk
+    assert "THEROCK_ENABLE_WSL_ROCDXG=ON" in sdk and '-DTHEROCK_WSL_WIN_SDK=$WIN_SDK' in sdk
+    assert lock["sources"]["win32metadata"] in sdk and lock["wkmi_dvc_md5"] in sdk
+    assert 'sha256sum "$SDK/lib/librocdxg.so.1"' in sdk
     assert 'CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS" cmake --build "$THEROCK_BUILD"' in sdk
     assert "HSA_OVERRIDE_GFX_VERSION" not in script + sdk
     assert "WITH_FLASHATTN=OFF" in script
@@ -76,7 +79,7 @@ def test_rocm_exact_pins_full_sdk_targets_and_no_spoofing():
     assert "WITH_ROCM AND WITH_FLASHATTN" in patch
 
 
-@pytest.mark.parametrize("existing", ["TheRock", "Paddle", "therock-build"])
+@pytest.mark.parametrize("existing", ["TheRock", "Paddle", "therock-build", "win32metadata"])
 def test_rocm_rejects_existing_source_before_starting_build(tmp_path, existing):
     (tmp_path / existing).mkdir()
     result = subprocess.run(

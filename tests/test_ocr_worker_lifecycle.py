@@ -344,12 +344,13 @@ def test_shutdown_waits_for_active_input_ownership_before_return(tmp_path):
         assert all(not process.is_alive() for process in context.processes)
 
 
-def test_worker_first_prediction_is_the_uploaded_receipt(tmp_path, monkeypatch):
+def test_worker_first_prediction_is_the_uploaded_receipt(tmp_path, monkeypatch, capsys):
     from types import SimpleNamespace
 
     from ocr_service import pipeline
     from ocr_service.worker import _worker_main, read_result
 
+    monkeypatch.setenv("OCR_LOG_LEVEL", "INFO")
     calls = []
     item = request(tmp_path)
 
@@ -375,6 +376,9 @@ def test_worker_first_prediction_is_the_uploaded_receipt(tmp_path, monkeypatch):
         object(),
         tmp_path,
     )
+    log = capsys.readouterr().err
+    assert f"phase=native state=start generation=1 request_id={item.request_id}" in log
+    assert str(item.original_path) not in log and item.source_sha256 not in log
     assert calls == [item.original_path]
     ready = outgoing.get()
     assert ready["kind"] == "ready"
@@ -1074,11 +1078,18 @@ def test_child_distinguishes_native_gpu_allocator_errors(
     assert "private" not in str(message)
 
 
-def test_ready_poll_cannot_restart_a_generation_retired_for_gpu_memory(tmp_path, monkeypatch):
+@pytest.mark.parametrize("managed", [False, True])
+def test_ready_poll_cannot_restart_a_generation_retired_for_gpu_memory(tmp_path, monkeypatch, managed):
     from ocr_service.worker import OcrWorkerError
 
     context = FakeContext(mode="gpu_memory")
     worker = manager(context)
+    owner = None
+    if managed:
+        owner = f"1:{uuid4()}"
+        worker.claim(owner)
+        worker.load(owner)
+    process = context.processes[-1]
     release_reply = threading.Event()
     recovery_started = threading.Event()
     recovery_finished = threading.Event()
@@ -1101,18 +1112,19 @@ def test_ready_poll_cannot_restart_a_generation_retired_for_gpu_memory(tmp_path,
     try:
         with ThreadPoolExecutor(max_workers=1) as pool:
             job = pool.submit(
-                worker.infer, request(tmp_path), deadline_monotonic=time.monotonic() + 3
+                worker.infer, request(tmp_path), deadline_monotonic=time.monotonic() + 3, owner=owner
             )
             assert context.entered.wait(1)
-            context.processes[0].thread.join(1)
+            process.thread.join(1)
             assert not worker.readiness().ready
             assert recovery_started.wait(1)
             release_reply.set()
             with pytest.raises(OcrWorkerError, match="ocr_gpu_out_of_memory"):
                 job.result(3)
         assert recovery_finished.wait(1)
-        assert len(context.processes) == 1
+        assert context.processes[-1] is process
         assert worker.readiness().reason_code == "ocr_gpu_out_of_memory"
+        assert worker.readiness().can_claim_after_failed_load is managed
     finally:
         release_reply.set()
         worker.stop()
@@ -1250,16 +1262,19 @@ def test_preload_probe_spends_the_existing_startup_budget(monkeypatch, now):
         manager.stop()
 
 
-def test_failed_managed_load_never_advertises_reclaimability_before_confirmed_reap(monkeypatch):
+@pytest.mark.parametrize("phase", ["load", "page"])
+def test_failed_managed_work_never_advertises_reclaimability_before_confirmed_reap(monkeypatch, tmp_path, phase):
     from ocr_service.worker import OcrWorkerError, OcrWorkerManager
 
-    context = FakeContext(init_blocked=True)
+    context = FakeContext("hang", init_blocked=phase == "load")
     worker = OcrWorkerManager(mp_context=context, startup_timeout=.05)
     owner = f"1:{uuid4()}"
     worker.claim(owner)
+    if phase == "page":
+        worker.load(owner)
 
     def fail_termination(process):
-        # The startup timer expired, but the process still owns the GPU.
+        # The timer expired, but the process still owns the GPU.
         assert process.is_alive()
         assert not worker.readiness().can_claim_after_failed_load
         raise OSError("cannot stop child")
@@ -1268,7 +1283,10 @@ def test_failed_managed_load_never_advertises_reclaimability_before_confirmed_re
         patched.setattr(FakeProcess, "terminate", fail_termination)
         try:
             with pytest.raises(OcrWorkerError, match="ocr_worker_unstoppable"):
-                worker.load(owner)
+                if phase == "load":
+                    worker.load(owner)
+                else:
+                    worker.infer(request(tmp_path), owner=owner, deadline_monotonic=time.monotonic() + .05)
             state = worker.readiness()
             assert state.reason_code == "ocr_worker_unstoppable"
             assert not state.can_claim_after_failed_load and context.processes[0].is_alive()
@@ -1304,5 +1322,154 @@ def test_failed_managed_replacement_can_only_be_loaded_by_a_fresh_owner(tmp_path
         worker.load(second)
         assert worker.readiness().ready and len(context.processes) == 3
         assert len(context.requests) == 1
+    finally:
+        worker.stop()
+
+
+@pytest.mark.parametrize("reason", ["ocr_deadline_exceeded", "ocr_cancelled", "ocr_gpu_out_of_memory"])
+def test_interrupted_managed_page_retires_owner_until_a_fresh_claim(tmp_path, monkeypatch, reason):
+    from types import SimpleNamespace
+
+    from ocr_contract import GpuMemorySnapshot
+    from ocr_service import worker as worker_module
+    from ocr_service.worker import OcrWorkerError, OcrWorkerManager
+
+    context = FakeContext("gpu_memory" if reason == "ocr_gpu_out_of_memory" else "hang")
+    runtime = SimpleNamespace(accelerator="cuda", gpu_index=0)
+    snapshot = GpuMemorySnapshot(accelerator="cuda", gpu_index=0, free_bytes=100, total_bytes=200)
+    monkeypatch.setattr(worker_module, "probe_gpu_memory", lambda *args, **kwargs: snapshot)
+    worker = OcrWorkerManager(mp_context=context, startup_timeout=1, runtime=runtime)
+    first, next_owner = f"1:{uuid4()}", f"2:{uuid4()}"
+    cancelled = threading.Event()
+    try:
+        worker.claim(first)
+        worker.load(first)
+        with ThreadPoolExecutor(1) as pool:
+            job = pool.submit(
+                worker.infer, request(tmp_path), owner=first, cancel_event=cancelled,
+                deadline_monotonic=time.monotonic() + (.2 if reason == "ocr_deadline_exceeded" else 3),
+            )
+            assert context.entered.wait(1)
+            if reason == "ocr_cancelled":
+                cancelled.set()
+            with pytest.raises(OcrWorkerError, match=reason):
+                job.result(2)
+        state = worker.readiness()
+        assert not state.ready and state.reason_code == reason and state.can_claim_after_failed_load
+        assert state.runtime_identity == {"profile_id": "profile", "runtime_fingerprint": "runtime"}
+        if reason == "ocr_gpu_out_of_memory":
+            assert state.preload_memory == snapshot
+        assert len(context.processes) == 1 and not context.processes[0].is_alive()
+        with pytest.raises(OcrWorkerError, match="ocr_owner_phase_closed"):
+            worker.load(first)
+        worker.claim(next_owner)
+        context.mode = "ok"
+        worker.load(next_owner)
+        assert worker.infer(request(tmp_path), owner=next_owner, deadline_monotonic=time.monotonic() + 1).text
+        assert len(context.requests) == 2 and len(context.processes) == 2
+    finally:
+        worker.stop()
+
+
+def test_cancelled_waiter_never_dispatches_or_retires_active_managed_page(tmp_path):
+    from ocr_service.worker import OcrWorkerError, OcrWorkerManager
+
+    context = FakeContext("hang")
+    worker = OcrWorkerManager(mp_context=context, startup_timeout=1)
+    owner = f"1:{uuid4()}"
+    cancel = threading.Event()
+    try:
+        worker.claim(owner)
+        worker.load(owner)
+        with ThreadPoolExecutor(2) as pool:
+            active = pool.submit(worker.infer, request(tmp_path), owner=owner, deadline_monotonic=time.monotonic() + 3)
+            assert context.entered.wait(1)
+            queued = pool.submit(
+                worker.infer, request(tmp_path), owner=owner, cancel_event=cancel,
+                deadline_monotonic=time.monotonic() + 3,
+            )
+            try:
+                until = time.monotonic() + 1
+                while not worker.pending_count:
+                    assert time.monotonic() < until
+                    time.sleep(.005)
+                cancel.set()
+                with pytest.raises(OcrWorkerError, match="ocr_cancelled"):
+                    queued.result(1)
+                assert worker.readiness().ready and len(context.requests) == 1
+            finally:
+                context.release.set()
+            assert active.result(1).text
+        with pytest.raises(OcrWorkerError, match="ocr_cancelled"):
+            worker.infer(request(tmp_path), owner=owner, cancel_event=cancel, deadline_monotonic=time.monotonic() + 1)
+        assert len(context.requests) == 1 and worker.readiness().ready
+    finally:
+        worker.stop()
+
+
+def test_disconnect_during_result_read_retires_the_dispatched_managed_page(tmp_path, monkeypatch):
+    from ocr_service import worker as worker_module
+    from ocr_service.worker import OcrWorkerError, OcrWorkerManager
+
+    context = FakeContext()
+    worker = OcrWorkerManager(mp_context=context, startup_timeout=1)
+    owner = f"1:{uuid4()}"
+    cancel = threading.Event()
+    read = worker_module.read_result
+
+    def disconnect_while_reading(*args):
+        cancel.set()
+        return read(*args)
+
+    monkeypatch.setattr(worker_module, "read_result", disconnect_while_reading)
+    try:
+        worker.claim(owner)
+        worker.load(owner)
+        with pytest.raises(OcrWorkerError, match="ocr_cancelled"):
+            worker.infer(request(tmp_path), owner=owner, cancel_event=cancel, deadline_monotonic=time.monotonic() + 1)
+        assert worker.readiness().can_claim_after_failed_load and not context.processes[0].is_alive()
+    finally:
+        worker.stop()
+
+
+@pytest.mark.parametrize("interruption", ["ocr_deadline_exceeded", "ocr_cancelled"])
+def test_duplicate_load_abandons_wait_without_revoking_original(interruption):
+    from ocr_service.worker import OcrWorkerError, OcrWorkerManager
+
+    context = FakeContext(init_blocked=True)
+    worker = OcrWorkerManager(mp_context=context, startup_timeout=4)
+    owner = f"1:{uuid4()}"
+    cancel = threading.Event()
+    duplicate_started = threading.Event()
+
+    def duplicate_load():
+        duplicate_started.set()
+        worker.load(
+            owner, deadline_monotonic=time.monotonic() + (
+                .1 if interruption == "ocr_deadline_exceeded" else 3
+            ), cancel_event=cancel,
+        )
+
+    try:
+        worker.claim(owner)
+        with ThreadPoolExecutor(2) as pool:
+            first = pool.submit(worker.load, owner)
+            try:
+                assert context.started.wait(1)
+                duplicate = pool.submit(duplicate_load)
+                assert duplicate_started.wait(1)
+                if interruption == "ocr_cancelled":
+                    cancel.set()
+                with pytest.raises(OcrWorkerError, match=interruption):
+                    duplicate.result(1)
+                assert not first.done() and context.processes[0].is_alive()
+            finally:
+                context.init_release.set()
+            first.result(1)
+        assert worker.readiness().ready
+        with pytest.raises(OcrWorkerError, match="ocr_deadline_exceeded"):
+            worker.load(owner, deadline_monotonic=time.monotonic() - 1)
+        worker.load(owner)
+        assert worker.readiness().ready and len(context.processes) == 1
     finally:
         worker.stop()

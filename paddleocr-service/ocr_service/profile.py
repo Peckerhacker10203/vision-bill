@@ -12,10 +12,10 @@ from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .fp32 import requires_host_assembly
 from .paddle_distribution import installed_native_paddle, native_paddle_distribution
+from .vlm_precision import component_precision, requires_host_assembly
 
-ADAPTER_VERSION = "native-fp32-v1"
+ADAPTER_VERSION = "native-selective-v1"
 NORMALIZER_VERSION = document_image.NORMALIZER_VERSION
 MODEL_NAMES = (
     "PP-DocLayoutV3",
@@ -34,12 +34,12 @@ class RuntimeIdentityMismatch(ValueError):
 
 
 class OcrProfile(BaseModel):
-    """The approved policy admits no platform-dependent substitutions."""
+    """Fixed pipeline settings and versioned hardware precision policy."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
     pipeline_version: Literal["v1.6"]
     backend: Literal["native"]
-    precision: Literal["float32"]
+    precision: Literal["native-selective-v1"]
     model_name: Literal["PaddleOCR-VL-1.6-0.9B"]
     layout_model: Literal["PP-DocLayoutV3"]
     min_pixels: Literal[112896]
@@ -247,12 +247,12 @@ def serving_identity(
     """Bind reusable receipt pages to their settings, artifacts, image and actual device."""
     profile_id = content_identity(
         {
-            "adapter": (
-                "native-receipt-fp32-host-checkpoint-v1"
-                if requires_host_assembly(
-                    runtime.accelerator, device_identity.get("compute_capability")
-                )
-                else "native-receipt-fp32-v2"
+            "adapter": ADAPTER_VERSION,
+            "component_precision": component_precision(
+                runtime.accelerator, device_identity.get("compute_capability")
+            ),
+            "host_assembly": requires_host_assembly(
+                runtime.accelerator, device_identity.get("compute_capability")
             ),
             "normalizer": NORMALIZER_VERSION,
             "effective_config": effective_pipeline_config(profile),

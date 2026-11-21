@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from ..config import Settings
+from ..helper.logging_config import submission_logs
 from ..model.handoff import HandoffWait
 from ..model.workflow import AccessScope
 from ..provider.db.image_db import ImageDB
@@ -103,7 +104,7 @@ class AnalysisScheduler:
             for image in await self._db.due_candidates(purpose=None):
                 completion = image.observations_available
                 try:
-                    with inference_admission(self._provider):
+                    with submission_logs(image.id), inference_admission(self._provider):
                         try:
                             async with asyncio.timeout(5):
                                 ready = await (
@@ -126,9 +127,17 @@ class AnalysisScheduler:
                             # A competing claim must not create a zero-delay loop.
                             self._deferred_image_ids.add(image.id)
                             continue
+                        logger.info(
+                            "analysis_claim state=start purpose=%s",
+                            "completion" if completion else "inference",
+                        )
                         result = await (
                             self._submissions.complete_checkpoint(claim) if completion
                             else self._submissions.process_claim(claim)
+                        )
+                        logger.info(
+                            "analysis_claim state=finished status=%s",
+                            result.submission.status if result.submission else "superseded",
                         )
                 except HandoffWait as exc:
                     await self._db.set_wait_reason(image, str(exc))

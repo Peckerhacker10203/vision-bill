@@ -707,6 +707,7 @@
 			"vision_fallback_unavailable": "The explicitly permitted vision fallback has no available suitable model.",
 			"ocr_unavailable": "Waiting for the OCR service to become ready.",
 			"ocr_disabled": "OCR is disabled in the current configuration.",
+			"ocr_cancelled": "The OCR request was cancelled. Waiting for the worker to become ready.",
 			"ocr_starting": "The OCR runtime is loading its model.",
 			"ocr_stopped": "The OCR runtime is stopped.",
 			"ocr_not_ready": "The OCR runtime is not ready to accept work.",

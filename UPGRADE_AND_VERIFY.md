@@ -338,13 +338,13 @@ Local application tests used synthetic receipts and CPU service doubles. See
 [current branch CI](https://github.com/Peckerhacker10203/vision-bill/actions?query=branch%3Acodex%2Fvision-bill-update-package)
 for the published commit's conclusions.
 
-Actual official CUDA wheel-lock resolution, CUDA/ROCm native compilation, physical
-GPU inference/qualification, current historical CPU image installation/inference,
-quality/latency/VRAM measurements remain **UNEXECUTED** here. CPU stubs and source/
-CMake checks certify software contracts only. No VRAM/performance blocker was
-established, and universal AMD support is not claimed. Intended Linux consumer
-scope is RX 6000+/RDNA2 and later selected candidates, each requiring its own real
-qualification. See [native prerequisites and commands](paddleocr-service/README.md).
+The November 21 WSL 2 CUDA checkpoint-loading observation reached worker
+readiness, then the receipt request returned HTTP 504. Software gates cover
+contracts, packaging and simulated lifecycle behavior. Neither that run nor CI
+establishes completed receipt quality, throughput, peak VRAM or qualification
+across the intended NVIDIA Turing+ and AMD RDNA2+ device families. Release
+maintainers record the selected physical device for each published native
+variant. Additional boards or hosts need separate evidence to claim qualification. [Native evidence and prerequisites](paddleocr-service/README.md)
 
 For future changes, canonical gates are `make lint`, `make test`, `make fe-verify`,
 `make release-test`, `make distribution-test`, `make distribution-pid1-test`,

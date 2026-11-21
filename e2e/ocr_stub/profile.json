@@ -3,7 +3,7 @@
   "model_name": "PaddleOCR-VL-1.6-0.9B",
   "layout_model": "PP-DocLayoutV3",
   "backend": "native",
-  "precision": "float32",
+  "precision": "native-selective-v1",
   "batch_size": 1,
   "use_queues": false,
   "use_doc_orientation_classify": true,

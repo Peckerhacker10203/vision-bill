@@ -153,6 +153,27 @@ def main() -> None:
                 "/var/lib/ocr",
                 "/coord",
             }
+            if accelerator == "rocm":
+                # The qualifier replaces volumes; apply the WSL driver bind last.
+                wsl = ["-f", str(ROOT / "docker-compose.rocm-wsl.yml")]
+                qualification = ["-f", str(ROOT / "docker-compose.ocr-qualification.yml")]
+                for mode in ([], qualification):
+                    wsl_config = resolve_compose(
+                        [*command, *mode, *wsl], private, {**environment, "OCR_ROCM_DEVICE_ID": "2"}
+                    )
+                    wsl_service = wsl_config["services"]["paddleocr-service"]
+                    assert [(d["source"], d["target"]) for d in wsl_service["devices"]] == [
+                        ("/dev/dxg", "/dev/dxg")
+                    ]
+                    assert not wsl_service.get("group_add")
+                    assert wsl_service["environment"]["HIP_VISIBLE_DEVICES"] == "2"
+                    dxcore = next(
+                        m for m in wsl_service["volumes"] if m["target"] == "/usr/lib/libdxcore.so"
+                    )
+                    assert dxcore["source"] == "/usr/lib/wsl/lib/libdxcore.so"
+                    assert dxcore["type"] == "bind" and dxcore["read_only"]
+                    assert not dxcore.get("bind", {}).get("create_host_path", False)
+                print("main + rocm + WSL: activation and qualification configurations valid")
             print(f"main + {accelerator}: configuration valid (no services started)")
 
 

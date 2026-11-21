@@ -35,6 +35,7 @@ services:
     environment:
       OMP_NUM_THREADS: "4"
       OCR_PORT: "8082"
+      OCR_LOG_LEVEL: "${OCR_LOG_LEVEL:-INFO}"
       PADDLE_PDX_CACHE_HOME: /var/cache/paddlex
       OCR_INSTALLATION_LOCK_PATH: /coord/installation.lock
       OCR_RUNTIME_SETTINGS_PATH: /var/lib/ocr/qualification.runtime.json

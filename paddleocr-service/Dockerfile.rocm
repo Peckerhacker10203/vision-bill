@@ -33,7 +33,7 @@ COPY ocr_service/targets.py /opt/ocr/ocr_service/targets.py
 ARG AMDGPU_TARGETS
 ARG BUILD_JOBS=8
 RUN BUILD_JOBS="$BUILD_JOBS" AMDGPU_TARGETS="$AMDGPU_TARGETS" bash /opt/ocr/build/build_therock.sh \
- && rm -rf /opt/native-src/TheRock /opt/native-src/therock-build
+ && rm -rf /opt/native-src/TheRock /opt/native-src/therock-build /opt/native-src/win32metadata
 COPY build/build_rocm.sh build/hip-rdna2-v1.patch build/hip-device-info.cpp /opt/ocr/build/
 RUN BUILD_JOBS="$BUILD_JOBS" AMDGPU_TARGETS="$AMDGPU_TARGETS" bash /opt/ocr/build/build_rocm.sh --paddle-only \
  && rm -rf /opt/native-src/Paddle

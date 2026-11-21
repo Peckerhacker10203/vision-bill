@@ -33,6 +33,7 @@ from .initialize import (
     check_prepared_installation,
     prepare_installation,
 )
+from .logging_config import configure_native_logging
 from .supervision import (
     InstallationBusy,
     ManagedInterrupted,
@@ -42,7 +43,7 @@ from .supervision import (
     managed_installation,
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ocr_service.activation")
 ACTIVATION_STORE = ActivationStore()
 PARK_TIMEOUT_SECONDS = 30
 POLL_SECONDS = 1
@@ -196,6 +197,7 @@ def process_request(
                 except PreparationRequired:
                     pass  # Migrate a previously requested installation under maintenance exclusion.
             if installation is None:
+                logger.info("ocr_activation generation=%s state=preparing", request.generation)
                 installation = prepare_installation(
                     *args,
                     maintenance_intent=request.maintenance_intent,
@@ -213,6 +215,7 @@ def process_request(
                     ActivationStatus(request.generation, ActivationPhase.READY)
                 ):
                     raise ActivationStateError("Activation request changed before parked readiness")
+                logger.info("ocr_activation generation=%s state=parked", request.generation)
                 admission.close()
                 process.wait()
             raise ServingExited("Native serving process exited")
@@ -266,6 +269,8 @@ def run_controller(store: ActivationStore, inputs: ReleaseInputs, port: int) -> 
 
 
 def main(store: ActivationStore = ACTIVATION_STORE) -> None:
+    configure_native_logging()
+
     def stop(signum: int, _frame: FrameType | None) -> None:
         raise ManagedInterrupted(signum)
 

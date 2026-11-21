@@ -490,6 +490,7 @@ async def test_parked_prepared_identity_is_used_before_first_receipt(monkeypatch
 
 @pytest.mark.parametrize("code,expected_identity", [
     ("ocr_startup_timeout", "prepared"),
+    ("ocr_cancelled", "prepared"),
     ("ocr_runtime_identity_mismatch", None),
 ])
 async def test_reclaimed_load_preserves_usable_cache_identity_only(monkeypatch, code, expected_identity):

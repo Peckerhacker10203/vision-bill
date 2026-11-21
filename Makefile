@@ -147,7 +147,7 @@ ocr-build-cuda: ## Build candidate CUDA image after official lock resolution
 	export OCR_CUDA_WHEEL_CONTEXT && \
 	docker compose --profile ocr -f docker-compose.yml -f docker-compose.cuda.yml build paddleocr-service
 
-ocr-build-rocm: ## Build native full-SDK RDNA2 candidate (large build; no support claim)
+ocr-build-rocm: ## Build the native Radeon SDK candidate
 	docker compose --profile ocr -f docker-compose.yml -f docker-compose.rocm.yml build paddleocr-service
 
 ocr-qualify-cuda ocr-qualify-rocm: ## Run an explicit supervised CUDA/ROCm source qualification
@@ -158,7 +158,11 @@ ocr-qualify-cuda ocr-qualify-rocm: ## Run an explicit supervised CUDA/ROCm sourc
 		compose=(docker compose --profile ocr -f docker-compose.yml -f "docker-compose.$$accelerator.yml"); \
 		running="$$("$${compose[@]}" ps --status running --status restarting --quiet vision_bill paddleocr-service)"; \
 		if test -n "$$running"; then echo "Stop the source app and OCR sidecar before qualification" >&2; exit 1; fi; \
-		"$${compose[@]}" -f docker-compose.ocr-qualification.yml run --rm --no-deps --pull never \
+		compose+=(-f docker-compose.ocr-qualification.yml); \
+		if [[ $$accelerator == rocm ]] && grep -qi microsoft /proc/sys/kernel/osrelease; then \
+			compose+=(-f docker-compose.rocm-wsl.yml); \
+		fi; \
+		"$${compose[@]}" run --rm --no-deps --pull never \
 			-v "$$PWD/server_data/ocr-runtime:/var/lib/ocr" -v "$$PWD/server_data/config:/app/config" \
 			paddleocr-service python -m ocr_service.source_maintenance --accelerator "$$accelerator" \
 			--runtime /var/lib/ocr/candidate.runtime.json --cases /var/lib/ocr/fixtures.toml \

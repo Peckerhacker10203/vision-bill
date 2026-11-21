@@ -24,6 +24,7 @@ from ocr_contract.activation import MaintenanceIntent
 from .device_inventory import DeviceIdentityUnavailable, inspect_device_identity
 from .gpu_memory import GPU_OOM_CODE, GPU_OOM_EXIT
 from .initialization_lock import lock_path, maintenance_handoff
+from .logging_config import configure_native_logging
 from .provision import (
     KINDS,
     ModelDownloadFailed,
@@ -40,16 +41,18 @@ from .provision import (
     verify_sources,
     verify_tree,
 )
-from .supervision import ManagedInterrupted as InitializationInterrupted
 from .supervision import (
+    InstallationBusy,
+    UncleanInstallation,
     check_fences,
     installation_lock,
     managed_installation,
     run_owned_qualification,
 )
+from .supervision import ManagedInterrupted as InitializationInterrupted
 from .targets import validate_profile
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ocr_service.initialize")
 
 
 class InitializationFailed(RuntimeError):
@@ -172,8 +175,10 @@ def cached_installation(
     if selected is None:
         return None
     root, completion = selected
-    if completion.get("schema_version") == 2:
-        return None  # A file-only installation does not satisfy an explicit release gate.
+    if "schema_version" in completion:
+        if type(completion["schema_version"]) is int and completion["schema_version"] == 2:
+            return None  # A file-only installation does not satisfy an explicit release gate.
+        raise ValueError("Unknown installed model metadata")
     files = completion.get("files", {})
     required = {
         "bundle.json",
@@ -216,14 +221,20 @@ def check_installation(
         state = state_dir.resolve()
         if not (state / "selected").exists():
             raise InitializationFailed(
-                "native_initialization_required: run explicit maintain with --maintenance-intent after stopping managed OCR and attesting external LLM quiescence or a separate OCR device"
+                "native_initialization_required: run explicit prepare with --maintenance-intent after stopping OCR and attesting external LLM quiescence or a separate OCR device"
             )
         device = inspect_device_identity(bundle.accelerator, bundle.gpu_index)
-        if (cached := cached_installation(state, bundle, image_id, device)) is None:
+        cached = cached_installation(state, bundle, image_id, device)
+        if cached is not None:
+            return cached
+        prepared = _cached_prepared(state, bundle, image_id, device)
+        if prepared is None:
             raise InitializationFailed(
-                "native_initialization_required: selected bundle/image/device changed; run explicit maintain"
+                "native_initialization_required: selected bundle/image/device changed; run explicit prepare"
             )
-        return cached
+        verify_package_pins(bundle)
+        verify_prepared_target(bundle, device)
+        return prepared
 
 
 @contextmanager
@@ -407,26 +418,28 @@ def verify_package_pins(bundle: ReleaseBundle) -> None:
         raise PreparationFailed("native_package_mismatch") from exc
 
 
+def verify_prepared_target(bundle: ReleaseBundle, device: dict[str, Any]) -> None:
+    if bundle.accelerator == "rocm":
+        evidence = json.loads(Path("/opt/ocr/build-evidence/kernels.json").read_bytes())
+        if device["gfx_target"] not in validate_profile(evidence["target_profile"])["candidate_targets"]:
+            raise ValueError("Selected GPU is outside this image's candidate targets")
+
+
 def _prepared_inputs(
-    bundle_path: Path, config: Path, image_id: str
+    bundle_path: Path, config: Path, image_id: str, *, standalone: bool = False,
 ) -> tuple[ReleaseBundle, dict[str, Any]]:
     bundle = load_release_bundle(bundle_path)
     verify_image(bundle, config, image_id)
-    if any(
-        source.scheme != "https" or not source.hostname
-        for source in (urlsplit(asset.source) for asset in bundle.models.values())
-    ):
-        raise PreparationFailed("native_activation_inputs_invalid")
+    for asset in bundle.models.values():
+        source = urlsplit(asset.source)
+        if standalone and not source.scheme:
+            safe_relative(asset.source)
+        elif source.scheme != "https" or not source.hostname:
+            raise PreparationFailed("native_activation_inputs_invalid")
     verify_package_pins(bundle)
     try:
         device = inspect_device_identity(bundle.accelerator, bundle.gpu_index)
-        if bundle.accelerator == "rocm":
-            evidence = json.loads(Path("/opt/ocr/build-evidence/kernels.json").read_bytes())
-            if (
-                device["gfx_target"]
-                not in validate_profile(evidence["target_profile"])["candidate_targets"]
-            ):
-                raise ValueError("Selected GPU is outside this image's candidate targets")
+        verify_prepared_target(bundle, device)
     except (DeviceIdentityUnavailable, ValueError, OSError, KeyError) as exc:
         raise PreparationFailed("native_device_identity_unavailable") from exc
     return bundle, device
@@ -460,7 +473,7 @@ def _cached_prepared(
     root, complete = selection
     if "schema_version" not in complete:
         return None  # Legacy qualified installation; reuse its pinned archive cache.
-    if complete.get("schema_version") != 2:
+    if type(complete["schema_version"]) is not int or complete["schema_version"] != 2:
         raise ValueError("Unknown installed model metadata")
     runtime_path = root / "runtime.json"
     if (
@@ -501,14 +514,19 @@ def prepare_installation(
     image_id: str,
     *,
     maintenance_intent: MaintenanceIntent,
-    handoff_lock: Path,
+    handoff_lock: Path | None,
     repair: bool = False,
+    standalone: bool = False,
 ) -> Path:
     """Install the four verified model trees. This is not a physical qualification."""
     MaintenanceIntent(maintenance_intent)
     with maintenance_handoff(handoff_lock), managed_installation("initializer", lock_path()):
-        bundle, device = _prepared_inputs(bundle_path, image_config, image_id)
+        bundle, device = _prepared_inputs(bundle_path, image_config, image_id, standalone=standalone)
         state = state_dir.resolve()
+        if standalone:
+            qualified = cached_installation(state, bundle, image_id, device)
+            if qualified is not None:
+                return qualified
         try:
             cached = _cached_prepared(state, bundle, image_id, device)
         except PreparationFailed as exc:
@@ -550,8 +568,39 @@ def prepare_installation(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", nargs="?", choices=("check", "maintain"), default="check")
+    configure_native_logging()
+    try:
+        _run_cli()
+    except InitializationInterrupted as exc:
+        raise SystemExit(128 + exc.signum) from None
+    except InitializationGpuOutOfMemory:
+        raise SystemExit(GPU_OOM_CODE) from None
+    except InitializationFailed:
+        raise SystemExit("native_initialization_required") from None
+    except InstallationBusy:
+        raise SystemExit("native_installation_busy") from None
+    except UncleanInstallation:
+        raise SystemExit("native_activation_recovery_required") from None
+    except DeviceIdentityUnavailable:
+        raise SystemExit("native_device_identity_unavailable") from None
+    except PreparationFailed as exc:
+        allowed = {
+            "native_activation_inputs_invalid", "native_package_mismatch",
+            "native_device_identity_unavailable", "native_model_download_failed",
+            "native_model_integrity_failed", "native_installation_write_failed",
+        }
+        raise SystemExit(exc.reason_code if exc.reason_code in allowed else "native_initialization_failed") from None
+    except OSError:
+        raise SystemExit("native_installation_io_failed") from None
+    except (ValueError, KeyError, TypeError, AttributeError, tarfile.TarError):
+        raise SystemExit("native_activation_inputs_invalid") from None
+    except Exception:  # noqa: BLE001 - native libraries may embed private inputs in their exceptions
+        raise SystemExit("native_initialization_failed") from None
+
+
+def _run_cli() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, exit_on_error=False)
+    parser.add_argument("operation", nargs="?", choices=("check", "prepare", "maintain"), default="check")
     parser.add_argument("--bundle", type=Path)
     parser.add_argument(
         "--state-dir", type=Path, default=Path(os.environ.get("OCR_STATE_DIR", "/var/lib/ocr"))
@@ -574,37 +623,47 @@ def main() -> None:
         help="Requalify in maintain; never bypasses locks or retained crash fences",
     )
     parser.add_argument("--print-source-identities", action="store_true")
-    args = parser.parse_args()
+    try:
+        args, unknown = parser.parse_known_args()
+    except argparse.ArgumentError:
+        parser.error("Invalid initializer arguments; see --help")
+    if unknown:
+        parser.error("Unrecognized initializer arguments; see --help")
     if args.print_source_identities:
         print(json.dumps(source_identities(), sort_keys=True, indent=2))
         return
     if not args.bundle or not args.image_config or not args.image_id:
         parser.error("--bundle, --image-config and actual --image-id are required")
-    if args.operation == "maintain" and not args.maintenance_intent:
-        parser.error("maintain requires invocation-local --maintenance-intent")
+    if args.operation != "check" and not args.maintenance_intent:
+        parser.error(f"{args.operation} requires invocation-local --maintenance-intent")
+    if args.force and args.operation != "maintain":
+        parser.error("--force requires maintain")
     if (
-        args.operation == "maintain"
+        args.operation != "check"
         and os.environ.get("OCR_MAINTENANCE_REQUIRE_HANDOFF") == "true"
         and not args.handoff_lock
     ):
         parser.error("Paired maintenance requires the original app --handoff-lock path explicitly")
-    if args.operation == "check" and (args.force or args.maintenance_intent or args.handoff_lock):
-        parser.error("--force, --maintenance-intent and --handoff-lock require maintain")
-    try:
-        if args.operation == "check":
-            check_installation(args.bundle, args.state_dir, args.image_config, args.image_id)
-        else:
-            initialize(
-                args.bundle,
-                args.state_dir,
-                args.image_config,
-                args.image_id,
-                maintenance_intent=args.maintenance_intent,
-                handoff_lock=args.handoff_lock,
-                force=args.force,
-            )
-    except InitializationInterrupted:
-        raise SystemExit(143) from None
+    if args.operation == "check" and (args.maintenance_intent or args.handoff_lock):
+        parser.error("--maintenance-intent and --handoff-lock require prepare or maintain")
+    if args.operation == "check":
+        check_installation(args.bundle, args.state_dir, args.image_config, args.image_id)
+    elif args.operation == "prepare":
+        prepare_installation(
+            args.bundle, args.state_dir, args.image_config, args.image_id,
+            maintenance_intent=MaintenanceIntent(args.maintenance_intent),
+            handoff_lock=args.handoff_lock, standalone=True, repair=True,
+        )
+    else:
+        initialize(
+            args.bundle,
+            args.state_dir,
+            args.image_config,
+            args.image_id,
+            maintenance_intent=args.maintenance_intent,
+            handoff_lock=args.handoff_lock,
+            force=args.force,
+        )
 
 
 if __name__ == "__main__":

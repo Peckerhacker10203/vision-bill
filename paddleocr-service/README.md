@@ -7,17 +7,34 @@ receipt fixtures belong in Git or the Docker build context.
 
 ## Fixed extraction policy
 
-PaddleOCR-VL-1.6 (`pipeline_version=v1.6`), PP-DocLayoutV3, native Paddle,
-FP32; batch 1 throughout, internal PaddleX queues off, chart/seal off. Document
-orientation classification detects page rotation and turns sideways or upside-down
-pages upright. UVDoc unwarping flattens curved or perspective-distorted
-pages. Both are enabled. EXIF orientation normalization applies smartphone
-metadata independently before native preprocessing. Region min 112896 /
-max 2000000 pixels (including table regions), OCR max_new_tokens 4096, no extra
-sampling parameters. The official VLM grid alignment applies **per region**;
-2MP is not a whole-working-image downscale. No platform-specific precision,
-backend, resolution or token reduction is permitted. Formatter 8192/context
-capacity are separate app/model facts, and unknown context stays null.
+Each photo goes through the native PaddleOCR-VL-1.6 pipeline once. Vision
+Bill runs batch size 1 with internal queues off. The pinned PaddleX
+pipeline enables layout analysis and leaves document preprocessing off by
+default. Vision Bill enables both preprocessing models for photographed
+receipts. [Official pipeline configuration](https://github.com/PaddlePaddle/PaddleX/blob/ffb64904d23708863ff5b8da312a5cbd52a7f462/paddlex/configs/pipelines/PaddleOCR-VL-1.6.yaml) · [Installed receipt profile](profile.json)
+
+| Stage | What it does for a receipt |
+| --- | --- |
+| Orientation | After applying the photo's EXIF metadata, PP-LCNet_x1_0_doc_ori reads the page content and predicts a quarter-turn (0°, 90°, 180° or 270°). [Model guide](https://github.com/PaddlePaddle/PaddleX/blob/ffb64904d23708863ff5b8da312a5cbd52a7f462/docs/module_usage/tutorials/ocr_modules/doc_img_orientation_classification.en.md) |
+| Unwarping | UVDoc corrects geometric distortion such as curled paper or perspective. Its output supplies both the layout model and the working image used for review. [Model guide](https://github.com/PaddlePaddle/PaddleX/blob/ffb64904d23708863ff5b8da312a5cbd52a7f462/docs/module_usage/tutorials/ocr_modules/text_image_unwarping.en.md) |
+| Layout | PP-DocLayoutV3 locates 25 types of document regions and predicts their reading order. PaddleX crops the regions and can merge adjacent blocks before recognition. [Model guide](https://github.com/PaddlePaddle/PaddleX/blob/ffb64904d23708863ff5b8da312a5cbd52a7f462/docs/module_usage/tutorials/ocr_modules/layout_analysis.en.md) |
+| Recognition | PaddleOCR-VL-1.6-0.9B transcribes eligible crops with prompts for text, tables or formulas. The receipt profile leaves chart and seal recognition off. [Pipeline guide](https://github.com/PaddlePaddle/PaddleX/blob/ffb64904d23708863ff5b8da312a5cbd52a7f462/docs/pipeline_usage/tutorials/ocr_pipelines/PaddleOCR-VL.en.md) |
+
+The pinned pipeline normally gives each recognized region 112,896–1,003,520
+input pixels. Vision Bill raises the maximum to 2,000,000, including for table
+crops. PaddleX resizes each crop to its patch grid. A page with several large
+regions can therefore exceed 2 MP of total VLM input. Generation can produce
+up to 4,096 new tokens **per crop** and can stop earlier. The receipt formatter
+has a separate output budget and model context. [PaddleX region sizing and generation](https://github.com/PaddlePaddle/PaddleX/blob/ffb64904d23708863ff5b8da312a5cbd52a7f462/paddlex/inference/pipelines/paddleocr_vl/pipeline.py#L498-L533)
+· [Per-task pixel defaults](https://github.com/PaddlePaddle/PaddleX/blob/ffb64904d23708863ff5b8da312a5cbd52a7f462/paddlex/inference/pipelines/paddleocr_vl/pipeline.py#L663-L684)
+
+The CUDA worker uses BF16 for the VLM text decoder on a selected GPU with
+compute capability 8.0 or higher. Turing (SM 7.5) and ROCm use FP32.
+The visual encoder, projector, orientation, unwarping and layout models retain
+FP32. Precision selection leaves the region and token limits unchanged. The model guides report
+individual inference timings on Tesla T4 (orientation and UVDoc) and A100
+(layout), excluding pre- and postprocessing. They supply no end-to-end timing
+for this receipt profile on a desktop GPU. [Pinned native predictor](https://github.com/PaddlePaddle/PaddleX/blob/ffb64904d23708863ff5b8da312a5cbd52a7f462/paddlex/inference/models/doc_vlm/predictor.py#L55-L78)
 
 Original bytes/hash/photo identity survive first-frame/EXIF conversion and
 white RGB transparency composition (`white-document-rgb-v2`). Actual preprocessor
@@ -38,7 +55,11 @@ working artifacts. The 2 MP setting still applies to VLM regions.
 The OCR container hosts the complete PaddleOCR/PaddleX pipeline with the native
 PaddlePaddle inference engine. Layout, orientation, unwarping and VLM recognition
 execute in its disposable native worker. Vision Bill uses its private HTTP API.
-The operator's separate text or vision LLM endpoint remains the receipt formatter.
+The operator's separate text or vision LLM endpoint, including a remote
+llama.cpp server, formats the completed OCR text. PaddleX also offers an
+optional inference server (such as vLLM) for its own VLM recognition stage.
+Vision Bill runs that stage locally in the OCR worker. The LLM endpoint
+setting controls the formatter. [PaddleX VLM inference services](https://github.com/PaddlePaddle/PaddleX/blob/ffb64904d23708863ff5b8da312a5cbd52a7f462/docs/pipeline_usage/tutorials/ocr_pipelines/PaddleOCR-VL.en.md#3-using-vlm-inference-services)
 
 ## Dedicated OCR from source
 
@@ -86,20 +107,31 @@ Windows or Linux host supplies its own GPU driver. Installing these models
 does not install host graphics drivers or firmware. Automatic CUDA source preparation
 uses the official CUDA 12.9 candidate by default. Set `OCR_CUDA_CHANNEL=cu126`
 to select CUDA 12.6. Use a host driver that supports the selected runtime and
-verify it on the actual board. [CUDA build inputs](#build-inputs)
+check driver compatibility before starting. PaddleOCR lists compute capability 7.0+ and
+CUDA 11.8+ for PaddlePaddle generally. Its separate Blackwell instructions use
+a driver supporting CUDA 12.9 or later. For a fresh RTX 50-series install,
+use Vision Bill's default `cu129`. [PaddleOCR device requirements](https://www.paddleocr.ai/main/en/version3.x/pipeline_usage/PaddleOCR-VL.html#environment-requirements) · [Blackwell setup](https://www.paddleocr.ai/main/en/version3.x/pipeline_usage/PaddleOCR-VL-NVIDIA-Blackwell.html) · [CUDA build inputs](#build-inputs)
 
 On WSL 2 with a selected CUDA SM 12.0 GPU (for example, an RTX 5080), each
 cold OCR worker assembles the PaddleOCR-VL checkpoint in system RAM, then
-copies the FP32 weights to the selected GPU. Allow temporary RAM headroom in
+copies the weights to the selected GPU. Allow temporary RAM headroom in
 WSL while it loads. Other GPU candidates assemble the weights on the GPU.
-Receipt inference runs on the selected GPU in FP32 on both paths.
+Receipt inference runs on the selected GPU on both paths.
 
-The OCR container log shows `ocr_vlm_checkpoint_load`. On the WSL host-memory
+The OCR container reports runtime and model verification time, effective component precision, and total cold-load time in `ocr_worker_load`. The checkpoint loader emits `ocr_vlm_checkpoint_load`. On the WSL host-memory
 path, `stage=assemble` is checkpoint assembly, `stage=transfer` is the copy to
 the GPU and `stage=ready` means the VLM weights are ready. The receipt's status
 in the queue shows when processing finishes.
 
-### AMD ROCm on native Linux
+### AMD ROCm on Linux or Windows with WSL 2
+
+The implementation targets RDNA2 and later. AMD support depends on the exact
+board, OS, ROCm version and host driver. Check the applicable AMD compatibility
+table before choosing either host. A listed GFX build target alone does not
+establish vendor support or successful receipt inference.
+[Radeon Linux compatibility](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/compatibility/compatibilityrad/native_linux/native_linux_compatibility.html) · [Radeon WSL compatibility](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/compatibility/compatibilityrad/wsl/wsl_compatibility.html)
+
+**Native Linux.** Install a compatible AMD kernel driver and Docker Engine.
 
 Use the host's `/dev/kfd` and the selected `/dev/dri/renderD*` node. The source
 command derives the two container group IDs from those device nodes and reads
@@ -112,6 +144,17 @@ target before starting the service. [ROCm build inputs](#build-inputs)
 ```bash
 python3 scripts/ocr_source_up.py rocm
 ```
+
+**Windows with WSL 2.** Install AMD's Windows driver for WSL and use a supported
+Ubuntu distro with Docker Engine inside it. The Windows host supplies the GPU
+driver. Check that the distro exposes `/dev/dxg` and
+`/usr/lib/wsl/lib/libdxcore.so`. Run the same source command inside
+Ubuntu. Select the GPU with `OCR_ROCM_DEVICE_ID` (default `0`). The launcher adds
+`docker-compose.rocm-wsl.yml` to the ROCm configuration. Set `OCR_AMDGPU_TARGETS` to the selected board’s GFX
+architecture to narrow the build. The default profile includes the listed
+RX 6000, 7000 and 9000 discrete Radeon targets. Host driver and firmware
+installation are outside the model installer.
+[AMD WSL setup](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/wsl/install-radeon.html) · [Pinned ROCm DXG design](https://github.com/ROCm/TheRock/blob/b324869fb3116353ac7eec5e6926aa3d452ac987/docs/development/wsl_rocdxg.md)
 
 To test different approved inputs, pass their directory as a second argument
 after the accelerator. It must contain `bundle.json` and its declared local
@@ -166,6 +209,78 @@ If the native image finished building before initial preparation was interrupted
 use `--reuse-native-image` with the local `source-build-…` tag printed by the launcher.
 It checks the selected image against this checkout and continues preparing the app.
 
+### Read the logs for a receipt
+
+Use the Docker engine that owns the installation. For Docker Desktop use
+PowerShell. For AMD on WSL use the terminal in the Ubuntu distro running Docker
+Engine. Identify both running containers by their Compose project and service.
+Source service names are `vision_bill` and `paddleocr-service`. Combined bundles
+use `app` and `ocr`. Substitute the two container IDs below, keeping the same
+project for both.
+
+**PowerShell**
+
+```powershell
+docker ps --filter label=com.docker.compose.service --format 'table {{.ID}}  {{.Names}}  {{.Image}}'
+$AppContainer = Read-Host 'App container ID'
+$OcrContainer = Read-Host 'OCR container ID'
+docker logs --since 30m --timestamps $AppContainer 2>&1
+docker logs --since 30m --timestamps $OcrContainer 2>&1
+```
+
+**Linux or WSL shell**
+
+```bash
+docker ps --filter label=com.docker.compose.service --format 'table {{.ID}}  {{.Names}}  {{.Image}}'
+read -rp 'App container ID: ' app_container
+read -rp 'OCR container ID: ' ocr_container
+docker logs --since 30m --timestamps "$app_container" 2>&1
+docker logs --since 30m --timestamps "$ocr_container" 2>&1
+```
+
+Use `docker logs --since 1m --follow --timestamps` with one container ID in
+each terminal to follow a queued receipt. Match timestamps with its queue entry.
+An HTTP 200 from worker load or readiness records startup. Check the receipt
+request, worker shutdown, formatter and final queue status to locate a later
+failure. An HTTP 504 records a deadline. It does not establish an allocation
+failure or receipt completion.
+
+During activation, `ocr_model_prepare` records verification and whether each
+model was already cached or newly installed. During official asset transfers,
+`ocr_model_download` logs progress as data arrives at roughly 15-second
+intervals. `received_bytes` and `mean_mbit_s` show bytes received and average
+megabits per second for that file. Small files may finish between updates.
+
+For a queued job, use the scheduler's `submission_id` in the app log to follow
+the submission across pages and formatting. Each `ocr_page` dispatch records
+its `request_id`, photo index and time budget. Use the same request ID to match the app’s
+dispatch and response to the native worker dispatch, child start and completion
+or failure. The worker generation identifies the process that ran the stages. After the worker parks,
+`ocr_formatter` records the start and completion of text formatting.
+
+In the OCR log, `ocr_worker_request` identifies admission, native execution
+and result reading. Compare the phase, elapsed time and remaining budget.
+After a failure, `cleanup_safe` reports whether cleanup was confirmed.
+`ocr_receipt_stage` follows normalization, orientation, unwarping, layout,
+VLM crops, conversion and publication. At INFO look for the first VLM call,
+progress every 16 completed regions and the final `regions_completed` count.
+DEBUG adds each crop's start and finish. `worker_peak_rss_kib` measures peak
+host memory over the worker's lifetime. When present, `gpu_allocated_bytes`
+measures allocations tracked by Paddle. Neither value measures total device
+VRAM use.
+
+The application logger uses `API__LOG_LEVEL`. The native controller and worker
+use `OCR_LOG_LEVEL`. Both default to `INFO`, which omits successful health polls. `DEBUG` shows those
+polls. For more detail set the relevant
+level to `DEBUG`, recreate the affected service using the installation's
+launcher, and return the level to `INFO` after diagnosis. For source Compose,
+set the levels in the project's private `.env`. In prepared bundles, put the
+app setting in `runtime.env`. For a manual start put the OCR setting in the
+Compose `.env` or shell. When using a bundled launcher, set it in the launcher’s
+environment. These settings control Vision Bill's own loggers.
+Keep diagnostic logs private and remove credentials, receipt content and
+identifying details before sharing excerpts.
+
 ### Upgrade an existing source installation
 
 Run from the original checkout. Back up the installation and let active jobs
@@ -180,8 +295,8 @@ upgrade. Keep the handoff journal intact. After upgrading, turn OCR back on
 and resume the existing receipt in the queue. If it reports changed settings,
 review them and choose the current-policy retry for that receipt.
 
-Stop the old deployment with its original project, profile and all
-three Compose files. Keep its named volumes, private settings and bind-mounted
+Stop the old deployment with its original project, profile and complete
+Compose file set. Keep its named volumes, private settings and bind-mounted
 files. For a CUDA deployment with the checkout's default project name:
 
 ```bash
@@ -193,7 +308,8 @@ python3 scripts/ocr_source_up.py cuda --upgrade
 
 If you originally selected a custom project name, use that same `-p NAME` on
 the stop command. For ROCm use `rocm` in the overlay name, directory and launcher
-argument. The upgrade verifies the original deployment claim, retains its
+argument. On ROCm WSL, include `-f docker-compose.rocm-wsl.yml` between the
+ROCm overlay and the generated `compose.local.json`. The upgrade verifies the original deployment claim, retains its
 project, device and approved model sources, then builds and starts the new
 images. If the build fails before the launcher publishes its new deployment
 record, `--restart` starts the previous recorded images. If the record was
@@ -229,8 +345,8 @@ project name selects the new OCR container.
 accelerator=cuda
 overlay="server_data/ocr-source/$accelerator/compose.local.json"
 project=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["x-vision-bill-source"]["project"])' "$overlay")
-ocr_id=$(docker compose -p "$project" --profile ocr -f docker-compose.yml \
-  -f "docker-compose.$accelerator.yml" -f "$overlay" ps -q paddleocr-service)
+ocr_id=$(docker ps -q --filter "label=com.docker.compose.project=$project" \
+  --filter label=com.docker.compose.service=paddleocr-service)
 if [ -n "$ocr_id" ]; then
   docker update --cpus 6.4 "$ocr_id" && docker inspect --format '{{.HostConfig.NanoCpus}}' "$ocr_id"
 fi
@@ -247,41 +363,42 @@ The release report records which physical device passed the full diagnostic.
 
 | Accelerator | Intended device families | Architectures to qualify | Host |
 | --- | --- | --- | --- |
-| CUDA | NVIDIA RTX 2000, 3000, 4000 and 5000 | Turing SM 7.5, Ampere SM 8.6, Ada SM 8.9, Blackwell SM 12.0 | Linux, including Docker Desktop with WSL 2 on Windows |
-| ROCm | AMD Radeon RX 6000, RX 7000 and RX 9000 | RDNA2 `gfx1030/1031/1032/1034`, RDNA3 `gfx1100/1101/1102`, RDNA4 `gfx1200/1201` | Linux with the matching ROCm driver and device access |
+| CUDA | GeForce RTX 20, 30, 40 and 50 series | Turing SM 7.5, Ampere SM 8.6, Ada SM 8.9, Blackwell SM 12.0 | Linux, including Docker Desktop with WSL 2 on Windows |
+| ROCm | AMD Radeon RX 6000, RX 7000 and RX 9000 | RDNA2 `gfx1030/1031/1032/1034`, RDNA3 `gfx1100/1101/1102`, RDNA4 `gfx1200/1201` | Native Linux or Windows with WSL 2, with the corresponding driver and device access |
 
 These are qualification targets. Release evidence records the architecture,
 driver and host environment for actual runs of the configured OCR pipeline.
-The automatic source launcher builds the selected ROCm device's architecture.
-The standalone ROCm build defaults to the listed RDNA2 candidates.
+On native Linux the source launcher reads the selected ROCm device's architecture
+from KFD. WSL uses the candidate build profile or explicit `OCR_AMDGPU_TARGETS`.
+The standalone ROCm build defaults to the nine listed RDNA2, RDNA3 and RDNA4 candidates.
 [NVIDIA GPU architectures](https://developer.nvidia.com/cuda/gpus) ·
 [TheRock targets at the pinned revision](https://github.com/ROCm/TheRock/blob/b324869fb3116353ac7eec5e6926aa3d452ac987/cmake/therock_amdgpu_targets.cmake) ·
 [Docker Desktop GPU support](https://docs.docker.com/desktop/features/gpu/)
 
 Evaluate one CUDA bundle against all four NVIDIA generations before splitting
 the binaries by architecture. Paddle publishes a 3.3.1 CPython 3.12 Linux x86_64
-wheel in its CUDA 12.9 channel. CUDA 12.8 introduced native SM 12.0 compilation.
+wheel in its CUDA 12.9 channel. Both CUDA channels keep the existing 3.3.1
+pin. The listed 3.4.0 CUDA 12.9 wheel remains a candidate pending verification
+of its metadata, content hash and dependency lock. CUDA 12.8 introduced native SM 12.0 compilation.
 Verify the wheel and linked libraries, then run device allocation and the
 full OCR pipeline on representative hardware.
 [Official Paddle CUDA 12.9 wheel index](https://www.paddlepaddle.org.cn/packages/stable/cu129/paddlepaddle-gpu/) ·
 [CUDA 12.8 release notes](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-toolkit-release-notes/index.html#new-features)
 
-Run the full native qualification per architecture and host environment you
-intend to support. For CUDA, include representative RTX 20-, 30-, 40- and
-50-series devices, including lower-VRAM configurations, and test native Linux
-and Docker Desktop with WSL 2 independently. For ROCm, qualify the recorded GFX
-target on native Linux. Record the image and model identities, installed driver,
-available VRAM, host OS and Docker version with each report. The CUDA
-`driver_version` value in the report is the driver API version. Record the
-installed NVIDIA driver release separately. Then activate
-Dedicated OCR in the app and verify a multi-photo receipt through OCR, confirmed
-worker shutdown, and LLM formatting. [Native qualification](#what-qualifies)
+The current publication gate runs full native qualification on one selected
+physical device for each OCR variant being published. Its report identifies the
+specific device, image, model and runtime. Other architectures and host paths
+remain implementation targets until independently measured. The CUDA
+`driver_version` field records the driver API version. For comparisons between
+installations, also record the installed driver release, VRAM, OS and Docker
+version. End-to-end receipt evidence includes OCR completion, worker shutdown
+and LLM formatting. [Native qualification](#what-qualifies)
 
 ## Build inputs
 
 `runtime-lock.json` records the immutable Ubuntu base, Ubuntu package snapshot,
 APT TLS bootstrap image, Paddle/PaddleOCR/PaddleX/TheRock source pins,
-compatibility patch hash, Rust archive hash, default RDNA2 target list and
+compatibility patch hash, Rust archive hash, default Radeon target list and
 upstream optional exclusions. The selected build candidate profile is recorded
 in build evidence/kernels.json.
 The common Python execution and native build locks contain real resolved hashes.
@@ -337,7 +454,7 @@ FlashAttention off.
 Build evidence is retained under `/opt/ocr/build-evidence`: original gitlinks,
 recursive actual checkout HEADs and dirty patches, patch/`.smrev` hashes, native
 wheel hashes, CMake caches, compiler commands/log, OS packages, and required
-library/payload hashes. Default build candidates are gfx1030/1031/1032/1034.
+library/payload hashes. Default build candidates are gfx1030/1031/1032/1034, gfx1100/1101/1102 and gfx1200/1201.
 `OCR_AMDGPU_TARGETS` selects a semicolon-separated **build-only** candidate list:
 
 ```sh
@@ -419,8 +536,10 @@ OCR_MAINTENANCE_INTENT=external-llm-quiesced \
   make "ocr-qualify-$accelerator"
 ```
 
-Use `accelerator=rocm` for Radeon. Set `OCR_RENDER_NODE`, `OCR_RENDER_GID` and
-`OCR_VIDEO_GID` to the actual host node and groups. For NVIDIA,
+Use `accelerator=rocm` for Radeon. On native Linux, set `OCR_RENDER_NODE`,
+`OCR_RENDER_GID` and `OCR_VIDEO_GID` to the actual host node and groups.
+On WSL, add `-f docker-compose.rocm-wsl.yml` for the stop command and select
+the GPU with `OCR_ROCM_DEVICE_ID`. The Make target selects the WSL overlay. For NVIDIA,
 `OCR_CUDA_DEVICE_ID` selects the host device and its container index is normally 0.
 The original app lock path must be absolute under the shared `/app/config` mount.
 Supply its actual location if overridden. Use the invocation-local
@@ -463,7 +582,7 @@ serving settings; the CLI exits nonzero. A failure report is written when storag
 permits. `qualification.json` records exact profile,
 model/image/runtime identities, actual device/GFX, source hashes, timing and audit
 counts/digests. It contains no OCR text or images. Only the actual target is added
-to `qualified_targets`; repeat the release gate on each physical target.
+to `qualified_targets`. Additional claims need their own physical evidence.
 
 ## Independent service and client
 
@@ -496,14 +615,22 @@ OCR host port. The app's optional endpoint selector is independent of service mo
 
 ## First setup and serving handoff
 
-Standalone prepared startup runs the cache-only `ocr-init` check before serving.
-It checks the selected installation against the
-[pinned release assets](release-bundle.schema.json), image config/source and device
-identities, licenses, qualification and model/fixture inventories. An exact healthy
-cache is reused. A missing, damaged or mismatched cache requires explicit
-`ocr-maintenance` using the prepared bundle's `ocr-maintenance` profile. During
-maintenance, `ocr_service.initialize maintain` provisions verified OCR assets and
-runs full native qualification before publishing the runtime and smoke paths.
+Standalone bundles provide explicit file-only setup. The profiled
+`ocr-prepare` service runs `ocr_service.initialize prepare`, checks the image
+and selected GPU, provisions approved local or HTTPS model assets, and writes
+verified serving state without processing images. On startup `ocr-init check`
+accepts either a prepared installation or a physically qualified one. It
+validates the selected state and remains passive. Repeating `prepare` can
+repair damaged model files in an owned schema-2 cache with intact metadata.
+Corrupt selection metadata, damaged qualified evidence and unknown versions
+block file-only preparation. Preserve the original state before restoring a
+verified backup. For a known damaged legacy certificate, explicit forced
+physical qualification can create a new selection after asset integrity is
+restored. [Standalone recovery](../distribution/README.md#native-cache-check-and-maintenance)
+The first standalone receipt owns the load/infer/park cycle.
+
+For optional hardware evidence, `ocr-maintenance` runs
+`ocr_service.initialize maintain` and exercises the qualification corpus.
 Maintenance runs independently of receipt attempts and comparative benchmarks.
 Combined bundles use file-only preparation after an explicit Dedicated OCR request.
 Their shared model handoff lock lives at `/coord/gpu-handoff.lock`. See the
@@ -539,8 +666,9 @@ opt out. A cold unmanaged native pipeline also waits before claim.
 
 The CUDA and ROCm source overlays start the UI activation controller. For a
 manually qualified offline source runtime, add `docker-compose.ocr-qualification.yml`
-after the selected accelerator overlay and start `paddleocr-service`. That
-overlay mounts `server_data/ocr-runtime` and selects the explicit runtime.
+after the selected accelerator overlay. For ROCm on WSL, append
+`docker-compose.rocm-wsl.yml` last to include the DXG bridge. Start
+`paddleocr-service`. The qualification overlay mounts `server_data/ocr-runtime` and selects the explicit runtime.
 Configure the app's external OCR endpoint separately when using that setup.
 Prepared installations select their runtime through the release manifest and
 image identities. Ordinary OCR uses text-only LLM
@@ -641,8 +769,10 @@ sidecar or native v2 qualification source. See the [harness](../scripts/ocr_harn
 CPU-only unit tests and `docker buildx build --check` validate contracts/recipes,
 not native build success, device kernel support or GPU qualification.
 
-Official CUDA lock resolution, native CUDA/ROCm builds, physical inference and
-qualification, hardware quality/latency/VRAM and current CPU comparator installation/
-inference remain UNEXECUTED here. No VRAM/performance blocker was established.
-Historical numerical reports remain historical; see the
-[accepted software evidence](../UPGRADE_AND_VERIFY.md#verification-evidence).
+In the November 21, 2026 WSL 2 CUDA run, the checkpoint log showed 210 seconds
+from host assembly to transfer and 3.45 seconds from transfer to weights ready.
+Managed load and the following readiness check both returned HTTP 200. The
+subsequent receipt request returned HTTP 504. This run establishes cold-load
+progress on one installation. Receipt quality, completed latency, peak VRAM
+and release qualification still need measurements on the actual target.
+[Accepted software evidence](../UPGRADE_AND_VERIFY.md#verification-evidence)

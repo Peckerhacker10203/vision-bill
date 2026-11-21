@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 from io import BytesIO
 from pathlib import Path
 from time import monotonic
@@ -20,11 +21,13 @@ from ...model.ocr import OcrCapabilities, OcrResponse, WorkerReadiness
 from ...model.ocr_errors import (
     OCR_GPU_OUT_OF_MEMORY,
     OCR_HTTP_ERRORS,
-    OCR_RESULT_CODES,
+    OCR_READINESS_CODES,
     OcrGpuOutOfMemoryError,
     OcrWorkerFailure,
 )
 from .base import OcrProvider
+
+logger = logging.getLogger(__name__)
 
 MAX_ERROR_BODY_BYTES = 4096
 
@@ -64,11 +67,17 @@ class PaddleOcrProvider(OcrProvider):
         self.managed_lifecycle = managed_lifecycle
 
     async def _lifecycle(self, action: str, token: str, deadline: float) -> None:
+        started = monotonic()
+        remaining = max(.001, deadline - started)
+        payload: dict[str, str | int] = {"owner_token": token}
+        if action == "load":
+            payload["timeout_ms"] = max(1, min(600000, int(remaining * 1000)))
+        logger.info("ocr_lifecycle action=%s state=start budget_ms=%d", action, int(remaining * 1000))
         async with (
-            httpx.AsyncClient(timeout=max(.001, deadline - monotonic()), trust_env=False) as client,
+            httpx.AsyncClient(timeout=remaining, trust_env=False) as client,
             client.stream(
                 "POST", f"{self.service_url}/lifecycle/{action}",
-                headers={"Accept-Encoding": "identity"}, json={"owner_token": token},
+                headers={"Accept-Encoding": "identity"}, json=payload,
             ) as response,
         ):
             if action == "load":
@@ -93,6 +102,8 @@ class PaddleOcrProvider(OcrProvider):
             )
         if not confirmed:
             raise httpx.RemoteProtocolError(error, request=response.request)
+
+        logger.info("ocr_lifecycle action=%s state=acknowledged elapsed_ms=%d", action, int((monotonic() - started) * 1000))
 
     async def claim(self, token: str, deadline: float) -> None:
         await self._lifecycle("claim", token, deadline)
@@ -133,7 +144,7 @@ class PaddleOcrProvider(OcrProvider):
                 ready = await asyncio.to_thread(
                     WorkerReadiness.model_validate_json, response.content
                 )
-                if ready.reason_code in OCR_RESULT_CODES or ready.reason_code == "ocr_parked":
+                if ready.reason_code in OCR_READINESS_CODES or ready.reason_code == "ocr_parked":
                     if response.status_code != 503 or ready.ready:
                         raise ValueError("ocr_invalid_readiness")
                     # An affirmative native state requires a JSON boolean, not a coerced value.
@@ -181,7 +192,8 @@ class PaddleOcrProvider(OcrProvider):
                     runtime_fingerprint=ready.runtime_fingerprint if ready.ready else identity.get("runtime_fingerprint"),
                     ocr_max_new_tokens=ocr_limit,
                 )
-        except (httpx.HTTPError, OSError, ValueError, TypeError):
+        except (httpx.HTTPError, OSError, ValueError, TypeError) as exc:
+            logger.debug("ocr_readiness state=unavailable reachable=%s error_type=%s", reachable, type(exc).__name__)
             return OcrCapabilities(
                 enabled=True,
                 configured=True,
@@ -210,6 +222,10 @@ class PaddleOcrProvider(OcrProvider):
         owner = current_owner()
         if owner is None and self.managed_lifecycle:
             raise ValueError("ocr_managed_session_required")
+        logger.info(
+            "ocr_page state=dispatch request_id=%s photo_index=%d budget_ms=%d",
+            request_id, photo_index, int(remaining * 1000),
+        )
         async with asyncio.timeout(max(0, deadline - monotonic())):
             async with httpx.AsyncClient(timeout=remaining, trust_env=False) as client:
                 async with client.stream(
@@ -225,6 +241,7 @@ class PaddleOcrProvider(OcrProvider):
                         "owner_token": owner.token if owner is not None else "",
                     },
                 ) as response:
+                    logger.info("ocr_page state=response request_id=%s status=%d", request_id, response.status_code)
                     await _raise_native_error(response)
                     response.raise_for_status()
                     limits.check_ocr_response_headers(

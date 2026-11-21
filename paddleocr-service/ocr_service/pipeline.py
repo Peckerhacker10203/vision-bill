@@ -5,10 +5,14 @@ import importlib
 import importlib.metadata
 import inspect
 import json
+import logging
 import math
 import os
+import resource
 import sys
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -16,12 +20,6 @@ from uuid import UUID
 from ocr_contract import GpuMemorySnapshot, OcrBlock, OcrResponse
 
 from .device_inventory import execution_target, inspect_device_identity
-from .fp32 import (
-    audit_dynamic_model,
-    fp32_predictor_class,
-    native_pipeline_class,
-    requires_host_assembly,
-)
 from .gpu_memory import probe_gpu_memory
 from .images import normalize_source, working_image
 from .precision import StaticArtifact, StaticAuditSession, begin_static_audit
@@ -44,11 +42,20 @@ from .profile import (
     verify_dependencies,
     verify_installed_versions,
 )
+from .vlm_precision import (
+    audit_dynamic_model,
+    component_precision,
+    native_pipeline_class,
+    native_predictor_class,
+    requires_host_assembly,
+)
 
 # Official PaddleX v3.7.2 source bytes. Modifications require a new audited adapter.
 PINNED_SOURCES = {
     "pipelines/paddleocr_vl/pipeline.py": "32966d14aad6ac1bc043737c96352a4f0b4efcbead96f9354254dd4b9d1c6675",
     "pipelines/base.py": "f955c34caa6e630b6853c10a4ad189157def0d547fecd262a2e2f9868d175a30",
+    "models/doc_vlm/modeling/paddleocr_vl/_paddleocr_vl.py": "2cb9ab3d39c21e776babd20ec34bace122ae2e6fdd6fd8edf1f5789db6d38347",
+    "models/common/transformers/transformers/model_utils.py": "eb6c36a17fb52d484331338565e6315cf423218174a309a5d3b42ccbb823c557",
     "models/doc_vlm/predictor.py": "9353a5fa81c1bd57a1e5f2e6bdad0e24c4ed1caccd765f4b5bb127e906e1c45c",
     "models/predictors/local_model_predictor.py": "f796661ba5a658dcdb7cc1378e2d2348edba3532136c91e6757954b21ce643dd",
     "models/__init__.py": "b4b5e5cfd94de3fa5b0edd5999226c202160c926f6b5450fac574371eb470812",
@@ -118,13 +125,98 @@ def recognized_blocks(result: Any, width: int, height: int) -> list[OcrBlock]:
     return blocks
 
 
+logger = logging.getLogger(__name__)
+
+
+def receipt_memory_fields(gpu_index: int) -> str:
+    # The native worker runs on Linux. These process-local counters neither launch
+    # another process nor synchronize GPU work. Some ROCm builds omit the counter.
+    fields = f"worker_peak_rss_kib={resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}"
+    try:
+        cuda = getattr(getattr(sys.modules.get("paddle"), "device", None), "cuda", None)
+        allocated = getattr(cuda, "memory_allocated", None)
+        if callable(allocated):
+            fields += f" gpu_allocated_bytes={int(allocated(gpu_index))}"
+    except Exception:  # noqa: BLE001 - optional allocator statistics cannot fail a page
+        return fields
+    return fields
+
+
+@contextmanager
+def trace_receipt_stages(native: Any, gpu_index: int) -> Iterator[None]:
+    """Measure real synchronous predictor calls, without logging their inputs."""
+    if not logger.isEnabledFor(logging.INFO):
+        yield
+        return
+    preprocessor = native.doc_preprocessor_pipeline
+    stages = (
+        ("orientation", preprocessor.doc_ori_classify_model),
+        ("unwarp", preprocessor.doc_unwarping_model),
+        ("layout", native.layout_det_model),
+        ("vlm_region", native.vl_rec_model),
+    )
+    regions_completed = 0
+    page_started = time.monotonic()
+    cpu_started = time.process_time()
+    region_seconds = 0.0
+
+    def trace(stage: str, process: Callable[..., Any]) -> Callable[..., Any]:
+        def measured(*args: Any, **kwargs: Any) -> Any:
+            nonlocal regions_completed, region_seconds
+            is_region = stage == "vlm_region"
+            # Bound INFO output. DEBUG exposes the exact last region on interruption.
+            level = logging.INFO if not is_region or regions_completed == 0 else logging.DEBUG
+            if level == logging.INFO:
+                logger.info("ocr_receipt_stage stage=%s state=start regions_completed=%d %s",
+                            stage, regions_completed, receipt_memory_fields(gpu_index))
+            else:
+                logger.debug("ocr_receipt_stage stage=%s state=start regions_completed=%d",
+                             stage, regions_completed)
+            started = time.monotonic()
+            try:
+                result = process(*args, **kwargs)
+            except Exception:
+                logger.warning("ocr_receipt_stage stage=%s state=failed regions_completed=%d elapsed_ms=%d",
+                               stage, regions_completed, round((time.monotonic() - started) * 1000))
+                raise
+            elapsed = time.monotonic() - started
+            if is_region:
+                regions_completed += 1  # The pinned native VLM uses batch size one.
+                region_seconds += elapsed
+            logger.log(level, "ocr_receipt_stage stage=%s state=done regions_completed=%d elapsed_ms=%d",
+                       stage, regions_completed, round(elapsed * 1000))
+            if is_region and regions_completed % 16 == 0:
+                logger.info("ocr_receipt_stage stage=vlm_regions state=continue regions_completed=%d elapsed_ms=%d %s",
+                            regions_completed, round(region_seconds * 1000), receipt_memory_fields(gpu_index))
+            return result
+        return measured
+
+    with ExitStack() as cleanup:
+        for stage, model in stages:
+            # Keep the native predictor, sampler, runner and lazy iterator intact.
+            if "process" in vars(model):
+                cleanup.callback(setattr, model, "process", vars(model)["process"])
+            else:
+                cleanup.callback(delattr, model, "process")
+            model.process = trace(stage, model.process)
+        yield
+    logger.info(
+        "ocr_receipt_stage stage=vlm_regions state=done regions_completed=%d elapsed_ms=%d "
+        "page_elapsed_ms=%d worker_cpu_ms=%d %s",
+        regions_completed, round(region_seconds * 1000), round((time.monotonic() - page_started) * 1000),
+        round((time.process_time() - cpu_started) * 1000), receipt_memory_fields(gpu_index),
+    )
+
+
 class ReceiptPipeline:
     """Serve real inputs using an explicitly constructed native pipeline."""
 
     def __init__(
-        self, pipeline: Any, profile: OcrProfile, profile_id: str, runtime_fingerprint: str
+        self, pipeline: Any, profile: OcrProfile, profile_id: str, runtime_fingerprint: str,
+        *, gpu_index: int = 0,
     ):
         self.pipeline = pipeline
+        self.gpu_index = gpu_index
         self.profile = profile
         self.profile_id = profile_id
         self.runtime_fingerprint = runtime_fingerprint
@@ -179,10 +271,17 @@ class ReceiptPipeline:
     def predict(
         self, image: Path, *, request_id: UUID, photo_index: int, source_sha256: str
     ) -> OcrResponse:
+        started = time.monotonic()
+        logger.info("ocr_receipt_stage stage=normalize state=start")
         with normalize_source(image, source_sha256) as normalized:
-            result = self._execute(normalized.path)
+            logger.info("ocr_receipt_stage stage=normalize state=done elapsed_ms=%d",
+                        round((time.monotonic() - started) * 1000))
+            with trace_receipt_stages(self.pipeline, self.gpu_index):
+                result = self._execute(normalized.path)
             try:
-                return self.convert_result(
+                started = time.monotonic()
+                logger.info("ocr_receipt_stage stage=convert state=start")
+                response = self.convert_result(
                     result,
                     request_id=request_id,
                     photo_index=photo_index,
@@ -190,6 +289,9 @@ class ReceiptPipeline:
                     transforms=normalized.transforms,
                     findings=normalized.findings,
                 )
+                logger.info("ocr_receipt_stage stage=convert state=done elapsed_ms=%d blocks=%d",
+                            round((time.monotonic() - started) * 1000), len(response.blocks))
+                return response
             except (AttributeError, KeyError, TypeError, ValueError, OverflowError) as exc:
                 raise InvalidReceiptOutput("Invalid OCR result") from exc
 
@@ -207,11 +309,13 @@ class PipelineAdapter(ReceiptPipeline):
         *,
         smoke_sha256: str | None = None,
         gpu_index: int = 0,
+        text_dtype: str = "float32",
     ):
         super().__init__(pipeline, profile, profile_id, runtime_fingerprint)
         self.static_audits = static_audits
         self.smoke_sha256 = smoke_sha256
         self.gpu_index = gpu_index
+        self.text_dtype = text_dtype
         self.qualified = False
 
     def _execute(self, image: Path) -> Any:
@@ -220,7 +324,7 @@ class PipelineAdapter(ReceiptPipeline):
         try:
             result = super()._execute(image)
             evidence = [session.finish() for session in self.static_audits]
-            audit_dynamic_model(self.pipeline.vl_rec_model.infer, self.gpu_index)
+            audit_dynamic_model(self.pipeline.vl_rec_model.infer, self.gpu_index, self.text_dtype)
             self.evidence = evidence
             return result
         except Exception:
@@ -336,9 +440,10 @@ def construct_native(
                 resolve(child)
 
     resolve(config)
-    predictor = fp32_predictor_class(
+    predictor = native_predictor_class(
         DocVLMLocalPredictor,
         runtime.gpu_index,
+        text_dtype=component_precision(runtime.accelerator, device.get("compute_capability"))["text"],
         assemble_on_host=requires_host_assembly(
             runtime.accelerator, device.get("compute_capability")
         ),
@@ -394,6 +499,9 @@ def build_serving_pipeline(
     runtime: PreparedRuntimeSettings | RuntimeSettings,
 ) -> ReceiptPipeline:
     """Verify the selected runtime, then load local models without running a sample."""
+    started = time.monotonic()
+    logger.info("ocr_worker_load stage=verify state=start accelerator=%s gpu_index=%d",
+                runtime.accelerator, runtime.gpu_index)
     try:
         if isinstance(runtime, PreparedRuntimeSettings):
             verify_installed_versions(runtime.expected_packages, accelerator=runtime.accelerator)
@@ -411,8 +519,15 @@ def build_serving_pipeline(
             model_content = manifest["model_content"]
             device = manifest["qualified_target"]
     except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        logger.warning("ocr_worker_load stage=verify state=failed error_type=%s", type(exc).__name__)
         raise RuntimeIdentityMismatch("Native runtime identity mismatch") from exc
 
+    logger.info(
+        "ocr_worker_load stage=verify state=done elapsed_ms=%d decoder_dtype=%s "
+        "visual_dtype=float32 projector_dtype=float32 static_dtype=float32 max_pixels=%d",
+        int((time.monotonic() - started) * 1000),
+        component_precision(runtime.accelerator, device.get("compute_capability"))["text"], profile.max_pixels,
+    )
     native, _, runner_type = construct_native(profile, runtime, device=device)
     preprocessor = native.doc_preprocessor_pipeline
     models = (
@@ -433,7 +548,9 @@ def build_serving_pipeline(
         ):
             raise RuntimeIdentityMismatch("Unexpected native static runner settings")
     identity = serving_identity(profile, runtime, model_content, device)
-    return ReceiptPipeline(native, profile, identity["profile_id"], identity["runtime_fingerprint"])
+    logger.info("ocr_worker_load stage=ready total_ms=%d", int((time.monotonic() - started) * 1000))
+    return ReceiptPipeline(native, profile, identity["profile_id"], identity["runtime_fingerprint"],
+                           gpu_index=runtime.gpu_index)
 
 
 def build_pipeline(profile: OcrProfile, runtime: RuntimeSettings) -> PipelineAdapter:
@@ -465,6 +582,7 @@ def build_pipeline(profile: OcrProfile, runtime: RuntimeSettings) -> PipelineAda
             "effective_config": effective_pipeline_config(profile),
             "limits": profile.model_dump(),
             "adapter": ADAPTER_VERSION,
+            "component_precision": manifest["qualified_target"]["component_precision"],
             "normalizer": NORMALIZER_VERSION,
             "model_content": model_content,
             "dependencies": versions,
@@ -490,6 +608,7 @@ def build_pipeline(profile: OcrProfile, runtime: RuntimeSettings) -> PipelineAda
         profile_id,
         fingerprint,
         audits,
+        text_dtype=manifest["qualified_target"]["component_precision"]["text"],
         smoke_sha256=manifest["smoke_sha256"],
         gpu_index=runtime.gpu_index,
     )

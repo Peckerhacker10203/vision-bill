@@ -9,10 +9,6 @@ from typing import Any, Literal, cast
 
 import httpx2
 
-from ...helper.logging_config import setup_logging
-
-setup_logging()
-
 from ...model.receipt import Receipt
 from ...provider.llm.base import (
     TEXT_CAPABILITIES,

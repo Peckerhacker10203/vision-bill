@@ -8,6 +8,7 @@ import codecs
 import ctypes
 import hashlib
 import json
+import logging
 import os
 import shutil
 import stat
@@ -20,6 +21,7 @@ import urllib.request
 from dataclasses import dataclass
 from http.client import HTTPException
 from pathlib import Path, PurePosixPath
+from time import monotonic
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
@@ -27,6 +29,8 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 from . import paddle_snapshots
 from .initialization_lock import installation_lock
 from .paddle_distribution import native_paddle_distribution
+
+logger = logging.getLogger(__name__)
 
 Digest = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 MODEL_NAMES = ("PP-DocLayoutV3", "PP-LCNet_x1_0_doc_ori", "UVDoc", "PaddleOCR-VL-1.6-0.9B")
@@ -445,11 +449,15 @@ def provision_models(
         if cache.is_symlink() or models.is_symlink():
             raise ValueError("Model cache must use owned directories")
         for name, asset in bundle.models.items():
+            started = monotonic()
+            logger.info("ocr_model_prepare model=%s state=verify", name)
             target = paths[name]
             replace = os.path.lexists(target)
             if replace:
                 try:
                     verify_tree(target, asset)
+                    logger.info("ocr_model_prepare model=%s state=cached elapsed_ms=%d",
+                                name, int((monotonic() - started) * 1000))
                     continue
                 except ValueError:
                     if not repair:
@@ -477,6 +485,8 @@ def provision_models(
                         raise ModelDownloadFailed from exc
                     extract_archive(archive, tree, asset)
                 publish_directory(tree, target, exchange=replace)
+                logger.info("ocr_model_prepare model=%s state=installed elapsed_ms=%d",
+                            name, int((monotonic() - started) * 1000))
     return paths
 
 
