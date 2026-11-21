@@ -226,7 +226,7 @@ async def test_list_receipts_scoped_to_owner(receipt_db: ReceiptDB) -> None:
     sql = call.args[0]
     assert sql.startswith(LIST_RECEIPTS_BASE_SQL)
     assert "user_id = $1" in sql
-    assert "ORDER BY date DESC LIMIT $2 OFFSET $3" in sql
+    assert "ORDER BY r.date DESC, r.id LIMIT $2 OFFSET $3" in sql
     assert call.args[1] == USER_A
     assert call.args[2:] == (50, 0)  # default limit / offset
 
@@ -242,7 +242,7 @@ async def test_list_receipts_see_all_unscoped(receipt_db: ReceiptDB) -> None:
 
     call = conn.fetch.call_args
     assert "user_id" not in call.args[0]
-    assert call.args[0] == LIST_RECEIPTS_BASE_SQL + " ORDER BY date DESC LIMIT $1 OFFSET $2"
+    assert call.args[0] == LIST_RECEIPTS_BASE_SQL + " ORDER BY r.date DESC, r.id LIMIT $1 OFFSET $2"
 
 
 @pytest.mark.asyncio

@@ -881,7 +881,7 @@ def test_list_receipts_without_filters_keeps_base_sql(api_context: ApiContext) -
     # no filter WHERE clause should be appended when no filters are given.
     expected = (
         "SELECT r.*, (SELECT i.thumbnail_path FROM images i WHERE i.id = r.image_id) "
-        "AS thumbnail_path FROM receipts r ORDER BY date DESC LIMIT $1 OFFSET $2"
+        "AS thumbnail_path FROM receipts r ORDER BY r.date DESC, r.id LIMIT $1 OFFSET $2"
     )
     assert sql == expected
     assert fetch_call.args[1] == 50
@@ -916,7 +916,7 @@ def test_list_receipts_passes_filters_to_db(api_context: ApiContext) -> None:
     assert "date <= $3" in sql
     assert "merchant_name ILIKE $4" in sql
     assert "receipt_number ILIKE $4" in sql
-    assert "ORDER BY date DESC LIMIT $5 OFFSET $6" in sql
+    assert "ORDER BY r.date DESC, r.id LIMIT $5 OFFSET $6" in sql
     args = fetch_call.args[1:]
     assert args[0] == ["verified"]
     assert args[1] == Date(2024, 1, 1)
