@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from ocr_contract import GpuMemorySnapshot, OcrResponse, WorkerReadiness
+from ocr_contract import MANAGED_LOAD_FAILURES, GpuMemorySnapshot, OcrResponse, WorkerReadiness
 from ocr_contract.document_image import decode_working_png, validate_working_png
 from ocr_contract.limits import MAX_OCR_RESPONSE_BYTES
 
@@ -208,6 +208,7 @@ class OcrWorkerManager:
         self._parked = True
         self._owner: str | None = None
         self._owner_generation = 0
+        self._can_claim_after_failed_load = False
         self._owner_load_allowed = False
         self.last_identity: dict[str, str | None] = {}
         if isinstance(runtime, PreparedRuntimeSettings):
@@ -236,6 +237,9 @@ class OcrWorkerManager:
             return max(0, self._admitted - 1)
 
     def readiness(self) -> WorkerReadiness:
+        return self.readiness_with_identity()[0]
+
+    def readiness_with_identity(self) -> tuple[WorkerReadiness, dict[str, str | None]]:
         recover_generation = None
         with self._state:
             try:
@@ -255,6 +259,8 @@ class OcrWorkerManager:
                 ):
                     self._idle_recovery_generation = self._generation
                     recover_generation = self._generation
+            identity = self.last_identity.copy()
+            can_claim = self._can_claim_after_failed_load and not self._stopped.is_set()
             observation = WorkerReadiness(
                 ready=ready,
                 generation=max(1, self._generation),
@@ -262,6 +268,8 @@ class OcrWorkerManager:
                 reason_code=reason,
                 runtime_fingerprint=self._runtime_fingerprint if ready else None,
                 preload_memory=self._preload_memory,
+                can_claim_after_failed_load=can_claim,
+                runtime_identity=identity if reason == "ocr_parked" or can_claim else None,
             )
 
         if recover_generation is not None:
@@ -271,7 +279,7 @@ class OcrWorkerManager:
                 name="ocr-idle-recovery",
                 daemon=True,
             ).start()
-        return observation
+        return observation, identity
 
     def _recover_idle(self, generation: int) -> None:
         # A polling thread never owns an in-flight request's artifacts. Wait
@@ -294,7 +302,10 @@ class OcrWorkerManager:
             # teardown/startup. A failed replacement must not grant another try.
             self._recovery_attempted_generation = generation
             try:
-                self.start()
+                if self._owner is None:
+                    self.start()
+                else:
+                    self.load(self._owner)
             except OcrWorkerError:
                 # Unconfirmed death preserves ownership and remains unready.
                 pass
@@ -302,7 +313,10 @@ class OcrWorkerManager:
     def _set_unready(self, reason: str, *, keep_preload: bool = False) -> None:
         with self._state:
             self._ready, self._reason, self._profile_id = False, reason, None
+            self._can_claim_after_failed_load = False
             self._runtime_fingerprint = None
+            if reason == "ocr_runtime_identity_mismatch":
+                self.last_identity.clear()
             if not keep_preload:
                 self._preload_memory = None
 
@@ -487,13 +501,23 @@ class OcrWorkerManager:
                 raise OcrWorkerError("ocr_stale_owner", 409)
             if not self._owner_load_allowed:
                 raise OcrWorkerError("ocr_owner_phase_closed", 409)
+            # If startup or its teardown fails, only a fresh generation may load.
+            self._owner_load_allowed = False
             self.start(deadline_monotonic=deadline_monotonic, cancel_event=cancel_event)
             ready = self.readiness()
             if not ready.ready:
+                # A client may have exhausted its deadline before it could park.
+                # Publish reclaimability only after this load no longer owns a child.
+                if (not self._standalone_session and self._proc is None
+                        and ready.reason_code in MANAGED_LOAD_FAILURES):
+                    with self._state:
+                        self._parked = True
+                        self._can_claim_after_failed_load = True
                 raise OcrWorkerError(
                     ready.reason_code or "ocr_not_ready",
                     504 if ready.reason_code == "ocr_deadline_exceeded" else 503,
                 )
+            self._owner_load_allowed = True
 
     def park(self, owner: str) -> None:
         with self._active, self._control:

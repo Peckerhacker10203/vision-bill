@@ -88,6 +88,17 @@ uses the official CUDA 12.9 candidate by default. Set `OCR_CUDA_CHANNEL=cu126`
 to select CUDA 12.6. Use a host driver that supports the selected runtime and
 verify it on the actual board. [CUDA build inputs](#build-inputs)
 
+On WSL 2 with a selected CUDA SM 12.0 GPU (for example, an RTX 5080), each
+cold OCR worker assembles the PaddleOCR-VL checkpoint in system RAM, then
+copies the FP32 weights to the selected GPU. Allow temporary RAM headroom in
+WSL while it loads. Other GPU candidates assemble the weights on the GPU.
+Receipt inference runs on the selected GPU in FP32 on both paths.
+
+The OCR container log shows `ocr_vlm_checkpoint_load`. On the WSL host-memory
+path, `stage=assemble` is checkpoint assembly, `stage=transfer` is the copy to
+the GPU and `stage=ready` means the VLM weights are ready. The receipt's status
+in the queue shows when processing finishes.
+
 ### AMD ROCm on native Linux
 
 Use the host's `/dev/kfd` and the selected `/dev/dri/renderD*` node. The source
@@ -158,7 +169,18 @@ It checks the selected image against this checkout and continues preparing the a
 ### Upgrade an existing source installation
 
 Run from the original checkout. Back up the installation and let active jobs
-finish. Stop the old deployment with its original project, profile and all
+finish. If an OCR load timed out on a separate GPU, keep that topology and
+switch **Dedicated OCR** off on the old stack. Wait for Settings to confirm
+it is off. An installed service can park a failed worker while leaving the
+remote LLM loaded. If the upgrade reports a pending handoff after shutdown,
+use `python3 scripts/ocr_source_up.py cuda --restart` from the original
+checkout with its saved deployment record. Switch OCR off there, confirm it
+is off, stop the stack, and back up the settled state before retrying the
+upgrade. Keep the handoff journal intact. After upgrading, turn OCR back on
+and resume the existing receipt in the queue. If it reports changed settings,
+review them and choose the current-policy retry for that receipt.
+
+Stop the old deployment with its original project, profile and all
 three Compose files. Keep its named volumes, private settings and bind-mounted
 files. For a CUDA deployment with the checkout's default project name:
 
@@ -500,7 +522,14 @@ reports liveness. `/ready` stays false with `ocr_parked` until the native worker
 loads. `/info` exposes worker state and runtime identity. Polling
 never cold-loads OCR merely to answer readiness. An already-explicitly-loaded idle
 worker's death can schedule one bounded coordinated replacement, fenced against
-active inference/park. A failed worker start exposes its error and stays unready.
+active inference/park. If the worker reaches its own startup limit, `/ready`
+returns HTTP 503 with `ocr_startup_timeout`. A confirmed GPU allocation failure
+reports `ocr_gpu_out_of_memory`. The app can mark an attempt `timed_out`
+while native startup is still running. The worker can reach its startup
+limit later. After a failed managed load, the service sets
+`can_claim_after_failed_load` only once it confirms the child has exited.
+A new owner can then claim the next bounded queue attempt. Polling alone
+does not start a worker. If exit cannot be confirmed, the GPU remains held.
 Parking disables recovery until a new explicit load; shutdown does not revive workers.
 
 Model/package/image/source/target changes invalidate the installation identity.

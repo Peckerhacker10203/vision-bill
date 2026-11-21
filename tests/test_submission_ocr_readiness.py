@@ -188,3 +188,47 @@ async def test_readiness_exposes_typed_native_error_without_claiming_receipt(set
     assert waits == [code] and waits[0] in READINESS_WAIT_REASONS
     assert claims == [] and image.attempt_count == 0
     llm.get_available_models.assert_not_awaited()
+
+
+@pytest.mark.parametrize("failure", ["ocr_startup_timeout", "ocr_gpu_out_of_memory"])
+async def test_managed_failed_load_without_park_allows_one_new_fenced_attempt(
+    settings, monkeypatch, tmp_path, failure
+):
+    from ocr_service.worker import OcrWorkerError
+
+    service, receipts, _llm, image, waits, claims = await submission_context(
+        settings, monkeypatch, tmp_path, managed=True
+    )
+    context = FakeContext(init_fail="gpu_memory" if failure == "ocr_gpu_out_of_memory" else False)
+    if failure == "ocr_startup_timeout":
+        context.init_release.clear()
+    worker = OcrWorkerManager(mp_context=context, startup_timeout=.15)
+    app = create_app(mode="managed", worker_factory=lambda: worker)
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(
+        **kwargs, transport=httpx.ASGITransport(app=app),
+    ))
+    first, second = f"1:{uuid4()}", f"2:{uuid4()}"
+    async with app.router.lifespan_context(app):
+        async with asyncio.timeout(3):
+            while not (await receipts.ocr_capabilities(settings.ocr)).can_load:
+                await asyncio.sleep(.005)
+        worker.claim(first)
+        assert "can_claim_after_failed_load" not in worker.readiness().model_dump()
+        with pytest.raises(OcrWorkerError, match=failure):
+            await asyncio.to_thread(worker.load, first)
+        # The first client's deadline expired without sending a final park.
+        assert len(context.processes) == 1 and not context.processes[0].is_alive()
+        assert (await receipts.ocr_capabilities(settings.ocr)).reason_code == failure
+        assert await service.ready_for(image)
+        assert waits == [None] and not claims
+        assert len(context.processes) == 1
+        with pytest.raises(OcrWorkerError, match="ocr_owner_phase_closed"):
+            worker.load(first)
+        context.init_fail = False
+        context.init_release.set()
+        worker.claim(second)
+        assert worker.readiness().reason_code == "ocr_parked"
+        await asyncio.to_thread(worker.load, second)
+        assert worker.readiness().ready and len(context.processes) == 2
+        worker.park(second)

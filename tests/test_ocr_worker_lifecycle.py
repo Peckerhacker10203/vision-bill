@@ -83,6 +83,8 @@ class FakeProcess:
             failure = {"generation": generation, "kind": "init_failed"}
             if self.context.init_fail == "gpu_memory":
                 failure["code"] = "ocr_gpu_out_of_memory"
+            elif self.context.init_fail == "identity":
+                failure["code"] = "ocr_runtime_identity_mismatch"
             out_q.put(failure)
             self.dead.set()
             return
@@ -1246,3 +1248,61 @@ def test_preload_probe_spends_the_existing_startup_budget(monkeypatch, now):
         assert not context.processes
     finally:
         manager.stop()
+
+
+def test_failed_managed_load_never_advertises_reclaimability_before_confirmed_reap(monkeypatch):
+    from ocr_service.worker import OcrWorkerError, OcrWorkerManager
+
+    context = FakeContext(init_blocked=True)
+    worker = OcrWorkerManager(mp_context=context, startup_timeout=.05)
+    owner = f"1:{uuid4()}"
+    worker.claim(owner)
+
+    def fail_termination(process):
+        # The startup timer expired, but the process still owns the GPU.
+        assert process.is_alive()
+        assert not worker.readiness().can_claim_after_failed_load
+        raise OSError("cannot stop child")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(FakeProcess, "terminate", fail_termination)
+        try:
+            with pytest.raises(OcrWorkerError, match="ocr_worker_unstoppable"):
+                worker.load(owner)
+            state = worker.readiness()
+            assert state.reason_code == "ocr_worker_unstoppable"
+            assert not state.can_claim_after_failed_load and context.processes[0].is_alive()
+            with pytest.raises(OcrWorkerError, match="ocr_owner_phase_closed"):
+                worker.load(owner)
+        finally:
+            patched.undo()
+            worker.stop()
+
+
+def test_failed_managed_replacement_can_only_be_loaded_by_a_fresh_owner(tmp_path):
+    from ocr_service.worker import OcrWorkerError, OcrWorkerManager
+
+    context = FakeContext("fatal")
+    worker = OcrWorkerManager(mp_context=context, startup_timeout=.15)
+    first, second = f"1:{uuid4()}", f"2:{uuid4()}"
+    try:
+        worker.claim(first)
+        worker.load(first)
+        with pytest.raises(OcrWorkerError, match="ocr_inference_failed"):
+            worker.infer(request(tmp_path), owner=first, deadline_monotonic=time.monotonic() + 1)
+        deadline = time.monotonic() + 2
+        while not worker.readiness().can_claim_after_failed_load:
+            assert time.monotonic() < deadline
+            time.sleep(.005)
+        assert worker.readiness().reason_code == "ocr_startup_timeout"
+        assert len(context.processes) == 2 and not any(p.is_alive() for p in context.processes)
+        with pytest.raises(OcrWorkerError, match="ocr_owner_phase_closed"):
+            worker.load(first)
+        context.init_release.set()
+        context.mode = "ok"
+        worker.claim(second)
+        worker.load(second)
+        assert worker.readiness().ready and len(context.processes) == 3
+        assert len(context.requests) == 1
+    finally:
+        worker.stop()

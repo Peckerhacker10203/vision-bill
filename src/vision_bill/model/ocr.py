@@ -2,6 +2,7 @@
 
 from ocr_contract import (
     CONTRACT_VERSION,
+    MANAGED_LOAD_FAILURES,
     BoundingBox,
     CoordinateSpace,
     GpuMemorySnapshot,
@@ -19,6 +20,7 @@ from ocr_contract import (
 
 __all__ = [
     "CONTRACT_VERSION",
+    "MANAGED_LOAD_FAILURES",
     "BoundingBox",
     "CoordinateSpace",
     "GpuMemorySnapshot",

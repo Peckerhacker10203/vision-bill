@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
-from ocr_contract import limits
+from ocr_contract import MANAGED_LOAD_FAILURES, limits
 from ocr_contract.document_image import decode_working_png, validate_working_png
 from PIL import Image
 from pydantic import ValidationError
@@ -149,12 +149,23 @@ class PaddleOcrProvider(OcrProvider):
                     raise ValueError("ocr_profile_mismatch")
                 reported_limit = info["profile"].get("max_new_tokens")
                 parked = ready.reason_code == "ocr_parked"
-                identity = info.get("runtime_identity", info.get("last_qualified_identity", {})) if parked else {}
+                reclaimable = (
+                    self.managed_lifecycle and info.get("service_mode") == "managed"
+                    and ready.can_claim_after_failed_load and ready.reason_code in MANAGED_LOAD_FAILURES
+                )
+                can_load = parked or reclaimable
+                # A reaped worker can preserve a verified OCR prefix. An explicit
+                # identity failure invalidates that evidence even after its child exits.
+                identity: object = {}
+                if can_load and ready.reason_code != "ocr_runtime_identity_mismatch":
+                    identity = ready.runtime_identity if ready.runtime_identity is not None else (
+                        info.get("runtime_identity", info.get("last_qualified_identity", {}))
+                    )
                 if not isinstance(identity, dict):
                     raise TypeError("ocr_contract_mismatch")
                 ocr_limit = (
                     reported_limit
-                    if (parked or (ready.ready and info_profile == ready.profile_id))
+                    if (can_load or (ready.ready and info_profile == ready.profile_id))
                     and type(reported_limit) is int
                     and reported_limit > 0
                     else None
@@ -164,7 +175,7 @@ class PaddleOcrProvider(OcrProvider):
                     configured=True,
                     reachable=True,
                     ready=ready.ready,
-                    can_load=parked,
+                    can_load=can_load,
                     profile_id=ready.profile_id or identity.get("profile_id"),
                     reason_code=ready.reason_code,
                     runtime_fingerprint=ready.runtime_fingerprint if ready.ready else identity.get("runtime_fingerprint"),

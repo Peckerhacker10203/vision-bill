@@ -632,6 +632,79 @@ def has_project_claim(identity: dict[str, Any], accelerator: str, release: Path)
     return len(records) == 1 and (records[0].get("Labels") or {}).get(label) == owner
 
 
+# Run the installed image's journal validator on a read-only mount. An absent
+# journal is valid for a deployment that has never used the corresponding topology.
+CHECK_UPGRADE_HANDOFF = """
+from pathlib import Path
+import sys
+from ocr_service.initialization_lock import _require_clean_journal
+
+lock = Path(sys.argv[1])
+try:
+    _require_clean_journal(lock.with_suffix(".json"))
+    _require_clean_journal(lock.with_suffix(".ocr-only.json"), ocr_only=True)
+except (OSError, RuntimeError, ValueError):
+    print("needs-recovery")
+else:
+    print("clean")
+"""
+
+
+def verify_upgrade_handoff(config: dict[str, Any], previous: dict[str, Any]) -> None:
+    """Check the stopped source project's original coordination volume before rebuilding."""
+    volume = "ocr-coordination"
+    lock = "/coord/gpu-handoff.lock"
+    for name, key in (
+        ("vision_bill", "OCR_ACTIVATION_HANDOFF_LOCK_PATH"),
+        (NATIVE, "OCR_HANDOFF_LOCK_PATH"),
+    ):
+        service = config["services"][name]
+        mounts = [m for m in service.get("volumes", []) if m.get("target") == "/coord"]
+        if (
+            service.get("environment", {}).get(key) != lock
+            or len(mounts) != 1
+            or mounts[0].get("type") != "volume"
+            or mounts[0].get("source") != volume
+            or mounts[0].get("volume", {}).get("subpath")
+        ):
+            raise ValueError("Cannot identify the source deployment's original GPU handoff mount")
+    actual = config.get("volumes", {}).get(volume, {}).get("name")
+    if not isinstance(actual, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", actual):
+        raise ValueError("Missing original source coordination volume")
+    if compose_volumes(previous["project"], volume) != [actual]:
+        raise ValueError("Cannot uniquely identify the original project's coordination volume")
+    verdict = command(
+        "docker",
+        "run",
+        "--rm",
+        "--pull=never",
+        "--network=none",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--env",
+        "NVIDIA_VISIBLE_DEVICES=void",
+        "--mount",
+        f"type=volume,source={actual},target=/coord,readonly,volume-nocopy",
+        "--entrypoint",
+        "python",
+        previous["image_ids"][NATIVE],
+        "-B",
+        "-c",
+        CHECK_UPGRADE_HANDOFF,
+        lock,
+        capture=True,
+    ).strip()
+    if compose_volumes(previous["project"], volume) != [actual]:
+        raise ValueError("The original coordination volume changed during the upgrade check")
+    if verdict != "clean":
+        raise ValueError(
+            "GPU handoff is pending or cannot be verified. Restart the original recorded stack "
+            "with --restart; for an OCR-only pending handoff, switch Dedicated OCR off in Settings "
+            "and wait for Disabled. Resolve other ownership errors on the original stack. "
+            "Then drain and stop the original project before retrying --upgrade. Preserve the journals."
+        )
+
+
 def acquire_project_claim(identity: dict[str, Any], accelerator: str, release: Path) -> None:
     name, label, owner = project_claim(identity, accelerator, release)
     # Docker serializes creation by name and reuses an existing local volume
@@ -710,20 +783,18 @@ def bind_sources_match(expected: dict[str, str], observed: dict[str, str], image
         command("docker", "container", "rm", probe, capture=True)
 
 
-def compose_volume_exists(project: str, volume: str) -> bool:
-    return bool(
-        command(
-            "docker",
-            "volume",
-            "ls",
-            "--quiet",
-            "--filter",
-            f"label=com.docker.compose.project={project}",
-            "--filter",
-            f"label=com.docker.compose.volume={volume}",
-            capture=True,
-        ).strip()
-    )
+def compose_volumes(project: str, volume: str) -> list[str]:
+    return command(
+        "docker",
+        "volume",
+        "ls",
+        "--quiet",
+        "--filter",
+        f"label=com.docker.compose.project={project}",
+        "--filter",
+        f"label=com.docker.compose.volume={volume}",
+        capture=True,
+    ).split()
 
 
 def verify_existing_app(
@@ -732,7 +803,7 @@ def verify_existing_app(
     containers = command(*compose, "ps", "--all", "--quiet", "vision_bill", capture=True).split()
     if not containers:
         db = command(*compose, "ps", "--all", "--quiet", "db", capture=True).split()
-        if not allow_orphan and (db or compose_volume_exists(project, "db_data")):
+        if not allow_orphan and (db or compose_volumes(project, "db_data")):
             raise ValueError(
                 "Cannot verify ownership of the existing database volume. Start the base app in its original checkout or use a fresh project"
             )
@@ -781,7 +852,7 @@ def verify_existing_app(
 
 
 def reject_existing_ocr(compose: tuple[str, ...], project: str) -> None:
-    if existing_controllers(compose) or compose_volume_exists(project, "ocr-activation-request"):
+    if existing_controllers(compose) or compose_volumes(project, "ocr-activation-request"):
         raise ValueError("Existing OCR activation state must stay with its original deployment")
 
 
@@ -918,6 +989,8 @@ def deploy(
     elif project != previous["project"]:
         raise ValueError("Cannot change Compose project during upgrade")
     verify_existing_app(compose, project, allow_orphan=upgrade)
+    if previous is not None:
+        verify_upgrade_handoff(config, previous)
     candidate = config["services"][NATIVE]
     devices, device_environment = gpu_args(accelerator, candidate)
     os.environ.update(device_environment)

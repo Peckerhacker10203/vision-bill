@@ -1018,9 +1018,9 @@ def test_source_upgrade_channel_only_changes_on_explicit_selection(
     )
 
 
-@pytest.mark.parametrize("fail_build", [True, False])
+@pytest.mark.parametrize("failure", [None, "build", "pending_ocr", "volume_mismatch"])
 def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
-    tmp_path, managed_release, monkeypatch, fail_build
+    tmp_path, managed_release, monkeypatch, failure
 ):
     from scripts import ocr_source_up as source
 
@@ -1054,8 +1054,34 @@ def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
         },
     }
 
+    volume_name = project + "_ocr-coordination"
+    built_config["volumes"] = {"ocr-coordination": {"name": volume_name}}
+    for name in (service, "vision_bill"):
+        built_config["services"][name]["volumes"] = [
+            {"type": "volume", "source": "ocr-coordination", "target": "/coord"}
+        ]
+    built_config["services"][service]["environment"] = {
+        "OCR_HANDOFF_LOCK_PATH": "/coord/gpu-handoff.lock"
+    }
+    built_config["services"]["vision_bill"]["environment"] = {
+        "OCR_ACTIVATION_HANDOFF_LOCK_PATH": "/coord/gpu-handoff.lock",
+    }
+
     def docker(*args, capture=False):
         commands.append(args)
+        if (
+            args[:3] == ("docker", "volume", "ls")
+            and args[-1] == "label=com.docker.compose.volume=ocr-coordination"
+        ):
+            assert f"label=com.docker.compose.project={project}" in args
+            return volume_name if failure != "volume_mismatch" else "other-volume"
+        if args[:2] == ("docker", "run") and "--mount" in args:
+            assert config_id in args and "--gpus" not in args
+            assert "--pull=never" in args and "--network=none" in args and "--read-only" in args
+            assert args[args.index("--mount") + 1] == (
+                f"type=volume,source={volume_name},target=/coord,readonly,volume-nocopy"
+            )
+            return "needs-recovery" if failure == "pending_ocr" else "clean"
         if "--environment" in args:
             return "COMPOSE_PROJECT_NAME=saved-project\n"
         if args[:2] == ("docker", "run") and "--volume" not in args:
@@ -1081,7 +1107,7 @@ def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
         if args[:2] == ("docker", "run"):
             staged = Path(args[args.index("--volume") + 1].removesuffix(":/release:ro"))
             return (staged / "bundle.json").read_text()
-        if "build" in args and fail_build:
+        if "build" in args and failure == "build":
             raise subprocess.CalledProcessError(2, args)
         if "tag" in args or "build" in args or "up" in args:
             return ""
@@ -1098,7 +1124,17 @@ def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
         return config_id
 
     monkeypatch.setattr(source, "export_config", image_config)
-    if fail_build:
+    if failure in {"pending_ocr", "volume_mismatch"}:
+        expected = "switch Dedicated OCR off" if failure == "pending_ocr" else "coordination volume"
+        with pytest.raises(ValueError, match=expected):
+            source.deploy(("docker", "compose"), tmp_path, "cuda", None, upgrade=True)
+        assert json.loads(managed.read_bytes()) == prior
+        assert list(tmp_path.glob("release-*")) == [old_release]
+        assert not any(
+            "build" in call or "up" in call or call[:1] == ("make",) for call in commands
+        )
+        return
+    if failure == "build":
         with pytest.raises(subprocess.CalledProcessError):
             source.deploy(("docker", "compose"), tmp_path, "cuda", None, upgrade=True)
         assert json.loads(managed.read_bytes()) == prior
@@ -1116,3 +1152,48 @@ def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
         assert "--no-build" in commands[-1] and project in commands[-1]
     assert source.was_admitted(managed)
     assert all("rm" not in args and "down" not in args for args in commands)
+
+
+@pytest.mark.parametrize(
+    "journal,pending,verdict",
+    [
+        (None, False, "clean"),
+        ("gpu-handoff.ocr-only.json", False, "clean"),
+        ("gpu-handoff.ocr-only.json", True, "needs-recovery"),
+        ("gpu-handoff.json", True, "needs-recovery"),
+    ],
+)
+def test_offline_upgrade_preflight_uses_both_real_journal_checks_without_writes(
+    tmp_path, journal, pending, verdict
+):
+    from scripts import ocr_source_up as source
+
+    if journal:
+        data = {
+            "version": 2,
+            "coordinator": "vision-bill-model-handoff-v2",
+            "generation": 1,
+            "resources": {"ocr": "paddle:example", "llm": "external-unmanaged"},
+            "ocr_pending": pending,
+            "unsettled": False,
+            "models": [],
+        }
+        record = tmp_path / journal
+        record.write_text(json.dumps(data))
+        record.chmod(0o600)
+    before = {p: (p.stat().st_mtime_ns, p.read_bytes()) for p in tmp_path.iterdir()}
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-c",
+            source.CHECK_UPGRADE_HANDOFF,
+            str(tmp_path / "gpu-handoff.lock"),
+        ],
+        cwd=source.ROOT / "paddleocr-service",
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.strip() == verdict
+    assert before == {p: (p.stat().st_mtime_ns, p.read_bytes()) for p in tmp_path.iterdir()}

@@ -232,13 +232,17 @@ def run_stage(stage: str, payload: dict[str, Any], directory: Path) -> dict[str,
 
 
 def device_identity(
-    paddle: Any, runtime: NativeRuntimeSettings, *, compute: bool = True
+    paddle: Any,
+    runtime: NativeRuntimeSettings,
+    *,
+    compute: bool = True,
+    hardware: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if os.environ.get("HSA_OVERRIDE_GFX_VERSION"):
         raise ValueError("Architecture spoofing is forbidden")
-    result = execution_target(
-        paddle, inspect_device_identity(runtime.accelerator, runtime.gpu_index), runtime.accelerator
-    )
+    if hardware is None:
+        hardware = inspect_device_identity(runtime.accelerator, runtime.gpu_index)
+    result = execution_target(paddle, hardware, runtime.accelerator)
     if runtime.accelerator == "rocm" and compute:
         result["compute_probe"] = compute_probe(paddle, runtime.gpu_index)
     return result
@@ -279,8 +283,14 @@ def collect(payload: dict[str, Any]) -> dict[str, Any]:
     )
     profile = load_profile(PROFILE)
     preload: list[GpuMemorySnapshot] = []
-    native, paddle, runner_type = construct_native(profile, runtime, record_preload=preload.append)
-    device = device_identity(paddle, runtime)
+    hardware = inspect_device_identity(runtime.accelerator, runtime.gpu_index)
+    native, paddle, runner_type = construct_native(
+        profile,
+        runtime,
+        device=hardware,
+        record_preload=preload.append,
+    )
+    device = device_identity(paddle, runtime, hardware=hardware)
     preprocessor = native.doc_preprocessor_pipeline
     models = [
         native.layout_det_model,

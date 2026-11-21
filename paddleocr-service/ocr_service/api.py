@@ -145,12 +145,18 @@ def create_app(
 
     @app.get("/info")
     async def info() -> dict[str, object]:
+        if worker is None:
+            body = ready_body()
+            identity: dict[str, str | None] = {}
+        else:
+            state, identity = worker.readiness_with_identity()
+            body = state.model_dump(exclude={"runtime_identity"})
         return {
             "contract_version": 2,
             "service_mode": mode,
             "profile": load_profile(Path(__file__).parents[1] / "profile.json").model_dump(),
-            "worker": ready_body(),
-            "runtime_identity": getattr(worker, "last_identity", {}),
+            "worker": body,
+            "runtime_identity": identity,
             "max_upload_bytes": max_upload_bytes,
             "max_pending": 4,
             "max_timeout_ms": 600000,
@@ -271,6 +277,6 @@ def create_app(
             getattr(worker, action)(body.owner_token)
         except OcrWorkerError as exc:
             raise HTTPException(exc.status_code, exc.code) from None
-        return ready_body()
+        return worker.readiness().model_dump(exclude={"runtime_identity"})
 
     return app

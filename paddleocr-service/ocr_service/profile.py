@@ -12,6 +12,7 @@ from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .fp32 import requires_host_assembly
 from .paddle_distribution import installed_native_paddle, native_paddle_distribution
 
 ADAPTER_VERSION = "native-fp32-v1"
@@ -246,7 +247,13 @@ def serving_identity(
     """Bind reusable receipt pages to their settings, artifacts, image and actual device."""
     profile_id = content_identity(
         {
-            "adapter": "native-receipt-fp32-v2",
+            "adapter": (
+                "native-receipt-fp32-host-checkpoint-v1"
+                if requires_host_assembly(
+                    runtime.accelerator, device_identity.get("compute_capability")
+                )
+                else "native-receipt-fp32-v2"
+            ),
             "normalizer": NORMALIZER_VERSION,
             "effective_config": effective_pipeline_config(profile),
             "limits": profile.model_dump(),

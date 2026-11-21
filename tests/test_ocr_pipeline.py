@@ -38,6 +38,117 @@ def test_fp32_override_precedes_single_loader_even_on_bf16_device():
     assert predictor.dtype == "float32"
 
 
+def test_wsl_cuda_checkpoint_assembled_on_cpu_transferred_and_audited(monkeypatch, capsys):
+    from contextlib import contextmanager
+
+    from ocr_service import fp32
+
+    calls = []
+    current = "gpu:3"
+    processor = object()
+    config = object()
+    tied = tensor()
+    buffer = tensor("int64")
+    model = SimpleNamespace(parameters=lambda: [tied], buffers=lambda: [buffer])
+
+    @contextmanager
+    def device_guard(device):
+        nonlocal current
+        previous, current = current, device
+        try:
+            yield
+        finally:
+            current = previous
+
+    def configure(directory):
+        calls.append(("config", current, directory))
+        return config
+
+    def assemble(directory, **kwargs):
+        calls.append(("assemble", current, directory, kwargs))
+        return model
+
+    def transfer(*, device, blocking):
+        calls.append(("transfer", current, device, blocking))
+        tied.place = tensor(gpu=3).place
+        buffer.place = tensor("int64", gpu=3).place
+        return model
+
+    model.to = transfer
+    model_type = SimpleNamespace(
+        config_class=SimpleNamespace(from_pretrained=configure), from_pretrained=assemble
+    )
+    monkeypatch.setattr(
+        fp32,
+        "import_module",
+        {
+            "paddlex.utils.device": SimpleNamespace(TemporaryDeviceChanger=device_guard),
+            "paddlex.inference.models.doc_vlm.modeling": SimpleNamespace(
+                PaddleOCRVLForConditionalGeneration=model_type
+            ),
+        }.__getitem__,
+        raising=False,
+    )
+
+    class Upstream:
+        device = "gpu:3"
+        model_dir = "/verified/vlm"
+
+        def build_processor(self):
+            calls.append(("processor", current))
+            return processor
+
+        def _build(self, **kwargs):
+            pytest.fail("targeted load invoked default GPU weight assembly")
+
+    predictor = fp32.fp32_predictor_class(Upstream, 3, assemble_on_host=True)()
+    assert predictor._build() == (model, processor)
+    assert current == predictor.device == "gpu:3"
+    assert calls == [
+        ("processor", "gpu:3"),
+        ("config", "gpu:3", "/verified/vlm"),
+        (
+            "assemble",
+            "cpu",
+            "/verified/vlm",
+            {"config": config, "dtype": "float32", "convert_from_hf": True},
+        ),
+        ("transfer", "gpu:3", "gpu:3", True),
+    ]
+    assert [line.split()[-1] for line in capsys.readouterr().err.splitlines()] == [
+        "stage=assemble",
+        "stage=transfer",
+        "stage=ready",
+    ]
+    model.to = lambda **kw: model
+    buffer.place = tensor("int64", gpu=None).place
+    with pytest.raises(ValueError, match="GPU"):
+        predictor._build()
+    assert "stage=ready" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "release,dxg,accelerator,capability,expected",
+    [
+        ("6.6.87.2-microsoft-standard-WSL2", False, "cuda", [12, 0], True),
+        ("linuxkit", True, "cuda", (12, 0), True),
+        ("6.8-linux", False, "cuda", [12, 0], False),
+        ("WSL2", False, "cuda", [12, 0], False),
+        ("4.4.0-Microsoft", False, "cuda", [12, 0], False),
+        ("6.6-microsoft-standard-WSL2", False, "cuda", [8, 6], False),
+        ("6.6-microsoft-standard-WSL2", False, "rocm", None, False),
+    ],
+)
+def test_host_assembly_selection(monkeypatch, release, dxg, accelerator, capability, expected):
+    import platform
+
+    from ocr_service import fp32
+
+    monkeypatch.setattr(platform, "release", lambda: release)
+    monkeypatch.setattr(Path, "exists", lambda path: str(path) == "/dev/dxg" and dxg)
+    assert fp32.requires_host_assembly(accelerator, capability) is expected
+
+
 @pytest.mark.parametrize(
     "dtype,gpu", [("bfloat16", 0), ("float16", 0), ("float32", None), ("float32", 1)]
 )
@@ -665,6 +776,54 @@ def test_prepared_serving_refuses_identity_drift_before_loading(native_runtime, 
     with pytest.raises(RuntimeIdentityMismatch):
         build_serving_pipeline(profile, runtime)
     assert calls == []
+
+
+def test_wsl_checkpoint_loader_bound_to_cache_and_explicit_qualification(
+    native_runtime, monkeypatch
+):
+    import json
+    import platform
+
+    from ocr_service import pipeline
+    from ocr_service.profile import PreparedRuntimeSettings, load_profile, serving_identity
+
+    legacy, _, device, calls = native_runtime
+    device["compute_capability"] = [12, 0]
+    manifest = json.loads(legacy.qualification_manifest.read_bytes())
+    manifest["qualified_target"]["compute_capability"] = [12, 0]
+    legacy.qualification_manifest.write_text(json.dumps(manifest))
+    prepared = PreparedRuntimeSettings(
+        **legacy.model_dump(exclude={"qualification_manifest"}),
+        schema_version=2,
+        model_content=manifest["model_content"],
+        device_identity=device,
+    )
+    profile = load_profile(Path(__file__).parents[1] / "paddleocr-service/profile.json")
+    monkeypatch.setattr(platform, "release", lambda: "6.8-generic")
+    direct = serving_identity(profile, prepared, prepared.model_content, device)
+    monkeypatch.setattr(platform, "release", lambda: "6.6-microsoft-standard-WSL2")
+    staged = serving_identity(profile, prepared, prepared.model_content, device)
+    assert direct["profile_id"] != staged["profile_id"]
+    assert direct["runtime_fingerprint"] != staged["runtime_fingerprint"]
+
+    with pytest.raises(ValueError, match="qualified target"):
+        pipeline.build_pipeline(profile, legacy)
+    assert calls == []
+    manifest["qualified_target"]["vlm_checkpoint_loader"] = "host-fp32-v1"
+    legacy.qualification_manifest.write_text(json.dumps(manifest))
+    loaders = []
+    original = pipeline.fp32_predictor_class
+
+    def observe(upstream, index, *, assemble_on_host):
+        loaders.append(assemble_on_host)
+        # Real Paddle construction is covered separately. Record each factory's selected policy.
+        return original(upstream, index)
+
+    monkeypatch.setattr(pipeline, "fp32_predictor_class", observe)
+    pipeline.build_pipeline(profile, legacy)
+    page_adapter = pipeline.build_serving_pipeline(profile, prepared)
+    assert loaders == [True, True]
+    assert page_adapter.runtime_fingerprint == staged["runtime_fingerprint"]
 
 
 def test_static_runner_actual_model_name_must_match(tmp_path):

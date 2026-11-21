@@ -486,3 +486,36 @@ async def test_parked_prepared_identity_is_used_before_first_receipt(monkeypatch
     caps = await PaddleOcrProvider("http://local").get_capabilities()
     assert caps.can_load and not caps.ready
     assert caps.profile_id == "profile" and caps.runtime_fingerprint == "prepared"
+
+
+@pytest.mark.parametrize("code,expected_identity", [
+    ("ocr_startup_timeout", "prepared"),
+    ("ocr_runtime_identity_mismatch", None),
+])
+async def test_reclaimed_load_preserves_usable_cache_identity_only(monkeypatch, code, expected_identity):
+    failed = {"ready": False, "generation": 2, "reason_code": code, "can_claim_after_failed_load": True}
+    def handler(request):
+        if request.url.path == "/info":
+            return httpx.Response(200, json={
+                "contract_version": 2, "service_mode": "managed", "profile": {"max_new_tokens": 4096},
+                "worker": failed, "runtime_identity": {"profile_id": "fixed", "runtime_fingerprint": "prepared"},
+            })
+        return httpx.Response(503, json=failed)
+    http_client(monkeypatch, handler)
+    caps = await PaddleOcrProvider("http://local").get_capabilities()
+    assert not caps.ready and caps.can_load and caps.reason_code == code
+    assert caps.runtime_fingerprint == expected_identity
+
+
+async def test_identity_invalidation_between_info_and_parked_ready_cannot_reuse_cache(monkeypatch):
+    parked = {"ready": False, "generation": 1, "reason_code": "ocr_parked"}
+    def handler(request):
+        if request.url.path == "/info":
+            return httpx.Response(200, json={
+                "contract_version": 2, "service_mode": "managed", "profile": {}, "worker": parked,
+                "runtime_identity": {"profile_id": "p", "runtime_fingerprint": "stale"},
+            })
+        return httpx.Response(503, json={**parked, "runtime_identity": {}})
+    http_client(monkeypatch, handler)
+    caps = await PaddleOcrProvider("http://local").get_capabilities()
+    assert caps.can_load and caps.runtime_fingerprint is None and caps.profile_id is None

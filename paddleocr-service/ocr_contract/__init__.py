@@ -9,9 +9,14 @@ from . import limits
 from .wire_json import check_encoded_metadata, preflight_wire_metadata
 
 CONTRACT_VERSION: Literal[2] = 2
+MANAGED_LOAD_FAILURES = frozenset({
+    "ocr_startup_timeout", "ocr_deadline_exceeded", "ocr_gpu_out_of_memory",
+    "ocr_init_failed", "ocr_model_load_failed", "ocr_runtime_identity_mismatch",
+})
 
 __all__ = [
     "CONTRACT_VERSION",
+    "MANAGED_LOAD_FAILURES",
     "BoundingBox",
     "CoordinateSpace",
     "GpuMemorySnapshot",
@@ -164,3 +169,8 @@ class WorkerReadiness(BaseModel):
     profile_id: str | None = None
     reason_code: str | None = None
     preload_memory: GpuMemorySnapshot | None = None
+    # The failed load has been reaped and its token cannot dispatch another load.
+    can_claim_after_failed_load: bool = Field(default=False, strict=True, exclude_if=lambda value: not value)
+    # A parked or reclaimable worker reports its cache identity in this same snapshot.
+    # An empty mapping explicitly invalidates an earlier /info observation.
+    runtime_identity: dict[str, str | None] | None = Field(default=None, exclude_if=lambda value: value is None)

@@ -57,6 +57,35 @@ def test_park_fences_delayed_load_http_until_new_claim_without_starting_child():
         assert len(context.processes) == 2
 
 
+def test_park_and_fresh_claim_preserve_identity_invalidation_until_successful_load():
+    from ocr_service.api import create_app
+    from ocr_service.worker import OcrWorkerManager
+
+    context = FakeContext()
+    worker = OcrWorkerManager(mp_context=context, startup_timeout=.2)
+    first, second, third = ({"owner_token": f"{i}:receipt"} for i in (1, 2, 3))
+    with TestClient(create_app(worker_factory=lambda: worker)) as client:
+        assert client.post("/lifecycle/claim", json=first).status_code == 200
+        assert client.post("/lifecycle/load", json=first).status_code == 200
+        verified = client.get("/info").json()["runtime_identity"]
+        assert verified["runtime_fingerprint"] == "runtime"
+        assert client.post("/lifecycle/park", json=first).status_code == 200
+        assert client.post("/lifecycle/claim", json=second).status_code == 200
+        context.init_fail = "identity"
+        failure = client.post("/lifecycle/load", json=second)
+        assert failure.status_code == 503 and failure.json()["detail"] == "ocr_runtime_identity_mismatch"
+        assert client.get("/info").json()["runtime_identity"] == {}
+        assert client.post("/lifecycle/park", json=second).status_code == 200
+        assert client.get("/info").json()["runtime_identity"] == {}
+        # A concurrent capabilities caller may already hold the first /info.
+        assert client.get("/ready").json()["runtime_identity"] == {}
+        assert client.post("/lifecycle/claim", json=third).status_code == 200
+        assert client.get("/info").json()["runtime_identity"] == {}
+        context.init_fail = False
+        assert client.post("/lifecycle/load", json=third).status_code == 200
+        assert client.get("/info").json()["runtime_identity"] == verified
+
+
 def test_health_does_not_imply_readiness_and_metadata_is_safe():
     from ocr_service.api import create_app
     from ocr_service.worker import OcrWorkerManager

@@ -16,7 +16,12 @@ from uuid import UUID
 from ocr_contract import GpuMemorySnapshot, OcrBlock, OcrResponse
 
 from .device_inventory import execution_target, inspect_device_identity
-from .fp32 import audit_dynamic_model, fp32_predictor_class, native_pipeline_class
+from .fp32 import (
+    audit_dynamic_model,
+    fp32_predictor_class,
+    native_pipeline_class,
+    requires_host_assembly,
+)
 from .gpu_memory import probe_gpu_memory
 from .images import normalize_source, working_image
 from .precision import StaticArtifact, StaticAuditSession, begin_static_audit
@@ -262,6 +267,7 @@ def construct_native(
     profile: OcrProfile,
     runtime: NativeRuntimeSettings,
     *,
+    device: dict[str, Any],
     record_preload: Callable[[GpuMemorySnapshot], None] | None = None,
 ) -> tuple[Any, Any, type[Any]]:
     """Construct the pinned native profile; no coverage or serving permission is implied."""
@@ -330,7 +336,13 @@ def construct_native(
                 resolve(child)
 
     resolve(config)
-    predictor = fp32_predictor_class(DocVLMLocalPredictor, runtime.gpu_index)
+    predictor = fp32_predictor_class(
+        DocVLMLocalPredictor,
+        runtime.gpu_index,
+        assemble_on_host=requires_host_assembly(
+            runtime.accelerator, device.get("compute_capability")
+        ),
+    )
     pipeline_type = native_pipeline_class(_PaddleOCRVLPipeline, predictor, normalize_engine_config)
     if record_preload is not None:
         snapshot = probe_gpu_memory(runtime.accelerator, runtime.gpu_index)
@@ -401,7 +413,7 @@ def build_serving_pipeline(
     except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
         raise RuntimeIdentityMismatch("Native runtime identity mismatch") from exc
 
-    native, _, runner_type = construct_native(profile, runtime)
+    native, _, runner_type = construct_native(profile, runtime, device=device)
     preprocessor = native.doc_preprocessor_pipeline
     models = (
         native.layout_det_model,
@@ -428,7 +440,9 @@ def build_pipeline(profile: OcrProfile, runtime: RuntimeSettings) -> PipelineAda
     manifest, artifacts, versions, dependency_content = verified_qualification_manifest(runtime)
     inspector = f"paddle:{runtime.expected_paddle_commit}"
     model_content = manifest["model_content"]
-    native, paddle, PaddleStaticRunner = construct_native(profile, runtime)
+    native, paddle, PaddleStaticRunner = construct_native(
+        profile, runtime, device=manifest["qualified_target"]
+    )
     preprocessor = native.doc_preprocessor_pipeline
     models = (
         native.layout_det_model,

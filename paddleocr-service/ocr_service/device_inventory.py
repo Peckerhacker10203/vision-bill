@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Literal
 
+from .fp32 import requires_host_assembly
 from .profile import content_identity, file_digest
 from .targets import validate_profile
 
@@ -144,6 +145,9 @@ def execution_target(paddle: Any, device: dict[str, Any], accelerator: str) -> d
     """Bind the loader to the selected driver, build and installed HIP kernels without compute."""
     result = dict(device)
     result["paddle_build"] = str(paddle.version.full_version)
+    if requires_host_assembly(accelerator, device.get("compute_capability")):
+        # Explicit qualification and replay must exercise the same checkpoint loader.
+        result["vlm_checkpoint_loader"] = "host-fp32-v1"
     if accelerator == "rocm":
         target = result["gfx_target"]
         kernels = json.loads(Path("/opt/ocr/build-evidence/kernels.json").read_text())
