@@ -80,6 +80,21 @@ profile/runtime remain recorded. Deprecated fallback fields and old results
 retain their historical meaning. Admins can explicitly select direct vision
 for a benchmark comparison.
 
+Ollama and OpenAI-compatible endpoints receive the same field instructions and
+nullable draft schema. In OCR mode the formatter receives the ordered transcript,
+layout blocks and permitted source references for each photo. A product name,
+its size or colour and a price on the following line can describe one purchase.
+Two separately priced occurrences of the same product remain two items. If a
+distinct purchase has an unreadable price, its price stays open for review.
+
+Vision Bill validates the returned JSON before preparing the review form.
+For example, a printed 19% belongs in the tax-rate field as `0.19`. If the
+model returns `19`, the formatter can ask once for just that field using the
+same evidence and the remaining time and call budget. Other observations stay
+in place. An unusable correction leaves the draft available for manual review
+when the formatting call finishes. The optional category and tag step only
+fills labels. [Review and financial contract](UPGRADE_AND_VERIFY.md#review-and-financial-contract)
+
 Only model-proposed ordered suffix/prefix overlaps between adjacent photos may be
 removed. `helper/duplicates.py::verify_duplicate` checks description, quantity and
 line total (exact defaults, normalized case/whitespace in descriptions). Every pair

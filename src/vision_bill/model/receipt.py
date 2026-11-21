@@ -42,7 +42,12 @@ ReceiptTime = Annotated[
 
 
 class LineItem(BaseModel):
-    description: str = Field(description="Name of the purchased item")
+    description: str = Field(
+        description=(
+            "Printed name of the charged item including its distinguishing size, colour or "
+            "model. The name and variant may appear on separate lines."
+        )
+    )
     spending_category: SpendingCategory = Field(
         default="unknown", description="One spending category code"
     )
@@ -118,10 +123,20 @@ class Receipt(BaseModel):
     category: Category = Field(
         default="other", description="Best-guess category for the whole purchase"
     )
-    line_items: list[LineItem] = Field(description="All purchased items")
+    line_items: list[LineItem] = Field(
+        description=(
+            "Ordered logical purchases and returns. Combine the name, variant and price "
+            "lines for one item. Keep separately charged occurrences."
+        )
+    )
     taxes: list[TaxLine] = Field(default_factory=list, description="Tax lines applied")
 
-    subtotal: Decimal = Field(description="Sum of line items before tax/discounts")
+    subtotal: Decimal = Field(
+        description=(
+            "Receipt-wide printed subtotal (including a printed net subtotal), or a net "
+            "subtotal derived from complete line and tax evidence."
+        )
+    )
     discount_total: Decimal | None = Field(
         default=Decimal(0), ge=0, description="Total discounts applied if printed"
     )

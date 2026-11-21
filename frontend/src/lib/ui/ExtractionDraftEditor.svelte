@@ -365,6 +365,11 @@
 						])}>{$t('editor.addItem')}</button
 				>
 				<h3 id="draft-taxes" tabindex="-1">{$t('editor.taxes')}</h3>
+				{#if document.taxes?.length}
+					<p id="draft-tax-rate-hint" class="text-sm text-on-surface-variant">
+						{$t('editor.taxRateHint')}
+					</p>
+				{/if}
 				{#each document.taxes ?? [] as tax, index (index)}<div
 						class="grid grid-cols-1 gap-2 sm:grid-cols-3"
 					>
@@ -372,6 +377,7 @@
 								>{$t(labelKeys[field])}<input
 									class="block w-full rounded border p-2"
 									id={`draft-taxes.${index}.${field}`}
+									aria-describedby={field === 'rate' ? 'draft-tax-rate-hint' : undefined}
 									aria-invalid={invalidFields.includes(`taxes.${index}.${field}`)}
 									value={tax[field as keyof typeof tax] ?? ''}
 									oninput={(e) =>

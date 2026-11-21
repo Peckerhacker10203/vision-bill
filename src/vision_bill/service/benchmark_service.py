@@ -145,6 +145,7 @@ class BenchmarkService:
             raise ValueError("Receipt/model is not part of this benchmark run")
         manifest = await self._db.manifest(run_id)
         if manifest:
+            self._require_current_prompt(run)
             available = {m.id: m for m in await self._provider.get_available_models(capability="all")}
             current = available.get(model_id)
             digest = (await self._run_digests(run)).get(model_id)
@@ -164,6 +165,12 @@ class BenchmarkService:
                     "actual": result.receipt.model_dump(mode="json"),
                     "metadata": result.metadata}
         raise ValueError("Historical benchmark has no execution manifest; create a new run")
+
+    @staticmethod
+    def _require_current_prompt(run: BenchmarkRun) -> None:
+        # Older manifests may have only a legacy harness prompt hash.
+        if run.prompt_version != PROMPT_VERSION:
+            raise ValueError("Extraction prompt changed since run creation; create a new run")
 
     async def _select_receipts(self, request: BenchmarkCreate, *, scope: AccessScope) -> list[UUID]:
         if request.receipt_ids is not None:
@@ -242,6 +249,7 @@ class BenchmarkService:
             async with asyncio.timeout_at(deadline - reserve):
                 if not manifest:
                     raise ValueError("Historical benchmark has no execution manifest; create a new run")
+                self._require_current_prompt(run)
                 try:
                     models = {m.id: m for m in await self._provider.get_available_models(capability="all")}
                 except Exception as exc:

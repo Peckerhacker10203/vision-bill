@@ -218,6 +218,16 @@ It makes no new OCR, formatter or classification request. A failed optional
 classification leaves usable observations and records the label outcome. A
 request whose delivery or settlement is uncertain keeps the checkpoint on hold.
 
+The formatter now uses prompt version 5 and extraction schema 2. The schema
+distinguishes an explicitly printed receipt-wide net subtotal from a printed
+subtotal on the same basis as the items. Completed receipts and saved drafts
+retain their values. A complete checkpoint from prompt 4 or schema 1 waits with
+`execution_policy_changed`. To extract again, explicitly retry with current
+policy after reconciling any outstanding model request. The retry archives the
+old observation and starts a new generation. Pending uploads without a complete
+observation use the installed formatter once their saved routing policy permits
+inference.
+
 For an unmanaged classification hold, inspect and reconcile the exact submitted
 image using the configured endpoint identity. In a prepared bundle use the
 `app` service. Source Compose uses `vision_bill`.
@@ -244,6 +254,10 @@ Required missing observations, unavailable/changed originals and invalid source
 references prevent finalization/verification. Unknown source mapping and unresolved
 overlaps require review. Observations remain nullable; human correction fills
 actual missing mandatory data before finalization. Drafts can save partial edits.
+A clothing receipt might print “T-shirt” on one line and “SKU 123 · M · blue ·
+12.90” on the next. Together these describe one item charged 12.90. If the
+same shirt is independently charged a second time, keep both items.
+
 For both new and migrated receipts, **Verify** and **Save & verify** fetch
 a preview for the current revision. Enter a comment for each current review
 finding in the dialog. A clean **Save & verify** completes immediately.
@@ -255,20 +269,24 @@ rates as decimal strings. Write requests accept strings and JSON numbers. Client
 that use binary floating point should keep the strings when editing or resubmitting
 printed values. Discount, tip, quantity and unit price can remain absent on the finalized receipt.
 Transaction and line totals remain required. Correct a present tax rate to its
-decimal fraction before finalizing, such as `0.07` for 7%.
+decimal fraction before finalizing, such as `0.19` for a printed 19%. A prior
+observation of `19` stays visible until corrected.
 
 Migration 0021 permits these nulls without updating existing receipt amounts.
 Its downgrade refuses to erase their meaning after new nullable values are saved.
 
 `AmountPolicy` states tax basis (`gross/net/unknown`), subtotal origin
-(`printed/derived_net/unknown`), tax information (`present/explicit_zero/missing`),
+(`printed/printed_net/derived_net/unknown`), tax information (`present/explicit_zero/missing`),
 discount treatment (`included_in_lines/subtract/unknown`) and tip treatment
 (`included/add/outside_receipt/none/unknown`). Unsupported/unknown conventions
 produce findings, not a forced net-plus-tax equation. With supported policy the
-line sum checks subtotal (subtract tax for a gross derived-net subtotal); total
-adds tax for net/derived-net, subtracts discount only for `subtract`, and adds tip
-only for `add`. Gross derived-net with separate discount/tip can be uncertain and
-is flagged rather than guessed. Explicit zero tax conflicts with a nonzero tax.
+line-price basis describes the items. Choose `printed` for a printed subtotal
+on the same basis as those items, or `printed_net` for an explicitly printed
+net subtotal for the entire transaction. A net amount for one VAT band can
+cover only part of the receipt. Choose `derived_net` when the full net subtotal
+was calculated from sufficient evidence. A net subtotal under gross lines is
+compared with the line sum less the printed tax. Separate discounts and tips can have an uncertain tax basis and trigger a finding.
+Only `subtract` deducts a discount and only `add` adds a tip. Explicit zero tax conflicts with a nonzero tax.
 
 Decimal comparisons flag differences **greater than** 0.01 for quantity×unit price
 versus line total when both factors exist, 0.05 for subtotal, 0.02 for tax sum
@@ -311,6 +329,10 @@ photo/hash/profile/runtime and retained artifact; no expected/reference values e
 inference. Ordinary OCR is strict text/evidence-only, including failures, repairs
 and classification. Direct vision comparison is an explicit admin pipeline choice;
 legacy fallback fields/results are compatibility/history, not fresh upload permission.
+New Gold selections under extraction schema 2 require fresh reference confirmation.
+Previously qualified references and recorded benchmark results remain available
+in their original runs. Create a new run to execute or reevaluate a case from
+prompt version 4. A queued case bound to that version fails before model inference.
 Changed model digests wait rather than silently drifting.
 Observed masks prevent absent reference observations from being treated as truth.
 

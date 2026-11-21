@@ -1,6 +1,7 @@
 from datetime import date
 from decimal import Decimal
 
+from vision_bill.model.extraction import EXTRACTION_SCHEMA_VERSION
 from vision_bill.model.receipt import Receipt
 from vision_bill.service.benchmark_scoring import PROMPT_VERSION, SCORING_VERSION, score_receipts
 
@@ -63,6 +64,7 @@ def test_category_component_is_omitted_without_expected_labels() -> None:
     assert "spending_categories" not in scores
 
 
-def test_prompt_and_scoring_versions_reflect_category_changes() -> None:
-    assert PROMPT_VERSION == "4"
+def test_logical_item_and_tax_contract_versions() -> None:
+    assert PROMPT_VERSION == "5"
+    assert EXTRACTION_SCHEMA_VERSION == "2"
     assert SCORING_VERSION == "2"

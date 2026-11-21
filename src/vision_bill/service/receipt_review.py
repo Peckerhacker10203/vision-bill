@@ -241,16 +241,14 @@ def evaluate_receipt(
                     for f in findings
                 )
             )
-            needs_tax = (
-                amount_policy.tax_basis == "net" or amount_policy.subtotal_origin == "derived_net"
+            subtotal_is_net = amount_policy.tax_basis == "net" or amount_policy.subtotal_origin in (
+                "derived_net",
+                "printed_net",
             )
-            if needs_tax and amount_policy.tax_information == "missing":
+            if subtotal_is_net and amount_policy.tax_information == "missing":
                 supported = False
-            derived_gross = (
-                amount_policy.subtotal_origin == "derived_net"
-                and amount_policy.tax_basis == "gross"
-            )
-            if derived_gross and (
+            gross_lines_with_net_subtotal = amount_policy.tax_basis == "gross" and subtotal_is_net
+            if gross_lines_with_net_subtotal and (
                 (discount and amount_policy.discount_treatment == "subtract")
                 or (tip and amount_policy.tip_treatment == "add")
             ):
@@ -260,7 +258,7 @@ def evaluate_receipt(
                 expected_subtotal = sum(
                     (item.total_price for item in complete.line_items), Decimal(0)
                 )
-                if derived_gross:
+                if gross_lines_with_net_subtotal:
                     expected_subtotal -= complete.tax_total
                 compare(
                     "subtotal_discrepancy", "subtotal", complete.subtotal, expected_subtotal, "0.05"
@@ -277,7 +275,7 @@ def evaluate_receipt(
                     finding("tax_information_conflict", "tax_total")
             if supported:
                 expected = complete.subtotal
-                if amount_policy.tax_basis == "net" or derived_gross:
+                if subtotal_is_net:
                     expected += complete.tax_total
                 if amount_policy.discount_treatment == "subtract":
                     expected -= discount

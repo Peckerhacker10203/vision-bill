@@ -57,7 +57,7 @@ export interface AmountPolicy {
 	tax_basis: 'gross' | 'net' | 'unknown';
 	discount_treatment: 'included_in_lines' | 'subtract' | 'unknown';
 	tip_treatment: 'included' | 'add' | 'outside_receipt' | 'none' | 'unknown';
-	subtotal_origin: 'printed' | 'derived_net' | 'unknown';
+	subtotal_origin: 'printed' | 'printed_net' | 'derived_net' | 'unknown';
 	tax_information: 'present' | 'explicit_zero' | 'missing';
 }
 export interface ReviewFinding {

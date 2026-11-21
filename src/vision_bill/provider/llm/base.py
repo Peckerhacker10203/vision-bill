@@ -6,7 +6,7 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import partial
@@ -94,6 +94,51 @@ class _PartialDraftError(ValueError):
         super().__init__("receipt_incomplete")
         self.envelope = envelope
         self.incomplete = incomplete
+
+
+_TAX_RATE_HINT = (
+    "Use a decimal fraction from 0 to 1 only when the printed rate supports it "
+    "(19% = 0.19, 7% = 0.07, 1% = 0.01). An amount or a bare 1 does not prove a percentage."
+)
+
+
+class _FieldCorrection(_PartialDraftError):
+    def __init__(
+        self, envelope: InferenceEnvelope, payload: dict[str, Any], fields: dict[str, str]
+    ):
+        super().__init__(envelope)
+        self.payload = payload
+        self.fields = fields
+
+    def prompt(self) -> str:
+        return (
+            "Recheck only the listed fields against the original receipt evidence. "
+            "Return one JSON object containing only a corrections object, with each listed path "
+            "as an exact key and its corrected scalar value. Use null if the source does not "
+            "establish the value. Preserve all other observations. Fields: "
+            + json.dumps(self.fields)
+        )
+
+    def apply(self, reply: str) -> str:
+        patch = json.loads(
+            reply.strip().removeprefix("```json").removesuffix("```").strip(), parse_float=Decimal
+        )
+        if not isinstance(patch, dict) or set(patch) != {"corrections"}:
+            raise ValueError("invalid_formatter_correction")
+        updates = patch["corrections"]
+        if not isinstance(updates, dict) or updates.keys() != self.fields.keys():
+            raise ValueError("invalid_formatter_correction_paths")
+        payload = deepcopy(self.payload)
+        values = payload.get("draft", payload)
+        for path, value in updates.items():
+            if value is not None and type(value) not in (str, int, Decimal):
+                raise ValueError("invalid_formatter_correction_value")
+            parts = path.split(".")
+            if len(parts) == 1:
+                values[path] = value
+            else:
+                values[parts[0]][int(parts[1])][parts[2]] = value
+        return json.dumps(payload, default=str, allow_nan=False)
 
 
 class LLMProvider(ABC):
@@ -207,23 +252,37 @@ class LLMProvider(ABC):
             try:
                 if not content or len(content) > 200000:
                     raise ValueError("invalid_response_size")
-                parsed = await run_sync_before(deadline, parse, content)
+                candidate = (
+                    await run_sync_before(deadline, partial_error.apply, content)
+                    if isinstance(partial_error, _FieldCorrection)
+                    else content
+                )
+                parsed = await run_sync_before(deadline, parse, candidate)
                 if isinstance(parsed, InferenceEnvelope):
                     self._record_supplied_fields(call, parsed)
                 return parsed
             except ValueError as exc:
+                if isinstance(exc, _FieldCorrection):
+                    call["repair_fields"] = list(exc.fields)
                 if isinstance(exc, _PartialDraftError):
-                    partial_error = exc
                     self._record_supplied_fields(call, exc.envelope)
                     if exc.incomplete:
                         return exc.envelope  # type: ignore[return-value]
+                # A typed draft gets one narrow correction within the original
+                # three-call budget. Keep its observations if the patch fails.
+                if isinstance(partial_error, _FieldCorrection):
+                    break
+                if isinstance(exc, _PartialDraftError):
+                    partial_error = exc
                 last_error = exc
                 messages = [
                     *messages,
                     {"role": "assistant", "content": content[:200000]},
                     {
                         "role": "user",
-                        "content": "That response was not valid JSON matching the required schema. "
+                        "content": partial_error.prompt()
+                        if isinstance(partial_error, _FieldCorrection)
+                        else "That response was not valid JSON matching the required schema. "
                         "Preserve missing values as null and include ordered source_image indices. "
                         "Please respond again with ONLY corrected JSON.",
                     },
@@ -488,7 +547,41 @@ class LLMProvider(ABC):
         values = payload.get("draft", payload)
         if not isinstance(values, dict):
             raise ValueError("invalid_draft")  # noqa: TRY004 - malformed model output
-        draft = ExtractionDraft.model_validate(values)
+        corrections: dict[str, str] = {}
+        try:
+            draft = ExtractionDraft.model_validate(values)
+        except ValidationError as exc:
+            # Salvage the other fields when every failure is a known numeric scalar.
+            sanitized = deepcopy(values)
+            for error in exc.errors():
+                path = ".".join(map(str, error["loc"]))
+                if re.fullmatch(r"line_items\.[0-9]+\.quantity", path):
+                    hint = "Use the printed positive quantity, or null when uncertain."
+                elif re.fullmatch(r"taxes\.[0-9]+\.rate", path):
+                    hint = _TAX_RATE_HINT
+                elif re.fullmatch(r"taxes\.[0-9]+\.amount|tax_total|discount_total|tip", path):
+                    hint = "Use the printed nonnegative amount, or null when uncertain."
+                elif path == "confidence":
+                    hint = "Use an integer from 0 to 100, or null."
+                else:
+                    raise
+                corrections[path] = hint
+                loc = error["loc"]
+                if len(loc) == 1:
+                    sanitized[path] = None
+                else:
+                    sanitized[loc[0]][loc[1]][loc[2]] = None
+            draft = ExtractionDraft.model_validate(sanitized)
+        for index, tax in enumerate(draft.taxes or []):
+            if tax.rate is not None and not 0 <= tax.rate <= 1:
+                corrections[f"taxes.{index}.rate"] = _TAX_RATE_HINT
+        if draft.merchant_name is not None and not draft.merchant_name.strip():
+            corrections["merchant_name"] = "Use the printed merchant name, or null."
+        for index, item in enumerate(draft.line_items or []):
+            if item.description is not None and not item.description.strip():
+                corrections[f"line_items.{index}.description"] = (
+                    "Use the printed row description, or null."
+                )
         field_sources: dict[str, list[SourceRef]] = {"input": input.source_refs}
         supplied_sources = payload.get("field_sources", {})
         if not isinstance(supplied_sources, dict):
@@ -582,6 +675,21 @@ class LLMProvider(ABC):
             for pair in candidates
             if isinstance(pair, dict)
         ]
+        if corrections:
+            # Review recalculates tax-range and missing-field findings after edits.
+            # Other structural errors are recorded on the private formatter call.
+            for path in corrections:
+                if path.endswith(".rate"):
+                    result.findings.append(
+                        ReviewFinding(
+                            id=f"invalid_tax_rate:{path}",
+                            code="invalid_tax_rate",
+                            field_path=path,
+                            severity="integrity",
+                            source_refs=field_sources.get(path, []),
+                        )
+                    )
+            raise _FieldCorrection(result, payload, corrections)
         removed: set[int] = set()
         try:
             if count > 1:

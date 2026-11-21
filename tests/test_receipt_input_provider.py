@@ -31,6 +31,54 @@ def ocr_input():
     )
 
 
+@pytest.mark.parametrize("mode", ["ocr", "direct_vision"])
+@pytest.mark.parametrize("backend", ["ollama", "openai"])
+def test_live_formatter_explains_receipt_columns_and_percent_units(backend, mode, tmp_path):
+    from PIL import Image
+
+    provider = (
+        OllamaProvider("http://local")
+        if backend == "ollama"
+        else OpenAIProvider("http://local", "local")
+    )
+    if mode == "ocr":
+        inputs = ocr_input()
+    else:
+        path = tmp_path / "source.png"
+        Image.new("RGB", (3, 4)).save(path)
+        inputs = ReceiptInput(mode=mode, image_paths=[str(path)])
+    _, messages, _ = provider._prepare_receipt_input(inputs)
+    content = messages[0]["content"]
+    prompt = content if isinstance(content, str) else next(
+        part["text"] for part in content if part["type"] == "text"
+    )
+    schema = json.loads(prompt.split("Nullable schema: ")[1].split("\nObservations:")[0])
+    for field in schema["properties"].values():
+        assert field.get("description") or "$ref" in field
+    tax = schema["$defs"]["DraftTaxLine"]["properties"]
+    for percent, fraction in [("19%", "0.19"), ("7%", "0.07"), ("1%", "0.01")]:
+        assert f"{percent} = {fraction}" in tax["rate"]["description"]
+    assert "taxable base" in tax["amount"]["description"]
+    row = schema["$defs"]["DraftLineItem"]["properties"]
+    assert "package size" in row["quantity"]["description"]
+    assert "per unit" in row["unit_price"]["description"]
+    assert "whole row" in row["total_price"]["description"]
+    assert "printed_net" in prompt and "one tax band" in prompt
+    assert "decimal comma" in prompt and "cash tendered" in schema["properties"]["total"]["description"]
+
+
+def test_formatter_groups_multiline_charge_without_dropping_a_real_unpriced_item():
+    from vision_bill.model.receipt import Receipt
+    from vision_bill.provider.llm.experiment import source_extraction_prompt
+
+    prompt = source_extraction_prompt(ocr_input())
+    assert "Mug 19%\nSKU 481 / Blue   4,50" in prompt
+    assert "one item" in prompt and 'description "Mug Blue"' in prompt and "total_price 4.50" in prompt
+    assert "unreadable price" in prompt and "total_price null" in prompt
+    assert "independently charged" in prompt and "cite both blocks" in prompt
+    assert "logical" in Receipt.model_json_schema()["properties"]["line_items"]["description"]
+
+
 @pytest.mark.parametrize("backend", ["ollama", "openai"])
 async def test_partial_null_draft_retains_actual_model_finish_and_bounded_attempts(backend, caplog):
     provider = (
@@ -130,7 +178,8 @@ async def test_openai_text_discovery_keeps_unknown_text_models():
     ]
 
 
-async def test_source_aware_overlap_keeps_original_draft_and_verified_decisions():
+@pytest.mark.parametrize("repair", ["none", "accepted", "refused"])
+async def test_source_aware_overlap_keeps_original_draft_and_verified_decisions(repair):
     from test_multi_image_extraction import extraction, item
 
     from vision_bill.model.experiment import ExperimentOptions
@@ -156,12 +205,25 @@ async def test_source_aware_overlap_keeps_original_draft_and_verified_decisions(
     provider = OllamaProvider("http://local").for_experiment(
         ExperimentOptions(include_classification=False)
     )
-    provider.send_message = AsyncMock(return_value=json.dumps(payload))
+    if repair != "none":
+        payload["taxes"] = [{"name": "VAT", "rate": 19, "amount": "0.19"}]
+    responses = [json.dumps(payload)]
+    if repair == "accepted":
+        responses.append(json.dumps({"corrections": {"taxes.0.rate": "0.19"}}))
+    elif repair == "refused":
+        responses.append("{}")
+    provider.send_message = AsyncMock(side_effect=responses)
     assert hasattr(provider, "extract_receipt_input"), "typed path missing"
     result = await provider.extract_receipt_input(
         "requested", inp, tags=[], deadline=time.monotonic() + 2
     )
     assert len(result.draft.line_items) == 4
+    assert result.raw_field_sources["line_items.3"] == [ref]
+    if repair == "refused":
+        assert result.receipt is None
+        assert result.field_sources["line_items.3"] == [ref]
+        assert result.overlap_decisions[-1]["verified"] is None
+        return
     assert len(result.receipt.line_items) == 3
     assert result.field_sources["line_items.2"] == [ref]
     assert result.overlap_decisions[-1]["verified"] is True
@@ -1086,8 +1148,87 @@ async def test_prompt_compliant_observations_admit_complete_without_raw_classifi
     assert len(result.receipt.line_items) == 1
     assert result.receipt.line_items[0].tags == (["food"] if classification else [])
     prompt = provider.send_message.call_args_list[0].args[1][0]["content"]
+    assert "one item" in prompt and "cite both blocks" in prompt
+    assert "independently charged" in prompt
     schema = json.loads(prompt.split("Nullable schema: ")[1].split("\nObservations:")[0])
     assert "amount_policy" in schema["properties"]
     policy_schema = schema["$defs"]["AmountPolicy"]["properties"]
     assert set(policy_schema["tax_basis"]["enum"]) == {"gross", "net", "unknown"}
     assert "explicit_zero" in policy_schema["tax_information"]["enum"]
+
+
+@pytest.mark.parametrize(
+    ("tax_rates", "reply", "expected_rates", "call_count"),
+    [
+        (["19", "7"], {"corrections": {"taxes.0.rate": "0.19", "taxes.1.rate": "0.07"}}, ["0.19", "0.07"], 2),
+        (["19"], {"corrections": {"taxes.0.rate": None}}, [None], 2),
+        (["1", "0.19", "0"], None, ["1", "0.19", "0"], 1),
+        (["19"], {"corrections": {"taxes.0.rate": "999"}}, ["19"], 2),
+        (["19"], {"corrections": {"taxes.0.rate": "0.19", "total": "999"}}, ["19"], 2),
+        (["19"], "bad patch", ["19"], 2),
+    ],
+)
+async def test_live_rate_repair_changes_only_requested_observations(tax_rates, reply, expected_rates, call_count):
+    from test_experiment_scoring import receipt
+
+    source = ocr_input()
+    original = receipt().model_dump(mode="json")
+    original["taxes"] = [{"name": "VAT", "rate": rate, "amount": "0.43"} for rate in tax_rates]
+    first = {"draft": original, "field_sources": {"taxes.0.rate": [source.source_refs[0].model_dump(mode="json")]}}
+    provider = OllamaProvider("http://local")
+    provider.send_message = AsyncMock(side_effect=[json.dumps(first), json.dumps(reply)])
+    result = await provider.extract_observations("model", source, tags=[], deadline=time.monotonic() + 3)
+    assert provider.send_message.await_count == len(result.telemetry.calls) == call_count
+    assert [row.rate for row in result.draft.taxes] == [
+        None if value is None else Decimal(value) for value in expected_rates
+    ]
+    if call_count > 1:
+        prompt = provider.send_message.await_args_list[-1].args[1]
+        assert prompt[0] == provider.send_message.await_args_list[0].args[1][0]
+        assert "taxes.0.rate" in prompt[-1]["content"] and "printed rate" in prompt[-1]["content"]
+        assert prompt[-2]["content"] == json.dumps(first)
+    assert result.raw_field_sources["taxes.0.rate"] == source.source_refs
+    assert result.draft.total == Decimal(original["total"])
+    assert [row.amount for row in result.draft.taxes] == [Decimal("0.43")] * len(tax_rates)
+    if "19" in expected_rates:
+        assert result.receipt is None
+        assert any(f.code == "invalid_tax_rate" and f.field_path == "taxes.0.rate" for f in result.findings)
+    else:
+        assert result.receipt is not None
+
+
+async def test_structural_correction_uses_remaining_budget_and_keeps_raw_failures():
+    from test_experiment_scoring import receipt
+
+    values = receipt().model_dump(mode="json")
+    values["line_items"][0]["quantity"] = 0
+    values["tip"] = -1
+    provider = OllamaProvider("http://local")
+    provider.send_message = AsyncMock(side_effect=[
+        "not JSON", json.dumps(values), json.dumps({"corrections": {"line_items.0.quantity": "0.5", "tip": None}}),
+    ])
+    result = await provider.extract_observations("model", ocr_input(), tags=[], deadline=time.monotonic() + 3)
+    assert len(result.telemetry.calls) == 3
+    assert result.telemetry.calls[1]["raw_response"] == json.dumps(values)
+    assert result.draft.line_items[0].quantity == Decimal("0.5")
+    assert result.draft.tip is None
+    assert result.draft.line_items[0].description == values["line_items"][0]["description"]
+
+
+async def test_failed_structural_correction_retains_name_only_row_for_editing():
+    from test_experiment_scoring import receipt
+
+    from vision_bill.service.receipt_review import persistent_findings
+
+    values = receipt().model_dump(mode="json")
+    values["line_items"][0] = {"description": "Bread", "quantity": 0}
+    provider = OllamaProvider("http://local")
+    provider.send_message = AsyncMock(side_effect=[json.dumps(values), "{}"])
+    result = await provider.extract_observations(
+        "model", ocr_input(), tags=[], deadline=time.monotonic() + 3
+    )
+    row = result.draft.line_items[0]
+    assert (row.description, row.quantity, row.total_price) == ("Bread", None, None)
+    assert result.telemetry.calls[0]["repair_fields"] == ["line_items.0.quantity"]
+    assert result.receipt is None
+    assert not any(f.severity == "integrity" for f in persistent_findings(result.findings))

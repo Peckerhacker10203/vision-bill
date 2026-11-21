@@ -7,6 +7,7 @@ from vision_bill.model.experiment import ExperimentOptions
 from vision_bill.model.workflow import AccessScope
 from vision_bill.provider.llm.ollama import OllamaProvider
 from vision_bill.provider.ocr.base import compact_ocr_text
+from vision_bill.service.benchmark_scoring import PROMPT_VERSION
 
 
 def test_empty_primary_text_uses_recognized_blocks():
@@ -273,7 +274,7 @@ async def test_reevaluation_rejects_changed_or_missing_model(current_digest):
     from vision_bill.service.benchmark_service import BenchmarkService
 
     run_id, receipt_id = uuid4(), uuid4()
-    run = SimpleNamespace(receipt_ids=[receipt_id], model_ids=["model"])
+    run = SimpleNamespace(receipt_ids=[receipt_id], model_ids=["model"], prompt_version=PROMPT_VERSION)
     service = object.__new__(BenchmarkService)
     service._db = SimpleNamespace(
         run=AsyncMock(return_value=run), manifest=AsyncMock(return_value={"options": {}})
@@ -297,7 +298,7 @@ async def test_reevaluation_enforces_saved_run_deadline():
     from vision_bill.service.benchmark_service import BenchmarkService
 
     run_id, receipt_id = uuid4(), uuid4()
-    run = SimpleNamespace(receipt_ids=[receipt_id], model_ids=["model"])
+    run = SimpleNamespace(receipt_ids=[receipt_id], model_ids=["model"], prompt_version=PROMPT_VERSION)
     service = object.__new__(BenchmarkService)
     service._db = SimpleNamespace(
         run=AsyncMock(return_value=run), manifest=AsyncMock(return_value={"options": {}})
@@ -617,6 +618,24 @@ async def test_pipeline_identity_ignores_unused_legacy_alternate_digest(settings
     provider.get_available_models.assert_not_awaited()
 
 
+async def test_frozen_source_prompt_binds_rendered_draft_schema(settings, monkeypatch):
+    from test_extraction_pipeline import formatter
+
+    from vision_bill.model.extraction import ExtractionDraft
+    from vision_bill.service.experiment_execution import pipeline_identity
+    from vision_bill.service.receipt_service import ReceiptService
+
+    service = ReceiptService(settings.images, settings.pg, formatter(False))
+    options = ExperimentOptions(pipeline="direct_vision")
+    first = await pipeline_identity(service, options)
+    schema = ExtractionDraft.model_json_schema()
+    schema["properties"]["subtotal"]["description"] = "Different subtotal instructions."
+    monkeypatch.setattr(ExtractionDraft, "model_json_schema", lambda: schema)
+    changed = await pipeline_identity(service, options)
+
+    assert first["source_prompt_sha256"] != changed["source_prompt_sha256"]
+
+
 async def test_unmanifested_benchmark_reevaluation_requires_explicit_new_run():
     from types import SimpleNamespace
 
@@ -859,7 +878,9 @@ async def test_benchmark_http_reports_gpu_oom_and_parks_worker(settings, tmp_pat
     })
     benchmark._db = SimpleNamespace(
         create_run=AsyncMock(),
-        run=AsyncMock(return_value=SimpleNamespace(id=run_id, model_ids=["fixture"], receipt_ids=[receipt_id])),
+        run=AsyncMock(return_value=SimpleNamespace(
+            id=run_id, model_ids=["fixture"], receipt_ids=[receipt_id], prompt_version=PROMPT_VERSION,
+        )),
         manifest=AsyncMock(),
     )
     benchmark._run_digests = AsyncMock(return_value={})

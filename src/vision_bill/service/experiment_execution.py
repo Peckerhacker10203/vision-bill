@@ -246,6 +246,9 @@ async def pipeline_identity(
                 capabilities = {key: capabilities[key] for key in (
                     "profile_id", "runtime_fingerprint", "ocr_max_new_tokens"
                 )}
+    # A fixed, evidence-free rendering binds the dynamically generated output schema.
+    # The source also binds input-specific branches, including OCR page serialization.
+    source_template = source_extraction_prompt(ReceiptInput(mode="direct_vision", image_paths=["receipt"]))
     return {
         "execution_policy_version": BENCHMARK_EXECUTION_POLICY_VERSION,
         "managed_binding_sha256": binding_sha256,
@@ -254,7 +257,7 @@ async def pipeline_identity(
         "schema_version": EXTRACTION_SCHEMA_VERSION,
         "source_projection_version": SOURCE_PROJECTION_VERSION,
         "source_prompt_sha256": hashlib.sha256(
-            inspect.getsource(source_extraction_prompt).encode()
+            (inspect.getsource(source_extraction_prompt) + "\0" + source_template).encode()
         ).hexdigest(),
         "input_schema_sha256": hashlib.sha256(
             json.dumps(ReceiptInput.model_json_schema(), sort_keys=True).encode()

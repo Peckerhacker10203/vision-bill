@@ -98,6 +98,63 @@ async def test_explicit_direct_never_calls_ocr(photos):
     assert len(llm._client.chat.call_args.kwargs["messages"][0]["images"]) == 2
 
 
+async def test_ocr_formatting_correction_preserves_separate_purchases_and_printed_vat(photos):
+    from decimal import Decimal
+    from uuid import uuid4
+
+    from vision_bill.model.ocr import SourceRef
+    from vision_bill.model.review import OriginalAvailability
+    from vision_bill.service.submission_service import SubmissionService
+
+    # Two independently priced identical purchases have the same two-line layout.
+    transcript = (
+        "Hat 19%\nSKU 37 / M / blue   12,00\nHat 19%\nSKU 37 / M / blue   12,00\n"
+        "Scarf 19%\nSKU 89 / red   11,70\nNet total 30,00   VAT 5,70   Total 35,70"
+    )
+    source_hash = hashlib.sha256(photos[0].read_bytes()).hexdigest()
+    ref = SourceRef(
+        part_id=uuid4(), photo_index=0, source_sha256=source_hash, coordinate_space="original"
+    )
+    ocr = sidecar()
+    page = OcrResponse.model_validate(wire_page(digest=source_hash, text=transcript))
+    ocr.extract_page = AsyncMock(return_value=page)
+    product_names = ["Hat M blue", "Hat M blue", "Scarf red"]
+    prices = ["12.00", "12.00", "11.70"]
+    observed = receipt(product_names).model_dump(mode="json")
+    for item, price in zip(observed["line_items"], prices, strict=True):
+        item.update(quantity=None, unit_price=None, total_price=price)
+    observed.update(
+        subtotal="30.00", tax_total="5.70", total="35.70",
+        taxes=[{"name": "VAT", "rate": 19, "amount": "5.70"}],
+        amount_policy={"tax_basis": "gross", "subtotal_origin": "printed_net", "tax_information": "present"},
+    )
+    llm = formatter(vision=False, payload=observed)
+    llm._client.chat.side_effect = [
+        llm._client.chat.return_value,
+        ChatResponse(message={"role": "assistant", "content": '{"corrections":{"taxes.0.rate":"0.19"}}'}),
+    ]
+
+    result = await pipeline(llm, ocr).extract(
+        "fixture", photos[:1], options=ExperimentOptions(pipeline="ocr", include_classification=False),
+        deadline=time.monotonic() + 5, tags=[], source_refs=[ref],
+    )
+    originals = [OriginalAvailability(part_id=ref.part_id, photo_index=0, available=True, sha256_matches=True)]
+    outcome = SubmissionService._outcome(result, [], originals)
+
+    ocr.extract_page.assert_awaited_once()
+    assert llm._client.chat.await_count == 2
+    first, correction = [call.kwargs["messages"] for call in llm._client.chat.await_args_list]
+    assert first[0] == correction[0]
+    assert "SKU 37" in first[0]["content"]
+    assert all("images" not in message for message in correction)
+    assert "taxes.0.rate" in correction[-1]["content"]
+    assert outcome.kind == "complete" and outcome.review.findings == []
+    assert [item.description for item in result.receipt.line_items] == product_names
+    assert [item.total_price for item in result.receipt.line_items] == [Decimal(price) for price in prices]
+    assert result.receipt.taxes[0].rate == Decimal("0.19")
+    assert result.receipt.subtotal == Decimal("30.00") and result.receipt.total == Decimal("35.70")
+
+
 @pytest.mark.parametrize("blank", [False, True])
 async def test_second_photo_failure_is_not_a_complete_prefix(photos, blank):
     ocr, llm = sidecar(1, blank), formatter()
@@ -821,6 +878,7 @@ async def test_dedicated_off_real_route_executes_direct_upload_and_holds_explici
     assert not activation.handoff.read_journal().unsettled
     from uuid import uuid4
 
+    from vision_bill.service.benchmark_scoring import PROMPT_VERSION
     from vision_bill.service.benchmark_service import BenchmarkService
 
     queued = object.__new__(BenchmarkService)
@@ -834,7 +892,8 @@ async def test_dedicated_off_real_route_executes_direct_upload_and_holds_explici
     manifest = {"inputs": [{"receipt_id": str(task["receipt_id"]), "pipeline": "ocr"}],
                 "options": ExperimentOptions(pipeline="ocr").model_dump(mode="json")}
     started = asyncio.get_running_loop().time()
-    await queued._execute_reserved(task, SimpleNamespace(model_ids=["fixture"]), manifest, started, started + 5)
+    run = SimpleNamespace(model_ids=["fixture"], prompt_version=PROMPT_VERSION)
+    await queued._execute_reserved(task, run, manifest, started, started + 5)
     queued._db.hold_before_inference.assert_awaited_once_with(
         task, "dedicated_ocr_disabled", deadline=started + 5,
     )

@@ -62,6 +62,30 @@ async def prepare(w, scope, tmp_path, *, kind="legacy", pipeline="direct_vision"
     return service, run, row, path, inference, ocr
 
 
+async def test_previous_prompt_version_cannot_run_under_current_contract(workflow_db, tmp_path):
+    w, scope = workflow_db
+    service, run, row, _, inference, _ = await prepare(w, scope, tmp_path, kind="manifest")
+    assert run.prompt_version == "5"
+    # Even a legacy manifest without typed pipeline identity must respect its run's version.
+    manifest = await service._db.manifest(run.id)
+    manifest.pop("identity")
+    async with w.pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE benchmark_runs SET prompt_version='4', experiment_manifest=$2 WHERE id=$1",
+            run.id, json.dumps(manifest),
+        )
+    service._provider.get_available_models.reset_mock()
+    with pytest.raises(ValueError, match="prompt changed"):
+        await service.reevaluate(run.id, row.id, "fixture", scope=scope)
+    await service._execute(dict(await service._db.lease_task()))
+    result = (await service._db.results(run.id))[0]
+    assert result["metadata"]["inference_attempt_count"] == 0
+    assert (await service.get_status(run.id, scope=scope)).run.prompt_version == "4"
+    assert (await service._db.summaries(run.id))[0].failed == 1
+    service._provider.get_available_models.assert_not_awaited()
+    inference.assert_not_awaited()
+
+
 async def test_unmanifested_history_fails_before_discovery_or_new_inference(workflow_db, tmp_path):
     w, scope = workflow_db
     service, run, _, _, inference, _ = await prepare(w, scope, tmp_path, kind="legacy")

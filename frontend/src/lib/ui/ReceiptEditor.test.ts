@@ -596,3 +596,30 @@ it('submits the exact entered quantity and rate', async () => {
 		taxes: [expect.objectContaining({ rate: '0.20000000000000001' })]
 	});
 });
+
+it('shows a legacy printed subtotal and raw rate until explicitly corrected', async () => {
+	const onSave = vi.fn();
+	render(ReceiptEditor, {
+		receipt: {
+			...receipt,
+			amount_policy: { ...receipt.amount_policy, tax_basis: 'gross', subtotal_origin: 'printed' }
+		},
+		lineItems: [line()],
+		taxes: [{ id: 'vat', receipt_id: receipt.id, name: 'VAT', rate: '19.0', amount: '0' }],
+		onSave
+	});
+	const rate = screen.getByLabelText('Tax rate (fraction)') as HTMLInputElement;
+	const subtotal = screen.getByRole('combobox', { name: /Subtotal origin/ }) as HTMLSelectElement;
+	expect(rate.value).toBe('19.0');
+	expect(rate.getAttribute('aria-describedby')).toBe(screen.getByText(/Enter 0.19 for 19%/).id);
+	expect(subtotal.value).toBe('printed');
+	await fireEvent.change(subtotal, { target: { value: 'printed_net' } });
+	expect(rate.value).toBe('19.0');
+	await fireEvent.input(rate, { target: { value: '0.190' } });
+	await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+	expect(onSave).toHaveBeenCalled();
+	expect(onSave.mock.calls[0][0]).toMatchObject({
+		amount_policy: { tax_basis: 'gross', subtotal_origin: 'printed_net' },
+		taxes: [{ name: 'VAT', amount: '0', rate: '0.190' }]
+	});
+});

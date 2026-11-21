@@ -60,12 +60,22 @@ def test_tax_basis_does_not_double_add_included_tax(basis, total):
         ("included_in_lines", "outside_receipt", "2", "10"),
     ],
 )
-def test_discount_and_tip_semantics(discount, tip_policy, tip, total):
+@pytest.mark.parametrize("origin,subtotal", [("printed", "10"), ("printed_net", "8.40")])
+def test_discount_and_tip_semantics(discount, tip_policy, tip, total, origin, subtotal):
     result = evaluate(
-        document(discount_total="1", tip=tip, total=total),
-        POLICY.model_copy(update={"discount_treatment": discount, "tip_treatment": tip_policy}),
+        document(discount_total="1", tip=tip, total=total, subtotal=subtotal),
+        POLICY.model_copy(
+            update={
+                "discount_treatment": discount,
+                "tip_treatment": tip_policy,
+                "subtotal_origin": origin,
+            }
+        ),
     )
-    assert result.can_auto_verify
+    if origin == "printed_net" and discount == "subtract":
+        assert [f.code for f in result.findings] == ["uncertain_net_subtotal_basis"]
+    else:
+        assert result.can_auto_verify
 
 
 @pytest.mark.parametrize(
@@ -405,6 +415,7 @@ def test_readable_legacy_original_is_human_only_not_automatic_bypass():
     [
         ("gross", "derived_net", "119", "100", "19", "119", "0", None),
         ("net", "printed", "100", "100", "19", "119", "0", None),
+        ("net", "printed_net", "100", "100", "19", "111", "10", "2"),
         ("net", "derived_net", "100", "100", "19", "111", "10", "2"),
         ("gross", "derived_net", "-100", "-119", "19", "-100", "0", None),
     ],
@@ -448,6 +459,10 @@ def test_subtotal_origin_drives_evidence_supported_equations(
         ("net", "printed", "missing", "0", None),
         ("gross", "derived_net", "present", "10", None),
         ("gross", "derived_net", "present", "0", "2"),
+        ("gross", "printed_net", "present", "10", None),
+        ("gross", "printed_net", "present", "0", "2"),
+        ("gross", "printed_net", "missing", "0", None),
+        ("unknown", "printed_net", "present", "0", None),
     ],
 )
 def test_uncertain_policy_does_not_invent_expected_subtotal_or_total(
@@ -466,7 +481,14 @@ def test_uncertain_policy_does_not_invent_expected_subtotal_or_total(
             }
         ),
     )
-    assert result.findings
+    if tax_info == "missing":
+        assert {f.code for f in result.findings} == {"missing_tax_information"}
+    elif basis == "unknown":
+        assert {f.code for f in result.findings} == {"unknown_tax_basis"}
+    elif origin == "unknown":
+        assert {f.code for f in result.findings} == {"unknown_subtotal_origin"}
+    else:
+        assert {f.code for f in result.findings} == {"uncertain_net_subtotal_basis"}
     assert not any(
         f.code in {"subtotal_discrepancy", "amount_discrepancy"} for f in result.findings
     )
@@ -496,3 +518,66 @@ def test_derived_net_genuine_discrepancy_and_negative_return_line():
     findings=evaluate(wrong,policy).findings
     assert {f.code for f in findings}=={'subtotal_discrepancy','amount_discrepancy'}
     assert next(f for f in findings if f.code=='subtotal_discrepancy').comparison['expected']=='90.00'
+
+
+@pytest.mark.parametrize("origin", ["printed_net", "derived_net"])
+def test_net_subtotal_with_gross_items_uses_observed_rounded_vat(origin):
+    receipt = document(
+        line_items=[
+            {"description": "Item", "total_price": amount} for amount in ("24.99", "17.99", "14.99")
+        ],
+        subtotal="48.72",
+        taxes=[{"name": "VAT", "rate": "0.19", "amount": "9.25"}],
+        tax_total="9.25",
+        total="57.97",
+        payment_method="cash",
+    )
+    before = receipt.model_dump()
+    policy = AmountPolicy.model_validate({**POLICY.model_dump(), "subtotal_origin": origin})
+    assert evaluate(receipt, policy).can_auto_verify
+    assert receipt.model_dump() == before
+
+    wrong_rate = receipt.model_copy(deep=True)
+    wrong_rate.taxes[0].rate = Decimal("19.0")
+    checked = evaluate(wrong_rate, policy)
+    assert not checked.can_finalize
+    assert [(f.code, f.severity) for f in checked.findings] == [("invalid_tax_rate", "integrity")]
+    assert wrong_rate.taxes[0].rate == Decimal("19.0")
+    assert {finding.code for finding in evaluate(wrong_rate, POLICY).findings} == {
+        "invalid_tax_rate",
+        "subtotal_discrepancy",
+        "amount_discrepancy",
+    }
+
+
+def test_printed_net_subtotal_with_mixed_vat_keeps_mismatches_and_review_identity():
+    receipt = document(
+        line_items=[
+            {"description": "Food", "total_price": "10.70"},
+            {"description": "Goods", "total_price": "23.80"},
+        ],
+        taxes=[
+            {"name": "VAT", "rate": "0.07", "amount": "0.70"},
+            {"name": "VAT", "rate": "0.19", "amount": "3.80"},
+        ],
+        subtotal="30.00",
+        tax_total="4.50",
+        total="34.50",
+    )
+    policy = AmountPolicy.model_validate({**POLICY.model_dump(), "subtotal_origin": "printed_net"})
+    assert evaluate(receipt, policy).can_auto_verify
+
+    incorrect = receipt.model_copy(update={"subtotal": Decimal("29.00")})
+    current = evaluate(incorrect, policy)
+    assert {finding.code: finding.comparison["expected"] for finding in current.findings} == {
+        "subtotal_discrepancy": "30.00",
+        "amount_discrepancy": "33.50",
+    }
+    # The saved policy and any acknowledgements belong to the original review.
+    old = evaluate(incorrect, POLICY)
+    approvals = [
+        FindingAcknowledgement(finding_id=f.id, comment="Checked original") for f in old.findings
+    ]
+    review.validate_acknowledgements(old, approvals)
+    with pytest.raises(ValueError, match="acknowledgements"):
+        review.validate_acknowledgements(current, approvals)

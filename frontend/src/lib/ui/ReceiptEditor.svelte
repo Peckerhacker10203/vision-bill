@@ -867,6 +867,9 @@
 		{#if form.taxLines.length === 0}
 			<p class="text-sm text-on-surface-variant">{$t('editor.noTaxes')}</p>
 		{:else}
+			<p id="receipt-tax-rate-hint" class="mb-2 text-sm text-on-surface-variant">
+				{$t('editor.taxRateHint')}
+			</p>
 			<div class="space-y-2">
 				{#each form.taxLines as tax, index (index)}
 					<div class="grid grid-cols-2 items-end gap-2 sm:grid-cols-[1fr_8rem_10rem_2.5rem]">
@@ -883,6 +886,7 @@
 							<label class={labelClass} for="tax-{index}-rate">{$t('editor.taxRate')}</label>
 							<input
 								id="tax-{index}-rate"
+								aria-describedby="receipt-tax-rate-hint"
 								inputmode="decimal"
 								class={inputClass}
 								value={tax.rate}

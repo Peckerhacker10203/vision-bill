@@ -14,7 +14,7 @@
 		tax_basis: ['unknown', 'gross', 'net'],
 		discount_treatment: ['unknown', 'included_in_lines', 'subtract'],
 		tip_treatment: ['unknown', 'included', 'add', 'outside_receipt', 'none'],
-		subtotal_origin: ['unknown', 'printed', 'derived_net'],
+		subtotal_origin: ['unknown', 'printed', 'printed_net', 'derived_net'],
 		tax_information: ['missing', 'present', 'explicit_zero']
 	};
 </script>

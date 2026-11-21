@@ -9,8 +9,8 @@ from ..model.receipt import Receipt
 MONEY_TOLERANCE = Decimal("0.01")
 # Bumped to 2: scoring output includes a separate spending-category component.
 SCORING_VERSION = "2"
-# Bumped to 4: line-item spending categories use the fixed vocabulary.
-PROMPT_VERSION = "4"
+# Version 5 groups logical purchases and interprets tax and subtotal evidence explicitly.
+PROMPT_VERSION = "5"
 COMPONENT_WEIGHTS = {"header": 0.20, "totals": 0.35, "line_items": 0.30, "taxes": 0.15}
 
 

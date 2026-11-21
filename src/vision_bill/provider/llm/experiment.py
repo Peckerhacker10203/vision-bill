@@ -115,36 +115,55 @@ def source_extraction_prompt(
     )
     return (
         "Extract literal observations for ONE complete receipt from ALL ordered input photos. "
-        "Keep missing or unreadable values null; never invent mandatory values or correct numbers. "
-        "Do not classify, categorize or tag. Preserve every original printed row in photo order, "
-        "then top-to-bottom, including overlapping rows and genuinely repeated purchases. "
+        "Keep missing or unreadable values null. Preserve the original figures even if they "
+        "disagree. Convert a decimal comma to a decimal point for JSON: 1,25 becomes 1.25. "
+        "Use headings, currency symbols, multiplication marks and row alignment to identify columns. "
+        "Do not classify, categorize or tag. Group physical text lines into logical purchases. "
+        "A product name or department with a tax code may introduce a following SKU, size, "
+        "colour and price. Illustrative example only: the two lines\nMug 19%\nSKU 481 / Blue   4,50\n"
+        'describe one item with description "Mug Blue" and total_price 4.50. Do not create an '
+        "item for a department heading, continuation or tax code. If OCR split the name and price, "
+        "cite both blocks for the item when available. Keep a clearly separate purchase with an "
+        "unreadable price as its own item with total_price null. Keep each independently charged "
+        "occurrence of an identical product. Preserve item order within and across photos, "
+        "including items visible again in adjacent overlapping photos. "
         "Each line_item must include source_image (zero-based photo index). "
-        "Return a flat populated receipt object following the nullable schema below. "
+        "Return only one flat JSON object using the field meanings in the nullable schema below. "
         "Include amount_policy based only on printed evidence: tax_basis gross means line "
-        "amounts include tax, net means tax is additive, unknown means evidence is insufficient. "
+        "amounts already include tax (do not add the VAT again), net means tax is additive, "
+        "unknown means evidence is insufficient. "
         "discount_treatment included_in_lines means already applied, subtract means a separate "
         "discount, otherwise unknown. tip_treatment included means already in line amounts, "
         "add means added to the receipt total, outside_receipt means paid separately, none means "
-        "no tip, otherwise unknown. subtotal_origin printed means the observed printed subtotal; "
-        "derived_net means line amounts converted to net using explicit known tax evidence "
-        "before separately applied discounts/tips; derive only with sufficient inputs, otherwise "
-        "leave subtotal null and origin unknown. tax_information present means observed tax "
+        "no tip, otherwise unknown. Set subtotal_origin to printed for a printed subtotal on "
+        "the same basis as the items, or printed_net for an explicitly printed receipt-wide "
+        "net subtotal, including a net grand total in a tax table. The net base of one tax band "
+        "alone does not establish a printed receipt-wide subtotal. If no subtotal is printed, "
+        "use derived_net only when all lines and their tax evidence establish the net amount "
+        "before separate discounts and tips. For example, with gross items totaling 11.90, "
+        "included VAT of 1.90 and no adjustments, the derived net subtotal is 10.00 and the "
+        "charged total stays 11.90. Leave subtotal null and origin unknown if ambiguous. "
+        "tax_information present means observed tax "
         "information, explicit_zero requires printed zero/exempt evidence, missing means absent "
         "or unreadable and must never be inferred as zero. Do not invent financial defaults. "
         "Also include duplicate_candidates as pairs {first_index,second_index} only for the "
         "complete ordered suffix/prefix overlap between adjacent photos. Never search globally "
         "for duplicate products. Include overlap_decisions for all overlap proposals. "
-        "Optional field_sources map field paths to supplied SourceRef objects; use only supplied "
-        "identities and block coordinates in the indicated coordinate_space. "
+        "Use field_sources to cite the evidence for individual fields when identifiable, "
+        "especially each tax rate and amount, subtotal and total. For example, taxes.0.rate "
+        "cites the printed percentage even though the JSON value is a fraction. Use only "
+        "supplied source identities and exact block coordinates in their coordinate_space. "
+        "Leave unsupported mappings absent. "
         "Source refs: "
         + json.dumps(
             [
                 ref.model_dump(mode="json")
                 for ref in (input.source_refs if source_refs is None else source_refs)
-            ]
+            ],
+            separators=(",", ":"),
         )
         + "\nNullable schema: "
-        + json.dumps(schema)
+        + json.dumps(schema, separators=(",", ":"))
         + "\nObservations:\n"
         + observed
     )

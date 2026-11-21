@@ -56,6 +56,7 @@ async def produce_checkpoint(
     terminal=False,
     active=False,
     historical=False,
+    contract_versions=None,
 ):
     images = ImageService(settings.images)
     if managed is None:
@@ -106,6 +107,8 @@ async def produce_checkpoint(
     assert claim.attempt_number == 3
     parts = await w.get_source_parts(image.id, scope=scope)
     payload = observation_payload(parts=[part.model_dump() for part in parts], ocr=ocr)
+    if contract_versions is not None:
+        payload["execution_identity"].update(contract_versions)
     payload["producer_attempt_number"] = 3
     payload["execution_identity"]["semantic_policy_sha256"] = semantic_policy_sha256(snapshot)
     payload["envelope"]["classification_enrichment"]["missing_fields"] = ["category"]
@@ -417,6 +420,34 @@ async def test_managed_checkpoint_waits_for_safe_owned_recovery(
     assert [result.status for result in results] == ["analyzed"]
     assert events == ["residency", "residency", "claim_park", ("unload", "test"), "residency"]
     assert not handoff.read_journal().models
+
+
+@pytest.mark.parametrize("contract_versions", [
+    {"prompt_version": "4"}, {"extraction_schema_version": "1"},
+    {"prompt_version": "4", "extraction_schema_version": "1"},
+])
+async def test_prior_formatter_checkpoint_holds_until_explicit_new_generation(
+    workflow_db, settings, tmp_path, contract_versions,
+):
+    w, scope = workflow_db
+    original, checkpoint, service, llm = await produce_checkpoint(
+        w, scope, settings, tmp_path, contract_versions=contract_versions,
+    )
+    image_id = original.image.id
+    scheduler = AnalysisScheduler(settings, llm, service.receipts, None, submission_service=service)
+    await scheduler.process_pending(scope=scope)
+    held = await w.get_submission(image_id, scope=scope)
+    assert held.wait_reason == "execution_policy_changed" and held.observations_available
+    assert held.generation == 1 and held.attempt_count == 3 and llm.calls == []
+    retried = await w.retry_submission(
+        image_id, workflow.RetryRequest(expected_generation=1, request_key=uuid4().hex, policy="current"),
+        scope=scope, replacement_snapshot=service.current_snapshot(),
+    )
+    assert retried.generation == 2 and retried.attempt_count == 0 and not retried.observations_available
+    _, count, events = await state(w, image_id)
+    retired = next(event["checkpoint"] for event in events if event["event"] == "observation_checkpoint_retired")
+    assert retired["execution_identity"] == checkpoint.execution_identity.model_dump()
+    assert count == 0 and llm.calls == []
 
 
 async def test_terminal_producer_can_complete_after_exact_original_restoration(

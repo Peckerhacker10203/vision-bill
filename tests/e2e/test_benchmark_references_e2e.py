@@ -61,6 +61,29 @@ async def test_gold_requires_separate_current_human_confirmation(workflow_db, tm
         await b.current_reference(row.id, scope=scope)
 
 
+async def test_old_extraction_schema_gold_requires_new_confirmation(workflow_db, tmp_path, monkeypatch):
+    from vision_bill.model import extraction
+
+    w, scope = workflow_db
+    row, _, _ = await human(w, scope, tmp_path)
+    b = bench(w)
+    with monkeypatch.context() as prior:
+        prior.setattr(extraction, "EXTRACTION_SCHEMA_VERSION", "1")
+        preview = await b.reference_preview(row.id, scope=scope)
+        old = await b.qualify_reference(row.id, preview.review_revision, preview.document_sha256, scope=scope)
+
+    with pytest.raises(ValueError, match="qualified"):
+        await b.current_reference(row.id, scope=scope)
+    fresh = await b.reference_preview(row.id, scope=scope)
+    assert fresh.expected == old.expected and fresh.review_revision == old.review_revision
+    assert old.schema_version == "1" and fresh.schema_version == "2"
+    current = await b.qualify_reference(row.id, fresh.review_revision, fresh.document_sha256, scope=scope)
+    assert current.id != old.id
+    async with w.pool.acquire() as conn:
+        saved = await conn.fetchrow("SELECT * FROM benchmark_references WHERE id=$1", old.id)
+    assert b._reference(saved) == old
+
+
 async def test_gold_preserves_unprinted_line_factors_and_adjustments(workflow_db, tmp_path):
     from decimal import Decimal
 

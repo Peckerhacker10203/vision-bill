@@ -214,7 +214,9 @@ test.describe('receipt editor', () => {
 		test.setTimeout(120_000);
 		await uploadFixture(page, context, await loadFixture('a'), { verify: false });
 		// Explicit server amount policy determines reconciliation after save.
-		await page.getByRole('combobox', { name: 'Tax basis', exact: true }).selectOption('net');
+		await page
+			.getByRole('combobox', { name: 'Tax basis of line prices', exact: true })
+			.selectOption('net');
 		await page
 			.getByRole('combobox', { name: 'Discount treatment', exact: true })
 			.selectOption('included_in_lines');

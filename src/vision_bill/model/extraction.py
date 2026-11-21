@@ -12,7 +12,8 @@ from .ocr import OcrPageMetadata, OcrResponse, Sha256, SourceRef, WorkingImage
 from .receipt import Category, Currency, LineItem, Receipt, ReceiptTime
 from .review import AmountPolicy, ReviewFinding, SourceView
 
-EXTRACTION_SCHEMA_VERSION = "1"
+# Version 2 distinguishes an explicitly printed net subtotal from a line-basis subtotal.
+EXTRACTION_SCHEMA_VERSION = "2"
 SOURCE_PROJECTION_VERSION = "2"
 PaymentMethod = Literal[
     "cash", "credit_card", "debit_card", "mobile_payment", "check", "other", "unknown"
@@ -55,11 +56,36 @@ def assert_metadata_only(value: Any) -> None:
 
 
 class DraftLineItem(BaseModel):
-    description: str | None = None
+    description: str | None = Field(
+        None,
+        description=(
+            "Printed product or service name, including distinguishing size, colour or model "
+            "from its detail lines. Omit price and VAT percentage. Use a SKU as the name "
+            "only when it is the sole printed item identifier."
+        ),
+    )
     spending_category: SpendingCategory | None = None
-    quantity: Annotated[Decimal, Field(gt=0)] | None = None
-    unit_price: Decimal | None = None
-    total_price: Decimal | None = None
+    quantity: Decimal | None = Field(
+        None, gt=0,
+        description=(
+            "Printed count or billed weight/volume. A package size in the name is not the "
+            "quantity purchased. Leave null if unstated."
+        ),
+    )
+    unit_price: Decimal | None = Field(
+        None,
+        description=(
+            "Printed price per unit of the billed quantity, e.g. price per kg for weighed "
+            "goods. Leave null if the receipt gives only a row amount."
+        ),
+    )
+    total_price: Decimal | None = Field(
+        None,
+        description=(
+            "Signed amount charged for the whole row. Preserve printed signs on returns, "
+            "deposits and credits."
+        ),
+    )
     tags: list[str] | None = None
 
     @field_validator("spending_category", mode="before")
@@ -74,30 +100,140 @@ class DraftLineItem(BaseModel):
 
 
 class DraftTaxLine(BaseModel):
-    name: str | None = None
-    rate: Decimal | None = None
-    amount: Annotated[Decimal, Field(ge=0)] | None = None
+    name: str | None = Field(
+        None,
+        description=(
+            "Printed tax name or band label from this tax-summary row, e.g. VAT, MwSt or A. "
+            "Keep different bands separate."
+        ),
+    )
+    rate: Decimal | None = Field(
+        None,
+        description=(
+            "Fraction of the taxable base, from 0 to 1: 19% = 0.19, 7% = 0.07, 1% = 0.01. "
+            "Use 0 only for an explicitly zero or exempt rate. Use null for an unknown rate."
+        ),
+    )
+    amount: Decimal | None = Field(
+        None, ge=0,
+        description=(
+            "Money in this row's tax/VAT amount column. The net taxable base and the gross "
+            "amount including tax are separate columns."
+        ),
+    )
 
 
 class ExtractionDraft(BaseModel):
     """Missing observations stay null, including fields with final Receipt defaults."""
 
-    confidence: Annotated[int, Field(ge=0, le=100)] | None = None
-    merchant_name: str | None = None
-    merchant_address: str | None = None
-    receipt_number: str | None = None
-    date: Date | None = None
-    time: ReceiptTime | None = None
-    currency: Currency | None = None
+    confidence: int | None = Field(
+        None, ge=0, le=100,
+        description=(
+            "Your confidence in the extraction as a whole, as an integer percent from 0 to "
+            "100."
+        ),
+    )
+    merchant_name: str | None = Field(
+        None,
+        description=(
+            "Seller's trading or legal name from printed receipt text. A logo alone or a "
+            "payment processor name does not identify the seller."
+        ),
+    )
+    merchant_address: str | None = Field(
+        None,
+        description=(
+            "Seller's printed address, with the street, postal code and locality that are "
+            "visible."
+        ),
+    )
+    receipt_number: str | None = Field(
+        None,
+        description=(
+            "Merchant's receipt or invoice number as printed, including leading zeros. "
+            "Exclude terminal IDs, card authorizations and payment references."
+        ),
+    )
+    date: Date | None = Field(
+        None,
+        description=(
+            "Purchase date in YYYY-MM-DD. Resolve local date order from evidence. Leave "
+            "ambiguous dates null."
+        ),
+    )
+    time: ReceiptTime | None = Field(
+        None,
+        description=(
+            "Local purchase time in HH:MM or HH:MM:SS, preserving printed fractional seconds "
+            "up to six places."
+        ),
+    )
+    currency: Currency | None = Field(
+        None,
+        description=(
+            "Transaction currency as a three-letter uppercase ISO code supported by the "
+            "printed code or an unambiguous currency symbol."
+        ),
+    )
     category: Category | None = None
-    line_items: list[DraftLineItem] | None = None
-    taxes: list[DraftTaxLine] | None = None
-    subtotal: Decimal | None = None
-    discount_total: Annotated[Decimal, Field(ge=0)] | None = None
-    tax_total: Annotated[Decimal, Field(ge=0)] | None = None
-    tip: Annotated[Decimal, Field(ge=0)] | None = None
-    total: Decimal | None = None
-    payment_method: PaymentMethod | None = None
+    line_items: list[DraftLineItem] | None = Field(
+        None,
+        description=(
+            "Ordered logical purchase, return, deposit and credit entries. Combine a name "
+            "and its detail/price lines into one entry. Exclude section headings, totals, "
+            "tax summaries and payment rows."
+        ),
+    )
+    taxes: list[DraftTaxLine] | None = Field(
+        None,
+        description=(
+            "Tax-summary rows in printed order. Preserve separately stated rates. Leave null "
+            "when tax information is missing."
+        ),
+    )
+    subtotal: Decimal | None = Field(
+        None,
+        description=(
+            "Receipt-wide subtotal interpreted with subtotal_origin. Prefer a printed subtotal. "
+            "Derive a net subtotal only from complete line and tax evidence."
+        ),
+    )
+    discount_total: Decimal | None = Field(
+        None, ge=0,
+        description=(
+            "Total discount magnitude when evidenced. Use discount_treatment to identify any "
+            "amount already included in the line prices."
+        ),
+    )
+    tax_total: Decimal | None = Field(
+        None, ge=0,
+        description=(
+            "Total tax charged across tax bands. Use a printed tax total or the sum of a "
+            "complete set of printed tax amounts, counting each once. Missing tax stays "
+            "null."
+        ),
+    )
+    tip: Decimal | None = Field(
+        None, ge=0,
+        description=(
+            "Gratuity actually paid as evidenced on the receipt. Suggested tip amounts are "
+            "not payments."
+        ),
+    )
+    total: Decimal | None = Field(
+        None,
+        description=(
+            "Final transaction amount charged or refunded. Exclude cash tendered, change, "
+            "card balance and payment subtotals."
+        ),
+    )
+    payment_method: PaymentMethod | None = Field(
+        None,
+        description=(
+            "Payment type supported by the tender entry. Use unknown for an unidentified "
+            "type, e.g. card with no debit/credit distinction. Leave missing evidence null."
+        ),
+    )
 
 
 class ReceiptInput(BaseModel):

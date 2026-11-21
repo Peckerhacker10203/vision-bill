@@ -520,6 +520,7 @@ async def test_benchmark_reevaluation_holds_a_stale_topology_before_experiment(
 
     from vision_bill.config import settings
     from vision_bill.model.workflow import AccessScope
+    from vision_bill.service.benchmark_scoring import PROMPT_VERSION
     from vision_bill.service.benchmark_service import BenchmarkService
 
     select_ready_separate_ocr(activation_store, monkeypatch, tmp_path / "installed.lock")
@@ -528,7 +529,9 @@ async def test_benchmark_reevaluation_holds_a_stale_topology_before_experiment(
     service = BenchmarkService.__new__(BenchmarkService)
     service._provider = SimpleNamespace(get_available_models=AsyncMock(return_value=[SimpleNamespace(id="fixture")]))
     service._db = SimpleNamespace(
-        run=AsyncMock(return_value=SimpleNamespace(receipt_ids=[receipt_id], model_ids=["fixture"])),
+        run=AsyncMock(return_value=SimpleNamespace(
+            receipt_ids=[receipt_id], model_ids=["fixture"], prompt_version=PROMPT_VERSION,
+        )),
         manifest=AsyncMock(return_value={"manifest": True}),
     )
     monkeypatch.setattr(service, "_run_digests", AsyncMock(return_value={}))

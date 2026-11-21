@@ -184,7 +184,7 @@ it('saves partial corrections with an out-of-range tax observation', async () =>
 		expected_revision: 7,
 		changes: { merchant_name: 'Shop corrected' }
 	});
-	expect((screen.getByLabelText('Rate (0–1)') as HTMLInputElement).value).toBe('7');
+	expect((screen.getByLabelText('Tax rate (fraction)') as HTMLInputElement).value).toBe('7');
 });
 
 it.each([7, '1.00000000000000001'])(
@@ -196,7 +196,7 @@ it.each([7, '1.00000000000000001'])(
 		});
 		const finalize = vi.spyOn(api, 'finalizeDraft');
 		render(ExtractionDraftEditor, { id: 'job' });
-		await screen.findByLabelText('Rate (0–1)');
+		await screen.findByLabelText('Tax rate (fraction)');
 		await fireEvent.click(screen.getByRole('button', { name: 'Finalize draft' }));
 		expect(screen.getByRole('alert').textContent).toContain('between 0 and 1');
 		expect(finalize).not.toHaveBeenCalled();
@@ -538,4 +538,31 @@ it('opens the receipt pane for an explicitly unknown field source', async () => 
 	expect(screen.getByRole('button', { name: 'Receipt' }).getAttribute('aria-pressed')).toBe('true');
 	expect(screen.queryByRole('img', { name: 'Source view' })).toBeNull();
 	expect(screen.getByText('Source mapping unknown')).toBeTruthy();
+});
+
+it('saves and reloads an explicitly printed net subtotal independently of gross line prices', async () => {
+	const loaded: DraftView = {
+		...completeDraft,
+		amount_policy: { ...completeDraft.amount_policy, tax_basis: 'gross' },
+		document: { ...completeDraft.document, taxes: [{ name: 'VAT', rate: '19.0', amount: '1.90' }] }
+	};
+	const saved: DraftView = {
+		...loaded,
+		revision: loaded.revision + 1,
+		amount_policy: { ...loaded.amount_policy, subtotal_origin: 'printed_net' }
+	};
+	vi.mocked(api.getDraft).mockResolvedValue(loaded);
+	const patch = vi.spyOn(api, 'patchDraft').mockResolvedValue(saved);
+	render(ExtractionDraftEditor, { id: 'job' });
+	const select = await screen.findByRole('combobox', { name: /Subtotal origin/ });
+	await fireEvent.change(select, { target: { value: 'printed_net' } });
+	await fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+	expect(patch).toHaveBeenCalledWith('job', {
+		expected_revision: loaded.revision,
+		changes: { amount_policy: saved.amount_policy }
+	});
+	expect((select as HTMLSelectElement).value).toBe('printed_net');
+	const rate = screen.getByLabelText('Tax rate (fraction)') as HTMLInputElement;
+	expect(rate.value).toBe('19.0');
+	expect(rate.getAttribute('aria-describedby')).toBe(screen.getByText(/Enter 0.19 for 19%/).id);
 });

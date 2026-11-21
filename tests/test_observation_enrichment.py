@@ -30,6 +30,7 @@ from vision_bill.model.receipt import Receipt
 from vision_bill.model.workflow import PersistedSourcePart
 from vision_bill.provider.llm.base import ModelInfo
 from vision_bill.provider.llm.experiment import endpoint_fingerprint
+from vision_bill.service.benchmark_scoring import PROMPT_VERSION
 from vision_bill.service.benchmark_service import BenchmarkService
 from vision_bill.service.experiment_execution import (
     ExperimentFailure,
@@ -375,7 +376,7 @@ async def test_benchmark_worker_preserves_observations_after_outer_release_failu
         "inference_started": False, "inference_attempt_count": count,
     }
     worker._db = SimpleNamespace(
-        run=AsyncMock(return_value=SimpleNamespace(model_ids=["fixture"])),
+        run=AsyncMock(return_value=SimpleNamespace(model_ids=["fixture"], prompt_version=PROMPT_VERSION)),
         manifest=AsyncMock(return_value=manifest),
         begin_attempt=AsyncMock(return_value={
             "inference_started": True, "inference_attempt_count": count + 1,
@@ -546,7 +547,7 @@ async def test_benchmark_worker_retry_only_before_admitted_observations(
         "inference_started": False, "inference_attempt_count": 0,
     }
     worker._db = SimpleNamespace(
-        run=AsyncMock(return_value=SimpleNamespace(model_ids=["fixture"])),
+        run=AsyncMock(return_value=SimpleNamespace(model_ids=["fixture"], prompt_version=PROMPT_VERSION)),
         manifest=AsyncMock(return_value=manifest),
         begin_attempt=AsyncMock(return_value={
             "inference_started": True, "inference_attempt_count": 1,
