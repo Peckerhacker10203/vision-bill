@@ -523,15 +523,19 @@ conditional native requirements and comment-only evidence are rejected. The Make
 targets provide the pinned packaging parser in an isolated uv tool environment.
 
 `make ocr-build-rocm` builds the full TheRock SDK and Paddle from the approved
-source pins. Fresh Git clones request `--filter=blob:none` for TheRock, Paddle
-and their recursive submodules. Git retains commit history and tags, downloads
-file contents for the checked-out revisions, and can fetch historical blobs on
-demand. The recipe initializes TheRock's recursive Git submodules at their
+source pins. The builder fetches the pinned TheRock root commit at depth one
+with all its files in the initial transfer. Checking out that commit works
+offline. Paddle and the recursive submodules still use `--filter=blob:none`
+and need access to their public remotes to retrieve file contents.
+The recipe initializes TheRock's recursive Git submodules at their
 recorded pins before applying upstream patches. It checks the source inventory
 before building `patchelf` and reports the path and pin of a missing checkout.
-Provision substantial disk/RAM/CPU capacity first; this is a large
-native compilation, not an ordinary sidecar dependency install. `OCR_BUILD_JOBS`
-sets the job limit for each CMake build (including TheRock subprojects) and
+
+Upstream estimates approximately 200 GB free and several hours for a TheRock
+source build. Check free space on the filesystem used by the Docker builder.
+[TheRock source build requirements at the selected commit](https://github.com/ROCm/TheRock/blob/b324869fb3116353ac7eec5e6926aa3d452ac987/README.md#building-from-source)
+
+`OCR_BUILD_JOBS` sets the job limit for each CMake build (including TheRock subprojects) and
 concurrent Git submodule fetches. TheRock can run multiple subprojects at once,
 so their combined compiler count can exceed this setting. Model weights
 are provisioned separately for qualification. The versioned patch replaces both

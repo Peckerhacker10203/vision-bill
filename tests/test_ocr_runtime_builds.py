@@ -133,10 +133,9 @@ def test_therock_preparation_inventories_gitlinks_omitted_by_upstream_fetch(tmp_
     )
     git(upstream, "add", "build_tools")
     git(upstream, "commit", "--quiet", "-m", "Pin TheRock inputs")
-    for checkout in ("old-checkout", "new-checkout"):
-        git(tmp_path, "clone", "--quiet", str(upstream), checkout)
-
+    pin = git(upstream, "rev-parse", "HEAD")
     old = tmp_path / "old-checkout"
+    git(tmp_path, "clone", "--quiet", str(upstream), str(old))
     output = tmp_path / "sources.json"
     subprocess.run([sys.executable, "build_tools/fetch_sources.py"], cwd=old, env=env, check=True)
     original_inventory = subprocess.run(
@@ -150,11 +149,22 @@ def test_therock_preparation_inventories_gitlinks_omitted_by_upstream_fetch(tmp_
     assert f"Uninitialized recursive source gitlink: {missing_gitlink}" in original_inventory.stderr
     assert not output.exists()
 
+    (upstream / "later.txt").write_text("Only present on the newer branch tip\n")
+    git(upstream, "add", "later.txt")
+    git(upstream, "commit", "--quiet", "-m", "Move the default branch after the pin")
     new = tmp_path / "new-checkout"
+    git(tmp_path, "init", "--quiet", str(new))
+    git(new, "remote", "add", "origin", upstream.as_uri())
     subprocess.run(
-        ["bash", SERVICE / "build/prepare_therock.sh", new, output, "4"], env=env, check=True
+        ["bash", SERVICE / "build/prepare_therock.sh", new, output, "4", pin], env=env, check=True
     )
 
+    assert git(new, "rev-parse", "HEAD") == pin
+    assert git(new, "rev-list", "--count", "HEAD") == "1"
+    assert not list((new / ".git/objects/pack").glob("*.promisor"))
+    assert (new / "build_tools/fetch_sources.py").read_bytes() == fetch_sources.read_bytes()
+    original_gitlinks = (tmp_path / "therock-original-gitlinks.txt").read_text().splitlines()
+    assert f"160000 {git(libraries, 'rev-parse', 'HEAD')} 0\trocm-libraries" in original_gitlinks
     for path in ("rocm-docs", "rocm-libraries", "rocm-libraries/projects/miopen/fin"):
         assert git(new / path, "config", "--get", "remote.origin.partialclonefilter") == "blob:none"
     report = json.loads(output.read_text())

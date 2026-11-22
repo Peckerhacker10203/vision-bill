@@ -20,10 +20,10 @@ mkdir -p "$SOURCE_ROOT" "$EVIDENCE"
 TARGETS="$(python "$RECIPE/../ocr_service/targets.py" --targets "${AMDGPU_TARGETS:-}" --output "$EVIDENCE/targets.json")"
 export VISION_BILL_AMDGPU_TARGETS="$TARGETS"
 
-git clone --filter=blob:none --no-checkout https://github.com/ROCm/TheRock.git "$THEROCK_SRC"
-git -C "$THEROCK_SRC" checkout --detach b324869fb3116353ac7eec5e6926aa3d452ac987
-git -C "$THEROCK_SRC" ls-files --stage > "$EVIDENCE/therock-original-gitlinks.txt"
-bash "$RECIPE/prepare_therock.sh" "$THEROCK_SRC" "$EVIDENCE/therock-sources.json" "$BUILD_JOBS"
+git init --quiet "$THEROCK_SRC"
+git -C "$THEROCK_SRC" remote add origin https://github.com/ROCm/TheRock.git
+bash "$RECIPE/prepare_therock.sh" "$THEROCK_SRC" "$EVIDENCE/therock-sources.json" "$BUILD_JOBS" \
+  b324869fb3116353ac7eec5e6926aa3d452ac987
 # The WSL thunk needs Windows SDK headers at compile time and the AMD WKMI
 # archive referenced by the rocm-systems gitlink. Neither is a host driver.
 git init -q "$WIN_HEADERS"
