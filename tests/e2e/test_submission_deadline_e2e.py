@@ -82,8 +82,6 @@ async def test_upload_deadline_atomic_recovery_and_artifacts(workflow_db, settin
     peer_pid = await peer.fetchval("SELECT pg_backend_pid()")
     original_pool = w._pool
     w._pool = pool
-    # Exercise the real ReceiptService -> ReceiptDB hidden read, not setup's mock.
-    del service.receipts.list_tags
     service.receipts._db._pool = pool
     service.worker = settings.worker.model_copy(update={"attempt_timeout_seconds": .4})
     original_attempt = service._attempt
