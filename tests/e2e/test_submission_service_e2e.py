@@ -61,7 +61,7 @@ async def setup(w, scope, settings, tmp_path, *, ocr=True):
     native.get_capabilities.return_value.runtime_fingerprint = "runtime"
     receipts = ReceiptService(settings.images, settings.pg, llm)
     receipts._workflow_db = w
-    receipts.list_tags = AsyncMock(return_value=[])
+    receipts._db._pool = w.pool
     receipts.ocr_capabilities = native.get_capabilities
 
     async def extract(model, paths, *, ocr_settings, **kwargs):

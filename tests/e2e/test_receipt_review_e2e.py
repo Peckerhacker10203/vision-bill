@@ -735,6 +735,21 @@ async def test_review_quantity_and_rate_are_exact_after_storage(workflow_db, tmp
     assert [f.id for f in actual.findings] == [f.id for f in expected.findings]
 
 
+async def seed_historical_amounts(conn):
+    receipt_id = await conn.fetchval(
+        """INSERT INTO receipts(merchant_name,date,subtotal,total)
+           VALUES('Historical','2025-01-01',12.34,12.34) RETURNING id"""
+    )
+    await conn.execute(
+        """INSERT INTO line_items(receipt_id,description,original_description,quantity,unit_price,total_price)
+           VALUES($1,'item','item',1.2345,10,12.34)""", receipt_id,
+    )
+    await conn.execute(
+        "INSERT INTO taxes(receipt_id,name,rate,amount) VALUES($1,'VAT',0.1234,1.23)", receipt_id,
+    )
+    return receipt_id
+
+
 @pytest.mark.parametrize(
     "table,column,value",
     [
@@ -744,55 +759,43 @@ async def test_review_quantity_and_rate_are_exact_after_storage(workflow_db, tmp
         ("taxes", "rate", "100"),
     ],
 )
-async def test_quantity_rate_downgrade_refuses_loss(workflow_db, tmp_path, table, column, value):
-    w, scope = workflow_db
-    row, _, _ = await seed(w, scope, tmp_path)
-    async with w.pool.acquire() as conn:
+async def test_quantity_rate_downgrade_refuses_loss(db, table, column, value):
+    import asyncpg
+
+    migrate(db, "0014")
+    conn = await asyncpg.connect(db.pg_dsn)
+    try:
+        receipt_id = await seed_historical_amounts(conn)
         await conn.execute(
-            "INSERT INTO taxes(receipt_id,name,rate,amount) VALUES($1,'VAT',0.1,0)", row.id
+            f"UPDATE {table} SET {column}=$1 WHERE receipt_id=$2", Decimal(value), receipt_id
         )
-        await conn.execute(
-            f"UPDATE {table} SET {column}=$1 WHERE receipt_id=$2", Decimal(value), row.id
-        )
-    refusal = migrate(w._settings, "0013", "downgrade", check=False)
-    assert refusal.returncode != 0
-    assert "precision losing" in refusal.stderr
+        refusal = migrate(db, "0013", "downgrade", check=False)
+        assert refusal.returncode != 0 and "precision losing numeric downgrade refused" in refusal.stderr
+        assert await conn.fetchval(
+            f"SELECT {column} FROM {table} WHERE receipt_id=$1", receipt_id
+        ) == Decimal(value)
+    finally:
+        await conn.close()
 
 
 async def test_quantity_rate_widening_preserves_historical_values(db):
     import asyncpg
 
-    from vision_bill.model.receipt import Receipt
-    from vision_bill.provider.db.receipt_db import ReceiptDB
-
     migrate(db, "0013")
-    receipt = Receipt(
-        confidence=90,
-        merchant_name="Historical",
-        date="2025-01-01",
-        subtotal="12.34",
-        total="12.34",
-        line_items=[
-            {"description": "item", "quantity": 1.2345, "unit_price": "10", "total_price": "12.34"}
-        ],
-        taxes=[{"name": "VAT", "rate": 0.1234, "amount": "1.23"}],
-    )
     conn = await asyncpg.connect(db.pg_dsn)
-    # Seed the historical schema using its actual tax columns; the current writer
-    # deliberately requires migration0016's ordered-tax position column.
-    saved = await ReceiptDB(db).insert_receipt(conn, receipt.model_copy(update={"taxes": []}), image_id=None, user_id=None)
-    await conn.execute("INSERT INTO taxes(receipt_id,name,rate,amount) VALUES($1,'VAT',0.1234,1.23)", saved.id)
-    query = "SELECT r.total,l.quantity,l.unit_price,l.total_price,t.rate,t.amount FROM receipts r JOIN line_items l ON l.receipt_id=r.id JOIN taxes t ON t.receipt_id=r.id WHERE r.id=$1"
-    before = await conn.fetchrow(query, saved.id)
-    await conn.close()
-    migrate(db)
-    conn = await asyncpg.connect(db.pg_dsn)
-    assert await conn.fetchrow(query, saved.id) == before
-    await conn.close()
-    migrate(db, "0013", "downgrade")
-    conn = await asyncpg.connect(db.pg_dsn)
-    assert await conn.fetchrow(query, saved.id) == before
-    await conn.close()
+    query = """SELECT r.total,l.quantity,l.unit_price,l.total_price,t.rate,t.amount
+               FROM receipts r JOIN line_items l ON l.receipt_id=r.id
+               JOIN taxes t ON t.receipt_id=r.id WHERE r.id=$1"""
+    try:
+        receipt_id = await seed_historical_amounts(conn)
+        before = await conn.fetchrow(query, receipt_id)
+        assert tuple(before) == tuple(map(Decimal, ("12.34", "1.2345", "10", "12.34", "0.1234", "1.23")))
+        migrate(db, "0014")
+        assert await conn.fetchrow(query, receipt_id) == before
+        migrate(db, "0013", "downgrade")
+        assert await conn.fetchrow(query, receipt_id) == before
+    finally:
+        await conn.close()
 
 
 @pytest.mark.parametrize("missing", ["new_all", "snapshot_all", "processed_all", "additional"])

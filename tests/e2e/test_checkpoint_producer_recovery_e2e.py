@@ -82,6 +82,7 @@ async def test_awaited_producer_checkpoint_resumes_after_uncertain_managed_class
     native.claim, native.park, native.load = AsyncMock(), AsyncMock(), AsyncMock()
     receipts = ReceiptService(settings.images, settings.pg, llm, native, settings.ocr)
     receipts._workflow_db = w
+    receipts._db._pool = w.pool
     receipts.list_tags = AsyncMock(return_value=[])
     submission = SubmissionService(settings, receipts, ImageService(settings.images))
     handoff = receipts.execution_handoff(settings.ocr)
@@ -198,6 +199,7 @@ async def test_unmanaged_producer_durably_fences_dispatch_and_recovers_once(
     settings.ocr = OcrSettings(enabled=False, manage_model_lifecycle=False)
     receipts = ReceiptService(settings.images, settings.pg, llm, ocr_settings=settings.ocr)
     receipts._workflow_db = w
+    receipts._db._pool = w.pool
     receipts.list_tags = AsyncMock(return_value=[])
     submission = SubmissionService(settings, receipts, ImageService(settings.images))
     image, claim = await prepare_last_attempt(w, scope, receipts, settings, tmp_path)

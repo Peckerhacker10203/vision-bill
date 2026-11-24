@@ -657,6 +657,8 @@
 		"merchantDisplayHint": "Choose an existing name or enter a new one.",
 		"useMerchantSuggestion": "Use “{name}”",
 		"merchantLookupFailed": "Merchant suggestions could not be loaded. You can still enter a name.",
+		"lineItemRow": "Line item {number}",
+		"taxRow": "Tax row {number}",
 		"optionalTags": "Optional tags",
 		"originalDescription": "On receipt",
 		"rememberCategory": "Remember for this item",

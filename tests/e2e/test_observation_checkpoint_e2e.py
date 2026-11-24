@@ -414,10 +414,18 @@ async def test_migration_preserves_0019_receipt_attempt_and_human_draft_rows(db)
             )
             == images_before
         )
-        assert await conn.fetch("SELECT to_jsonb(r) FROM receipts r ORDER BY id") == receipts_before
+        assert await conn.fetch(
+            "SELECT to_jsonb(r)-'merchant_display_name' FROM receipts r ORDER BY id"
+        ) == receipts_before
+        assert not await conn.fetchval(
+            "SELECT EXISTS(SELECT FROM receipts WHERE merchant_display_name IS NOT NULL)"
+        )
         assert (
-            await conn.fetch("SELECT to_jsonb(d) FROM receipt_drafts d ORDER BY image_id")
+            await conn.fetch("SELECT to_jsonb(d)-'item_category_sources' FROM receipt_drafts d ORDER BY image_id")
             == drafts_before
+        )
+        assert not await conn.fetchval(
+            "SELECT EXISTS(SELECT FROM receipt_drafts WHERE item_category_sources IS DISTINCT FROM '[]'::jsonb)"
         )
         assert (
             await conn.fetch("SELECT to_jsonb(e) FROM receipt_extractions e ORDER BY id")

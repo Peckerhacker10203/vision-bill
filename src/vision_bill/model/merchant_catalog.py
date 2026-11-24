@@ -259,6 +259,8 @@ def suggest_merchant(merchant_name: str, merchant_address: str | None = None) ->
         return _ALIASES[name]
     words = name.split()
     if words[:1] == ["hit"]:
+        if re.fullmatch(r"hit [0-9]{3}", name):
+            return "HIT Handelsgruppe"
         legal = re.search(r"\(([^()]+)\)\s*$", merchant_name)
         if legal and _key(new_merchant_name(legal[1])) == "hit handelsgruppe":
             return "HIT Handelsgruppe"
@@ -266,6 +268,8 @@ def suggest_merchant(merchant_name: str, merchant_address: str | None = None) ->
         town = re.sub(r"^hit (?:[0-9]{3} )?", "", name)
         if _matches_town(town, merchant_address):
             return "HIT Handelsgruppe"
+    if words[:2] == ["k", "kiosk"]:
+        return "k kiosk"
     if "kiosk" in words:
         place = ""
         if words[0] == "kiosk":

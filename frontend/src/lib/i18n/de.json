@@ -657,6 +657,8 @@
 		"merchantDisplayHint": "Vorhandenen Namen auswählen oder einen neuen eingeben.",
 		"useMerchantSuggestion": "„{name}“ übernehmen",
 		"merchantLookupFailed": "Händlervorschläge konnten nicht geladen werden. Sie können einen Namen eingeben.",
+		"lineItemRow": "Belegposition {number}",
+		"taxRow": "Steuerzeile {number}",
 		"optionalTags": "Optionale Schlagwörter",
 		"originalDescription": "Auf dem Beleg",
 		"rememberCategory": "Für diese Position merken",

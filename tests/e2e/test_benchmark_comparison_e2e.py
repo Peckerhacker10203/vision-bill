@@ -161,12 +161,24 @@ async def test_mixed_inputs_remain_scoped_and_use_the_same_sparse_gold(workflow_
     assert (await service._db.manifest(primary.id))["inputs"][1]["expected"]["total"] == "17.43"
 
 
-async def test_downgrade_refuses_loss_of_comparison_identity(workflow_db, tmp_path):
+async def test_downgrade_refuses_loss_of_comparison_identity(db):
     from tests.e2e.test_workflow_db_e2e import migrate
 
-    w, scope = workflow_db
-    service, request, _, _ = await setup_comparison(w, scope, tmp_path)
-    primary = await service.create_run(request, scope=scope)
-    migration = migrate(w._settings, "0022", "downgrade", check=False)
-    assert migration.returncode != 0 and "benchmark comparison downgrade refused" in migration.stderr
-    assert len(await service.list_runs(scope=scope, comparison_id=primary.comparison_id)) == 2
+    migrate(db, "0023")
+    conn = await asyncpg.connect(db.pg_dsn)
+    comparison = uuid4()
+    try:
+        await conn.executemany(
+            """INSERT INTO benchmark_runs(model_ids,receipt_ids,dataset_fingerprint,
+               prompt_version,scoring_version,comparison_id,comparison_arm)
+               VALUES('["fixture"]','[]','fixture','1','1',$1,$2)""",
+            [(comparison, "direct_vision"), (comparison, "ocr")],
+        )
+        migration = migrate(db, "0022", "downgrade", check=False)
+        assert migration.returncode != 0 and "benchmark comparison downgrade refused" in migration.stderr
+        arms = await conn.fetch(
+            "SELECT comparison_arm FROM benchmark_runs WHERE comparison_id=$1 ORDER BY comparison_arm", comparison
+        )
+        assert [row["comparison_arm"] for row in arms] == ["direct_vision", "ocr"]
+    finally:
+        await conn.close()

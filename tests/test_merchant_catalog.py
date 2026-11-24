@@ -22,6 +22,7 @@ from vision_bill.model.receipt import Category
         ("HIT Handelsgruppe GmbH & Co. KG", "HIT Handelsgruppe"),
         ("HIT 003 St. Augustin (HIT Handelsgruppe GmbH & Co. KG)", "HIT Handelsgruppe"),
         ("HIT 027 Siegburg", "HIT Handelsgruppe"),
+        ("HIT 003", "HIT Handelsgruppe"),
         ("HIT-Verbrauchermarkt Bonn", "HIT Handelsgruppe"),
         ("EDEKA Peter Schneider e.K.", "EDEKA"),
         ("Hennes & Mauritz B.V. & Co. KG", "H&M"),
@@ -34,6 +35,7 @@ from vision_bill.model.receipt import Category
         ("Siegburg Kiosk", "Kiosk"),
         ("Kiosk St. Augustin", "Kiosk"),
         ("Kiosk Sankt Augustin", "Kiosk"),
+        ("k kiosk Filiale 12", "k kiosk"),
     ],
 )
 def test_printed_chain_and_generic_names(printed: str, display: str) -> None:

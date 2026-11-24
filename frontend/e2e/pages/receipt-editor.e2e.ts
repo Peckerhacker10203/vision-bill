@@ -268,9 +268,10 @@ test.describe('receipt editor', () => {
 		await page.locator('#li-1-unit').fill('1.20');
 		await page.locator('#li-1-total').fill('1.20');
 
-		// Remove the ORIGINAL row (line-item removes precede tax removes in
-		// DOM order; this fixture has 1 line + 1 tax before the add).
-		await page.getByRole('button', { name: 'Remove' }).nth(0).click();
+		await page
+			.getByRole('group', { name: 'Line item 1', exact: true })
+			.getByRole('button', { name: 'Remove', exact: true })
+			.click();
 		await expect(page.getByPlaceholder('Description')).toHaveCount(1);
 
 		await page.getByRole('button', { name: 'Save', exact: true }).click();
@@ -283,7 +284,10 @@ test.describe('receipt editor', () => {
 	test('no line items state', async ({ page, context }) => {
 		test.setTimeout(120_000);
 		await uploadFixture(page, context, await loadFixture('b'), { verify: false });
-		await page.getByRole('button', { name: 'Remove' }).nth(0).click();
+		await page
+			.getByRole('group', { name: 'Line item 1', exact: true })
+			.getByRole('button', { name: 'Remove', exact: true })
+			.click();
 		await expect(page.getByText('No line items yet.')).toBeVisible();
 		await expect(page.getByRole('button', { name: 'Add item' })).toBeVisible();
 	});
@@ -336,12 +340,13 @@ test.describe('receipt editor', () => {
 		await page.locator('#tax-1-rate').fill('0.10');
 		await page.locator('#tax-1-amount').fill('0.10');
 
-		// FIX #2: Fixture b has 1 line item + 1 pre-existing tax (VAT).
-		// After "Add tax" the Remove buttons in DOM order are:
-		//   [li-0 Remove, tax-0(VAT) Remove, tax-1(Service) Remove]
-		// nth(1) targets VAT (tax-0); nth(2) targets the new tax (tax-1).
-		await page.getByRole('button', { name: 'Remove' }).nth(2).click();
-		await expect(page.locator('#tax-1-name')).toHaveCount(0);
+		const vat = page.getByRole('group', { name: 'Tax row 1', exact: true });
+		const service = page.getByRole('group', { name: 'Tax row 2', exact: true });
+		await expect(vat.getByLabel('Name', { exact: true })).toHaveValue('VAT');
+		await expect(service.getByLabel('Name', { exact: true })).toHaveValue('Service');
+		await service.getByRole('button', { name: 'Remove', exact: true }).click();
+		await expect(service).toHaveCount(0);
+		await expect(vat.getByLabel('Name', { exact: true })).toHaveValue('VAT');
 
 		await page.getByRole('button', { name: 'Save', exact: true }).click();
 		await expect(page.getByText('Changes saved')).toBeVisible({ timeout: 15_000 });

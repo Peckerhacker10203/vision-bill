@@ -735,7 +735,11 @@
 		{:else}
 			<div class="space-y-3">
 				{#each form.lines as line, index (line)}
-					<div class="rounded-lg border border-outline-variant bg-surface-container-lowest p-3">
+					<div
+						role="group"
+						aria-label={$t('editor.lineItemRow', { values: { number: index + 1 } })}
+						class="rounded-lg border border-outline-variant bg-surface-container-lowest p-3"
+					>
 						<div class="flex items-start gap-2">
 							<input
 								class="{inputClass} flex-1"
@@ -894,7 +898,11 @@
 			</p>
 			<div class="space-y-2">
 				{#each form.taxLines as tax, index (index)}
-					<div class="grid grid-cols-2 items-end gap-2 sm:grid-cols-[1fr_8rem_10rem_2.5rem]">
+					<div
+						role="group"
+						aria-label={$t('editor.taxRow', { values: { number: index + 1 } })}
+						class="grid grid-cols-2 items-end gap-2 sm:grid-cols-[1fr_8rem_10rem_2.5rem]"
+					>
 						<div>
 							<label class={labelClass} for="tax-{index}-name">{$t('editor.taxName')}</label>
 							<input
