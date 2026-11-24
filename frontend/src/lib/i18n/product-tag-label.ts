@@ -1,4 +1,4 @@
-import labels from './product-tags.json';
+import labels from '../../../../src/vision_bill/model/product_tags.json';
 
 const vocabulary = new Map(Object.entries(labels));
 

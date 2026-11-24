@@ -275,7 +275,8 @@ async def test_update_receipt_scoped_to_owner(receipt_db: ReceiptDB) -> None:
     await receipt_db.update_receipt(RESOURCE_ID, ReceiptUpdate.model_validate(dict(_make_receipt().model_dump(), expected_operation_revision=1)), user_id=USER_A, can_see_all=False)
 
     call = next(c for c in conn.fetchrow.call_args_list if "confidence      = $1" in c.args[0])
-    assert "AND user_id = $16 RETURNING *" in call.args[0]
+    owner_parameter = len(call.args) - 1  # asyncpg parameters start after the SQL string
+    assert f"AND user_id = ${owner_parameter} RETURNING *" in call.args[0]
     assert call.args[-1] == USER_A
 
 

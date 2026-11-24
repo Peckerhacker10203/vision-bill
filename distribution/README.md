@@ -283,7 +283,7 @@ docker compose -f "$compose_file" exec app cat /app/config/initial-admin.yaml
 
 Sign in with that administrator. Self-registration, when enabled, creates ordinary
 users. Keep the initial-admin file, configuration and auth secret/pepper private
-and backed up. The app migrates the database to schema 0024. See
+and backed up. The app migrates the database to schema 0025. See
 [upgrade and grants](../UPGRADE_AND_VERIFY.md).
 
 ### Stop, cut over and recover

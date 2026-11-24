@@ -10,12 +10,18 @@ from ..ocr import SourceRef
 from ..review import CHECKS_VERSION, AmountPolicy, FindingAcknowledgement, ReviewFinding
 
 
+class MerchantOptions(BaseModel):
+    suggestion: str | None
+    merchants: list[str]
+
+
 class ReceiptRow(BaseModel):
     """Represents a single row in the `receipts` table."""
 
     id: UUID
     confidence: int
     merchant_name: str
+    merchant_display_name: str | None = None
     merchant_address: str | None = None
     receipt_number: str | None = None
     date: Date

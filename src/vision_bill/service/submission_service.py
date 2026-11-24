@@ -20,6 +20,7 @@ from ..model.db.receipt import ReceiptRow
 from ..model.experiment import ExperimentOptions
 from ..model.extraction import (
     EXTRACTION_SCHEMA_VERSION,
+    OBSERVATION_PROMPT_VERSION,
     SOURCE_PROJECTION_VERSION,
     DraftView,
     ExtractionDraft,
@@ -50,7 +51,6 @@ from ..provider.db.workflow_db import OBSERVATION_RECOVERY_WAIT
 from ..provider.llm.base import ModelInfo
 from ..provider.llm.errors import AnalysisTimeoutError, UnreadableReceiptError
 from ..provider.ocr.base import compact_ocr_text
-from .benchmark_scoring import PROMPT_VERSION
 from .execution_policy import (
     managed_ocr,
     policy_hold_reason,
@@ -134,7 +134,7 @@ class SubmissionService:
                 checkpoint_identity=identity.inference_identity,
             )
             or identity.inference_identity != self.receipts.inference_identity
-            or identity.prompt_version != PROMPT_VERSION
+            or identity.prompt_version != OBSERVATION_PROMPT_VERSION
             or identity.extraction_schema_version != EXTRACTION_SCHEMA_VERSION
             or identity.source_projection_version != SOURCE_PROJECTION_VERSION
         ):
@@ -502,7 +502,7 @@ class SubmissionService:
                         semantic_policy_sha256=semantic_policy_sha256(snapshot),
                         model_id=provenance.model_id,
                         model_digest=provenance.model_digest,
-                        prompt_version=PROMPT_VERSION,
+                        prompt_version=OBSERVATION_PROMPT_VERSION,
                         extraction_schema_version=EXTRACTION_SCHEMA_VERSION,
                         source_projection_version=envelope.source_projection_version,
                     ),
@@ -513,6 +513,15 @@ class SubmissionService:
             if not await self.db.save_observation_checkpoint(claim, checkpoint, deadline=db_deadline):
                 raise StaleClaimError
             observation_checkpoint_id = checkpoint.checkpoint_id
+            if (image.user_id is not None and envelope.receipt is not None
+                    and envelope.classification_enrichment.state == "pending"):
+                # Only this live classifier receives the owner's display-name hint. The
+                # committed checkpoint and raw draft retain the printed merchant name.
+                receipt = envelope.receipt
+                receipt.merchant_display_name = await self.receipts.suggested_merchant_name(
+                    image.user_id, receipt.merchant_name, receipt.merchant_address,
+                    deadline=db_deadline,
+                )
 
         async def record_classification_event(state: Literal["started", "settled"]) -> None:
             if observation_checkpoint_id is None:

@@ -11,6 +11,7 @@
 	import { isPlainDecimal, isSignedDecimal, validReviewDecimal } from '$lib/ui/money';
 	import { snackbar } from '$lib/ui/snackbar.svelte';
 	import Icon from '$lib/ui/Icon.svelte';
+	import MerchantNameInput from './MerchantNameInput.svelte';
 	import TagEditor from '$lib/ui/TagEditor.svelte';
 	import CollectionPicker from '$lib/ui/CollectionPicker.svelte';
 	import AmountPolicyEditor from './AmountPolicyEditor.svelte';
@@ -58,6 +59,7 @@
 		overlap_decisions: Record<string, unknown>[];
 		confidence: string;
 		merchant_name: string;
+		merchant_display_name?: string;
 		merchant_address: string;
 		receipt_number: string;
 		date: string;
@@ -88,6 +90,7 @@
 			overlap_decisions: structuredClone($state.snapshot(receipt.overlap_decisions)),
 			confidence: String(receipt.confidence),
 			merchant_name: receipt.merchant_name,
+			merchant_display_name: receipt.merchant_display_name ?? '',
 			merchant_address: receipt.merchant_address ?? '',
 			receipt_number: receipt.receipt_number ?? '',
 			date: receipt.date,
@@ -326,6 +329,12 @@
 			overlap_decisions: form.overlap_decisions,
 			confidence: Number(form.confidence),
 			merchant_name: form.merchant_name.trim(),
+			...(form.merchant_display_name !== undefined &&
+			(form.merchant_display_name.trim() !== (receipt.merchant_display_name ?? '') ||
+				form.merchant_name.trim() !== receipt.merchant_name ||
+				form.merchant_address.trim() !== (receipt.merchant_address ?? ''))
+				? { merchant_display_name: form.merchant_display_name.trim() || null }
+				: {}),
 			merchant_address: form.merchant_address.trim() || null,
 			receipt_number: form.receipt_number.trim() || null,
 			date: form.date,
@@ -389,9 +398,19 @@
 		line.description = description;
 	}
 
-	function changeMerchant(merchant: string) {
+	function changeMerchant(
+		field: 'merchant_name' | 'merchant_display_name' | 'merchant_address',
+		value: string
+	) {
+		if (form[field] === value) return;
 		merchantVersion++;
-		form.merchant_name = merchant;
+		form[field] = value;
+		if (field !== 'merchant_display_name')
+			form.merchant_display_name =
+				form.merchant_name.trim() === receipt.merchant_name &&
+				form.merchant_address.trim() === (receipt.merchant_address ?? '')
+					? (receipt.merchant_display_name ?? '')
+					: undefined;
 		for (const line of form.lines) {
 			clearHistoryCategory(line);
 			line.remember_category = false;
@@ -406,8 +425,15 @@
 		const currentMerchantVersion = merchantVersion;
 		const currentReceiptId = receipt.id;
 		try {
-			const result = await api.getCategorySuggestion(merchant, description);
+			const result = await api.getCategorySuggestion({
+				merchant_name: merchant,
+				merchant_display_name: form.merchant_display_name?.trim() || undefined,
+				merchant_address: form.merchant_address.trim() || undefined,
+				description,
+				receipt_id: currentReceiptId
+			});
 			if (
+				!isCurrentView() ||
 				line.lookupVersion !== version ||
 				merchantVersion !== currentMerchantVersion ||
 				receipt.id !== currentReceiptId ||
@@ -484,10 +510,25 @@
 				<label class={labelClass} for="re-merchant">{$t('editor.merchant')}</label>
 				<input
 					id="re-merchant"
+					aria-describedby="re-printed-hint"
 					class={inputClass}
 					value={form.merchant_name}
-					oninput={(e) => changeMerchant((e.currentTarget as HTMLInputElement).value)}
+					oninput={(e) => changeMerchant('merchant_name', e.currentTarget.value)}
 					onblur={() => form.lines.forEach((line) => void lookupCategory(line))}
+				/>
+				<p id="re-printed-hint" class="text-xs text-on-surface-variant">
+					{$t('editor.printedMerchantHint')}
+				</p>
+			</div>
+			<div class="sm:col-span-2">
+				<MerchantNameInput
+					id="re-merchant-display"
+					value={form.merchant_display_name}
+					printed={form.merchant_name}
+					address={form.merchant_address}
+					receiptId={receipt.id}
+					onChange={(name) => changeMerchant('merchant_display_name', name)}
+					onCommit={() => form.lines.forEach((line) => void lookupCategory(line))}
 				/>
 			</div>
 			<div class="sm:col-span-2">
@@ -496,7 +537,8 @@
 					id="re-address"
 					class={inputClass}
 					value={form.merchant_address}
-					oninput={(e) => (form.merchant_address = (e.currentTarget as HTMLInputElement).value)}
+					oninput={(e) => changeMerchant('merchant_address', e.currentTarget.value)}
+					onblur={() => form.lines.forEach((line) => void lookupCategory(line))}
 				/>
 			</div>
 			<div>
@@ -807,7 +849,7 @@
 								{/if}
 							</div>
 							<div class="col-span-2 sm:col-span-4">
-								<details>
+								<details open={line.tags.length > 0}>
 									<summary class="cursor-pointer text-xs text-on-surface-variant"
 										>{$t('editor.optionalTags')}</summary
 									>

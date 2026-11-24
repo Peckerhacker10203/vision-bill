@@ -28,7 +28,11 @@ the review choice creates a new request and preserves the other saved options.
 Review preserves exact decimal strings, ordered row identities, original/current descriptions and local receipt times
 including valid seconds/microseconds. Source views distinguish original and working
 coordinates; unknown inverse transforms remain null. EN/DE findings explain checks2,
-readiness waits, policy holds and explicit current-policy retries. The upload UI
+readiness waits, policy holds and explicit current-policy retries. Both editors
+show the printed seller and an editable merchant display name. They use localized
+receipt categories, item categories and multi-select tags. The shared tag
+dictionary is a build input from the adjacent Python package in this checkout.
+The upload UI
 follows the server's OCR configuration. Historical fallback fields are retained for
 request replay. See [the upload and review workflow](../MULTI_IMAGE_RECEIPTS.md).
 

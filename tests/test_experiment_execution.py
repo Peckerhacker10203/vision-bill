@@ -7,7 +7,7 @@ from vision_bill.model.experiment import ExperimentOptions
 from vision_bill.model.workflow import AccessScope
 from vision_bill.provider.llm.ollama import OllamaProvider
 from vision_bill.provider.ocr.base import compact_ocr_text
-from vision_bill.service.benchmark_scoring import PROMPT_VERSION
+from vision_bill.service.benchmark_scoring import PROMPT_VERSION, validation_schema_sha256
 
 
 def test_empty_primary_text_uses_recognized_blocks():
@@ -681,7 +681,6 @@ async def test_managed_benchmark_distinguishes_topology_from_frozen_client_drift
     settings, tmp_path, monkeypatch, change,
 ):
     import hashlib
-    import json
     from time import monotonic
 
     from PIL import Image
@@ -692,7 +691,6 @@ async def test_managed_benchmark_distinguishes_topology_from_frozen_client_drift
     from vision_bill import config
     from vision_bill.config import OcrSettings
     from vision_bill.model.handoff import HandoffWait
-    from vision_bill.model.receipt import Receipt
     from vision_bill.provider.llm.experiment import endpoint_fingerprint
     from vision_bill.provider.ocr.paddleocr import PaddleOcrProvider
     from vision_bill.service.benchmark_service import BenchmarkService
@@ -730,9 +728,7 @@ async def test_managed_benchmark_distinguishes_topology_from_frozen_client_drift
         "provider": type(llm).__name__,
         "endpoint_fingerprint": endpoint_fingerprint(llm),
         "ocr_fingerprint": ocr_fingerprint(ocr),
-        "validation_schema_sha256": hashlib.sha256(
-            json.dumps(Receipt.model_json_schema(), sort_keys=True).encode()
-        ).hexdigest(),
+        "validation_schema_sha256": validation_schema_sha256(),
         "inputs": [{
             "receipt_id": str(receipt_id),
             "pipeline": "ocr",

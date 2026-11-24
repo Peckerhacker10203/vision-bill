@@ -151,7 +151,9 @@
 								href={resolve(`/receipts/${receipt.id}`)}
 								class="flex flex-wrap items-center justify-between gap-2 py-3 text-sm text-primary hover:underline"
 								><span class="break-words font-medium"
-									>{receipt.merchant_name || $t('receipts.unknownVendor')} · {receipt.date}</span
+									>{receipt.merchant_display_name ||
+										receipt.merchant_name ||
+										$t('receipts.unknownVendor')} · {receipt.date}</span
 								><span class="font-semibold tabular-nums"
 									>{formatMoney(receipt.total, receipt.currency)}</span
 								></a

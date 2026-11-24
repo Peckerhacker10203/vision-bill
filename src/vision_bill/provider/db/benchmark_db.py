@@ -359,7 +359,7 @@ class BenchmarkDB:
                             'photo_index': original.photo_index,
                             'path': part.image_path,
                             'sha256': actual_hash})
-        expected = receipt_from_draft(document).model_dump(mode='json')
+        expected = receipt_from_draft(document).model_dump(mode='json', exclude={'merchant_display_name'})
         material = material_document(document)
         material['line_items'] = [{k: item[k] for k in ('description','quantity','unit_price','total_price')}
                                   for item in expected['line_items']]

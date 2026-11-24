@@ -36,8 +36,9 @@ from ...model.extraction import (
     PipelineProvenance,
     ReceiptInput,
 )
-from ...model.item_category import CATEGORY_CODE_SET, CATEGORY_CODES, CATEGORY_DEFINITIONS
+from ...model.item_category import CATEGORY_CODE_SET, CATEGORY_DEFINITIONS
 from ...model.ocr import SourceRef, WorkingImage
+from ...model.product_tags import canonical_product_tag, product_tag_catalog
 from ...model.receipt import Category, LineItem, Receipt
 from ...model.receipt_extraction import DuplicateCandidate, MultiImageReceipt, validate_overlap
 from ...model.review import AmountPolicy, ReviewFinding
@@ -47,10 +48,53 @@ from ...service.observation_admission import admit_observations
 from ...service.receipt_review import observation_values
 from .errors import UnreadableReceiptError
 from .experiment import extraction_prompt, source_extraction_prompt
+from .merchant_choice import candidates_for, merchant_instructions, validated_display_name
 
 TEXT_CAPABILITIES = {"completion", "text", "chat", "vision", "multimodal"}
 
 T = TypeVar("T")
+
+
+def _label_instructions(tags: Sequence[str]) -> str:
+    vocabulary = (
+        "Prefer tags from this list: " + ", ".join(tags) + ". "
+        if tags else "There are no registered tags. For free-form tags, apply the suggestion rule below. "
+    )
+    return (
+        "Choose exactly one top-level category for the whole receipt from "
+        + json.dumps(get_args(Category))
+        + ". Use merchant and basket evidence together. A HIT supermarket receipt is grocery. "
+        "For each line_items[].spending_category choose one item code from "
+        + json.dumps(CATEGORY_DEFINITIONS)
+        + ". Use unknown for insufficient evidence. Classify the product independently of the shop. "
+        "For each line_items[].tags return a JSON array of all distinct applicable registered codes. "
+        "Use multiple tags when supported, for example a product family and specific product. "
+        + vocabulary
+        + "Display labels (German/English) explain registered codes: "
+        + json.dumps(product_tag_catalog(tags), ensure_ascii=False)
+        + ". Return codes exactly as registered. If none fits, you may suggest a single new "
+        "short English code in lowercase snake_case, at most three words. Return [] when uncertain. "
+        "Examples, using tag codes only if available: Remoulade is sauces_spices, tagged sauces; "
+        "Bio Karotten is vegetables, tagged vegetables, carrots and organic. "
+        "These examples are not observations. Never translate or rewrite merchant names or item descriptions."
+    )
+
+
+def _model_tags(values: list[str], registered: Mapping[str, str]) -> list[str]:
+    """Resolve registered names before bilingual aliases and retain one fallback suggestion."""
+    selected: dict[str, None] = {}
+    suggestion = None
+    for raw in LineItem._normalize_tags(values):
+        exact = registered.get(raw.casefold())
+        canonical = canonical_product_tag(raw)
+        match = exact or (registered.get(canonical.casefold()) if canonical else None)
+        if match:
+            selected[match] = None
+        elif suggestion is None:
+            candidate = canonical or raw
+            if re.fullmatch(r"[a-z][a-z0-9]*(?:_[a-z0-9]+){0,2}", candidate):
+                suggestion = candidate
+    return list(selected) or ([suggestion] if suggestion else [])
 
 
 def inference_endpoint_identity(provider: str, endpoint: str) -> str:
@@ -302,7 +346,8 @@ class LLMProvider(ABC):
             )
 
     async def _legacy_analysis(
-        self, model_id: str, messages: list[dict[str, Any]], *, image_count: int = 1
+        self, model_id: str, messages: list[dict[str, Any]], *, image_count: int = 1,
+        tags: Sequence[str] | None = None,
     ) -> AnalysisResult:
         """Explicit compatibility/replay path for historical Receipt-only responses."""
         deadline = monotonic() + self.analysis_timeout_seconds
@@ -310,10 +355,11 @@ class LLMProvider(ABC):
             async with asyncio.timeout(self.analysis_timeout_seconds), (
                 self.handoff.session(deadline, model_id=model_id) if self.handoff is not None else nullcontext()
             ):
-                return await self._legacy_analysis_owned(model_id, messages, image_count=image_count)
+                return await self._legacy_analysis_owned(model_id, messages, image_count=image_count, tags=tags)
 
     async def _legacy_analysis_owned(
-        self, model_id: str, messages: list[dict[str, Any]], *, image_count: int = 1
+        self, model_id: str, messages: list[dict[str, Any]], *, image_count: int = 1,
+        tags: Sequence[str] | None = None,
     ) -> AnalysisResult:
         started = perf_counter()
         attempts: list[dict[str, Any]] = []
@@ -323,7 +369,11 @@ class LLMProvider(ABC):
                 r"provide.*image", content, re.IGNORECASE | re.DOTALL
             ):
                 raise ValueError("Please ensure the model supports vision capabilities")
-            return self.parse_llm_response(content, image_count=image_count)
+            receipt = self.parse_llm_response(content, image_count=image_count)
+            registered = {tag.casefold(): tag for tag in tags or ()}
+            for row in receipt.line_items:
+                row.tags = _model_tags(row.tags, registered)
+            return receipt
 
         try:
             receipt = await self._repair_response(
@@ -388,7 +438,7 @@ class LLMProvider(ABC):
             result = await probe._repair_response(
                 model_id,
                 messages,
-                partial(probe._parse_receipt_input, input=input, prototype=result),
+                partial(probe._parse_receipt_input, input=input, prototype=result, vocabulary=tags),
                 deadline=deadline,
                 attempts=attempts,
             )
@@ -533,7 +583,8 @@ class LLMProvider(ABC):
         return authorized
 
     def _parse_receipt_input(
-        self, content: str, *, input: ReceiptInput, prototype: InferenceEnvelope
+        self, content: str, *, input: ReceiptInput, prototype: InferenceEnvelope,
+        vocabulary: Sequence[str] = (),
     ) -> InferenceEnvelope:
         """Pure worker result; no caller envelope or attempt list is mutated."""
         result = prototype.model_copy(deep=True)
@@ -547,6 +598,7 @@ class LLMProvider(ABC):
         values = payload.get("draft", payload)
         if not isinstance(values, dict):
             raise ValueError("invalid_draft")  # noqa: TRY004 - malformed model output
+        values.pop("merchant_display_name", None)
         corrections: dict[str, str] = {}
         try:
             draft = ExtractionDraft.model_validate(values)
@@ -577,7 +629,10 @@ class LLMProvider(ABC):
                 corrections[f"taxes.{index}.rate"] = _TAX_RATE_HINT
         if draft.merchant_name is not None and not draft.merchant_name.strip():
             corrections["merchant_name"] = "Use the printed merchant name, or null."
+        registered = {tag.casefold(): tag for tag in vocabulary}
         for index, item in enumerate(draft.line_items or []):
+            if item.tags:
+                item.tags = _model_tags(item.tags, registered) or None
             if item.description is not None and not item.description.strip():
                 corrections[f"line_items.{index}.description"] = (
                     "Use the printed row description, or null."
@@ -587,6 +642,8 @@ class LLMProvider(ABC):
         if not isinstance(supplied_sources, dict):
             raise ValueError("invalid_field_sources")  # noqa: TRY004 - malformed model output
         for key, refs in supplied_sources.items():
+            if key == "merchant_display_name":
+                continue
             if not isinstance(refs, list):
                 raise ValueError("invalid_field_sources")  # noqa: TRY004 - malformed model output
             validated = [SourceRef.model_validate(ref) for ref in refs]
@@ -751,6 +808,8 @@ class LLMProvider(ABC):
             raise _PartialDraftError(result) from exc
 
         missing = ["category"] if draft.category is None else []
+        if len(candidates_for(receipt)) > 1:
+            missing.append("merchant_display_name")
         remaining_rows = (
             row for index, row in enumerate(draft.line_items or []) if index not in removed
         )
@@ -776,18 +835,18 @@ class LLMProvider(ABC):
             "Classify these ordered receipt rows. Fill only the requested label paths. "
             "Return JSON with category only when requested. If any row labels are requested, "
             "include line_items in the same count and order, using {} for fully labeled rows. "
-            "Allowed tags: "
-            + json.dumps(list(tags))
-            + "; categories: "
-            + json.dumps(CATEGORY_DEFINITIONS)
+            + _label_instructions(tags)
+            + merchant_instructions(receipt)
             + "; requested label paths: "
             + json.dumps(result.classification_enrichment.missing_fields)
             + "; receipt: "
-            + receipt.model_dump_json()
+            + receipt.model_dump_json(exclude={"merchant_display_name"})
         )
 
     @staticmethod
-    def _parse_classification(content: str, result: InferenceEnvelope) -> InferenceEnvelope:
+    def _parse_classification(
+        content: str, result: InferenceEnvelope, vocabulary: Sequence[str] = ()
+    ) -> InferenceEnvelope:
         result = result.model_copy(deep=True)
         assert result.receipt is not None
         missing = set(result.classification_enrichment.missing_fields)
@@ -803,13 +862,18 @@ class LLMProvider(ABC):
         if not isinstance(payload, dict):
             return result
         rows = payload.get("line_items", [])
-        if ("line_items" in payload or missing - {"category"}) and (
+        if ("line_items" in payload or missing - {"category", "merchant_display_name"}) and (
             not isinstance(rows, list)
             or len(rows) != len(result.receipt.line_items)
             or any(not isinstance(row, dict) for row in rows)
         ):
             return result
 
+        # An abstention is a valid merchant decision. The original printed name
+        # remains usable when no candidate can be independently corroborated.
+        result.receipt.merchant_display_name = validated_display_name(result.receipt, payload)
+        missing.discard("merchant_display_name")
+        registered = {tag.casefold(): tag for tag in vocabulary}
         updated = result.receipt.model_dump()
         if "category" in missing and payload.get("category") in get_args(Category):
             updated["category"] = payload["category"]
@@ -831,7 +895,7 @@ class LLMProvider(ABC):
                 continue
             tags = additions.get("tags")
             if isinstance(tags, list) and all(isinstance(tag, str) for tag in tags):
-                normalized = LineItem._normalize_tags(tags)
+                normalized = _model_tags(tags, registered)
                 if normalized or not tags:
                     row["tags"] = normalized
                     missing.remove(tags_path)
@@ -886,7 +950,7 @@ class LLMProvider(ABC):
                         raw_response=content[:200000],
                         response_truncated=len(content) > 200000,
                     )
-                    parsed = await asyncio.to_thread(probe._parse_classification, content, result)
+                    parsed = await asyncio.to_thread(probe._parse_classification, content, result, tuple(tags))
         except TimeoutError:
             if not timeout.expired():
                 raise
@@ -941,23 +1005,13 @@ class LLMProvider(ABC):
     ) -> str:
         """Build a prompt for the LLM to analyze an image.
 
-        When ``tags`` is provided, the prompt gives the model the full tag
-        vocabulary and lets it suggest one new tag when nothing fits; otherwise
-        the model may invent short free-form tags.
+        Use the registered vocabulary and allow one new suggestion per row
+        when none of the registered tags fits.
         """
         if self.experiment_options and not self.experiment_options.include_classification:
             return extraction_prompt(image_count, ocr=ocr)
-        if tags:
-            tag_instruction = (
-                "Add short tags to each line_item when useful. Prefer tags from this list: "
-                f"{', '.join(tags)}. If no tag in the list fits, you may suggest a single new "
-                "short tag (lowercase snake_case, at most three words); suggested tags are "
-                "reviewed by a human before they become standard tags."
-            )
-        else:
-            tag_instruction = "Add short free-form tags to each line_item when useful."
-        categories = "; ".join(f"{code}: {CATEGORY_DEFINITIONS[code]}" for code in CATEGORY_CODES)
-        schema = MultiImageReceipt if image_count > 1 else Receipt
+        schema = (MultiImageReceipt if image_count > 1 else Receipt).model_json_schema()
+        schema["properties"].pop("merchant_display_name", None)
         overlap_instruction = (
             "Extract EVERY purchased row separately from EACH photo, including overlap rows. "
             "Do NOT remove duplicates yourself. Set source_image to its zero-based photo index. "
@@ -991,17 +1045,13 @@ class LLMProvider(ABC):
     header or footer, the address line, a website, or any other written hint).
     Do not guess or infer the company name from a logo, photo, or design; if no printed name exists,
     use the best available written hint.
-    {tag_instruction}
-    Set exactly one spending_category on each line_item using only these codes:
-    {categories}.
-    Use unknown when the text does not support a category; use deposit for Pfand lines.
-    Set the top-level category to the single best category for the whole purchase.
+    {_label_instructions(tags or ())}
     Use positive unit_price and total_price for deposit/Pfand charges; use negative prices
     for refunds, credits, or deposits returned to the customer.
     Tag every deposit charge or return with `deposit`, and set spending_category to deposit.
     Do not add any additional text or commentary. Only provide the JSON response matching this schema:
 
-    {schema.model_json_schema()}
+    {schema}
     """
 
     def parse_llm_response(self, response: str, *, image_count: int = 1) -> Receipt:
@@ -1011,6 +1061,8 @@ class LLMProvider(ABC):
             payload = json.loads(raw_text, parse_float=Decimal)
         except json.JSONDecodeError:
             payload = None
+        if isinstance(payload, dict):
+            payload.pop("merchant_display_name", None)
         if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
             error = payload["error"]
             if error.get("code") == "unreadable" and isinstance(error.get("message"), str):

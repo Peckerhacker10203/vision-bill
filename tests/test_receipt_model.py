@@ -68,16 +68,13 @@ def test_history_key_preserves_product_numbers_and_punctuation() -> None:
     assert normalize_history_key("H-MILCH 3,5%") != normalize_history_key("H-MILCH 1,5%")
 
 
-def test_line_item_has_no_category_field() -> None:
-    """Only the receipt carries a category; line items use tags instead."""
-    assert "category" not in LineItem.model_fields
-
-
-def test_receipt_schema_keeps_only_receipt_level_category() -> None:
-    """The LLM JSON schema exposes category on the receipt, not on line items."""
+def test_receipt_and_line_item_have_distinct_category_fields() -> None:
     schema = Receipt.model_json_schema()
-    assert "category" not in schema["$defs"]["LineItem"]["properties"]
+    row_fields = schema["$defs"]["LineItem"]["properties"]
+    assert {"tags", "spending_category"} <= row_fields.keys()
+    assert "category" not in row_fields
     assert "category" in schema["properties"]
+    assert "spending_category" not in schema["properties"]
 
 
 # ── Negative prices (Pfand / bottle-deposit refunds) ──────────────────

@@ -327,7 +327,9 @@
 				<Icon icon="close" />
 			</a>
 			<h1 class="flex-1 truncate text-xl font-semibold">
-				{data.receipt.merchant_name || $t('receipts.unknownVendor')}
+				{data.receipt.merchant_display_name ||
+					data.receipt.merchant_name ||
+					$t('receipts.unknownVendor')}
 			</h1>
 			{#if canVerify || canReviewAsHuman}
 				<button
@@ -406,7 +408,9 @@
 				{#if data.receipt.image_id !== null}
 					<ReceiptPhotos
 						imageId={data.receipt.image_id}
-						alt={data.receipt.merchant_name || $t('receipts.unknownVendor')}
+						alt={data.receipt.merchant_display_name ||
+							data.receipt.merchant_name ||
+							$t('receipts.unknownVendor')}
 						views={sourceJob.data?.source_views ?? []}
 						sources={selectedSources}
 					/>

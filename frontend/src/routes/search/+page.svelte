@@ -130,7 +130,9 @@
 								>{purchase.description}</a
 							>
 							<p class="mt-1 break-words text-sm text-on-surface-variant">
-								{purchase.merchant_name || $t('receipts.unknownVendor')}
+								{purchase.merchant_display_name ||
+									purchase.merchant_name ||
+									$t('receipts.unknownVendor')}
 							</p>
 							<p class="mt-1 text-sm text-on-surface-variant">{purchase.date}</p>
 						</div>

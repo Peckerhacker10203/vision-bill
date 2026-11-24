@@ -1,7 +1,7 @@
 # Collect only public guide inputs on an empty filesystem. Builders using
 # Docker's vfs storage driver copy the base filesystem for every COPY layer.
 FROM scratch AS guide-inputs
-COPY README.md AGENTS.md MULTI_IMAGE_RECEIPTS.md OPENAI_COMPATIBLE.md RELEASES.md UPGRADE_AND_VERIFY.md ./
+COPY README.md AGENTS.md HAENDLERVERZEICHNIS.md MULTI_IMAGE_RECEIPTS.md OPENAI_COMPATIBLE.md RELEASES.md UPGRADE_AND_VERIFY.md ./
 COPY .github/workflows/distribution-inputs.yml .github/workflows/distribution-release.yml .github/workflows/
 COPY distribution/README.md distribution/artifacts.schema.json distribution/
 COPY frontend/README.md frontend/
@@ -30,6 +30,7 @@ RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
 
 # Full frontend source, then produce the static SPA in /build/frontend/out.
 COPY frontend/ ./
+COPY src/vision_bill/model/product_tags.json /build/src/vision_bill/model/product_tags.json
 COPY paddleocr-service/README.md /build/paddleocr-service/README.md
 COPY distribution/README.md /build/distribution/README.md
 COPY --from=operator-guides /guides.zip ./static/vision-bill-operator-guides.zip

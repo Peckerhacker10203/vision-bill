@@ -1,3 +1,5 @@
+import { api } from '$lib/api/client';
+import { setLocale } from '$lib/i18n';
 import { session } from '$lib/session-lifetime';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -622,4 +624,89 @@ it('shows a legacy printed subtotal and raw rate until explicitly corrected', as
 		amount_policy: { tax_basis: 'gross', subtotal_origin: 'printed_net' },
 		taxes: [{ name: 'VAT', amount: '0', rate: '0.190' }]
 	});
+});
+
+it('selects a suggested display name independently of the printed name and switches locale with populated categories and tags', async () => {
+	const lookup = vi
+		.spyOn(api, 'listMerchants')
+		.mockResolvedValue({ merchants: ['REWE'], suggestion: 'REWE' });
+	const onSave = vi.fn();
+	const item = { ...line('milk', 'llm'), tags: ['apples', 'Hausmarke'] };
+	render(ReceiptEditor, {
+		receipt: { ...receipt, merchant_name: 'REWE CITY 123' },
+		lineItems: [item],
+		taxes: [],
+		onSave
+	});
+	try {
+		await fireEvent.click(await screen.findByRole('button', { name: 'Use “REWE”' }));
+		expect(lookup).toHaveBeenCalledWith(
+			expect.objectContaining({ merchant_name: 'REWE CITY 123', receipt_id: receipt.id }),
+			expect.objectContaining({ userId: 'viewer' })
+		);
+		setLocale('de');
+		const display = await screen.findByLabelText('Anzeigename des Händlers');
+		expect((display as HTMLInputElement).value).toBe('REWE');
+		expect((screen.getByLabelText('Händler') as HTMLInputElement).value).toBe('REWE CITY 123');
+		expect(screen.getByRole('option', { name: 'Milch', selected: true })).toBeTruthy();
+		expect(screen.getByRole('option', { name: 'Bar', selected: true })).toBeTruthy();
+		expect(screen.getByText('Äpfel').closest('details')?.open).toBe(true);
+		expect(screen.getByText('Hausmarke')).toBeTruthy();
+		await fireEvent.input(display, { target: { value: 'REWE Nord' } });
+		await fireEvent.click(screen.getByRole('button', { name: 'Speichern' }));
+		expect(onSave.mock.calls[0][0]).toMatchObject({
+			merchant_name: 'REWE CITY 123',
+			merchant_display_name: 'REWE Nord'
+		});
+	} finally {
+		setLocale('en');
+		lookup.mockRestore();
+	}
+});
+
+it('discards a merchant suggestion that arrives after the rendered account changes', async () => {
+	const pending = deferred<{ suggestion: string | null; merchants: string[] }>();
+	const lookup = vi.spyOn(api, 'listMerchants').mockReturnValue(pending.promise);
+	try {
+		render(ReceiptEditor, { receipt, lineItems: [], taxes: [] });
+		await waitFor(() => expect(lookup).toHaveBeenCalled());
+		session.set({ id: 'another-user', username: 'bob', is_admin: false, can_see_all: false });
+		pending.resolve({ suggestion: 'Private Shop', merchants: ['Private Shop'] });
+		await pending.promise;
+		expect(screen.queryByRole('button', { name: 'Use “Private Shop”' })).toBeNull();
+		expect(document.querySelector('datalist option[value="Private Shop"]')).toBeNull();
+	} finally {
+		lookup.mockRestore();
+	}
+});
+
+it('looks up category history for this receipt and branch and forgets a stale display name after address changes', async () => {
+	const onSave = vi.fn();
+	const pending = deferred<{ category: string; source: 'history' }>();
+	const lookup = vi.spyOn(api, 'getCategorySuggestion').mockReturnValue(pending.promise);
+	try {
+		render(ReceiptEditor, {
+			receipt: { ...receipt, merchant_display_name: 'Kiosk Nord', merchant_address: 'Berlin' },
+			lineItems: [line()],
+			taxes: [],
+			onSave
+		});
+		await fireEvent.blur(screen.getByLabelText('Description'));
+		expect(lookup).toHaveBeenCalledWith({
+			receipt_id: receipt.id,
+			merchant_name: 'Shop A',
+			merchant_display_name: 'Kiosk Nord',
+			merchant_address: 'Berlin',
+			description: 'MUESLI'
+		});
+		await fireEvent.input(screen.getByLabelText('Address'), { target: { value: 'Bonn' } });
+		expect((screen.getByLabelText('Merchant display name') as HTMLInputElement).value).toBe('');
+		pending.resolve({ category: 'milk', source: 'history' });
+		await pending.promise;
+		await fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+		expect(onSave.mock.calls[0][0]).not.toHaveProperty('merchant_display_name');
+		expect(onSave.mock.calls[0][0].line_items[0].spending_category).toBe('unknown');
+	} finally {
+		lookup.mockRestore();
+	}
 });

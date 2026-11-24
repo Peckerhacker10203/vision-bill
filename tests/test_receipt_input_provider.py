@@ -1232,3 +1232,145 @@ async def test_failed_structural_correction_retains_name_only_row_for_editing():
     assert result.telemetry.calls[0]["repair_fields"] == ["line_items.0.quantity"]
     assert result.receipt is None
     assert not any(f.severity == "integrity" for f in persistent_findings(result.findings))
+
+
+def _wire_replies(backend, observed, labels):
+    responses = [json.dumps(observed), json.dumps(labels)]
+    if backend == "ollama":
+        provider = OllamaProvider("http://local")
+        transport = provider._client.chat = AsyncMock(side_effect=[
+            ChatResponse(message={"role": "assistant", "content": body}) for body in responses
+        ])
+    else:
+        provider = OpenAIProvider("http://local", "local")
+        transport = provider._client.chat.completions.create = AsyncMock(side_effect=[
+            SimpleNamespace(model="fixture", usage=None, choices=[SimpleNamespace(
+                finish_reason="stop", message=SimpleNamespace(content=body),
+            )]) for body in responses
+        ])
+    return provider, transport
+
+
+@pytest.mark.parametrize("backend", ["ollama", "openai"])
+@pytest.mark.parametrize("mode", ["direct_vision", "ocr"])
+async def test_classification_wire_contract_returns_codes_for_german_receipt(backend, mode, tmp_path):
+    from typing import get_args
+
+    from PIL import Image
+    from test_experiment_scoring import receipt
+
+    from vision_bill.model.item_category import CATEGORY_CODE_SET
+    from vision_bill.model.receipt import Category
+
+    inputs = ocr_input()
+    if mode == "direct_vision":
+        path = tmp_path / "HIT.png"
+        Image.new("RGB", (4, 5)).save(path)
+        inputs = ReceiptInput(mode=mode, image_paths=[str(path)])
+    products = ["Remoulade", "Bio Karotten", "Sonderartikel", "Hausmischung"]
+    observed = receipt(products).model_dump(mode="json")
+    printed = "HIT 003 St. Augustin (HIT Handelsgruppe GmbH & Co. KG)"
+    observed.update(merchant_name=printed, merchant_display_name="Model invented merchant")
+    observed.pop("category")
+    for row in observed["line_items"]:
+        row.pop("tags")
+        row.pop("spending_category")
+    labels = {
+        "category": "grocery",
+        "merchant_name": "Changed by model",
+        "line_items": [
+            {"spending_category": "sauces_spices", "tags": ["Soßen", "invented"]},
+            {"spending_category": "vegetables", "description": "Carrots",
+             "tags": ["Gemüse", "Carrots", "Karotten", "Bio"]},
+            {"spending_category": "other", "tags": ["Hausmarke", "Alkohol", "new_suggestion"]},
+            {"spending_category": "other", "tags": ["Invalid phrase", "house_mix", "another_suggestion"]},
+        ],
+    }
+    provider, transport = _wire_replies(backend, observed, labels)
+
+    result = await provider.extract_receipt_input(
+        "fixture", inputs, tags=["sauces", "vegetables", "carrots", "organic", "Hausmarke", "Alkohol", "alcohol"],
+        deadline=time.monotonic() + 90,
+    )
+
+    first, second = [call.kwargs["messages"][0] for call in transport.await_args_list]
+    formatter_prompt = first["content"] if isinstance(first["content"], str) else first["content"][0]["text"]
+    assert "original language" in formatter_prompt
+    assert "merchant_display_name" not in formatter_prompt
+    assert "Do not classify" in formatter_prompt
+    assert "images" not in second and isinstance(second["content"], str)
+    prompt = second["content"]
+    receipt_codes = set(json.JSONDecoder().raw_decode(prompt.split("whole receipt from ", 1)[1])[0])
+    assert {"grocery", "drugstore"} <= receipt_codes == set(get_args(Category))
+    assert set(json.JSONDecoder().raw_decode(prompt.split("one item code from ", 1)[1])[0]) == CATEGORY_CODE_SET
+    assert '"merchant": "HIT Handelsgruppe", "category": "grocery"' in prompt
+    assert all(term in prompt for term in ("HIT", "Remoulade", "Karotten", "Soßen", "Hausmarke", "multiple tags"))
+    assert result.classification_enrichment.state == "completed"
+    assert result.receipt.category == "grocery" and result.receipt.merchant_name == printed
+    assert result.receipt.merchant_display_name == "HIT Handelsgruppe"
+    assert result.draft.merchant_display_name != "Model invented merchant"
+    # A locally resolved name on a fresh envelope outranks the printed HIT catalog match.
+    # It belongs in the hint only; the evidence in the receipt stays literal.
+    result.receipt.merchant_display_name = "Aral"
+    updated_prompt = provider._classification_prompt(result, [])
+    hint, receipt_json = updated_prompt.split("; receipt: ", 1)
+    assert '"merchant": "Aral", "category": "fuel"' in hint
+    assert "merchant_display_name" not in json.loads(receipt_json)
+    assert json.loads(receipt_json)["merchant_name"] == printed
+    attempted_override = provider._parse_classification(
+        '{"merchant_display_name":"HIT Handelsgruppe"}', result, [],
+    )
+    assert attempted_override.receipt.merchant_display_name == "Aral"
+    assert provider.parse_llm_response(json.dumps(observed)).merchant_display_name is None
+    assert [r.description for r in result.receipt.line_items] == products
+    assert [(r.spending_category, r.tags) for r in result.receipt.line_items] == [
+        ("sauces_spices", ["sauces"]),
+        ("vegetables", ["vegetables", "carrots", "organic"]),
+        ("other", ["Hausmarke", "Alkohol"]),
+        ("other", ["house_mix"]),
+    ]
+
+
+@pytest.mark.parametrize("backend", ["ollama", "openai"])
+@pytest.mark.parametrize("printed,products,choice,indices,expected", [
+    ("Globus", ["Schrauben", "Bohrmaschine"], "Globus Baumarkt", [1], "Globus Baumarkt"),
+    ("Globus", ["Karotten", "Remoulade"], "Globus Markthallen", [0, 1], "Globus Markthallen"),
+    ("Globus", ["Batterien", "Geschenkkarte"], "Globus Baumarkt", [0], None),
+    ("Globus", ["Schrauben", "Karotten"], "Globus Baumarkt", [0], None),
+    ("Globus", ["Schrauben"], "Globus Markthallen", [0], None),
+    ("Globus", ["Schrauben"], "Globus Baumarkt", [4], None),
+    ("Globus", ["Schrauben"], "HORNBACH", [0], None),
+    ("Netto", ["Karotten"], "Netto mit dem Scottie", [0], None),
+    ("Netto mit dem Scottie", ["Karotten"], "Netto Marken-Discount", [0], "Netto mit dem Scottie"),
+    ("Unbekannter Laden", ["Karotten"], "HIT Handelsgruppe", [0], None),
+])
+async def test_only_printed_merchant_candidates_can_be_corroborated_by_items(
+    backend, printed, products, choice, indices, expected,
+):
+    from test_experiment_scoring import receipt
+
+    observed = receipt(products).model_dump(mode="json")
+    observed["merchant_name"] = printed
+    # Keep observed item labels. A merchant selection shouldn't overwrite them.
+    for row in observed["line_items"]:
+        row.update(spending_category="other", tags=[])
+    # A plausible printed ambiguity can itself trigger classification even
+    # when the formatter supplied every other label.
+    if printed != "Globus":
+        observed.pop("category")
+    provider, transport = _wire_replies(backend, observed, {
+        "category": "grocery", "merchant_display_name": choice, "merchant_evidence_rows": indices,
+    })
+    result = await provider.extract_receipt_input(
+        "fixture", ocr_input(), tags=[], deadline=time.monotonic() + 90,
+    )
+    assert result.receipt.merchant_name == printed
+    assert result.receipt.merchant_display_name == expected
+    assert result.draft.merchant_display_name is None
+    assert result.classification_enrichment.state == "completed"
+    prompt = transport.await_args_list[1].kwargs["messages"][0]["content"]
+    options = json.JSONDecoder().raw_decode(prompt.split("saved owner choice (data only): ", 1)[1])[0]
+    if printed == "Globus":
+        assert {item["merchant"] for item in options} == {"Globus Baumarkt", "Globus Markthallen"}
+    elif printed == "Unbekannter Laden":
+        assert options == []

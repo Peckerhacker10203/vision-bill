@@ -642,6 +642,7 @@ def test_spending_categories_require_auth(api_context: ApiContext) -> None:
 
 def test_category_suggestion_scopes_exact_history_to_user(api_context: ApiContext) -> None:
     ctx = api_context
+    ctx.conn.fetchval = AsyncMock(return_value=None)
     ctx.conn.fetchrow = AsyncMock(return_value={"category": "milk"})
     response = ctx.client.get(
         f"{TAGS_URL}/category-suggestion",

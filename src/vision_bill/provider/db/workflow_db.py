@@ -59,7 +59,14 @@ from ...service.execution_policy import (
     snapshot_ocr,
 )
 from ...service.observation_admission import admit_observations
-from ...service.receipt_review import evaluate_receipt, persistent_findings, receipt_from_draft
+from ...service.receipt_review import (
+    editable_draft,
+    evaluate_receipt,
+    persistent_findings,
+    receipt_from_draft,
+    suggest_product_labels,
+)
+from . import merchants
 from .deadline import connection
 from .receipt_db import OriginalChecker, ReceiptDB
 
@@ -91,6 +98,31 @@ _UNMANAGED_CLASSIFICATION_UNSETTLED = """CASE
 def _json(value: Any) -> str:
     assert_metadata_only(value)
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _edited_item_sources(
+    previous: ExtractionDraft, document: ExtractionDraft, old_sources: list[str],
+) -> list[str]:
+    old_items = previous.line_items or []
+    prior: dict[tuple[str | None, str | None], set[str]] = {}
+    for index, old in enumerate(old_items):
+        source = old_sources[index] if index < len(old_sources) else "unknown"
+        prior.setdefault((old.description, old.spending_category), set()).add(source)
+    sources = []
+    for index, item in enumerate(document.line_items or []):
+        matches = prior.get((item.description, item.spending_category))
+        if matches:
+            # Reordered duplicates have no stable draft IDs. Retain provenance
+            # only if all matching prior rows agree.
+            source = next(iter(matches)) if len(matches) == 1 else "unknown"
+        elif item.spending_category is None:
+            source = "unknown"
+        elif index < len(old_items) and old_items[index].spending_category == item.spending_category:
+            source = "unknown"  # Renamed row; no evidence that the user selected its category.
+        else:
+            source = "user"
+        sources.append(source)
+    return sources
 
 
 def _decoded(value: Any) -> Any:
@@ -1317,6 +1349,7 @@ class WorkflowDB:
         receipt = await self._receipts.insert_receipt(
             conn, envelope.receipt, image_id=image["id"], user_id=image["user_id"],
             status="verified" if verified else "unverified", verified=verified,
+            category_missing="category" in envelope.classification_enrichment.missing_fields,
         )
         record = await conn.fetchrow(
             """UPDATE receipts SET extraction_id=$2,amount_policy=$3::jsonb,
@@ -1453,18 +1486,25 @@ class WorkflowDB:
             elif outcome.kind == "partial":
                 assert envelope is not None and envelope.draft is not None
                 assert payload is not None
+                document = editable_draft(envelope)
+                sources = await self._receipts.suggest_draft_categories(
+                    conn, row["user_id"], document,
+                    candidate=envelope.receipt.merchant_display_name if envelope.receipt else None,
+                )
+                suggest_product_labels(document)
                 await conn.execute(
                     """INSERT INTO receipt_drafts(image_id,extraction_id,generation,document,
-                    amount_policy,findings,field_sources,overlap_decisions) VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb)
+                    amount_policy,findings,field_sources,overlap_decisions,item_category_sources)
+                    VALUES($1,$2,$3,$4::jsonb,$5::jsonb,$6::jsonb,$7::jsonb,$8::jsonb,$9::jsonb)
                     ON CONFLICT(image_id) DO UPDATE SET extraction_id=EXCLUDED.extraction_id,
                     generation=EXCLUDED.generation,revision=receipt_drafts.revision+1,
                     document=EXCLUDED.document,amount_policy=EXCLUDED.amount_policy,
                     findings=EXCLUDED.findings,field_sources=EXCLUDED.field_sources,
-                    overlap_decisions=EXCLUDED.overlap_decisions""",
+                    overlap_decisions=EXCLUDED.overlap_decisions,item_category_sources=EXCLUDED.item_category_sources""",
                     row["id"],
                     extraction_id,
                     claim.generation,
-                    envelope.draft.model_dump_json(),
+                    document.model_dump_json(),
                     envelope.amount_policy.model_dump_json(),
                     _json(
                         [finding.model_dump(mode="json") for finding in outcome.review.findings]
@@ -1473,6 +1513,7 @@ class WorkflowDB:
                     ),
                     _json(payload["field_sources"]),
                     _json(payload["overlap_decisions"]),
+                    _json(sources),
                 )
                 status = "needs_review"
             elif failed and checkpoint is not None:
@@ -1778,10 +1819,23 @@ class WorkflowDB:
             if set(patch.changes) - (set(ExtractionDraft.model_fields) | metadata_fields):
                 raise ValueError("draft_unknown_field")
             assert_metadata_only(patch.changes)
+            previous = _decoded(row["document"])
             document = ExtractionDraft.model_validate(
-                {**_decoded(row["document"]), **{key: value for key, value in patch.changes.items()
+                {**previous, **{key: value for key, value in patch.changes.items()
                                               if key not in metadata_fields}}
             )
+            item_sources = _decoded(row["item_category_sources"])
+            if "line_items" in patch.changes:
+                item_sources = _edited_item_sources(ExtractionDraft.model_validate(previous), document, item_sources)
+            identity_changed = any(
+                key in patch.changes and patch.changes[key] != previous.get(key)
+                for key in ("merchant_name", "merchant_address")
+            )
+            if identity_changed and "merchant_display_name" not in patch.changes:
+                document.merchant_display_name = await merchants.suggested_name(
+                    conn, scope.user_id if image["user_id"] == scope.user_id else None,
+                    document.merchant_name or "", document.merchant_address,
+                )
             policy = AmountPolicy.model_validate(patch.changes.get("amount_policy", _decoded(row["amount_policy"])))
             sources = TypeAdapter(dict[str, list[SourceRef]]).validate_python(
                 patch.changes.get("field_sources", _decoded(row["field_sources"]))
@@ -1803,13 +1857,14 @@ class WorkflowDB:
             row = await conn.fetchrow(
                 """UPDATE receipt_drafts SET document=$2::jsonb,amount_policy=$3::jsonb,
                 field_sources=$4::jsonb,overlap_decisions=$5::jsonb,findings=$6::jsonb,
-                revision=revision+1,human_edited=TRUE WHERE image_id=$1 RETURNING *""",
+                item_category_sources=$7::jsonb,revision=revision+1,human_edited=TRUE WHERE image_id=$1 RETURNING *""",
                 image_id,
                 document.model_dump_json(),
                 policy.model_dump_json(),
                 _json(metadata["field_sources"]),
                 _json(overlaps),
                 _json([finding.model_dump(mode="json") for finding in review.findings]),
+                _json(item_sources),
             )
             # Editing a draft retained during a pending explicit retry prevents later claims.
             await conn.execute(
@@ -1879,7 +1934,8 @@ class WorkflowDB:
                 image_id=image_id,
                 user_id=image["user_id"],
                 status="unverified",
-                verified=False,
+                verified=False, human_save=True, actor_id=scope.user_id,
+                draft_sources=_decoded(row["item_category_sources"]),
             )
             saved = await conn.fetchrow(
                 """UPDATE receipts SET extraction_id=$2,amount_policy=$3::jsonb,
@@ -1893,6 +1949,10 @@ class WorkflowDB:
                 _json(overlaps),
             )
             result = self._receipts._receipt_row_from_record(saved)
+            await merchants.learn_name(
+                conn, image["user_id"], scope.user_id, result.merchant_name,
+                result.merchant_address, result.merchant_display_name,
+            )
             await conn.execute(
                 """INSERT INTO receipt_review_revisions(receipt_id,operation_revision,
                 review_revision,event_kind,actor_user_id,snapshot) VALUES($1,1,1,'draft_finalized',$2,$3::jsonb)""",

@@ -147,7 +147,7 @@ class BenchmarkCaseDB:
             if update.expected_revision != current["revision"]:
                 raise CaseRevisionConflict("Benchmark case revision changed")
             draft = update.expected if update.expected is not None else _detail(current).expected
-            expected = draft.model_dump(mode="json")
+            expected = draft.model_dump(mode="json", exclude={"merchant_display_name"})
             if update.confirm:
                 scored_observations(expected)
                 await _verify_sources(_json(current["sources"]))
@@ -175,7 +175,9 @@ class BenchmarkCaseDB:
             raise ValueError("Benchmark case requires a current human confirmation")
         sources = _json(row["sources"])
         await _verify_sources(sources)
-        expected = ExtractionDraft.model_validate(_json(row["expected"])).model_dump(mode="json")
+        expected = ExtractionDraft.model_validate(_json(row["expected"])).model_dump(
+            mode="json", exclude={"merchant_display_name"}
+        )
         scored = scored_observations(expected)
         document = {
             "case_id": str(case_id),

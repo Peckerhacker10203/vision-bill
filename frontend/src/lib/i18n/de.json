@@ -274,6 +274,13 @@
 		"fuel": "Kraftstoff",
 		"pharmacy": "Apotheke",
 		"entertainment": "Unterhaltung",
+		"drugstore": "Drogerie",
+		"home_furnishings": "Möbel & Einrichtung",
+		"hardware_garden": "Baumarkt & Garten",
+		"books_stationery": "Bücher & Schreibwaren",
+		"pet_supplies": "Tierbedarf",
+		"sporting_goods": "Sportartikel",
+		"postal_services": "Post- & Paketdienste",
 		"other": "Sonstiges"
 	},
 	"spendingCategories": {
@@ -645,6 +652,11 @@
 	},
 	"editor": {
 		"spendingCategory": "Ausgabenkategorie",
+		"printedMerchantHint": "Name auf dem Beleg.",
+		"merchantDisplayName": "Anzeigename des Händlers",
+		"merchantDisplayHint": "Vorhandenen Namen auswählen oder einen neuen eingeben.",
+		"useMerchantSuggestion": "„{name}“ übernehmen",
+		"merchantLookupFailed": "Händlervorschläge konnten nicht geladen werden. Sie können einen Namen eingeben.",
 		"optionalTags": "Optionale Schlagwörter",
 		"originalDescription": "Auf dem Beleg",
 		"rememberCategory": "Für diese Position merken",

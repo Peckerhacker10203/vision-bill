@@ -178,6 +178,24 @@ Line-item tag suggestions use the selected interface language. Choosing
 languages relabels built-in tags on existing receipts. Custom names outside
 the built-in catalog retain their spelling.
 
+The text classifier receives the valid receipt categories, item spending
+categories and current tag vocabulary. For built-in tags it sees both German
+and English terms. It can assign several relevant tags to one item. Both
+interface languages use the same codes, so changing the language keeps
+earlier classifications searchable. Printed descriptions and trader names
+remain in their source language.
+
+The editor keeps the merchant's printed name and address alongside an editable
+display name. German chains have a built-in directory covering common trading
+names. An identified municipal kiosk can be grouped under **Kiosk**, while
+a named kiosk or another independent business can keep its own name. Select
+an existing merchant or type a new one. Finishing the draft or explicitly
+saving or verifying your own receipt learns the choice. Automatic analysis,
+benchmark runs and saving an unfinished draft do not teach your directory.
+New uploads can reuse your previous merchant choices. A private directory is
+scoped to its account. Merchant suggestions use the authenticated
+`POST /api/v1/merchants/suggestions` with the lookup text in its JSON body.
+
 Receipt review uses checks version 3. See the
 [amount policy and human acknowledgement contract](UPGRADE_AND_VERIFY.md#review-and-financial-contract).
 **Verify** and **Save & verify** fetch the current server preview. Enter comments

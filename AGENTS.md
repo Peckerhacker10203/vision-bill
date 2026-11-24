@@ -27,7 +27,7 @@ experiment reports do not certify production hardware or accuracy.
 - `src/vision_bill/provider/db/`: raw SQL and transactional ownership/CAS/leases;
   services delegate DB access here. `provider/llm/`: model discovery, extraction,
   repairs/classification; services do not call provider SDKs directly.
-- `alembic/versions/`: migrations 0001–0024. No application DDL/autogenerate.
+- `alembic/versions/`: migrations 0001–0025. No application DDL/autogenerate.
 - `paddleocr-service/ocr_service/`: isolated native pipeline, qualification and
   disposable worker lifecycle. `build/` and locks pin runtime/build candidates.
 - `frontend/`: SvelteKit static SPA, TypeScript, Tailwind, Vitest, Playwright,
@@ -110,6 +110,11 @@ optional downstream enrichment. Missing currency and amounts stay missing.
 Complete observations can survive safely settled label failure with an explicit
 `classification_enrichment` status. Missing optional labels stay outside
 financial and integrity checks.
+Keep the printed merchant and editable display name separate. Only an explicit
+save/finalization/verification by the receipt owner teaches their private
+merchant directory. The shared bilingual product tag dictionary lives in
+`src/vision_bill/model/product_tags.json` and is bundled into both the SPA and
+Python package. Benchmarks use frozen references.
 Only proposed adjacent suffix/prefix overlaps that pass shared duplicate verification
 may be removed. Preserve repeated purchases; no global deduplication or blanket
 splitting. `receipt_review.py` checks version 3 performs exact Decimal diagnostics
@@ -213,7 +218,7 @@ Lifespan creates provider/services, initializes DB, bootstraps admin, starts ana
 and benchmark workers when ready; shutdown stops workers before closing DB.
 SPA fallback is registered after API routes. DB initialization failures are sanitized.
 
-Current migration head `0024`. Stop/drain old app/benchmark/standalone workers
+Current migration head `0025`. Stop/drain old app/benchmark/standalone workers
 **before** schema, queue or policy cutover; never run old/new workers concurrently. Alembic uses settings `PG__*`, including on the image entrypoint;
 `MIGRATION_DATABASE_URL` is only the grant tool input. Bootstrap missing group roles
 as admin/CREATEROLE, execute grants/default ACL as the actual migration owner,

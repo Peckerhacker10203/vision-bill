@@ -274,6 +274,13 @@
 		"fuel": "Fuel",
 		"pharmacy": "Pharmacy",
 		"entertainment": "Entertainment",
+		"drugstore": "Drugstore",
+		"home_furnishings": "Home furnishings",
+		"hardware_garden": "Hardware & garden",
+		"books_stationery": "Books & stationery",
+		"pet_supplies": "Pet supplies",
+		"sporting_goods": "Sporting goods",
+		"postal_services": "Postal & parcel services",
 		"other": "Other"
 	},
 	"spendingCategories": {
@@ -645,6 +652,11 @@
 	},
 	"editor": {
 		"spendingCategory": "Spending category",
+		"printedMerchantHint": "Name printed on the receipt.",
+		"merchantDisplayName": "Merchant display name",
+		"merchantDisplayHint": "Choose an existing name or enter a new one.",
+		"useMerchantSuggestion": "Use “{name}”",
+		"merchantLookupFailed": "Merchant suggestions could not be loaded. You can still enter a name.",
 		"optionalTags": "Optional tags",
 		"originalDescription": "On receipt",
 		"rememberCategory": "Remember for this item",

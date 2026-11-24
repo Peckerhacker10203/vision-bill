@@ -180,7 +180,7 @@
 	}
 
 	function vendor(receipt: ReceiptRow): string {
-		return receipt.merchant_name || $t('receipts.unknownVendor');
+		return receipt.merchant_display_name || receipt.merchant_name || $t('receipts.unknownVendor');
 	}
 </script>
 

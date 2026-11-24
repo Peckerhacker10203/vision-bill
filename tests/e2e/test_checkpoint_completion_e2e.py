@@ -157,7 +157,8 @@ async def state(w, image_id):
 async def test_last_attempt_completes_from_saved_observations(workflow_db, settings, tmp_path, ocr, historical):
     w, scope = workflow_db
     original, checkpoint, service, llm = await produce_checkpoint(
-        w, scope, settings, tmp_path, ocr=ocr, expired=ocr, historical=historical
+        w, scope, settings, tmp_path, ocr=ocr, expired=ocr, historical=historical,
+        contract_versions={"prompt_version": "5"} if historical else None,
     )
     image_id = original.image.id
     producer_before, _, _ = await state(w, image_id)

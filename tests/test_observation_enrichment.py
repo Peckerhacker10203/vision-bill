@@ -26,11 +26,10 @@ from test_submission_service import context
 from vision_bill.config import OcrSettings
 from vision_bill.model.db.image import ImagePart
 from vision_bill.model.experiment import ExperimentOptions
-from vision_bill.model.receipt import Receipt
 from vision_bill.model.workflow import PersistedSourcePart
 from vision_bill.provider.llm.base import ModelInfo
 from vision_bill.provider.llm.experiment import endpoint_fingerprint
-from vision_bill.service.benchmark_scoring import PROMPT_VERSION
+from vision_bill.service.benchmark_scoring import PROMPT_VERSION, validation_schema_sha256
 from vision_bill.service.benchmark_service import BenchmarkService
 from vision_bill.service.experiment_execution import (
     ExperimentFailure,
@@ -79,6 +78,8 @@ async def test_submission_checkpoints_all_views_before_text_labels(
         receipts._ocr_settings = settings.ocr
         receipts._ocr_provider = sidecar()
     receipts.list_tags = AsyncMock(return_value=[])
+    claim.image.user_id = uuid4()
+    receipts.suggested_merchant_name = AsyncMock(return_value="Privater Hofladen")
     service.receipts = receipts
     claim.image.effective_options["inference_identity"] = receipts.inference_identity
     events = []
@@ -91,6 +92,8 @@ async def test_submission_checkpoints_all_views_before_text_labels(
         assert checkpoint.source_parts == [first, second]
         assert checkpoint.model_id == "fixture"
         assert checkpoint.envelope.receipt.total == Decimal("4.00")
+        assert checkpoint.envelope.receipt.merchant_display_name is None
+        assert checkpoint.envelope.draft.merchant_display_name is None
         assert checkpoint.envelope.draft.category is None
         assert checkpoint.envelope.classification_enrichment.state == "pending"
         assert checkpoint.envelope.provenance.used_pipeline == mode
@@ -128,6 +131,7 @@ async def test_submission_checkpoints_all_views_before_text_labels(
             else:
                 assert len(messages[0]["images"]) == 2
             return formatted
+        assert "Privater Hofladen" in prompt
         events.append("classification_dispatched")
         assert all("images" not in message for message in messages)
         return chat_reply('{"category":"grocery","line_items":[{}]}')
@@ -142,9 +146,13 @@ async def test_submission_checkpoints_all_views_before_text_labels(
         assert outcome.envelope.receipt.line_items[0].spending_category == "milk"
         assert outcome.envelope.classification_enrichment.state == "unavailable"
         assert len(outcome.persisted_views) == 2
+        assert outcome.envelope.draft.merchant_display_name is None
+        assert outcome.envelope.receipt.merchant_display_name == "Privater Hofladen"
+        assert receipts.suggested_merchant_name.await_args.args == (claim.image.user_id, "Store", None)
     else:
         assert events == []
         assert result.stale
+        receipts.suggested_merchant_name.assert_not_awaited()
         db.record_unmanaged_classification_event.assert_not_awaited()
         db.finish_attempt.assert_not_awaited()
 
@@ -363,9 +371,7 @@ async def test_benchmark_worker_preserves_observations_after_outer_release_failu
         "provider": type(llm).__name__,
         "endpoint_fingerprint": endpoint_fingerprint(llm),
         "ocr_fingerprint": ocr_fingerprint(extract.ocr),
-        "validation_schema_sha256": hashlib.sha256(
-            json.dumps(Receipt.model_json_schema(), sort_keys=True).encode(),
-        ).hexdigest(),
+        "validation_schema_sha256": validation_schema_sha256(),
         "prompt_hashes": {"1": hashlib.sha256(
             llm.for_experiment(options).build_prompt([], image_count=1).encode(),
         ).hexdigest()},

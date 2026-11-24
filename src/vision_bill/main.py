@@ -14,6 +14,7 @@ from .api.benchmarks import router as benchmark_router
 from .api.collections import router as collections_router
 from .api.drafts import router as draft_router
 from .api.images import router as image_router
+from .api.merchants import router as merchants_router
 from .api.receipts import router as receipt_router
 from .api.search import router as search_router
 from .api.statistics import router as statistics_router
@@ -161,6 +162,7 @@ app = FastAPI(title="Receipt Tracker API", lifespan=lifespan)
 
 # JSON API routes
 app.include_router(auth_router, prefix="/api/v1/auth", tags=["Auth"])
+app.include_router(merchants_router, prefix="/api/v1/merchants", tags=["Merchants"])
 app.include_router(receipt_router, prefix="/api/v1/receipts", tags=["Receipts"])
 app.include_router(draft_router, prefix="/api/v1/images", tags=["Drafts"])
 app.include_router(image_router, prefix="/api/v1/images", tags=["Images"])

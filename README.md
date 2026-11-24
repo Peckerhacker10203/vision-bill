@@ -57,7 +57,22 @@ categories or tags remain visible. When correcting a draft, select the payment
 method in the current language and enter confidence as a whole percentage from
 0 to 100. Saving refreshes the checks before finalization. Product tags such
 as **Coffee** or **Kaffee** use the same stored value across both languages.
-You can also add your own tags. Human corrections and original bytes survive review.
+Each item can carry several tags. Add or remove them in the editor. The
+classifier receives separate choices for the whole receipt and for each item.
+The interface language controls their labels. Product descriptions and the
+seller printed on the receipt keep their original language.
+
+The merchant field groups branches under a common name. For example, an identified
+HIT branch appears as **HIT Handelsgruppe** with a **Grocery** suggestion.
+The review form also shows the seller as printed and the branch address. Choose
+a suggested merchant or type the trading name of an independent shop. An
+explicit receipt save or verification, including finalizing a corrected draft,
+remembers that choice in your account for future receipts. Keeping an unfinished
+draft saves your edits without adding a merchant to the directory.
+For ambiguous trading names the classifier can choose among locally matched
+brands using distinctive purchased items. Groceries alone cannot identify a
+particular supermarket. For covered German brands, see the
+[merchant directory and its official sources](HAENDLERVERZEICHNIS.md).
 Verify changes database workflow state without moving files. See the
 [multi-photo/API workflow](MULTI_IMAGE_RECEIPTS.md).
 

@@ -15,7 +15,7 @@ def extraction_prompt(image_count: int, *, ocr: bool = False) -> str:
     schema = (MultiImageReceipt if image_count > 1 else Receipt).model_json_schema()
     for obj in [schema, *schema.get("$defs", {}).values()]:
         props = obj.get("properties", {})
-        for name in ("category", "spending_category", "tags"):
+        for name in ("category", "spending_category", "tags", "merchant_display_name"):
             props.pop(name, None)
             if name in obj.get("required", []):
                 obj["required"].remove(name)
@@ -100,7 +100,7 @@ def source_extraction_prompt(
     schema.setdefault("required", []).append("amount_policy")
     for obj in [schema, *schema.get("$defs", {}).values()]:
         props = obj.get("properties", {})
-        for name in ("category", "spending_category", "tags"):
+        for name in ("category", "spending_category", "tags", "merchant_display_name"):
             props.pop(name, None)
     line_schema = schema.get("$defs", {}).get("DraftLineItem", {})
     line_schema.setdefault("properties", {})["source_image"] = {"type": "integer", "minimum": 0}
@@ -115,6 +115,7 @@ def source_extraction_prompt(
     )
     return (
         "Extract literal observations for ONE complete receipt from ALL ordered input photos. "
+        "Keep printed merchant names and product descriptions in their original language. "
         "Keep missing or unreadable values null. Preserve the original figures even if they "
         "disagree. Convert a decimal comma to a decimal point for JSON: 1,25 becomes 1.25. "
         "Use headings, currency symbols, multiplication marks and row alignment to identify columns. "

@@ -16,7 +16,7 @@ from openai import APITimeoutError
 
 from ..config import ImageSettings, OcrSettings, PGSettings, Settings, WorkerSettings
 from ..model.db.image import ImagePart, ImageRow
-from ..model.db.receipt import ReceiptRow, ReceiptWithDetails
+from ..model.db.receipt import MerchantOptions, ReceiptRow, ReceiptWithDetails
 from ..model.extraction import InferenceEnvelope
 from ..model.handoff import HandoffStatus, HandoffWait
 from ..model.ocr import OcrCapabilities, OcrResponse, SourceRef
@@ -151,10 +151,27 @@ class ReceiptService:
             return await self._db.list_tags()
         return await self._db.list_tags(deadline=deadline)
 
-    async def get_category_suggestion(
-        self, user_id: UUID, merchant_name: str, description: str
+    async def suggested_merchant_name(
+        self, user_id: UUID | None, merchant_name: str, merchant_address: str | None,
+        *, deadline: float | None = None,
     ) -> str | None:
-        return await self._db.get_category_suggestion(user_id, merchant_name, description)
+        return await self._db.suggested_merchant_name(
+            user_id, merchant_name, merchant_address, deadline=deadline,
+        )
+
+    async def merchant_options(
+        self, scope: AccessScope, printed: str, address: str | None, query: str,
+        receipt_id: UUID | None, image_id: UUID | None,
+    ) -> MerchantOptions | None:
+        return await self._db.merchant_options(scope, printed, address, query, receipt_id, image_id)
+
+    async def get_category_suggestion(
+        self, user_id: UUID, merchant_name: str, description: str, *,
+        display_name: str | None = None, address: str | None = None, receipt_id: UUID | None = None,
+    ) -> str | None:
+        return await self._db.get_category_suggestion(
+            user_id, merchant_name, description, display_name=display_name, address=address, receipt_id=receipt_id,
+        )
 
     async def create_tag(self, raw_name: str) -> tuple[str, bool]:
         """Normalize a tag name and make sure it exists in the tag vocabulary.

@@ -163,7 +163,7 @@ Run from a prepared checkout/environment on a network that reaches the intended
 DB. Clear conflicting process/dotenv settings and use a private
 `VISION_BILL_CONFIG_PATH` as appropriate: process env > dotenv > YAML precedence
 still applies. No DSN/password needs to appear in public commands or shell history.
-The resulting head is **0024**. Before starting uvicorn with runtime credentials,
+The resulting head is **0025**. Before starting uvicorn with runtime credentials,
 complete owner migration and grants. The current image still executes Alembic at
 startup using the runtime `PG__*` identity; it can only check an already-current
 schema, not apply pending owner DDL. Future upgrades must repeat the owner step.
@@ -171,8 +171,8 @@ Do not temporarily leave the app serving as the owner to simplify migration.
 
 ### Fresh and legacy mapping
 
-Fresh installations apply 0001 through 0024. An installation at 0021 applies
-0022 through 0024. An installation at 0010 first applies 0011–0021 for workflow,
+Fresh installations apply 0001 through 0025. An installation at 0021 applies
+0022 through 0025. An installation at 0010 first applies 0011–0021 for workflow,
 review, benchmark references, claim fencing, cleanup and optional receipt values.
 Migration 0011 preserves linked receipts, verified flags, amounts and historical
 paths and marks their submissions analyzed; they are not re-OCRed. Receipt-free
@@ -190,6 +190,12 @@ and deletion protection. Migration 0023 records the comparison group and
 pipeline on each paired run. Existing single runs retain their original history.
 Migration 0024 adds everyday product tags. Existing vocabulary rows and receipt
 labels retain their identities. A downgrade to 0023 leaves vocabulary entries in place.
+Migration 0025 adds an optional display name and an account-scoped merchant
+directory with aliases. It leaves historical printed names and human corrections
+intact. Existing receipts can acquire a display name through normal review.
+Downgrading to 0024 refuses to discard stored merchant display names, aliases
+or directory entries. Use the compatible app or restore the coordinated backup
+to a separate installation when a rollback would lose saved choices.
 
 A downgrade from 0023 to 0022 refuses if a comparison exists. A downgrade
 from 0022 to 0021 refuses if any case exists, including an unconfirmed draft.
@@ -243,7 +249,13 @@ It makes no new OCR, formatter or classification request. A failed optional
 classification leaves usable observations and records the label outcome. A
 request whose delivery or settlement is uncertain keeps the checkpoint on hold.
 
-The formatter now uses prompt version 5 and extraction schema 2. The schema
+New benchmark runs use prompt version 6 for the bilingual tag and category
+classifier. Historical runs keep their results and recorded prompt version.
+Create a new run to evaluate the new classifier on the same references. Changing
+a merchant display name preserves the receipt dataset fingerprint.
+
+Complete observation checkpoints keep formatter contract version 5 and
+extraction schema 2, so they can still complete after this upgrade. The schema
 distinguishes an explicitly printed receipt-wide net subtotal from a printed
 subtotal on the same basis as the items. Completed receipts and saved drafts
 retain their values. A complete checkpoint from prompt 4 or schema 1 waits with

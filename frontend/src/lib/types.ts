@@ -11,6 +11,13 @@ export const CATEGORIES = [
 	'fuel',
 	'pharmacy',
 	'entertainment',
+	'drugstore',
+	'home_furnishings',
+	'hardware_garden',
+	'books_stationery',
+	'pet_supplies',
+	'sporting_goods',
+	'postal_services',
 	'other'
 ] as const;
 export type Category = (typeof CATEGORIES)[number];
@@ -92,6 +99,7 @@ export interface DraftTaxLine {
 	amount?: string | null;
 }
 export interface ExtractionDraft {
+	merchant_display_name?: string | null;
 	confidence?: number | null;
 	merchant_name?: string | null;
 	merchant_address?: string | null;
@@ -193,6 +201,7 @@ export interface ModelInfo {
 }
 
 export interface ReceiptRow {
+	merchant_display_name?: string | null;
 	operation_revision: number;
 	review_revision: number;
 	amount_policy: AmountPolicy;
@@ -433,6 +442,7 @@ export interface TaxLineWrite {
 
 /** Body for PUT /receipts/{id} (mirrors the backend `Receipt` write model). */
 export interface ReceiptWrite {
+	merchant_display_name?: string | null;
 	expected_operation_revision: number;
 	amount_policy?: AmountPolicy;
 	field_sources?: Record<string, SourceRef[]>;
@@ -494,6 +504,7 @@ export interface ImageListFilters {
 
 /** One verified line-item purchase matching a product search. */
 export interface ProductPurchase {
+	merchant_display_name?: string | null;
 	receipt_id: string;
 	description: string;
 	merchant_name: string;

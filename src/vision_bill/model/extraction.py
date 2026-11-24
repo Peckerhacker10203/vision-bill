@@ -9,9 +9,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .item_category import SpendingCategory, llm_category
 from .ocr import OcrPageMetadata, OcrResponse, Sha256, SourceRef, WorkingImage
-from .receipt import Category, Currency, LineItem, Receipt, ReceiptTime
+from .receipt import Category, Currency, LineItem, MerchantDisplayName, Receipt, ReceiptTime
 from .review import AmountPolicy, ReviewFinding, SourceView
 
+# Completion-only recovery uses saved observations and never reruns optional classification.
+OBSERVATION_PROMPT_VERSION = "5"
 # Version 2 distinguishes an explicitly printed net subtotal from a line-basis subtotal.
 EXTRACTION_SCHEMA_VERSION = "2"
 SOURCE_PROJECTION_VERSION = "2"
@@ -140,6 +142,7 @@ class ExtractionDraft(BaseModel):
             "payment processor name does not identify the seller."
         ),
     )
+    merchant_display_name: MerchantDisplayName = None
     merchant_address: str | None = Field(
         None,
         description=(

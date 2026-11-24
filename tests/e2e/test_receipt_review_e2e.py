@@ -27,13 +27,13 @@ POLICY = AmountPolicy(
 )
 
 
-async def seed(w, scope, tmp_path, *, total="10", verified=False):
+async def seed(w, scope, tmp_path, *, total="10", verified=False, merchant_name="Shop"):
     w._receipts._pool = w.pool
     original = tmp_path / str(uuid4())
     original.write_bytes(b"original receipt bytes")
     payload = {
         "confidence": 90,
-        "merchant_name": "Shop",
+        "merchant_name": merchant_name,
         "date": "2026-01-01",
         "currency": "EUR",
         "subtotal": total,
@@ -211,7 +211,7 @@ async def test_stored_local_time_does_not_become_integrity_failure(workflow_db, 
 
 async def test_classification_collection_intent_and_admin_owner_learning(workflow_db, tmp_path):
     w, scope = workflow_db
-    row, body, _ = await seed(w, scope, tmp_path, verified=True)
+    row, body, _ = await seed(w, scope, tmp_path, verified=True, merchant_name="Example bakery")
     detail = await w._receipts.get_receipt_with_details(row.id)
     item_id = detail.line_items[0].id
     body.line_items[0].id = item_id
@@ -1247,3 +1247,33 @@ async def test_receipt_editor_replaces_only_visible_memberships(workflow_db, tmp
     body.collection_ids = [own.id]
     await w._receipts.update_receipt(row.id, body, user_id=other_owner, can_see_all=True)
     assert (await detail(other_owner, True)).collection_ids == [own.id]
+
+
+async def test_private_aliases_follow_qualified_kiosk_address_and_manual_reset(workflow_db):
+    from vision_bill.provider.db import merchants
+
+    workflow, owner = workflow_db
+    async with workflow.pool.acquire() as conn, conn.transaction():
+        first, second = "A-Straße 1, 53111 Bonn", "B-Straße 2, 53111 Bonn"
+        printed = "Kiosk Bonn"
+        await merchants.learn_name(conn, owner.user_id, owner.user_id, printed, first, "Lenas Kiosk")
+        assert await merchants.suggested_name(conn, owner.user_id, printed, first) == "Lenas Kiosk"
+        assert await merchants.suggested_name(conn, owner.user_id, printed, second) == "Kiosk"
+        await merchants.learn_name(conn, owner.user_id, owner.user_id, printed, first, "Kiosk")
+        assert await merchants.suggested_name(conn, owner.user_id, printed, first) == "Kiosk"
+        await merchants.learn_name(conn, owner.user_id, owner.user_id, "Hofladen Test GmbH", None, "Mein Hof")
+        assert await merchants.suggested_name(conn, owner.user_id, "Hofladen Test", None) == "Mein Hof"
+        await merchants.learn_name(conn, owner.user_id, owner.user_id, "Kiosk", None, "Lenas Kiosk")
+        assert await merchants.suggested_name(conn, owner.user_id, "Kiosk", None) == "Kiosk"
+
+
+async def test_merchant_downgrade_preserves_private_directory(workflow_db):
+    from vision_bill.provider.db import merchants
+
+    workflow, owner = workflow_db
+    async with workflow.pool.acquire() as conn:
+        await merchants.learn_name(conn, owner.user_id, owner.user_id, "Hofladen Test", None, "Mein Hof")
+    refusal = migrate(workflow._settings, "0024", "downgrade", check=False)
+    assert refusal.returncode != 0 and "merchant directory downgrade refused" in refusal.stderr
+    async with workflow.pool.acquire() as conn:
+        assert await merchants.suggested_name(conn, owner.user_id, "Hofladen Test", None) == "Mein Hof"

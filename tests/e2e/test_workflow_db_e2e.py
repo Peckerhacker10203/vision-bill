@@ -210,7 +210,7 @@ def complete(*, total="90071992547.91"):
 async def test_bootstrap_and_empty_downgrade(db):
     migrate(db)
     conn = await asyncpg.connect(db.pg_dsn)
-    assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0024"
+    assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0025"
     await conn.close()
     migrate(db, "0010", "downgrade")
     migrate(db)
@@ -220,7 +220,7 @@ async def test_product_tag_upgrade_preserves_identity_and_matches_translations(d
     from vision_bill.provider.db.receipt_db import ReceiptDB
 
     migrate(db, "0023")
-    catalog = json.loads((ROOT / "frontend/src/lib/i18n/product-tags.json").read_text())
+    catalog = json.loads((ROOT / "src/vision_bill/model/product_tags.json").read_text())
     assert all(set(labels) == {"en", "de"} and all(labels.values()) for labels in catalog.values())
     conn = await asyncpg.connect(db.pg_dsn)
     provider = ReceiptDB(db)
@@ -546,7 +546,7 @@ async def test_finish_atomic_decimal_and_immutable_history(workflow_db, db):
         )
     assert migrate(db, "0010", "downgrade", check=False).returncode != 0
     async with w.pool.acquire() as conn:
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0024"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0025"
         assert await conn.fetchval("SELECT count(*) FROM receipt_review_revisions") == 1
 
 
@@ -847,7 +847,7 @@ async def test_upgrade_0010_preserves_precise_local_times_and_legacy_evidence(db
                 assert await conn.fetchval("SELECT image_path FROM images WHERE id=$1", image) == str(original)
         finally:
             await reader.destroy_db()
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0024"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0025"
     finally:
         await conn.close()
 

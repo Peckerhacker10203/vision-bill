@@ -9,6 +9,7 @@ OUTPUT = ROOT / "frontend/static/vision-bill-operator-guides.zip"
 PUBLIC_FILES = (
     "README.md",
     "AGENTS.md",
+    "HAENDLERVERZEICHNIS.md",
     "MULTI_IMAGE_RECEIPTS.md",
     "OPENAI_COMPATIBLE.md",
     "RELEASES.md",

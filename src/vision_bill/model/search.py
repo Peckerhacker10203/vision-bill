@@ -11,6 +11,7 @@ class ProductPurchase(BaseModel):
     receipt_id: UUID
     description: str
     merchant_name: str
+    merchant_display_name: str | None = None
     date: Date
     time: str | None = None
     quantity: Decimal | None

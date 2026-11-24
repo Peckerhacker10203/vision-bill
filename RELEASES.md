@@ -19,7 +19,9 @@ independent cases use version 5 across the dataset and score confirmed observati
 Migrations 0022 and 0023 preserve existing runs and add private cases and paired
 run identity. Migration 0024 extends the product tag vocabulary for new and
 existing installations. The English and German interfaces display localized
-built-in labels and save the same tag identifiers. Back up the database and
+built-in labels and save the same tag identifiers. Migration 0025 adds an
+editable merchant display name and merchant choices learned on explicit receipt
+saves within each account. Back up the database and
 image store together before upgrading.
 The update also includes account and view isolation. Dedicated
 OCR downloads and verifies its three pinned models when enabled. Its first prediction

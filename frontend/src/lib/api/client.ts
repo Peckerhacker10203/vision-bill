@@ -524,6 +524,27 @@ export const api = {
 		return request<void>(`/receipts/${id}`, { method: 'DELETE' });
 	},
 
+	listMerchants(
+		params: {
+			merchant_name?: string;
+			merchant_address?: string;
+			q?: string;
+			receipt_id?: string;
+			image_id?: string;
+		},
+		actor = captureSessionActor()
+	) {
+		return request<{ suggestion: string | null; merchants: string[] }>(
+			'/merchants/suggestions',
+			{
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(params)
+			},
+			actor
+		);
+	},
+
 	/** GET /tags returns the line-item tag vocabulary (the select source). */
 	listTags(): Promise<string[]> {
 		return request<string[]>('/tags');
@@ -533,10 +554,18 @@ export const api = {
 		return request<SpendingCategory[]>('/tags/categories');
 	},
 
-	getCategorySuggestion(merchantName: string, description: string): Promise<CategorySuggestion> {
-		return request<CategorySuggestion>(
-			`/tags/category-suggestion${toQueryString({ merchant_name: merchantName, description })}`
-		);
+	getCategorySuggestion(params: {
+		merchant_name: string;
+		merchant_address?: string;
+		merchant_display_name?: string;
+		receipt_id: string;
+		description: string;
+	}): Promise<CategorySuggestion> {
+		return request<CategorySuggestion>('/tags/category-suggestion', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(params)
+		});
 	},
 
 	/**

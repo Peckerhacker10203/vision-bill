@@ -2,16 +2,25 @@
 
 import hashlib
 import json
+import re
 from collections.abc import Sequence
 from datetime import date
 from decimal import Decimal, localcontext
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import UUID
 
 from pydantic import ValidationError
 
-from ..model.extraction import DraftLineItem, DraftTaxLine, ExtractionDraft
+from ..model.extraction import (
+    DraftLineItem,
+    DraftTaxLine,
+    ExtractionDraft,
+    InferenceEnvelope,
+    PersistedInferenceEnvelope,
+)
+from ..model.item_category import CATEGORY_CODE_SET, SpendingCategory
 from ..model.ocr import SourceRef
+from ..model.product_tags import canonical_product_tag
 from ..model.receipt import LineItem, Receipt, TaxLine
 from ..model.review import (
     CHECKS_VERSION,
@@ -21,6 +30,76 @@ from ..model.review import (
     ReviewEvaluation,
     ReviewFinding,
 )
+
+
+def editable_draft(envelope: InferenceEnvelope | PersistedInferenceEnvelope) -> ExtractionDraft:
+    """Copy accepted enrichment to the editor while retaining the original row order and evidence."""
+    assert envelope.draft is not None
+    document = envelope.draft.model_copy(deep=True)
+    receipt = envelope.receipt
+    enrichment = envelope.classification_enrichment
+    if receipt is None or enrichment.state not in ("completed", "unavailable"):
+        return document
+    unresolved = set(enrichment.missing_fields)
+    if document.category is None and "category" not in unresolved:
+        document.category = receipt.category
+
+    raw_rows = document.line_items or []
+    removed = {
+        step.get("removed_index") for step in envelope.overlap_decisions
+        if step.get("verified") is True and type(step.get("removed_index")) is int
+    }
+    kept = [row for index, row in enumerate(raw_rows) if index not in removed]
+    if len(kept) != len(receipt.line_items):
+        return document
+    for index, (raw, labeled) in enumerate(zip(kept, receipt.line_items, strict=True)):
+        if raw.description != labeled.description:
+            continue
+        if raw.tags is None and f"line_items.{index}.tags" not in unresolved:
+            raw.tags = list(labeled.tags)
+        if (raw.spending_category in (None, "unknown")
+                and f"line_items.{index}.spending_category" not in unresolved):
+            raw.spending_category = labeled.spending_category
+    return document
+
+
+# Match a complete product name to avoid treating an ingredient, e.g. carrot cake, as produce.
+_PRODUCT_NAMES = {
+    "möhre": "carrots", "möhren": "carrots", "karotte": "carrots", "carrot": "carrots",
+    "remoulade": "sauces", "p&w remoulade": "sauces",
+    "shorts": "clothing",
+}
+_PRODUCT_GROUPS = {
+    "carrots": "vegetables", "tomatoes": "vegetables", "onions": "vegetables",
+    "potatoes": "vegetables", "apples": "fruit", "bananas": "fruit", "berries": "fruit",
+    "bread": "bread_bakery", "rolls": "bread_bakery", "sauces": "sauces_spices",
+    "rice": "pasta_rice_grains", "pasta": "pasta_rice_grains", "butter": "butter_spreads",
+    "coffee": "coffee_tea", "tea": "coffee_tea",
+}
+
+
+def suggest_product_labels(document: ExtractionDraft) -> None:
+    """Seed empty editable labels from identifiable products; retain explicit empty tag lists."""
+    for row in document.line_items or []:
+        name = " ".join((row.description or "").casefold().split())
+        # Receipt rows often include package size or a garment colour after the product.
+        name = re.sub(r"\s+\d+(?:[.,]\d+)?\s*(?:g|kg|ml|l)$", "", name)
+        if re.fullmatch(r"(?:h&m )?shorts (?:blau|blue|schwarz|black|weiss|white)", name):
+            name = "shorts"
+        organic = name.startswith(("bio ", "bio-", "organic "))
+        product = re.sub(r"^(?:bio[ -]|organic )", "", name)
+        tag = _PRODUCT_NAMES.get(product) or canonical_product_tag(product)
+        if tag is None:
+            continue
+        category = _PRODUCT_GROUPS.get(tag, tag)
+        if row.tags is None:
+            row.tags = [tag]
+            if tag != category and category in {"fruit", "vegetables"}:
+                row.tags.append(category)
+            if organic and tag != "organic":
+                row.tags.append("organic")
+        if row.spending_category in (None, "unknown") and category in CATEGORY_CODE_SET:
+            row.spending_category = cast(SpendingCategory, category)
 
 
 def observation_values(document: Receipt | ExtractionDraft) -> dict[str, Any]:
@@ -73,7 +152,7 @@ def _review_factor(value: Any) -> Any:
 
 def material_document(receipt: Receipt | ExtractionDraft) -> dict[str, Any]:
     """Ordered printed observations, excluding classification/tag/identity metadata."""
-    fields = ExtractionDraft.model_fields.keys() - {"confidence", "category"}
+    fields = ExtractionDraft.model_fields.keys() - {"confidence", "category", "merchant_display_name"}
     data = {key: value for key, value in receipt.model_dump().items() if key in fields}
     if data.get("line_items") is not None:
         data["line_items"] = [

@@ -710,3 +710,22 @@ it('focuses a nested server validation field and omits unavailable row actions',
 	await fireEvent.click(screen.getByRole('button', { name: '1 · Tags' }));
 	expect(document.activeElement?.id).toBe('draft-line_items.0.tags');
 });
+
+it('patches only the canonical merchant name when the printed merchant stays unchanged', async () => {
+	vi.mocked(api.getDraft).mockResolvedValue(completeDraft);
+	const patch = vi.spyOn(api, 'patchDraft').mockResolvedValue({
+		...completeDraft,
+		revision: 8,
+		document: { ...completeDraft.document, merchant_display_name: 'Shop Group' }
+	});
+	render(ExtractionDraftEditor, { id: 'job' });
+	const display = await screen.findByLabelText('Merchant display name');
+	expect((display as HTMLInputElement).maxLength).toBe(200);
+	await fireEvent.input(display, { target: { value: 'Shop Group' } });
+	expect((screen.getByLabelText('Merchant') as HTMLInputElement).value).toBe('Shop');
+	await fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+	expect(patch).toHaveBeenCalledWith('job', {
+		expected_revision: 7,
+		changes: { merchant_display_name: 'Shop Group' }
+	});
+});

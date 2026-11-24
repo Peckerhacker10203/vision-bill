@@ -7,8 +7,11 @@ import pytest
 from pydantic import ValidationError
 
 from vision_bill.model import workflow
-from vision_bill.model.extraction import EXTRACTION_SCHEMA_VERSION, SOURCE_PROJECTION_VERSION
-from vision_bill.service.benchmark_scoring import PROMPT_VERSION
+from vision_bill.model.extraction import (
+    EXTRACTION_SCHEMA_VERSION,
+    OBSERVATION_PROMPT_VERSION,
+    SOURCE_PROJECTION_VERSION,
+)
 
 
 def observation_payload(
@@ -66,7 +69,7 @@ def observation_payload(
             "semantic_policy_sha256": "e" * 64,
             "model_id": "test",
             "model_digest": digest,
-            "prompt_version": PROMPT_VERSION,
+            "prompt_version": OBSERVATION_PROMPT_VERSION,
             "extraction_schema_version": EXTRACTION_SCHEMA_VERSION,
             "source_projection_version": SOURCE_PROJECTION_VERSION,
         },

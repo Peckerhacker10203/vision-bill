@@ -315,3 +315,18 @@ it('exposes draft validation codes and field paths to the editor', async () => {
 		problem: { code: 'draft_invalid_fields', fields: ['payment_method'] }
 	});
 });
+
+it('sends merchant evidence in the suggestion request body and binds it to the active account', async () => {
+	mockOkFetch();
+	const evidence = {
+		receipt_id: 'receipt-id',
+		merchant_name: 'Local Grocer',
+		merchant_address: 'Sample Street 3'
+	};
+	await api.listMerchants(evidence);
+	const [url, init] = vi.mocked(fetch).mock.calls[0];
+	expect(url).toBe('/api/v1/merchants/suggestions');
+	expect(init?.method).toBe('POST');
+	expect(JSON.parse(init?.body as string)).toEqual(evidence);
+	expect(new Headers(init?.headers).get('X-Vision-Bill-Expected-User')).toBe(USER_ID);
+});

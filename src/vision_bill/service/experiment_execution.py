@@ -181,7 +181,10 @@ async def execute_submission(
 
 
 def observation_metadata(persisted: PersistedInferenceEnvelope) -> dict[str, Any]:
-    evidence = persisted.model_dump(mode="json", exclude={"provenance", "receipt", "amount_policy"})
+    evidence = persisted.model_dump(mode="json", exclude={
+        "provenance": True, "receipt": True, "amount_policy": True,
+        "draft": {"merchant_display_name"},
+    })
     return {
         **persisted.provenance.model_dump(mode="json"),
         **evidence,

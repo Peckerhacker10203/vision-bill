@@ -141,8 +141,10 @@
 					<ReceiptImage
 						imageId={receipt.image_id}
 						thumbnailPath={receipt.thumbnail_path ?? null}
-						alt={receipt.merchant_name || $t('receipts.unknownVendor')}
-						previewLabel={`${$t('receipt.viewFullImage')}: ${receipt.merchant_name || $t('receipts.unknownVendor')}`}
+						alt={receipt.merchant_display_name ||
+							receipt.merchant_name ||
+							$t('receipts.unknownVendor')}
+						previewLabel={`${$t('receipt.viewFullImage')}: ${receipt.merchant_display_name || receipt.merchant_name || $t('receipts.unknownVendor')}`}
 						class="size-12 shrink-0 rounded-lg object-cover"
 					/>
 					<a
@@ -151,7 +153,9 @@
 					>
 						<div class="min-w-0 flex-1">
 							<p class="break-words text-sm font-medium">
-								{receipt.merchant_name || $t('receipts.unknownVendor')}
+								{receipt.merchant_display_name ||
+									receipt.merchant_name ||
+									$t('receipts.unknownVendor')}
 							</p>
 							<p class="text-xs text-on-surface-variant">
 								{#if receipt.date}
@@ -196,7 +200,12 @@
 	title={$t('receipt.deleteTitle')}
 	body={confirmDelete
 		? translate('receipt.deleteBody', {
-				values: { merchant: confirmDelete.merchant_name || $t('receipts.unknownVendor') }
+				values: {
+					merchant:
+						confirmDelete.merchant_display_name ||
+						confirmDelete.merchant_name ||
+						$t('receipts.unknownVendor')
+				}
 			})
 		: ''}
 	confirmLabel={$t('common.delete')}

@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from datetime import date as Date
 from datetime import time as Time
 from decimal import Decimal
-from typing import Any
+from hashlib import sha256
+from typing import Any, cast
 from uuid import UUID
 
 import asyncpg
@@ -14,6 +15,7 @@ from ...config import PGSettings
 from ...model.db.image import ImagePart, ImageRow
 from ...model.db.receipt import (
     LineItemRow,
+    MerchantOptions,
     ReceiptRow,
     ReceiptWithDetails,
     TaxLineRow,
@@ -25,9 +27,10 @@ from ...model.extraction import (
     ExtractionDraft,
     assert_metadata_only,
 )
-from ...model.item_category import CATEGORY_CODE_SET, normalize_history_key
+from ...model.item_category import CATEGORY_CODE_SET, SpendingCategory, normalize_history_key
+from ...model.merchant_catalog import is_generic_merchant, merchant_category
 from ...model.ocr import SourceRef
-from ...model.receipt import Receipt
+from ...model.receipt import Category, Receipt
 from ...model.review import OriginalAvailability, ReviewEvaluation
 from ...model.search import ProductPurchase
 from ...model.statistics import (
@@ -44,6 +47,7 @@ from ...service.receipt_review import (
     persistent_findings,
     validate_acknowledgements,
 )
+from . import merchants
 from .deadline import connection
 
 # ── SQL (DML; DDL lives in alembic/versions/0001_initial_schema.py) ──
@@ -52,9 +56,9 @@ INSERT_RECEIPT_SQL = """
     INSERT INTO receipts
         (confidence, merchant_name, merchant_address, receipt_number, date, time,
          currency, category, subtotal, discount_total, tax_total, tip, total,
-         payment_method, status, image_id, verified, user_id)
+         payment_method, status, image_id, verified, user_id, merchant_display_name)
     VALUES
-        ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+        ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
     RETURNING *
 """
 
@@ -76,7 +80,8 @@ UPDATE_RECEIPT_BY_IMAGE_SQL = """
         payment_method = $14,
         status = $15,
         verified = $16,
-        user_id = $17
+        user_id = $17,
+        merchant_display_name = $19
     WHERE id = (
         SELECT id FROM receipts
         WHERE image_id = $18
@@ -101,7 +106,8 @@ UPDATE_RECEIPT_SQL = """
         tax_total       = $11,
         tip             = $12,
         total           = $13,
-        payment_method  = $14
+        payment_method  = $14,
+        merchant_display_name = $16
     WHERE id = $15
     RETURNING *
 """
@@ -171,6 +177,7 @@ SEARCH_PRODUCTS_BASE_SQL = """
         li.quantity,
         li.unit_price,
         r.merchant_name,
+        r.merchant_display_name,
         r.date,
         r.time,
         r.currency
@@ -363,6 +370,7 @@ class ReceiptDB:
             receipt_id=d["receipt_id"],
             description=d["description"],
             merchant_name=d["merchant_name"],
+            merchant_display_name=d.get("merchant_display_name"),
             date=d["date"],
             time=t.isoformat() if t is not None else None,
             quantity=d["quantity"],
@@ -414,63 +422,145 @@ class ReceiptDB:
                     position,
                 )
 
-    async def get_category_suggestion(
-        self, user_id: UUID, merchant_name: str, description: str
+    async def suggested_merchant_name(
+        self, user_id: UUID | None, merchant_name: str, merchant_address: str | None,
+        *, deadline: float | None = None,
     ) -> str | None:
-        """Return only this user's confirmed exact mapping."""
-        merchant_key = normalize_history_key(merchant_name)
+        async with connection(self.pool, deadline=deadline) as conn:
+            return await merchants.suggested_name(conn, user_id, merchant_name, merchant_address, printed_fallback=False)
+
+    async def merchant_options(
+        self, scope: AccessScope, printed: str, address: str | None, query: str,
+        receipt_id: UUID | None, image_id: UUID | None,
+    ) -> MerchantOptions | None:
+        async with self.pool.acquire() as conn:
+            owner: UUID | None = scope.user_id
+            if receipt_id or image_id:
+                table = "receipts" if receipt_id else "images"
+                resource = await conn.fetchrow(
+                    f"SELECT user_id FROM {table} WHERE id=$1 AND (user_id=$2 OR $3)",
+                    receipt_id or image_id, scope.user_id, scope.can_see_all,
+                )
+                if resource is None:
+                    return None
+                if resource["user_id"] != scope.user_id:
+                    owner = None
+            return await merchants.options(conn, owner, printed, address, query)
+
+    async def get_category_suggestion(
+        self, user_id: UUID, merchant_name: str, description: str, *,
+        display_name: str | None = None, address: str | None = None, receipt_id: UUID | None = None,
+    ) -> str | None:
+        """Receipt editors only consult personal product history on their own receipt."""
         description_key = normalize_history_key(description)
-        if not merchant_key or not description_key:
+        if not merchant_name.strip() or not description_key:
             return None
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                GET_CATEGORY_ALIAS_SQL, user_id, merchant_key, description_key
-            )
-        category = dict(row).get("category") if row is not None else None
-        return category if category in CATEGORY_CODE_SET and category != "unknown" else None
+            if receipt_id is not None and not await conn.fetchval(
+                "SELECT EXISTS (SELECT FROM receipts WHERE id=$1 AND user_id=$2)", receipt_id, user_id,
+            ):
+                return None
+            display = display_name or await merchants.suggested_name(conn, user_id, merchant_name, address)
+            for key in self._merchant_history_keys(merchant_name, display, address):
+                row = await conn.fetchrow(GET_CATEGORY_ALIAS_SQL, user_id, key, description_key)
+                category = row["category"] if row else None
+                if isinstance(category, str) and category in CATEGORY_CODE_SET and category != "unknown":
+                    return category
+        return None
 
     @staticmethod
+    def _merchant_history_keys(
+        printed: str, display: str | None, address: str | None,
+    ) -> list[str]:
+        unresolved = normalize_history_key(display or printed) == normalize_history_key(printed)
+        if is_generic_merchant(display or printed) or (unresolved and merchants.needs_address(printed, address)):
+            # Avoid sharing product learning across unrelated, unnamed shops.
+            if not address:
+                return []
+            identity = json.dumps([normalize_history_key(printed), normalize_history_key(address)])
+            return [f"branch:{sha256(identity.encode()).hexdigest()}"]
+        names = [normalize_history_key(display or printed)]
+        if not merchants.needs_address(printed, address):
+            names.append(normalize_history_key(printed))
+        return list(dict.fromkeys(
+            name if len(name.encode()) <= 800 else f"merchant:{sha256(name.encode()).hexdigest()}"
+            for name in names if name
+        ))
+
     async def _history_for_items(
-        conn: asyncpg.Connection, user_id: UUID | None, merchant_name: str,
-        descriptions: list[str],
+        self, conn: asyncpg.Connection, user_id: UUID | None, merchant_name: str,
+        descriptions: list[str], display: str | None = None, address: str | None = None,
     ) -> dict[str, str]:
-        if user_id is None or not descriptions:
-            return {}
-        merchant_key = normalize_history_key(merchant_name)
         keys = sorted({normalize_history_key(value) for value in descriptions if value.strip()})
-        if not merchant_key or not keys:
+        if user_id is None or not keys:
             return {}
-        rows = await conn.fetch(LIST_CATEGORY_ALIASES_SQL, user_id, merchant_key, keys)
-        return {
-            row["description_key"]: row["category"]
-            for row in rows
-            if row["category"] in CATEGORY_CODE_SET and row["category"] != "unknown"
-        }
+        result: dict[str, str] = {}
+        for merchant_key in self._merchant_history_keys(merchant_name, display, address):
+            rows = await conn.fetch(LIST_CATEGORY_ALIASES_SQL, user_id, merchant_key, keys)
+            for row in rows:
+                if row["category"] in CATEGORY_CODE_SET and row["category"] != "unknown":
+                    result.setdefault(row["description_key"], row["category"])
+        return result
+
+    async def suggest_draft_categories(
+        self, conn: asyncpg.Connection, owner: UUID | None, document: ExtractionDraft, *, candidate: str | None = None,
+    ) -> list[str]:
+        printed = document.merchant_name or ""
+        display = await merchants.suggested_name(conn, owner, printed, document.merchant_address, candidate=candidate)
+        document.merchant_display_name = display
+        if document.category is None and (category := merchant_category(display or "")):
+            document.category = cast(Category, category)
+        items = document.line_items or []
+        history = await self._history_for_items(
+            conn, owner, printed, [item.description or "" for item in items],
+            display, document.merchant_address,
+        )
+        sources = []
+        for item in items:
+            if learned := history.get(normalize_history_key(item.description or "")):
+                item.spending_category = cast(SpendingCategory, learned)
+                sources.append("history")
+            else:
+                sources.append("llm" if item.spending_category not in (None, "unknown") else "unknown")
+        return sources
 
     # ── Persist extracted data ───────────────────────────────────────
 
     async def insert_receipt(
         self, conn: asyncpg.Connection, receipt: Receipt, *, image_id: UUID,
         user_id: UUID | None, status: str = "unverified", verified: bool = False,
+        human_save: bool = False, actor_id: UUID | None = None, category_missing: bool = False,
+        draft_sources: list[str] | None = None,
     ) -> ReceiptRow:
         """Insert only on the caller's transaction; never overwrite a linked receipt."""
+        display = (receipt.merchant_display_name if human_save else None) or await merchants.suggested_name(
+            conn, user_id if not human_save or user_id == actor_id else None,
+            receipt.merchant_name, receipt.merchant_address, candidate=receipt.merchant_display_name,
+        )
+        category = receipt.category
+        if not human_save and category == "other" and category_missing:
+            category = cast(Category, merchant_category(display or "") or category)
         row = await conn.fetchrow(
             INSERT_RECEIPT_SQL, receipt.confidence, receipt.merchant_name,
             receipt.merchant_address, receipt.receipt_number, receipt.date,
-            self._receipt_time_value(receipt), receipt.currency, receipt.category,
+            self._receipt_time_value(receipt), receipt.currency, category,
             receipt.subtotal, receipt.discount_total, receipt.tax_total, receipt.tip,
-            receipt.total, receipt.payment_method, status, image_id, verified, user_id,
+            receipt.total, receipt.payment_method, status, image_id, verified, user_id, display,
         )
-        history = await self._history_for_items(
-            conn, user_id, receipt.merchant_name, [i.description for i in receipt.line_items]
+        history = {} if human_save else await self._history_for_items(
+            conn, user_id, receipt.merchant_name, [i.description for i in receipt.line_items],
+            display, receipt.merchant_address,
         )
-        decisions = [ItemCategoryDecision(
-            id=None, original_description=item.description,
-            category=history.get(normalize_history_key(item.description), item.spending_category),
-            source="history" if normalize_history_key(item.description) in history else (
-                "llm" if item.spending_category != "unknown" else "unknown"
-            ),
-        ) for item in receipt.line_items]
+        decisions = []
+        for index, item in enumerate(receipt.line_items):
+            learned = history.get(normalize_history_key(item.description))
+            source = "llm" if item.spending_category != "unknown" else "unknown"
+            if human_save:
+                source = draft_sources[index] if draft_sources and index < len(draft_sources) else "unknown"
+            decisions.append(ItemCategoryDecision(
+                id=None, original_description=item.description,
+                category=learned or item.spending_category, source="history" if learned else source,
+            ))
         await self._insert_children(conn, row["id"], receipt, decisions)
         await self._capture_initial_collection(conn, row["id"], user_id)
         return self._receipt_row_from_record(row)
@@ -542,6 +632,11 @@ class ReceiptDB:
         )
 
         async with self.pool.acquire() as conn, conn.transaction():
+            display = await merchants.suggested_name(
+                conn, user_id, receipt.merchant_name, receipt.merchant_address, candidate=receipt.merchant_display_name,
+            )
+            if "category" not in receipt.model_fields_set and (category := merchant_category(display or "")):
+                values = (*values[:7], cast(Category, category), *values[8:])
             row = None
             if image_id is not None:
                 row = await conn.fetchrow(
@@ -551,15 +646,16 @@ class ReceiptDB:
                     verified,
                     user_id,
                     image_id,
+                    display,
                 )
             if row is None:
                 row = await conn.fetchrow(
-                    INSERT_RECEIPT_SQL, *values, status, image_id, verified, user_id
+                    INSERT_RECEIPT_SQL, *values, status, image_id, verified, user_id, display
                 )
             receipt_id: UUID = row["id"]
             history = await self._history_for_items(
                 conn, user_id, receipt.merchant_name,
-                [item.description for item in receipt.line_items],
+                [item.description for item in receipt.line_items], display, receipt.merchant_address,
             )
             decisions = []
             for item in receipt.line_items:
@@ -864,6 +960,7 @@ class ReceiptDB:
             receipt.total,
             receipt.payment_method,
             receipt_id,
+            None,  # Filled from the locked receipt and this update below.
         ]
         sql = UPDATE_RECEIPT_SQL
         if not can_see_all and user_id is not None:
@@ -877,6 +974,15 @@ class ReceiptDB:
             if before is None:
                 return None
             current = self._receipt_row_from_record(before)
+            display = receipt.merchant_display_name
+            if "merchant_display_name" not in receipt.model_fields_set and (
+                current.merchant_name == receipt.merchant_name and current.merchant_address == receipt.merchant_address
+            ):
+                display = current.merchant_display_name
+            own_account = user_id if user_id == current.user_id else None
+            args[15] = display or await merchants.suggested_name(
+                conn, own_account, receipt.merchant_name, receipt.merchant_address,
+            )
             document = await self._review_document(conn, before)
             policy = getattr(receipt, "amount_policy", None) or current.amount_policy
             sources = getattr(receipt, "field_sources", None)
@@ -910,12 +1016,16 @@ class ReceiptDB:
             assert row is not None
 
             owner_id: UUID | None = dict(row).get("user_id")
+            await merchants.learn_name(
+                conn, owner_id, user_id, receipt.merchant_name, receipt.merchant_address, args[15],
+            )
             old_rows = [dict(old) for old in await conn.fetch(LIST_LINE_ITEMS_SQL, receipt_id)]
             old_by_id = {old["id"]: old for old in old_rows}
             old_by_position = {old["position"]: old for old in old_rows}
             used_ids: set[UUID] = set()
             decisions: list[ItemCategoryDecision] = []
-            merchant_key = normalize_history_key(receipt.merchant_name)
+            merchant_keys = self._merchant_history_keys(receipt.merchant_name, args[15], receipt.merchant_address)
+            merchant_key = merchant_keys[0] if merchant_keys else None
             legacy_items = all(getattr(item, "id", None) is None for item in receipt.line_items)
             for position, item in enumerate(receipt.line_items):
                 item_id: UUID | None = getattr(item, "id", None)
@@ -960,9 +1070,10 @@ class ReceiptDB:
                         if not description_key:
                             continue
                         if category == "unknown":
-                            await conn.execute(
-                                DELETE_CATEGORY_ALIAS_SQL, owner_id, merchant_key, description_key
-                            )
+                            for key in merchant_keys:
+                                await conn.execute(
+                                    DELETE_CATEGORY_ALIAS_SQL, owner_id, key, description_key
+                                )
                         else:
                             await conn.execute(
                                 UPSERT_CATEGORY_ALIAS_SQL,
@@ -1097,14 +1208,22 @@ class ReceiptDB:
             validate_acknowledgements(evaluation, request.acknowledgements)
             if evaluation.findings and missing_revision:
                 raise ValueError("review_revision_required")
+            display = current.merchant_display_name or await merchants.suggested_name(
+                conn, user_id if user_id == current.user_id else None,
+                current.merchant_name, current.merchant_address,
+            )
+            await merchants.learn_name(
+                conn, current.user_id, user_id, current.merchant_name, current.merchant_address, display,
+            )
             saved = await conn.fetchrow(
-                """UPDATE receipts SET status='verified',verified=TRUE,verification_source='human',
+                """UPDATE receipts SET status='verified',verified=TRUE,merchant_display_name=$5,verification_source='human',
                 operation_revision=operation_revision+1,findings=$2::jsonb,checks_version=$3,
                 acknowledgements=$4::jsonb WHERE id=$1 RETURNING *""",
                 receipt_id,
                 json.dumps([f.model_dump(mode="json") for f in evaluation.findings]),
                 evaluation.checks_version,
                 json.dumps([a.model_dump(mode="json") for a in request.acknowledgements]),
+                display,
             )
             assert saved is not None
             await self._append_review_history(conn, saved, "verified", user_id)
@@ -1203,7 +1322,7 @@ class ReceiptDB:
         if search:
             pattern = f"%{search}%"
             args.append(pattern)
-            where.append(f"(merchant_name ILIKE ${len(args)} OR receipt_number ILIKE ${len(args)})")
+            where.append(f"(merchant_name ILIKE ${len(args)} OR merchant_display_name ILIKE ${len(args)} OR receipt_number ILIKE ${len(args)})")
         if collection_id is not None:
             args.append(collection_id)
             where.append(
@@ -1277,7 +1396,7 @@ class ReceiptDB:
             currency_rows = await conn.fetch(STATS_CURRENCY_SQL.format(scope=scope), *scope_args)
             merchant_rows = await conn.fetch(
                 STATS_NAMED_SQL.format(
-                    field="COALESCE(NULLIF(merchant_name, ''), 'Unknown merchant')",
+                    field="COALESCE(merchant_display_name, NULLIF(merchant_name, ''), 'Unknown merchant')",
                     scope=scope,
                 ),
                 *scope_args,

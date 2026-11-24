@@ -41,6 +41,7 @@ paddleocr-service/ocr_contract/**
 # Public files linked by the offline Settings manuals.
 !README.md
 !AGENTS.md
+!HAENDLERVERZEICHNIS.md
 !MULTI_IMAGE_RECEIPTS.md
 !OPENAI_COMPATIBLE.md
 !RELEASES.md

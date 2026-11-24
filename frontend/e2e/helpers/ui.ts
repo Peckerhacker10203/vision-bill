@@ -72,7 +72,7 @@ export async function uploadFixture(
 	expect(outcome.status, `submission ${jobId}: ${outcome.result_code}`).toBe('analyzed');
 	expect(typeof outcome.receipt_id).toBe('string');
 	await page.getByRole('link', { name: 'Open and review receipt' }).click();
-	await expect(page.getByRole('heading', { name: fixture.expected.merchant_name })).toBeVisible({
+	await expect(page.locator('#re-merchant')).toHaveValue(fixture.expected.merchant_name, {
 		timeout: 30_000
 	});
 	if (opts.bypass) {

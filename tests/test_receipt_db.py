@@ -746,6 +746,7 @@ def test_list_sql_exposes_thumbnail_path() -> None:
 @pytest.mark.asyncio
 async def test_confirmed_history_overrides_model_without_learning(db: ReceiptDB) -> None:
     conn = AsyncMock()
+    conn.fetchval.return_value = None  # No previously confirmed merchant alias.
     db._pool = _make_pool(conn)
     owner = UUID("00000000-0000-4000-8000-000000000099")
     conn.fetchrow = AsyncMock(return_value=_receipt_row(user_id=owner))
@@ -812,6 +813,7 @@ async def test_legacy_replacement_does_not_inherit_removed_item(db: ReceiptDB) -
 @pytest.mark.asyncio
 async def test_explicit_unknown_removes_both_confirmed_aliases(db: ReceiptDB) -> None:
     conn = AsyncMock()
+    conn.fetchval.return_value = None  # No previously confirmed merchant alias.
     db._pool = _make_pool(conn)
     owner = UUID("00000000-0000-4000-8000-000000000099")
     conn.fetchrow = AsyncMock(return_value=_receipt_row(user_id=owner))
@@ -849,3 +851,23 @@ async def test_details_and_replacement_only_access_visible_collection_links(db: 
     delete_sql, *delete_args = conn.execute.await_args_list[0].args
     assert "USING collections" in delete_sql and "c.user_id" in delete_sql
     assert delete_args == [RECEIPT_ID, owner]
+
+
+@pytest.mark.parametrize("candidate, expected", [
+    ("Globus Baumarkt", "Globus Baumarkt"),
+    ("Globus Markthallen", "Globus Markthallen"),
+    ("Unrelated chain", "Globus"),
+])
+async def test_automatic_receipt_accepts_only_candidates_for_printed_brand(db, candidate, expected):
+    from vision_bill.provider.db.receipt_db import INSERT_RECEIPT_SQL
+
+    conn = AsyncMock()
+    conn.fetchrow.return_value = _receipt_row()
+    db._pool = _make_pool(conn)
+    receipt = _make_receipt("Globus")
+    receipt.merchant_display_name = candidate
+    await db.persist_receipt(receipt)
+    insert = conn.fetchrow.await_args
+    assert insert.args[0] == INSERT_RECEIPT_SQL
+    assert insert.args[2] == "Globus"
+    assert insert.args[19] == expected

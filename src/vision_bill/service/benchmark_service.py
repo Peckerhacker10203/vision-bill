@@ -35,7 +35,12 @@ from ..provider.llm.base import LLMProvider
 from ..provider.llm.errors import UnreadableReceiptError
 from ..provider.llm.experiment import endpoint_fingerprint
 from .activation_admission import inference_admission
-from .benchmark_scoring import PROMPT_VERSION, dataset_fingerprint, score_receipts
+from .benchmark_scoring import (
+    PROMPT_VERSION,
+    dataset_fingerprint,
+    score_receipts,
+    validation_schema_sha256,
+)
 from .experiment_execution import (
     ExperimentFailure,
     ExperimentResult,
@@ -173,7 +178,7 @@ class BenchmarkService:
             "endpoint_fingerprint": endpoint_fingerprint(self._provider),
             "ocr_fingerprint": ocr_fingerprint(getattr(self._receipts, "_ocr_provider", None)),
             "prompt_hashes": {str(count): sha256(probe.build_prompt(tags, image_count=count).encode()).hexdigest() for count in counts},
-            "validation_schema_sha256": sha256(json.dumps(Receipt.model_json_schema(), sort_keys=True).encode()).hexdigest(),
+            "validation_schema_sha256": validation_schema_sha256(),
             "thinking_default": "server-controlled" if options.think is None else "explicit",
         }
 
@@ -211,8 +216,10 @@ class BenchmarkService:
             detail = await asyncio.to_thread(self._score, manifest, receipt_id, expected, result.receipt, result.metadata)
             item = next(item for item in manifest["inputs"] if item["receipt_id"] == str(receipt_id))
             return {"receipt_id": receipt_id, "model_id": model_id, **detail,
-                    "expected": item["expected"] if item.get("reference") else expected.model_dump(mode="json"),
-                    "actual": result.receipt.model_dump(mode="json"),
+                    "expected": item["expected"] if item.get("reference") else expected.model_dump(
+                        mode="json", exclude={"merchant_display_name"}
+                    ),
+                    "actual": result.receipt.model_dump(mode="json", exclude={"merchant_display_name"}),
                     "metadata": result.metadata}
         raise ValueError("Historical benchmark has no execution manifest; create a new run")
 
@@ -496,7 +503,7 @@ class BenchmarkService:
                     state="configuration_required", reason_code="execution_policy_changed",
                 ))
             raise ValueError(f"{topology_error}; create a new run")
-        schema_hash = sha256(json.dumps(Receipt.model_json_schema(), sort_keys=True).encode()).hexdigest()
+        schema_hash = validation_schema_sha256()
         if manifest["validation_schema_sha256"] != schema_hash:
             raise ValueError("Receipt validation schema changed; create a new run")
         paths = [Path(image["path"]) for image in item["images"]]
@@ -666,7 +673,7 @@ class BenchmarkService:
         detail = await asyncio.to_thread(self._score, manifest, task["receipt_id"], expected, result.receipt, result.metadata)
         result.metadata.update(self._attempt_metadata(task))
         payload = {**detail, "expected": next(x["expected"] for x in manifest["inputs"] if x["receipt_id"] == str(task["receipt_id"])),
-                   "actual": result.receipt.model_dump(mode="json"), "metadata": result.metadata}
+                   "actual": result.receipt.model_dump(mode="json", exclude={"merchant_display_name"}), "metadata": result.metadata}
         if isinstance(expected, Receipt) and detail.get("version") != MASKED_SCORING_VERSION:
             payload["legacy_scores"] = score_receipts(expected, result.receipt)
         finished = await self._db.finish_task(task, success=True, score=detail["scores"]["normalized"],

@@ -3,7 +3,7 @@ from datetime import time as Time
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BaseModel, Field, field_validator
+from pydantic import AfterValidator, BaseModel, BeforeValidator, Field, field_validator
 
 from .item_category import SpendingCategory, llm_category
 
@@ -15,12 +15,30 @@ Category = Literal[
     "fuel",
     "pharmacy",
     "entertainment",
+    "drugstore",
+    "home_furnishings",
+    "hardware_garden",
+    "books_stationery",
+    "pet_supplies",
+    "sporting_goods",
+    "postal_services",
     "other",
 ]
 
 
 MAX_TAG_LENGTH = 100
 Currency = Annotated[str, Field(pattern=r"^[A-Z]{3}$")]
+
+
+def _clean_merchant_display_name(value: object) -> object:
+    if isinstance(value, str):
+        return " ".join(value.split()) or None
+    return value
+
+
+MerchantDisplayName = Annotated[
+    Annotated[str, Field(max_length=200)] | None, BeforeValidator(_clean_merchant_display_name)
+]
 
 
 def _canonical_local_time(value: str) -> str:
@@ -109,6 +127,7 @@ class Receipt(BaseModel):
             "(header, footer, address, website) — never guessed from a logo"
         )
     )
+    merchant_display_name: MerchantDisplayName = None
     merchant_address: str | None = Field(
         default=None, description="Store address if printed on receipt"
     )

@@ -86,7 +86,7 @@
 						checked={ids.includes(row.id)}
 						disabled={!eligible(row)}
 						onchange={() => {
-							labels[row.id] = row.merchant_name || row.id;
+							labels[row.id] = row.merchant_display_name || row.merchant_name || row.id;
 							toggle(row.id);
 						}}
 					/>
@@ -101,7 +101,12 @@
 						/>
 					{/if}
 					<span
-						><strong>{row.merchant_name || $t('receipts.unknownVendor')}</strong> · {row.date} · {row.total}
+						><strong
+							>{row.merchant_display_name ||
+								row.merchant_name ||
+								$t('receipts.unknownVendor')}</strong
+						>
+						· {row.date} · {row.total}
 						{row.currency}
 						<small class="block text-on-surface-variant"
 							>{$t(
@@ -121,7 +126,7 @@
 						class="text-sm text-primary underline"
 						onclick={() => onPreview(row.id)}
 						aria-label={$t('benchmarkForm.previewOne', {
-							values: { name: row.merchant_name || row.id }
+							values: { name: row.merchant_display_name || row.merchant_name || row.id }
 						})}>{$t('benchmarkForm.preview')}</button
 					>
 				{/if}

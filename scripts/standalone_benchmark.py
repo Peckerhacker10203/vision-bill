@@ -50,7 +50,7 @@ from vision_bill.model.workflow import AccessScope
 from vision_bill.provider.factory import get_llm_provider, get_ocr_provider
 from vision_bill.provider.llm.base import LLMProvider
 from vision_bill.provider.ocr.base import OcrProvider
-from vision_bill.service.benchmark_scoring import score_receipts
+from vision_bill.service.benchmark_scoring import score_receipts, validation_schema_sha256
 from vision_bill.service.experiment_execution import ExperimentResult
 
 logger = logging.getLogger(__name__)
@@ -393,9 +393,7 @@ async def execution_identity(
             "provider": type(provider).__name__,
             "endpoint_fingerprint": endpoint_fingerprint(provider),
             "requested_model": {"id": model.id, "digest": model.digest},
-            "validation_schema_sha256": sha256(
-                json.dumps(Receipt.model_json_schema(), sort_keys=True).encode()
-            ).hexdigest(),
+            "validation_schema_sha256": validation_schema_sha256(),
         }
 
 

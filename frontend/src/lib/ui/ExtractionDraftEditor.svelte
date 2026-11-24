@@ -16,6 +16,7 @@
 	import ReceiptPhotos from './ReceiptPhotos.svelte';
 	import AmountPolicyEditor from './AmountPolicyEditor.svelte';
 	import { hasOverlapRows, unknownOverlap } from './overlap-decisions';
+	import MerchantNameInput from './MerchantNameInput.svelte';
 	import TagEditor from './TagEditor.svelte';
 	import { isSignedDecimal, isPlainDecimal, validReviewDecimal } from './money';
 	let { id }: { id: string } = $props();
@@ -65,6 +66,7 @@
 	const fields = [
 		'confidence',
 		'merchant_name',
+		'merchant_display_name',
 		'merchant_address',
 		'receipt_number',
 		'date',
@@ -81,6 +83,7 @@
 	const labelKeys: Record<string, string> = {
 		confidence: 'editor.confidence',
 		merchant_name: 'editor.merchant',
+		merchant_display_name: 'editor.merchantDisplayName',
 		merchant_address: 'editor.address',
 		receipt_number: 'editor.number',
 		date: 'editor.date',
@@ -143,7 +146,12 @@
 		const changes: DraftPatch['changes'] = {};
 		if (!draft) return changes;
 		for (const key of Object.keys(document) as (keyof ExtractionDraft)[]) {
-			if (JSON.stringify(document[key]) !== JSON.stringify(draft.document[key]))
+			if (
+				JSON.stringify(document[key]) !== JSON.stringify(draft.document[key]) ||
+				(key === 'merchant_display_name' &&
+					(document.merchant_name !== draft.document.merchant_name ||
+						document.merchant_address !== draft.document.merchant_address))
+			)
 				Object.assign(changes, { [key]: document[key] });
 		}
 		if (JSON.stringify(policy) !== JSON.stringify(draft.amount_policy))
@@ -157,6 +165,21 @@
 	let dirty = $derived(Object.keys(changes).length > 0);
 	function numeric(value: string) {
 		return value.trim() === '' ? null : Number(value);
+	}
+	function updateField(field: (typeof fields)[number], text: string) {
+		const value = field === 'confidence' ? numeric(text) : text.trim() || null;
+		if (document[field] === value) return;
+		Object.assign(document, { [field]: value });
+		if (field === 'merchant_name' || field === 'merchant_address') {
+			delete document.merchant_display_name;
+			if (
+				draft?.document.merchant_display_name !== undefined &&
+				document.merchant_name === draft.document.merchant_name &&
+				document.merchant_address === draft.document.merchant_address
+			) {
+				document.merchant_display_name = draft.document.merchant_display_name;
+			}
+		}
 	}
 	function validation(): string[] {
 		const errors: string[] = [];
@@ -330,48 +353,60 @@
 				>{$t('submission.openReceipt')}</a
 			>{:else}
 			<fieldset disabled={busy} class="space-y-4">
-				{#each [fields.slice(0, 9), fields.slice(9)] as group, groupIndex (groupIndex)}
+				{#each [fields.slice(0, 10), fields.slice(10)] as group, groupIndex (groupIndex)}
 					<fieldset class="rounded-xl border border-outline-variant bg-surface-container-low p-4">
 						<legend class="px-1 font-semibold"
 							>{$t(groupIndex === 0 ? 'editor.details' : 'editor.amounts')}</legend
 						>
 						<div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
 							{#each group as field (field)}<div class="block text-sm">
-									<label for={`draft-${field}`}>{$t(labelKeys[field])}</label
-									>{#if field === 'payment_method' || field === 'category'}
-										{@const options = field === 'payment_method' ? PAYMENT_METHODS : CATEGORIES}
-										{@const current = document[field]}
-										<select
-											class="block w-full rounded border p-2"
-											id={`draft-${field}`}
-											aria-invalid={invalidFields.includes(field)}
-											value={current ?? ''}
-											onchange={(e) =>
-												Object.assign(document, { [field]: e.currentTarget.value || null })}
-										>
-											<option value="">—</option>
-											{#if current && !options.some((option) => option === current)}<option
-													value={current}>{current}</option
-												>{/if}
-											{#each options as option (option)}<option value={option}
-													>{$t(
-														`${field === 'payment_method' ? 'payment' : 'categories'}.${option}`
-													)}</option
-												>{/each}
-										</select>
-									{:else}<input
-											class="block w-full rounded border p-2"
-											id={`draft-${field}`}
-											aria-invalid={invalidFields.includes(field)}
-											value={document[field] ?? ''}
-											oninput={(e) =>
-												Object.assign(document, {
-													[field]:
-														field === 'confidence'
-															? numeric(e.currentTarget.value)
-															: e.currentTarget.value.trim() || null
-												})}
-										/>{/if}
+									{#if field === 'merchant_display_name'}
+										<MerchantNameInput
+											id="draft-merchant_display_name"
+											value={document.merchant_display_name}
+											printed={document.merchant_name}
+											address={document.merchant_address}
+											imageId={id}
+											onChange={(name) => (document.merchant_display_name = name || null)}
+										/>
+									{:else}<label for={`draft-${field}`}>{$t(labelKeys[field])}</label
+										>{#if field === 'payment_method' || field === 'category'}
+											{@const options = field === 'payment_method' ? PAYMENT_METHODS : CATEGORIES}
+											{@const current = document[field]}
+											<select
+												class="block w-full rounded border p-2"
+												id={`draft-${field}`}
+												aria-invalid={invalidFields.includes(field)}
+												value={current ?? ''}
+												onchange={(e) =>
+													Object.assign(document, { [field]: e.currentTarget.value || null })}
+											>
+												<option value="">—</option>
+												{#if current && !options.some((option) => option === current)}<option
+														value={current}>{current}</option
+													>{/if}
+												{#each options as option (option)}<option value={option}
+														>{$t(
+															`${field === 'payment_method' ? 'payment' : 'categories'}.${option}`
+														)}</option
+													>{/each}
+											</select>
+										{:else}<input
+												class="block w-full rounded border p-2"
+												id={`draft-${field}`}
+												aria-invalid={invalidFields.includes(field)}
+												aria-describedby={field === 'merchant_name'
+													? 'draft-printed-hint'
+													: undefined}
+												value={document[field] ?? ''}
+												oninput={(e) => updateField(field, e.currentTarget.value)}
+											/>{/if}
+										{#if field === 'merchant_name'}<p
+												id="draft-printed-hint"
+												class="text-xs text-on-surface-variant"
+											>
+												{$t('editor.printedMerchantHint')}
+											</p>{/if}{/if}
 								</div>{/each}
 						</div>
 					</fieldset>{/each}

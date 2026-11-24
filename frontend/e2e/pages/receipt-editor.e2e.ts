@@ -29,9 +29,28 @@ test.describe('receipt editor', () => {
 		// confirmed by the assertion below.
 		// Fixture 'a' has multiple line items all tagged 'food'; use .first()
 		// to avoid Playwright strict-mode violation.
-		await page.getByText('Optional tags').first().click();
 		await expect(page.getByText('Food').first()).toBeVisible();
 		await expect(page.getByRole('button', { name: 'Verify' })).toBeVisible();
+	});
+
+	test('keeps the printed merchant when a German display name is selected, saved and reopened', async ({
+		page,
+		context
+	}) => {
+		test.setTimeout(120_000);
+		await uploadFixture(page, context, await loadFixture('a'), { verify: false });
+		await page.locator('#locale-select').selectOption('de');
+		await page.locator('#re-merchant').fill('HIT 061 Bonn');
+		await page.getByRole('button', { name: '„HIT Handelsgruppe“ übernehmen' }).click();
+		await expect(page.getByLabel('Anzeigename des Händlers')).toHaveValue('HIT Handelsgruppe');
+		await page.getByRole('button', { name: 'Speichern', exact: true }).click();
+		await expect(
+			page.getByRole('heading', { name: 'HIT Handelsgruppe', exact: true })
+		).toBeVisible();
+		await page.reload();
+		await expect(page.locator('#re-merchant')).toHaveValue('HIT 061 Bonn');
+		await page.locator('#locale-select').selectOption('en');
+		await expect(page.getByLabel('Merchant display name')).toHaveValue('HIT Handelsgruppe');
 	});
 
 	test('verify dialog cancel keeps the receipt unverified', async ({ page, context }) => {
@@ -278,7 +297,6 @@ test.describe('receipt editor', () => {
 
 		// Classification already selected food. Add a different vocabulary tag
 		// and check selected pills, not matching text in the open options list.
-		await page.getByText('Optional tags').first().click();
 		await expect(page.getByRole('button', { name: 'Remove “Food”', exact: true })).toBeVisible();
 		await expect(page.getByRole('button', { name: 'Remove “Beverages”', exact: true })).toHaveCount(
 			0
@@ -297,7 +315,6 @@ test.describe('receipt editor', () => {
 		await expect(page.getByText('Changes saved')).toBeVisible({ timeout: 15_000 });
 
 		await page.reload();
-		await page.getByText('Optional tags').first().click();
 		await expect(
 			page.getByRole('button', { name: 'Remove “Beverages”', exact: true })
 		).toBeVisible();

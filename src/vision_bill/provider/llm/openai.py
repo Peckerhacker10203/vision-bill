@@ -315,7 +315,7 @@ class OpenAIProvider(LLMProvider):
         messages = [
             {"role": "user", "content": self.build_ocr_prompt(compact_ocr_text(ocr_result), tags)}
         ]
-        return (await self._legacy_analysis(model_id, messages)).receipt
+        return (await self._legacy_analysis(model_id, messages, tags=tags)).receipt
 
     async def analyse_receipt_with_metadata(
         self, model_id: str, image: Path | Sequence[Path], tags: Sequence[str] | None = None
@@ -323,5 +323,6 @@ class OpenAIProvider(LLMProvider):
         return await self._legacy_analysis(
             model_id,
             self._build_image_messages(image, tags),
+            tags=tags,
             image_count=1 if isinstance(image, Path) else len(image),
         )
