@@ -40,6 +40,16 @@ def validate_profile(value: Any) -> dict[str, Any]:
     return {"schema": 1, "candidate_targets": _validated(value["candidate_targets"])}
 
 
+def verify_rocm_image_target(inventory: dict[str, Any], device: dict[str, Any]) -> None:
+    profile = validate_profile(inventory.get("target_profile"))
+    if device["gfx_target"] not in profile["candidate_targets"]:
+        raise ValueError("Selected HIP target is outside this image's candidate target set")
+    # Earlier images always built both the KFD and the WSL libraries.
+    transport = "wsl" if device.get("transport") == "wsl-dxg" else "kfd"
+    if inventory.get("transport", "dual") not in ("dual", transport):
+        raise ValueError(f"ROCm image transport does not match the selected {transport} device")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--targets", default="")

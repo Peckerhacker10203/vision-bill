@@ -383,7 +383,7 @@ def test_failed_candidate_cannot_create_restart_record(
             return prepared.stdout
         if "--check" in args:
             assert args[-2:] == ("--channel", selected_channel)
-            return ""
+            return "f" * 64 if "--reuse-image" in args else str(SCRIPT.parents[1] / "paddleocr-service")
         if args[:2] == ("make", "ocr-build-cuda"):
             assert not reuse
             return ""
@@ -448,7 +448,10 @@ def test_failed_candidate_cannot_create_restart_record(
 
 
 @pytest.mark.parametrize(
-    "altered", [None, "lock", "sources", "legacy", "bad_retired", "wrong_snapshot", "unexpected", "missing"]
+    "altered", [
+        None, "lock", "sources", "legacy", "bad_retired", "wrong_snapshot", "unexpected", "missing",
+        "wrong_gpu", "two_gpus", "old_gpu", "old_driver",
+    ]
 )
 def test_native_binding_uses_full_exact_package_closure(
     ocr_release: tuple[Path, dict[str, Any], Path],  # noqa: F811
@@ -516,9 +519,27 @@ def test_native_binding_uses_full_exact_package_closure(
         metadata, "distributions", lambda: [SimpleNamespace(metadata={"Name": "paddlepaddle-gpu"})]
     )
     monkeypatch.setattr(bootstrap, "seal_dependencies", lambda name, **kwargs: (closure, {}))
-    monkeypatch.setattr(device_inventory, "inspect_device_identity", lambda *args: {})
+    import ctypes
+    from uuid import UUID
+
+    expected_uuid = UUID("aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb")
+    monkeypatch.setenv("VISION_BILL_CUDA_SELECTION", f"gpu-{expected_uuid}")
+    def count_devices(count):
+        count._obj.value = 2 if altered == "two_gpus" else 1
+        return 0
+
+    monkeypatch.setattr(ctypes, "CDLL", lambda *_: SimpleNamespace(cuDeviceGetCount=count_devices))
+    monkeypatch.setattr(device_inventory, "inspect_device_identity", lambda *args: {
+        "uuid": "f" * 32 if altered == "wrong_gpu" else expected_uuid.hex,
+        "compute_capability": [6, 1] if altered == "old_gpu" else [7, 0],
+        "driver_version": 11080 if altered == "old_driver" else 12090,
+    })
     binder = path.parent / "bind.py"
     binder.write_text(BIND_BUNDLE)
+    if altered in {"wrong_gpu", "two_gpus", "old_gpu", "old_driver"}:
+        with pytest.raises(ValueError, match="CUDA|SM 7.0"):
+            runpy.run_path(str(binder))
+        return
     if altered == "lock":
         with pytest.raises(ValueError, match="Built CUDA lock differs"):
             runpy.run_path(str(binder))
@@ -535,6 +556,7 @@ def test_native_binding_uses_full_exact_package_closure(
     runpy.run_path(str(binder))
     assert path.read_bytes() == original
     bound = json.loads(capsys.readouterr().out)
+    assert bound["_bound_cuda_uuid"] == expected_uuid.hex
     assert bound["expected_packages"] == closure
     assert bound["image_identity"] == image_id
     assert bound["image_config_sha256"] == config_id[7:]
@@ -1138,6 +1160,8 @@ def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
         digest,
         config_id=config_id,
     )
+    if not reuse:
+        prior["services"][source.NATIVE]["environment"]["OCR_CUDA_EXPECTED_UUID"] = "a" * 32
     managed = tmp_path / "compose.local.json"
     managed.write_text(json.dumps(prior))
     source.record_admission(managed)
@@ -1202,9 +1226,11 @@ def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
             return "cu126\n"
         if "--check" in args:
             assert args[args.index("--channel") + 1] == "cu126"
-            if "--wheel-context" in args:
+            if "--build-context" in args:
                 assert not reuse and args[-2:] == ("--prior-image", config_id)
-            return ""
+                return str(SCRIPT.parents[1] / "paddleocr-service")
+            assert "--reuse-image" in args
+            return "f" * 64
         if "config" in args:
             assert args[args.index("--project-name") + 1] == project
             return json.dumps(built_config)
@@ -1218,13 +1244,14 @@ def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
         if args[:3] == ("docker", "image", "inspect"):
             return new_id
         if args[:2] == ("docker", "run"):
+            assert (("OCR_CUDA_EXPECTED_UUID=" + "a" * 32) in args) is (not reuse)
             staged = Path(args[args.index("--volume") + 1].removesuffix(":/release:ro"))
             manifest = json.loads((staged / "bundle.json").read_text())
             if reuse:
                 expected = json.loads(args[args.index("-c") + 5])
                 assert expected == source.checkout_sources()
                 manifest["source_files"] = expected
-            return json.dumps(manifest)
+            return json.dumps(dict(manifest, _bound_cuda_uuid="a" * 32))
         if "build" in args and failure == "build":
             raise subprocess.CalledProcessError(2, args)
         if "tag" in args or "build" in args or "up" in args:
@@ -1274,6 +1301,7 @@ def test_upgrade_builds_and_restarts_the_saved_project_without_dropping_data(
         )
         assert saved["image_ids"][service] == new_id
         assert saved["cuda_channel"] == "cu126"
+        assert json.loads(managed.read_bytes())["services"][service]["environment"]["OCR_CUDA_EXPECTED_UUID"] == "a" * 32
         assert saved["claim_origin"]["release"] == old_release.name
         assert "--no-build" in commands[-1] and project in commands[-1]
     assert source.was_admitted(managed)

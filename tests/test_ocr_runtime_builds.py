@@ -114,6 +114,9 @@ def test_therock_preparation_inventories_gitlinks_omitted_by_upstream_fetch(tmp_
     nested = repo("fin")
     libraries = repo("libraries")
     docs = repo("docs")
+    (docs / "docs-only-marker").write_text("This file should never be fetched.\n")
+    git(docs, "add", "docs-only-marker")
+    git(docs, "commit", "--quiet", "-m", "Seal docs marker")
     upstream = repo("upstream")
     git(libraries, "submodule", "add", "--quiet", nested.as_uri(), "projects/miopen/fin")
     git(libraries, "commit", "--quiet", "-am", "Pin nested source")
@@ -165,14 +168,37 @@ def test_therock_preparation_inventories_gitlinks_omitted_by_upstream_fetch(tmp_
     assert (new / "build_tools/fetch_sources.py").read_bytes() == fetch_sources.read_bytes()
     original_gitlinks = (tmp_path / "therock-original-gitlinks.txt").read_text().splitlines()
     assert f"160000 {git(libraries, 'rev-parse', 'HEAD')} 0\trocm-libraries" in original_gitlinks
-    for path in ("rocm-docs", "rocm-libraries", "rocm-libraries/projects/miopen/fin"):
+    docs_commit = git(docs, "rev-parse", "HEAD")
+    assert f"160000 {docs_commit} 0\trocm-docs" in original_gitlinks
+    assert not (new / "rocm-docs/docs-only-marker").exists()
+    assert not (new / ".git/modules/rocm-docs").exists()
+    for path in ("rocm-libraries", "rocm-libraries/projects/miopen/fin"):
         assert git(new / path, "config", "--get", "remote.origin.partialclonefilter") == "blob:none"
     report = json.loads(output.read_text())
-    assert report["checkouts"]["rocm-docs"]["head"] == git(docs, "rev-parse", "HEAD")
+    assert "rocm-docs" not in report["checkouts"]
+    assert report["omitted_root_gitlinks"] == {"rocm-docs": docs_commit}
     assert report["checkouts"]["rocm-libraries/projects/miopen/fin"]["head"] == git(nested, "rev-parse", "HEAD")
     assert report["checkouts"]["rocm-libraries"]["head"] != git(libraries, "rev-parse", "HEAD")
     assert report["checkouts"]["rocm-libraries"]["head"] == git(new / "rocm-libraries", "rev-parse", "HEAD")
     assert ".rocm-libraries.smrev" in report["patches_and_smrev"]
+
+    inventory = [sys.executable, SERVICE / "build/source_inventory.py", new, tmp_path / "invalid.json",
+                 "--omit-root-gitlink", "rocm-docs"]
+    git(new, "update-index", "--cacheinfo", f"160000,{git(libraries, 'rev-parse', 'HEAD')},rocm-docs")
+    changed = subprocess.run(inventory, capture_output=True, text=True, check=False)
+    assert changed.returncode != 0
+    assert "differs from the pinned root tree" in changed.stderr
+    git(new, "reset", "HEAD", "--", "rocm-docs")
+    git(new / "rocm-libraries", "submodule", "deinit", "-f", "projects/miopen/fin")
+    incomplete = subprocess.run(inventory, capture_output=True, text=True, check=False)
+    assert incomplete.returncode != 0
+    assert f"Uninitialized recursive source gitlink: {git(nested, 'rev-parse', 'HEAD')} rocm-libraries/projects/miopen/fin" in incomplete.stderr
+    git(new, "submodule", "deinit", "-f", "rocm-libraries")
+    missing_root = subprocess.run(inventory, capture_output=True, text=True, check=False)
+    assert missing_root.returncode != 0
+    assert f"Uninitialized recursive source gitlink: {git(libraries, 'rev-parse', 'HEAD')} rocm-libraries" in missing_root.stderr
+    assert not (tmp_path / "invalid.json").exists()
+
 
 
 def test_sidecar_independent_context_cache_and_internal_readiness():
@@ -329,10 +355,24 @@ def test_build_bootstrap_tools_are_hashed_before_no_isolation_source_builds():
     bootstrap = SERVICE / "requirements.bootstrap.lock"
     assert bootstrap.is_file(), "locked build bootstrap missing"
     assert "setuptools==" in bootstrap.read_text() and "--hash=sha256:" in bootstrap.read_text()
-    for accelerator in ("cuda", "rocm"):
-        text = (SERVICE / f"Dockerfile.{accelerator}").read_text()
-        assert "--only-binary=:all: -r /opt/locks/requirements.bootstrap.lock" in text
-        assert "--no-build-isolation -r /opt/locks/requirements.build.lock" in text
+    rocm = (SERVICE / "Dockerfile.rocm").read_text()
+    assert "--only-binary=:all: -r /opt/locks/requirements.bootstrap.lock" in rocm
+    assert "--no-build-isolation -r /opt/locks/requirements.build.lock" in rocm
+
+
+def test_cuda_stages_only_install_the_locked_runtime_into_the_final_venv():
+    recipe = (SERVICE / "Dockerfile.cuda").read_text()
+    base, rest = recipe.split("FROM runtime-base AS cuda-builder")
+    builder, runtime = rest.split("FROM runtime-base\n")
+    assert "requirements.build.lock" not in recipe
+    assert "build-essential" not in base
+    assert "libgomp1" in base
+    assert "--only-binary=:all: -r /opt/locks/requirements.cuda-build.lock" in builder
+    assert "--root /runtime --ignore-installed --require-hashes --no-deps" in builder
+    assert "COPY --from=cuda-builder /runtime/opt/venv/ /opt/venv/" in runtime
+    assert "COPY --from=cuda-builder /opt/locks/ /opt/locks/" in runtime
+    assert "COPY --from=cuda-builder /opt/ocr/build/resolve_cuda.py" in runtime
+    assert "RUN --network=none python -m pip check" in runtime
 
 
 def test_runtime_lock_hashes_match_committed_inputs():
@@ -650,3 +690,90 @@ def test_cuda_resolution_is_identical_across_scratch_paths(tmp_path, monkeypatch
         outputs.append((lock.read_bytes(), lock.with_suffix(".attestation.json").read_bytes()))
     assert outputs[0] == outputs[1]
     assert str(tmp_path).encode() not in outputs[0][0]
+
+
+@pytest.mark.parametrize("transport", ["kfd", "wsl", "dual", "unknown"])
+def test_therock_transport_controls_native_sources_before_build(tmp_path, transport):
+    import shutil
+
+    recipe = tmp_path / "recipe"
+    recipe.mkdir()
+    shutil.copy(SERVICE / "build/build_therock.sh", recipe)
+    shutil.copy(SERVICE / "build/build_jobs.py", recipe)
+    (recipe / "prepare_therock.sh").write_text("exit 0\n")
+    (tmp_path / "ocr_service").mkdir()
+    shutil.copy(SERVICE / "ocr_service/targets.py", tmp_path / "ocr_service")
+    commands = tmp_path / "commands"
+    commands.mkdir()
+    log = tmp_path / "commands.log"
+    for name, body in {
+        "git": """
+if [[ $1 == init ]]; then
+    mkdir -p "${@: -1}/dockerfiles"
+    touch "${@: -1}/dockerfiles/install_pinned_patchelf.sh"
+fi
+if [[ "$*" == *win32metadata*"fetch --depth"* ]]; then exit 44; fi
+""",
+        "cmake": 'if [[ "$1" == --build ]]; then exit 45; fi',
+    }.items():
+        executable = commands / name
+        executable.write_text(f'#!/bin/bash\necho "{name} $*" >> "$LOG"\n{body}\n')
+        executable.chmod(0o755)
+    evidence = tmp_path / "evidence"
+    result = subprocess.run(
+        ["bash", recipe / "build_therock.sh"],
+        env={
+            **os.environ, "PATH": f"{commands}:{os.environ['PATH']}", "LOG": str(log),
+            "SOURCE_ROOT": str(tmp_path / "source"), "EVIDENCE": str(evidence),
+            "OCR_ROCM_TRANSPORT": transport, "AMDGPU_TARGETS": "gfx1032", "BUILD_JOBS": "1",
+        },
+        check=False, capture_output=True, text=True,
+    )
+    if transport == "unknown":
+        assert "Invalid OCR_ROCM_TRANSPORT" in result.stderr
+        assert not log.exists()
+        return
+    assert (evidence / "rocm-transport.txt").read_text() == transport + "\n"
+    calls = log.read_text()
+    assert re.search(r"ocr_rocm_phase phase=therock_sources elapsed_s=[0-9.]+", result.stderr)
+    if transport in {"wsl", "dual"}:
+        assert result.returncode == 44 and "win32metadata" in calls
+    else:
+        assert result.returncode == 45 and "win32metadata" not in calls
+        assert re.search(r"ocr_rocm_phase phase=sdk_compile elapsed_s=[0-9.]+", result.stderr)
+        for option in ("WSL", "WSL_ROCDXG", "MIRAGE", "HIPDNN_SAMPLES"):
+            assert f"-DTHEROCK_ENABLE_{option}=OFF" in calls
+        for option in ("LLVM_PARALLEL_LINK_JOBS", "FLANG_PARALLEL_COMPILE_JOBS"):
+            assert f"-D{option}=1" in calls
+
+
+@pytest.mark.parametrize("transport", ["kfd", "wsl", "dual"])
+@pytest.mark.parametrize("script", ["build_therock.sh", "build_rocm.sh"])
+def test_local_sdk_rejects_unspecified_target_before_source_fetch(tmp_path, transport, script):
+    result = subprocess.run(
+        ["bash", SERVICE / "build" / script, "--paddle-only"],
+        env={
+            **os.environ, "OCR_ROCM_TRANSPORT": transport, "AMDGPU_TARGETS": "",
+            "BUILD_JOBS": "1", "SOURCE_ROOT": str(tmp_path / "sources"),
+            "EVIDENCE": str(tmp_path / "evidence"), "GIT_ALLOW_PROTOCOL": "file",
+        },
+        check=False, capture_output=True, text=True,
+    )
+    assert result.returncode != 0 and "make ocr-build-rocm" in result.stderr
+    assert not (tmp_path / "sources").exists()
+
+
+def test_paddle_timing_preserves_wheel_failure_through_tee(tmp_path):
+    script = (SERVICE / "build/build_rocm.sh").read_text()
+    phase = script[script.index("TIMEFORMAT='ocr_rocm_phase phase=paddle_compile"):].split(
+        '\ncp "$PADDLE_SRC"/dist/', 1
+    )[0]
+    (tmp_path / "setup.py").write_text("print('wheel failed')\nraise SystemExit(19)\n")
+    result = subprocess.run(
+        ["bash", "-c", "set -euo pipefail\n" + phase],
+        env={**os.environ, "PADDLE_SRC": str(tmp_path), "EVIDENCE": str(tmp_path)},
+        check=False, capture_output=True, text=True,
+    )
+    assert result.returncode == 19
+    assert (tmp_path / "paddle-build.log").read_text() == "wheel failed\n"
+    assert re.search(r"ocr_rocm_phase phase=paddle_compile elapsed_s=[0-9.]+", result.stderr)

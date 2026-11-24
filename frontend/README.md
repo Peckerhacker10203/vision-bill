@@ -58,7 +58,10 @@ success-only average is displayed separately.
 
 Admin **Settings** includes a GPU setup and recovery guide for Dedicated OCR.
 Download and extract the offline operator guides ZIP to follow local links
-between manuals. The individual Markdown guides are also available. Local
+between manuals. For a checkout, open `paddleocr-service/README.md` for local
+GPU selection and build settings. For a downloaded release, open
+`distribution/README.md` for its image and launcher instructions.
+The individual Markdown guides are also available. Local
 frontend builds and the dev server use Python 3 to assemble the ZIP. Edit the [source guide](../paddleocr-service/README.md)
 and [bundle guide](../distribution/README.md) and rebuild the frontend to
 refresh the downloads.

@@ -50,7 +50,7 @@ from .supervision import (
     run_owned_qualification,
 )
 from .supervision import ManagedInterrupted as InitializationInterrupted
-from .targets import validate_profile
+from .targets import verify_rocm_image_target
 
 logger = logging.getLogger("ocr_service.initialize")
 
@@ -421,8 +421,7 @@ def verify_package_pins(bundle: ReleaseBundle) -> None:
 def verify_prepared_target(bundle: ReleaseBundle, device: dict[str, Any]) -> None:
     if bundle.accelerator == "rocm":
         evidence = json.loads(Path("/opt/ocr/build-evidence/kernels.json").read_bytes())
-        if device["gfx_target"] not in validate_profile(evidence["target_profile"])["candidate_targets"]:
-            raise ValueError("Selected GPU is outside this image's candidate targets")
+        verify_rocm_image_target(evidence, device)
 
 
 def _prepared_inputs(

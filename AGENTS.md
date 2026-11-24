@@ -134,9 +134,14 @@ installation, restart and worker creation must make zero model predictions.
 The explicit release qualifier owns all fixture inference. Default OCR Dockerfile
 requires a selected accelerator.
 Linux x86_64 containers target NVIDIA Turing/RTX 20+ and AMD RDNA2/RX 6000+
-on native Linux and WSL 2. AMD driver support is board- and host-specific. The broad default profile includes
-RDNA2, RDNA3 and RDNA4 discrete Radeon build targets. Record a selected
-build profile (`OCR_AMDGPU_TARGETS`) separately from physical qualification.
+on native Linux and WSL 2. The CUDA probe's vendor floor is SM 7.0. Consumer
+qualification starts at Turing SM 7.5. Source installations bind and recheck
+the observed CUDA GPU UUID. AMD driver support is board- and host-specific.
+The source launcher and `make ocr-build-rocm` select the local GFX architecture
+and KFD or WSL transport. The explicit target list selects architectures.
+The `dual` build transport includes both GPU interfaces. Release plans carry
+their own target list.
+Record the selected build profile separately from physical qualification.
 Never claim universal AMD support or GPU qualification from CPU tests.
 
 Fixed PaddleOCR-VL-1.6/v1.6, PP-DocLayoutV3, native Paddle, batch 1 everywhere,

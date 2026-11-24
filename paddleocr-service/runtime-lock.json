@@ -15,6 +15,7 @@
     "ocr_contract/wire_json.py": "d68762507779fbae4a528c47f6d2587cb37cb5fe4ec583da2f72fc1f34431882",
     "requirements.bootstrap.lock": "ea0463cbcbd31b0f368bd61ecca40ab60afe376dbfc6f6af4734eab20aa134f3",
     "requirements.build.lock": "69689dc39bd5e96aff805a1fc556fab5d786b3de7330d1ab3b21cd954833872d",
+    "requirements.cuda-build.lock": "026a4838a8ede5fcbbf8fadac1d4e3cf34bfa793001d6ced8bfe758434c743e6",
     "requirements.runtime.lock": "c6d6471af279f271daac0e46017aea566af881493d0e43404d1ab0c9a6b15b88"
   },
   "platform": "linux-x86_64-cp312",
@@ -32,7 +33,7 @@
     "version": "1.95.0"
   },
   "schema": 1,
-  "sdk_components": "THEROCK_ENABLE_ALL=ON",
+  "sdk_components": "THEROCK_ENABLE_ALL=ON; THEROCK_ENABLE_MIRAGE=OFF; THEROCK_ENABLE_HIPDNN_SAMPLES=OFF",
   "sources": {
     "paddle": "7688495538f4d6c1893f084dd238a402e8f68ab6",
     "paddleocr": "b03f46425e8ff4442b268ce449e3eef758146cd4",

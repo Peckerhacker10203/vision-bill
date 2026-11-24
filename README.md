@@ -128,8 +128,11 @@ or separate OCR GPU.
 The source profiles target NVIDIA Turing (RTX 20 series) and later with CUDA,
 and AMD RDNA2 (RX 6000 series) and later with ROCm, on native Linux or Windows
 with WSL 2. NVIDIA uses Docker Desktop on Windows. AMD uses the WSL GPU bridge
-and Docker Engine inside Ubuntu. Check the exact Radeon board and driver
-against AMD’s OS-specific compatibility table. [Source GPU setup](paddleocr-service/README.md#dedicated-ocr-from-source) · [Receipt logs in PowerShell or Linux](paddleocr-service/README.md#read-the-logs-for-a-receipt)
+and Docker Engine inside Ubuntu. For a local source installation, CUDA uses
+the official wheel for the selected channel. ROCm compiles for the selected
+Radeon's GFX architecture and host interface. Check the exact board and driver
+against AMD’s OS-specific compatibility table. Verified distribution bundles
+use the native image already built for the release. [Source GPU setup](paddleocr-service/README.md#dedicated-ocr-from-source) · [Receipt logs in PowerShell or Linux](paddleocr-service/README.md#read-the-logs-for-a-receipt)
 
 `make lint`, `make test`, `make fe-verify`, `make release-test`,
 `make distribution-test`, `make distribution-pid1-test`, `make compose-check`,

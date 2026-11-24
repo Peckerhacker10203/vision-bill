@@ -17,6 +17,7 @@ services:
       context: ./paddleocr-service
       dockerfile: Dockerfile.cuda
       additional_contexts:
+        cuda-locks: "${OCR_CUDA_LOCK_CONTEXT:-./paddleocr-service}"
         cuda-wheel: "${OCR_CUDA_WHEEL_CONTEXT:-./paddleocr-service/empty-wheel-context}"
       args:
         OCR_CUDA_CHANNEL: "${OCR_CUDA_CHANNEL:-cu129}"

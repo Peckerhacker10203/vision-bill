@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .profile import content_identity, file_digest
-from .targets import validate_profile
+from .targets import verify_rocm_image_target
 from .vlm_precision import component_precision, requires_host_assembly
 
 
@@ -31,6 +31,11 @@ def _cuda_identity(index: int) -> dict[str, Any]:
     pointer = ctypes.POINTER(integer)
     device, version, major, minor = (integer() for _ in range(4))
     call("cuInit", [ctypes.c_uint], 0)
+    if "OCR_CUDA_EXPECTED_UUID" in os.environ:
+        count = integer()
+        call("cuDeviceGetCount", [pointer], ctypes.byref(count))
+        if count.value != 1:
+            raise ValueError("Managed OCR must expose exactly one CUDA device")
     call("cuDeviceGet", [pointer, integer], ctypes.byref(device), index)
     call("cuDriverGetVersion", [pointer], ctypes.byref(version))
     name, bus, uuid = (
@@ -73,6 +78,9 @@ def inspect_device_identity(accelerator: Literal["cuda", "rocm"], gpu_index: int
         wsl = accelerator == "rocm" and Path("/dev/dxg").is_char_device()
         if accelerator == "cuda":
             result = _cuda_identity(gpu_index)
+            expected_uuid = os.environ.get("OCR_CUDA_EXPECTED_UUID")
+            if expected_uuid is not None and result["uuid"] != expected_uuid:
+                raise ValueError("CUDA device differs from the prepared OCR installation")
         else:
             command = ["/opt/ocr/bin/hip-device-info", str(gpu_index)]
             if wsl:
@@ -166,9 +174,7 @@ def execution_target(paddle: Any, device: dict[str, Any], accelerator: str) -> d
     if accelerator == "rocm":
         target = result["gfx_target"]
         kernels = json.loads(Path("/opt/ocr/build-evidence/kernels.json").read_text())
-        profile = validate_profile(kernels.get("target_profile"))
-        if target not in profile["candidate_targets"]:
-            raise ValueError("Actual HIP target is outside the candidate target set")
+        verify_rocm_image_target(kernels, device)
         for library in ("paddle", "rocblas", "miopen"):
             if not kernels[library].get("files"):
                 raise ValueError("Required kernel/library inventory is empty")

@@ -114,10 +114,10 @@ use text and evidence. Direct vision needs an image-capable selected model.
 App port defaults to `127.0.0.1:8080`, with `APP_BIND_ADDRESS` and `APP_PORT`
 available for Compose interpolation. Independent OCR defaults to
 `127.0.0.1:8082`, with `OCR_BIND_ADDRESS` and `OCR_PORT`. Set
-`OCR_CUDA_DEVICE_ID` for NVIDIA or `OCR_RENDER_NODE` for Radeon as needed.
-Generated ROCm bundles run the native service as container root. The source
-launcher derives device group IDs from the host. Linux AMD
-target selection starts with RX 6000/RDNA2 candidates. Qualify the exact device
+`OCR_CUDA_DEVICE_ID` for NVIDIA or `OCR_RENDER_NODE` for native Linux Radeon as needed.
+The bundle pulls the release's digest-pinned image with its compiled target
+list. These device settings select the installed GPU at runtime.
+Generated ROCm bundles run the native service as container root. Qualify the exact device
 for release publication. On AMD WSL 2, use the AMD-compatible Windows driver,
 Docker Engine inside Ubuntu and `OCR_ROCM_DEVICE_ID` (default `0`). Start a
 combined ROCm bundle with `./start-linux.sh` inside Ubuntu.
@@ -466,6 +466,8 @@ source command and release builder each bind the manifest to their built image.
    --inputs DIR --output DIR`, then `--phase qualify --output DIR`, then only after
    success `--phase publish --output DIR`. These are workflow-bound phases requiring
    dispatch identity/environment, not standalone user installation commands.
+   For CUDA, build resolves the selected official channel afresh and uses the same
+   immutable local snapshot for the wheel, installed lock and bundled attestation.
    Build creates exact-source OCI candidates without publication; qualify runs the
    native initializer/full physical gate on the actual selected GPU. App-only choice
    validates the CPU bundle and has no native qualification claim.
@@ -488,7 +490,8 @@ uv and adequate build/archive capacity. Labels are `vision-bill-cuda` and
 OCR device. ROCm selected targets must agree with compile inputs, kernel
 inventory and the actual qualified AMD device. For a ROCm WSL 2 release runner,
 set `rocm.wsl_device_id` to the selected zero-based device index alongside
-`rocm.targets` in the release inputs. For CUDA, `release-inputs.json`
+`rocm.targets` in the release inputs. This explicit release list is independent
+of automatic GFX detection for local source builds. For CUDA, `release-inputs.json`
 defaults to `cu129` for new candidates. Set `"cuda_channel": "cu126"` to select
 CUDA 12.6 explicitly. On multi-GPU runners set `cuda_device_id` to the physical
 GPU index as a string or to the NVIDIA GPU UUID. It defaults to `"0"`. Only

@@ -8,18 +8,24 @@ and attestation together.
 
 import argparse
 import email
+import fcntl
 import hashlib
 import html.parser
 import json
 import os
 import re
-import shutil
 import subprocess
+import sys
 import tempfile
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from http.client import HTTPMessage
+from collections.abc import Iterator
+from contextlib import contextmanager
+from http.client import HTTPMessage, IncompleteRead
+from importlib.metadata import version
 from pathlib import Path
 from typing import IO, Any, Never
 
@@ -248,8 +254,94 @@ def wheel_cache() -> Path:
 
 def download_wheel(url: str, target: Path) -> None:
     opener = urllib.request.build_opener(NoRedirects())
-    with opener.open(url, timeout=600) as response, target.open("xb") as stream:
-        shutil.copyfileobj(response, stream, 1024 * 1024)
+    start = time.monotonic()
+    last = start
+    received = 0
+    total = None
+    etag = None
+    print(f"Downloading CUDA wheel from {url}", file=sys.stderr, flush=True)
+    with target.open("xb") as stream:
+        for attempt in range(3):
+            request = urllib.request.Request(url, headers={"Accept-Encoding": "identity"})
+            if received and etag is not None:
+                request.add_header("Range", f"bytes={received}-")
+                request.add_header("If-Range", etag)
+            try:
+                with opener.open(request, timeout=600) as response:
+                    if response.status == 200:
+                        stream.seek(0)
+                        stream.truncate()
+                        received = 0
+                        length = response.headers.get("Content-Length")
+                        total = int(length) if length is not None else None
+                        etag = response.headers.get("ETag")
+                    elif not (
+                        response.status == 206
+                        and received
+                        and total is not None
+                        and response.headers.get("ETag") == etag
+                        and response.headers.get("Content-Range")
+                        == f"bytes {received}-{total - 1}/{total}"
+                    ):
+                        raise ValueError("Unexpected CUDA wheel range response")
+                    elif response.headers.get("Content-Length") not in (
+                        None,
+                        str(total - received),
+                    ):
+                        raise ValueError("Unexpected CUDA wheel range response length")
+                    while chunk := response.read(1024 * 1024):
+                        if total is not None and received + len(chunk) > total:
+                            raise ValueError("CUDA wheel exceeds the declared response length")
+                        stream.write(chunk)
+                        received += len(chunk)
+                        now = time.monotonic()
+                        if now - last >= 10:
+                            print(
+                                f"CUDA wheel: {received} bytes, {now - start:.1f}s, "
+                                f"{received / max(now - start, 0.001) / 1048576:.1f} MiB/s",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            last = now
+                    if total is not None and received != total:
+                        raise EOFError("Incomplete CUDA wheel transfer")
+                    break
+            except (
+                EOFError,
+                IncompleteRead,
+                ConnectionError,
+                TimeoutError,
+                urllib.error.URLError,
+            ) as exc:
+                if isinstance(exc, urllib.error.URLError) and not isinstance(
+                    exc.reason, (ConnectionError, TimeoutError)
+                ):
+                    raise
+                if attempt == 2:
+                    raise
+                if not (
+                    received
+                    and total
+                    and received < total
+                    and etag
+                    and re.fullmatch(r'"[^"]+"', etag)
+                ):
+                    received = 0
+                    total = None
+                    etag = None
+                    stream.seek(0)
+                    stream.truncate()
+                print(
+                    f"Retrying CUDA wheel transfer from byte {received}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+    elapsed = time.monotonic() - start
+    print(
+        f"CUDA wheel: {received} bytes, {elapsed:.1f}s, "
+        f"{received / max(elapsed, 0.001) / 1048576:.1f} MiB/s",
+        file=sys.stderr,
+    )
 
 
 def seed_from_previous_image(image: str, data: dict[str, Any], candidate: Path) -> bool:
@@ -291,6 +383,13 @@ def wheel_context(
 ) -> Path:
     """Expose only the verified wheel for this digest to the Docker builder."""
     base = wheel_cache()
+    with cache_lock(base / (data["wheel_sha256"] + ".lock")):
+        return populate_wheel_context(base, data, downloaded, prior_image)
+
+
+def populate_wheel_context(
+    base: Path, data: dict[str, Any], downloaded: Path | None, prior_image: str | None
+) -> Path:
     directory: Path = base / data["wheel_sha256"]
     directory.mkdir(mode=0o700, exist_ok=True)
     if (
@@ -306,6 +405,7 @@ def wheel_context(
         if not target.is_file():
             raise ValueError("CUDA wheel cache contains a nonregular entry")
         if sha256(target) == data["wheel_sha256"]:
+            print(f"CUDA wheel cache hit: verified {target.name}", file=sys.stderr, flush=True)
             return directory
     if downloaded is not None:
         # The resolver hashed this newly downloaded private file on this filesystem.
@@ -343,7 +443,172 @@ def install_requirements(lock: Path, data: dict[str, Any], context: Path, output
             stream.write(f"{source} {pins}\n")
 
 
-def resolve(service: Path, channel: str = DEFAULT_CHANNEL) -> None:
+def atomic_bytes(path: Path, contents: bytes) -> None:
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+            stream.close()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def cache_lock(path: Path) -> Iterator[None]:
+    with path.open("a+b") as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        yield
+
+
+@contextmanager
+def resolution_lock(service: Path, cache: Path) -> Iterator[None]:
+    # Both files in the checkout can be replaced. Lock the stable directory inode
+    # so every resolver writing here participates, even with a separate XDG cache.
+    checkout_fd = os.open(service, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(checkout_fd, fcntl.LOCK_EX)
+        with cache_lock(cache / ".resolution.lock"):
+            yield
+    finally:
+        os.close(checkout_fd)
+
+
+def resolution_key(service: Path, channel: str) -> str:
+    inputs = {
+        "channel": channel,
+        "runtime": sha256(service / "requirements.runtime.lock"),
+        "requirements": sha256(service / "build/runtime.in"),
+        "resolver": sha256(Path(__file__)),
+        "packaging": version("packaging"),
+        "uv": subprocess.check_output(["uv", "--version"], text=True).strip(),
+        "settings": {
+            key: value
+            for key, value in os.environ.items()
+            if key.startswith("UV_") and key not in {"UV_CACHE_DIR", "UV_OFFLINE"}
+        },
+    }
+    return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+
+
+def resolve(service: Path, channel: str = DEFAULT_CHANNEL, *, ensure: bool = False) -> None:
+    cache = wheel_cache()
+    with resolution_lock(service, cache):
+        resolve_locked(service, channel, ensure, cache)
+
+
+def resolve_locked(service: Path, channel: str, ensure: bool, cache: Path) -> None:
+    lock = service / "requirements.cuda.lock"
+    attestation = lock.with_suffix(".attestation.json")
+    entry = cache / ("resolution-" + resolution_key(service, channel) + ".json")
+    if ensure:
+        try:
+            validate_lock(lock, channel=channel)
+            markers = re.findall(
+                r"^# vision-bill-resolution: (\S+)$", lock.read_text(), re.MULTILINE
+            )
+            if not markers or markers == [entry.stem]:
+                return  # Legacy operator-supplied locks remain authoritative.
+        except (ValueError, FileNotFoundError):
+            pass
+    if ensure and entry.exists():
+        try:
+            with tempfile.TemporaryDirectory(dir=cache) as temporary:
+                restored = Path(temporary) / lock.name
+                pair = json.loads(entry.read_bytes())
+                if pair["key"] != entry.stem or re.findall(
+                    r"^# vision-bill-resolution: (\S+)$", pair["lock"], re.MULTILINE
+                ) != [entry.stem]:
+                    raise ValueError("Cached CUDA resolution input mismatch")
+                restored.write_text(pair["lock"])
+                restored.with_suffix(".attestation.json").write_text(pair["attestation"])
+                validate_lock(restored, service / "requirements.runtime.lock", channel=channel)
+                atomic_bytes(lock, restored.read_bytes())
+                atomic_bytes(attestation, restored.with_suffix(".attestation.json").read_bytes())
+                return
+        except (ValueError, KeyError, TypeError, UnicodeError):
+            pass
+    resolve_official(service, channel, entry)
+
+
+def build_context(
+    lock: Path, channel: str, prior_image: str | None = None, *, refresh: bool = False
+) -> Path:
+    cache = wheel_cache()
+    with resolution_lock(lock.parent, cache):
+        resolve_locked(lock.parent, channel, not refresh, cache)
+        data = validate_lock(lock, channel=channel)
+        lock_bytes = lock.read_bytes()
+        attestation = lock.with_suffix(".attestation.json")
+        attested_bytes = attestation.read_bytes()
+    # Different channels can now resolve concurrently with this download/build.
+    wheel = wheel_context(data, prior_image=prior_image) / data["wheel_url"].rsplit("/", 1)[1]
+    snapshot = cache / ("build-" + hashlib.sha256(attested_bytes).hexdigest())
+    with cache_lock(cache / (snapshot.name + ".lock")):
+        if not snapshot.exists():
+            with tempfile.TemporaryDirectory(dir=cache) as temporary:
+                staging = Path(temporary) / "build"
+                staging.mkdir(mode=0o700)
+                (staging / lock.name).write_bytes(lock_bytes)
+                (staging / attestation.name).write_bytes(attested_bytes)
+                os.link(wheel, staging / wheel.name)
+                staging.rename(snapshot)
+        if (
+            snapshot.is_symlink()
+            or set(snapshot.iterdir())
+            != {snapshot / lock.name, snapshot / attestation.name, snapshot / wheel.name}
+            or any(p.is_symlink() for p in snapshot.iterdir())
+            or (snapshot / lock.name).read_bytes() != lock_bytes
+            or (snapshot / attestation.name).read_bytes() != attested_bytes
+        ):
+            raise ValueError("CUDA build snapshot does not match verified resolution")
+        if not (snapshot / wheel.name).samefile(wheel):
+            # A corrupted wheel cache entry can have been replaced with verified bytes.
+            with tempfile.TemporaryDirectory(dir=cache) as temporary:
+                replacement = Path(temporary) / wheel.name
+                os.link(wheel, replacement)
+                replacement.replace(snapshot / wheel.name)
+    return snapshot
+
+
+def reuse_lock_digest(lock: Path, channel: str, image: str) -> str:
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
+        raise ValueError("CUDA reuse requires an exact local image ID")
+    output = subprocess.check_output(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--pull=never",
+            "--network=none",
+            "--read-only",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--log-driver=none",
+            "--entrypoint=sha256sum",
+            image,
+            "/opt/locks/requirements.cuda.lock",
+        ],
+        text=True,
+    )
+    match = re.fullmatch(r"([a-f0-9]{64})  /opt/locks/requirements.cuda.lock\n", output)
+    if not match:
+        raise ValueError("Cannot read the local CUDA image lock identity")
+    digest = match[1]
+    cache = wheel_cache()
+    with resolution_lock(lock.parent, cache):
+        for candidate in (lock, *cache.glob("build-*/requirements.cuda.lock")):
+            if candidate.is_file() and sha256(candidate) == digest:
+                validate_lock(
+                    candidate, lock.with_name("requirements.runtime.lock"), channel=channel
+                )
+                return digest
+    raise ValueError("Restore the validated CUDA lock and attestation for this local image")
+
+
+def resolve_official(service: Path, channel: str, entry: Path) -> None:
     index = official_index(channel)
     opener = urllib.request.build_opener(NoRedirects())
     os.environ["SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEX"] = "3.7.2"
@@ -383,6 +648,7 @@ def resolve(service: Path, channel: str = DEFAULT_CHANNEL) -> None:
                 "pip",
                 "compile",
                 str(incoming),
+                "--no-config",
                 "--python-version",
                 "3.12",
                 "--python-platform",
@@ -395,9 +661,11 @@ def resolve(service: Path, channel: str = DEFAULT_CHANNEL) -> None:
                 "--output-file",
                 str(output),
             ],
+            stdout=sys.stderr,
             check=True,
         )
         with output.open("a") as stream:
+            stream.write(f"\n# vision-bill-resolution: {entry.stem}\n")
             stream.write(f"\npaddlepaddle-gpu @ {url} \\\n    --hash=sha256:{digest}\n")
         data = {
             "cuda_channel": channel,
@@ -416,17 +684,38 @@ def resolve(service: Path, channel: str = DEFAULT_CHANNEL) -> None:
         attestation.write_text(json.dumps(data, sort_keys=True, indent=2) + "\n")
         validate_lock(output, service / "requirements.runtime.lock", channel=channel)
         wheel_context(data, downloaded=wheel)
-        (service / output.name).write_bytes(output.read_bytes())
-        (service / attestation.name).write_bytes(attestation.read_bytes())
+        atomic_bytes(
+            entry,
+            json.dumps(
+                {
+                    "key": entry.stem,
+                    "lock": output.read_text(),
+                    "attestation": attestation.read_text(),
+                }
+            ).encode(),
+        )
+        atomic_bytes(service / output.name, output.read_bytes())
+        atomic_bytes(service / attestation.name, attestation.read_bytes())
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--refresh", action="store_true", help="fresh official resolution for a build context"
+    )
     parser.add_argument("--check", type=Path)
-    parser.add_argument("--prior-image", help="optional exact previous image ID for --wheel-context")
+    parser.add_argument(
+        "--prior-image", help="optional exact previous image ID for --wheel-context"
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--wheel-context", action="store_true", help="print the verified local Docker context"
+    )
+    mode.add_argument(
+        "--build-context", action="store_true", help="print immutable local build inputs"
+    )
+    mode.add_argument(
+        "--reuse-image", help="verify and print the existing image lock digest offline"
     )
     mode.add_argument("--install-lock", nargs=2, type=Path, metavar=("WHEEL_CONTEXT", "OUTPUT"))
     parser.add_argument(
@@ -436,15 +725,25 @@ if __name__ == "__main__":
     )
     parser.add_argument("--service", type=Path, default=Path(__file__).resolve().parents[1])
     args = parser.parse_args()
-    if args.prior_image is not None and not args.wheel_context:
+    if args.prior_image is not None and not (args.wheel_context or args.build_context):
         parser.error("--prior-image requires --wheel-context")
-    if args.check:
+    if args.refresh and not args.build_context:
+        parser.error("--refresh requires --build-context")
+    if args.check and args.build_context:
+        print(
+            build_context(
+                args.check, args.channel or DEFAULT_CHANNEL, args.prior_image, refresh=args.refresh
+            )
+        )
+    elif args.check and args.reuse_image:
+        print(reuse_lock_digest(args.check, args.channel or DEFAULT_CHANNEL, args.reuse_image))
+    elif args.check:
         evidence = validate_lock(args.check, channel=args.channel)
         if args.wheel_context:
             print(wheel_context(evidence, prior_image=args.prior_image))
         if args.install_lock:
             install_requirements(args.check, evidence, *args.install_lock)
-    elif args.wheel_context or args.install_lock:
+    elif args.wheel_context or args.build_context or args.reuse_image or args.install_lock:
         parser.error("wheel context and installation lock operations require --check")
     else:
         resolve(args.service, args.channel or DEFAULT_CHANNEL)

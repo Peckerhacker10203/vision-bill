@@ -13,6 +13,7 @@ ocr_service/**
 !ocr_service/*.py
 !build/
 build/**
+!build/build_jobs.py
 !build/build_rocm.sh
 !build/build_therock.sh
 !build/prepare_therock.sh

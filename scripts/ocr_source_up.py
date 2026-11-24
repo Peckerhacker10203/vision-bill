@@ -9,13 +9,16 @@ import json
 import os
 import platform
 import re
+import runpy
 import shutil
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
@@ -37,7 +40,7 @@ MANIFEST_TYPES = {
 # Use the verifiers shipped in the exact built image. Neither provisioning nor
 # qualification can run during this offline metadata-only invocation.
 BIND_BUNDLE = """
-import json, subprocess, sys
+import ctypes, json, os, subprocess, sys
 from pathlib import Path
 from ocr_service.bootstrap import bind_approved_dependencies
 from ocr_service.device_inventory import inspect_device_identity
@@ -78,13 +81,25 @@ manifest['expected_packages'] = bind_approved_dependencies(
 )
 bundle = ReleaseBundle.model_validate(manifest)
 device = inspect_device_identity(bundle.accelerator, bundle.gpu_index)
+if bundle.accelerator == 'cuda':
+    count = ctypes.c_int()
+    if ctypes.CDLL('libcuda.so.1').cuDeviceGetCount(ctypes.byref(count)) or count.value != 1:
+        raise ValueError('Docker must expose exactly one selected CUDA device')
+    from uuid import UUID
+    actual_uuid = 'gpu-' + str(UUID(hex=device['uuid']))
+    expected_uuid = os.environ.get('VISION_BILL_CUDA_SELECTION', '')
+    if expected_uuid and not actual_uuid.startswith(expected_uuid):
+        raise ValueError('Docker CUDA device differs from the selected host GPU')
+    if tuple(device['compute_capability']) < (7, 0) or device['driver_version'] < 12000:
+        raise ValueError('The selected OCR GPU requires SM 7.0 or newer and a CUDA 12-capable driver')
 if bundle.accelerator == 'rocm':
-    from ocr_service.targets import validate_profile
+    from ocr_service.targets import verify_rocm_image_target
     kernels = json.loads(Path('/opt/ocr/build-evidence/kernels.json').read_bytes())
-    targets = validate_profile(kernels['target_profile'])['candidate_targets']
-    if device['gfx_target'] not in targets:
-        raise ValueError('Selected GPU GFX target missing from OCR_AMDGPU_TARGETS')
-print(json.dumps(bundle.model_dump(mode='json'), sort_keys=True, indent=2))
+    verify_rocm_image_target(kernels, device)
+bound = bundle.model_dump(mode='json')
+if bundle.accelerator == 'cuda':
+    bound['_bound_cuda_uuid'] = device['uuid']
+print(json.dumps(bound, sort_keys=True, indent=2))
 """
 
 
@@ -265,10 +280,29 @@ def managed_overlay(
     }
 
 
+@contextmanager
+def build_phase(name: str) -> Iterator[None]:
+    started = time.monotonic()
+    print(f"ocr_source_phase phase={name} status=started", flush=True)
+    try:
+        yield
+    except BaseException:
+        print(f"ocr_source_phase phase={name} status=interrupted elapsed_s={time.monotonic() - started:.1f}", flush=True)
+        raise
+    print(f"ocr_source_phase phase={name} status=complete elapsed_s={time.monotonic() - started:.1f}", flush=True)
+
+
 def command(*args: str, capture: bool = False) -> str:
-    return (
-        subprocess.run(args, cwd=ROOT, check=True, capture_output=capture, text=True).stdout or ""
+    show_progress = "--build-context" in args
+    result = subprocess.run(
+        args,
+        cwd=ROOT,
+        check=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture and not show_progress else None,
+        text=True,
     )
+    return result.stdout or ""
 
 
 def stage_first_run_inputs(release: Path, accelerator: str) -> None:
@@ -466,18 +500,14 @@ def bootstrap(
             or details.st_mode & 0o077
         ):
             raise ValueError("Source deployment state must be a private operator-owned directory")
-    compose: tuple[str, ...] = (
-        "docker",
-        "compose",
-        "--profile",
-        "ocr",
-        "-f",
-        "docker-compose.yml",
-        "-f",
-        f"docker-compose.{accelerator}.yml",
-    )
-    if accelerator == "rocm" and "microsoft" in platform.release().lower():
-        compose += ("-f", "docker-compose.rocm-wsl.yml")
+    compose = source_compose(accelerator)
+    if (
+        accelerator == "rocm"
+        and not restart
+        and not upgrade
+        and "docker-compose.rocm-wsl.yml" not in compose
+    ):
+        select_rocm_render_node(compose)
     lock = deployment / "deploy.lock"
     with lock.open("a") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -495,8 +525,10 @@ def bootstrap(
 
 def gpu_args(accelerator: str, native: dict[str, Any]) -> tuple[list[str], dict[str, str]]:
     if accelerator == "cuda":
-        reservation = native["deploy"]["resources"]["reservations"]["devices"][0]
-        ids = reservation["device_ids"]
+        reservations = native["deploy"]["resources"]["reservations"]["devices"]
+        if len(reservations) != 1:
+            raise ValueError("Select exactly one CUDA device reservation")
+        ids = reservations[0]["device_ids"]
         if len(ids) != 1 or not re.fullmatch(r"(?:[0-9]+|GPU-[0-9A-Fa-f-]+)", ids[0]):
             raise ValueError("Select one CUDA device by numeric index or GPU UUID")
         return ["--gpus", f"device={ids[0]}"], {"OCR_CUDA_DEVICE_ID": ids[0]}
@@ -527,6 +559,9 @@ def gpu_args(accelerator: str, native: dict[str, Any]) -> tuple[list[str], dict[
         or not re.fullmatch(r"/dev/dri/renderD[0-9]+", render)
     ):
         raise ValueError("ROCm requires /dev/kfd and one selected DRI render node")
+    vendor = Path("/sys/class/drm") / Path(render).name / "device/vendor"
+    if vendor.is_file() and vendor.read_text().strip().lower() != "0x1002":
+        raise ValueError(f"Selected DRI render node {render} is not an AMD device")
     arguments: list[str] = []
     groups: list[str] = []
     for device in (kfd, render):
@@ -574,6 +609,113 @@ def rocm_render_target(render: Path, topology: Path = KFD_TOPOLOGY) -> str:
             f"Cannot determine the GFX target for {render}. Select the render node "
             "and set OCR_AMDGPU_TARGETS to its actual native architecture."
         ) from exc
+
+
+def source_compose(accelerator: str) -> tuple[str, ...]:
+    compose: tuple[str, ...] = (
+        "docker",
+        "compose",
+        "--profile",
+        "ocr",
+        "-f",
+        "docker-compose.yml",
+        "-f",
+        f"docker-compose.{accelerator}.yml",
+    )
+    if accelerator == "rocm" and "microsoft" in platform.release().lower():
+        compose += ("-f", "docker-compose.rocm-wsl.yml")
+    return compose
+
+
+def select_rocm_render_node(compose: tuple[str, ...], topology: Path = KFD_TOPOLOGY) -> None:
+    """Select the only compute-capable AMD render node when Compose has no explicit choice."""
+    environment = command(*compose, "config", "--environment", capture=True)
+    if any(
+        line.startswith("OCR_RENDER_NODE=") and line.partition("=")[2]
+        for line in environment.splitlines()
+    ):
+        return
+    nodes = set()
+    for properties in topology.glob("[0-9]*/properties"):
+        values = dict(line.split(maxsplit=1) for line in properties.read_text().splitlines())
+        minor = values.get("drm_render_minor", "")
+        if (
+            values.get("vendor_id") == "4098"
+            and minor.isdecimal()
+            and int(minor) >= 128
+            and int(values.get("gfx_target_version", "0")) > 0
+        ):
+            nodes.add(f"/dev/dri/renderD{int(minor)}")
+    if not nodes:
+        return
+    if len(nodes) != 1:
+        raise ValueError(
+            f"Multiple AMD render nodes: {', '.join(sorted(nodes))}. Set OCR_RENDER_NODE."
+        )
+    os.environ["OCR_RENDER_NODE"] = nodes.pop()
+
+
+def wsl_rocm_target(index: str) -> str:
+    # rocminfo enumerates HSA agents; its ordering is not a HIP device index.
+    # Only a sole GPU has an unambiguous mapping. All other cases need a manual target.
+    help_text = (
+        "Set OCR_AMDGPU_TARGETS to the selected GPU's exact GFX architecture "
+        "and OCR_ROCM_DEVICE_ID to its HIP index."
+    )
+    binary = shutil.which("rocminfo") or "/opt/rocm/bin/rocminfo"
+    if index != "0" or os.environ.get("HSA_OVERRIDE_GFX_VERSION"):
+        raise ValueError(help_text)
+    environment = dict(os.environ)
+    for mask in (
+        "ROCR_VISIBLE_DEVICES",
+        "HIP_VISIBLE_DEVICES",
+        "CUDA_VISIBLE_DEVICES",
+        "GPU_DEVICE_ORDINAL",
+    ):
+        environment.pop(mask, None)
+    try:
+        result = subprocess.run(
+            [binary], check=True, capture_output=True, text=True, timeout=10, env=environment
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(f"WSL GPU identity unavailable. {help_text}") from exc
+    agents = re.split(r"(?m)^\s*Agent [0-9]+\s*$", result.stdout)[1:]
+    gpus = [agent for agent in agents if re.search(r"(?m)^\s*Device Type:\s*GPU\s*$", agent)]
+    if len(gpus) == 1:
+        name = re.search(r"(?m)^\s*Name:\s*(\S+)\s*$", gpus[0])
+        vendor = re.search(r"(?m)^\s*Vendor Name:\s*AMD\s*$", gpus[0])
+        if vendor and name and re.fullmatch(r"gfx[0-9a-f]{3,8}", name[1]):
+            return name[1]
+    raise ValueError(f"Cannot map WSL HIP device {index} to one AMD GPU. {help_text}")
+
+
+def configure_rocm_build(candidate: dict[str, Any], devices: dict[str, str]) -> None:
+    args = candidate["build"]["args"]
+    native_transport = "wsl" if "OCR_ROCM_DEVICE_ID" in devices else "kfd"
+    transport = args.get("OCR_ROCM_TRANSPORT") or native_transport
+    if transport not in {"wsl", "kfd", "dual"}:
+        raise ValueError("OCR_ROCM_TRANSPORT must be kfd, wsl or dual")
+    if devices and transport not in {native_transport, "dual"}:
+        raise ValueError(f"Selected device requires OCR_ROCM_TRANSPORT={native_transport} or dual")
+    configured = args.get("AMDGPU_TARGETS")
+    profile = runpy.run_path(
+        str(Path(__file__).resolve().parents[1] / "paddleocr-service/ocr_service/targets.py")
+    )
+    if configured:
+        targets = profile["parse_targets"](configured)
+    else:
+        if native_transport == "kfd":
+            detected = rocm_render_target(Path(devices["OCR_RENDER_NODE"]))
+        else:
+            detected = wsl_rocm_target(devices["OCR_ROCM_DEVICE_ID"])
+        if detected not in profile["DEFAULT_TARGETS"]:
+            raise ValueError(
+                f"{detected} is outside the local Radeon candidate list. "
+                "Set OCR_AMDGPU_TARGETS explicitly for an experimental build."
+            )
+        targets = [detected]
+    os.environ.update(OCR_AMDGPU_TARGETS=";".join(targets), OCR_ROCM_TRANSPORT=transport)
+    print(f"Local ROCm build: {transport}, {', '.join(targets)}", flush=True)
 
 
 def cuda_build_channel(
@@ -1097,18 +1239,30 @@ def deploy(
     elif project != previous["project"]:
         raise ValueError("Cannot change Compose project during upgrade")
     verify_existing_app(compose, project, allow_orphan=upgrade)
-    if previous is not None:
-        verify_upgrade_handoff(config, previous, recover_stopped_ocr=recover_stopped_ocr)
     candidate = config["services"][NATIVE]
     devices, device_environment = gpu_args(accelerator, candidate)
     os.environ.update(device_environment)
     if accelerator == "rocm" and reuse_native_image is None:
-        configured_targets = candidate["build"]["args"]["AMDGPU_TARGETS"]
-        # WSL has no KFD topology. An empty argument uses the image's Radeon
-        # candidate profile; the metadata bind checks the actual selected GFX.
-        if not configured_targets and "OCR_RENDER_NODE" in device_environment:
-            configured_targets = rocm_render_target(Path(device_environment["OCR_RENDER_NODE"]))
-        os.environ["OCR_AMDGPU_TARGETS"] = configured_targets
+        configure_rocm_build(candidate, device_environment)
+    if accelerator == "cuda":
+        channel = cuda_build_channel(
+            compose, candidate, previous,
+            old_release / "image-config.json" if previous is not None else None,
+        )
+        os.environ["OCR_CUDA_CHANNEL"] = channel
+        cuda_probe = importlib.import_module(
+            ".ocr_cuda_probe" if __package__ else "ocr_cuda_probe", package=__package__
+        )
+        expected_uuid = cuda_probe.preflight(device_environment["OCR_CUDA_DEVICE_ID"], channel)
+        devices.extend(("--env", f"VISION_BILL_CUDA_SELECTION={expected_uuid}"))
+        if previous is not None:
+            # A managed selector may be an ordinal on WSL. Carry the original
+            # hardware identity through the upgrade even if indexing changed.
+            prior_uuid = prior["services"][NATIVE]["environment"].get("OCR_CUDA_EXPECTED_UUID")
+            if prior_uuid:
+                devices.extend(("--env", f"OCR_CUDA_EXPECTED_UUID={prior_uuid}"))
+    if previous is not None:
+        verify_upgrade_handoff(config, previous, recover_stopped_ocr=recover_stopped_ocr)
     native_image = reuse_native_image or candidate["image"]
     image_id = ""
     expected_sources: dict[str, str] = {}
@@ -1136,27 +1290,18 @@ def deploy(
                 "--check",
                 "paddleocr-service/requirements.cuda.lock",
             ]
-            channel = cuda_build_channel(
-                compose, candidate, previous,
-                old_release / "image-config.json" if previous is not None else None,
-            )
-            os.environ["OCR_CUDA_CHANNEL"] = channel
-            lock.extend(("--channel", channel))
-            try:
-                command(*lock, capture=True)
-            except subprocess.CalledProcessError:
-                command("make", "ocr-lock-cuda")
-                command(*lock, capture=True)
-            if previous is not None and reuse_native_image is None:
-                # Older source builds may have the exact wheel in the previous image's pip cache.
-                command(
-                    *lock,
-                    "--wheel-context",
-                    "--prior-image",
-                    previous["image_ids"][NATIVE],
-                    capture=True,
-                )
-            digest = path_digest(ROOT / "paddleocr-service" / "requirements.cuda.lock")
+            if reuse_native_image is not None:
+                lock.insert(2, "--offline")
+                digest = command(
+                    *lock, "--reuse-image", image_id, "--channel", channel, capture=True
+                ).strip()
+            else:
+                context_args = [*lock, "--build-context", "--channel", channel]
+                if previous is not None:
+                    context_args.extend(("--prior-image", previous["image_ids"][NATIVE]))
+                context = command(*context_args, capture=True).strip()
+                os.environ["VISION_BILL_VERIFIED_CUDA_WHEEL_CONTEXT"] = context
+                digest = path_digest(Path(context) / "requirements.cuda.lock")
             cuda_verification = [
                 channel,
                 digest,
@@ -1164,12 +1309,14 @@ def deploy(
                 "/opt/ocr/build/resolve_cuda.py",
             ]
         if reuse_native_image is None:
-            if accelerator == "cuda":
-                command("make", "ocr-build-cuda")
-            else:
-                command(*compose, "build", NATIVE)
-            image_id = inspect_image(native_image)
-        config_id = export_config(release, image_id)
+            with build_phase(f"{accelerator}_image_build"):
+                if accelerator == "cuda":
+                    command("make", "ocr-build-cuda")
+                else:
+                    command(*compose, "build", NATIVE)
+            image_id = inspect_image(native_image, report_size=True)
+        with build_phase("verify_image_config"):
+            config_id = export_config(release, image_id)
         print("Validating the native OCR packages and GPU selection…", flush=True)
         # The metadata probe has neither model cache/state mounts nor a network.
         bound = command(
@@ -1198,13 +1345,18 @@ def deploy(
             capture=True,
         )
         manifest = json.loads(bound)
+        if accelerator == "cuda":
+            bound_cuda_uuid = manifest.pop("_bound_cuda_uuid")
+            if not isinstance(bound_cuda_uuid, str) or not re.fullmatch(r"[0-9a-f]{32}", bound_cuda_uuid):
+                raise ValueError("Invalid bound CUDA UUID")
         if reuse_native_image is not None and (
             inspect_image(native_image) != image_id or manifest["source_files"] != expected_sources
         ):
             raise ValueError("Reused OCR image or its sources changed during verification")
         (release / "bundle.json").write_text(json.dumps(manifest, indent=2) + "\n")
         command("docker", "image", "tag", image_id, image_tag(accelerator, image_id))
-        command(*compose, "build", "vision_bill")
+        with build_phase("app_image_build"):
+            command(*compose, "build", "vision_bill")
         app_id = inspect_image(config["services"]["vision_bill"]["image"])
         overlay = managed_overlay(
             accelerator,
@@ -1218,6 +1370,7 @@ def deploy(
         )
         if cuda_verification:
             overlay["x-vision-bill-source"]["cuda_channel"] = channel
+            overlay["services"][NATIVE]["environment"]["OCR_CUDA_EXPECTED_UUID"] = bound_cuda_uuid
         if previous is not None:
             overlay["x-vision-bill-source"]["claim_origin"] = claim_origin(previous, old_release)
         command("docker", "image", "tag", app_id, overlay["services"]["vision_bill"]["image"])
@@ -1252,8 +1405,13 @@ def deploy(
     start(*selected)
 
 
-def inspect_image(image: str) -> str:
-    return command("docker", "image", "inspect", "--format", "{{.Id}}", image, capture=True).strip()
+def inspect_image(image: str, *, report_size: bool = False) -> str:
+    fmt = "{{.Id}} {{.Size}}" if report_size else "{{.Id}}"
+    metadata = command("docker", "image", "inspect", "--format", fmt, image, capture=True).strip()
+    image_id, _, size = metadata.partition(" ")
+    if report_size and size.isdecimal():
+        print(f"ocr_source_image id={image_id} image_size_bytes={size}", flush=True)
+    return image_id
 
 
 def start(*compose: str) -> None:

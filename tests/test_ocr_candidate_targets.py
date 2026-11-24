@@ -8,6 +8,26 @@ import pytest
 from test_ocr_runtime_builds import SERVICE, ROOT, load_build_module
 
 
+@pytest.mark.parametrize("transport", ["kfd", "wsl", "dual", None])
+@pytest.mark.parametrize("wsl", [True, False])
+def test_rocm_binding_checks_image_transport_and_preserves_portable_images(transport, wsl):
+    from ocr_service.targets import verify_rocm_image_target
+
+    inventory = {"target_profile": {"schema": 1, "candidate_targets": ["gfx1030"]}}
+    if transport is not None:
+        inventory["transport"] = transport
+    device = {"gfx_target": "gfx1030"}
+    if wsl:
+        device["transport"] = "wsl-dxg"
+    if transport in (None, "dual", "wsl" if wsl else "kfd"):
+        verify_rocm_image_target(inventory, device)
+    else:
+        with pytest.raises(ValueError, match="transport"):
+            verify_rocm_image_target(inventory, device)
+    with pytest.raises(ValueError, match="target"):
+        verify_rocm_image_target(inventory, dict(device, gfx_target="gfx1100"))
+
+
 def test_candidate_parser_retains_defaults_and_rejects_injection():
     from ocr_service.targets import DEFAULT_TARGETS, parse_targets, validate_profile
     assert parse_targets('') == list(DEFAULT_TARGETS) == [

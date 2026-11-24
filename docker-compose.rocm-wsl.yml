@@ -1,6 +1,9 @@
 # Apply after docker-compose.rocm.yml inside Windows WSL 2.
 services:
   paddleocr-service:
+    build:
+      args:
+        OCR_ROCM_TRANSPORT: ${OCR_ROCM_TRANSPORT:-wsl}
     devices: !override
       - /dev/dxg:/dev/dxg
     group_add: !reset []

@@ -736,6 +736,50 @@ test("CUDA bundle verifies executable Paddle pin and the lock measured by the bu
   }
 });
 
+test("CUDA release resolves once and binds both build contexts and evidence to its snapshot", async (t) => {
+  const { prepareCudaReleaseBuild } =
+    await import("./distribution-release.mjs");
+  const directory = temp(t);
+  const context = join(directory, "immutable resolution");
+  const evidence = join(directory, "evidence");
+  mkdirSync(context);
+  mkdirSync(evidence);
+  const { bytes } = fixture();
+  const lock = bytes["cuda/requirements.cuda.lock"];
+  const attestation = bytes["cuda/lock-attestation.json"];
+  writeFileSync(join(context, "requirements.cuda.lock"), lock);
+  writeFileSync(
+    join(context, "requirements.cuda.attestation.json"),
+    attestation,
+  );
+  let calls = 0;
+  const freshSnapshot = (cmd, args) => {
+    calls++;
+    assert.equal(cmd, "uv");
+    assert.ok(args.includes("--refresh") && args.includes("--build-context"));
+    assert.equal(args[args.indexOf("--channel") + 1], "cu126");
+    return context + "\n";
+  };
+  const prepared = prepareCudaReleaseBuild("cu126", evidence, freshSnapshot);
+  assert.equal(calls, 1);
+  assert.equal(prepared.digest, hash(lock));
+  assert.ok(prepared.args.includes("cuda-wheel=" + context));
+  assert.ok(prepared.args.includes("cuda-locks=" + context));
+  assert.equal(
+    readFileSync(join(evidence, "requirements.cuda.lock"), "utf8"),
+    lock,
+  );
+  assert.equal(
+    readFileSync(join(evidence, "lock-attestation.json"), "utf8"),
+    attestation,
+  );
+  writeFileSync(join(context, "requirements.cuda.lock"), lock + "# changed\n");
+  assert.throws(
+    () => prepareCudaReleaseBuild("cu126", evidence, freshSnapshot),
+    /differs from attestation/,
+  );
+});
+
 test("CUDA Make targets pass an expected channel by default and on explicit selection", (t) => {
   const directory = temp(t);
   writeFileSync(

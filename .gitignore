@@ -264,6 +264,7 @@ paddleocr-service/.wheelhouse/
 # These are versioned native build recipes, not generated build output.
 !paddleocr-service/build/
 paddleocr-service/build/*
+!paddleocr-service/build/build_jobs.py
 !paddleocr-service/build/build_rocm.sh
 !paddleocr-service/build/build_therock.sh
 !paddleocr-service/build/prepare_therock.sh

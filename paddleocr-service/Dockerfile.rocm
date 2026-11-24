@@ -1,5 +1,9 @@
 # syntax=docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 FROM python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS apt-ca
+# Validate before the signed APT snapshot or Rust toolchain downloads. Only the
+# CA bundle leaves this stage, so the shared prerequisites stay cacheable.
+ARG AMDGPU_TARGETS
+RUN test -n "$AMDGPU_TARGETS" || { echo "Use make ocr-build-rocm or pass an explicit AMDGPU_TARGETS build argument." >&2; exit 1; }
 FROM ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5 AS native-builder
 # Bootstrap HTTPS until Ubuntu's own ca-certificates package is installed.
 COPY --from=apt-ca /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
@@ -15,8 +19,8 @@ RUN rm -f /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources \
  && mkdir -p /opt/ocr/build-evidence \
  && dpkg-query -W > /opt/ocr/build-evidence/os-packages.txt \
  && rm -rf /var/lib/apt/lists/*
-RUN python3.12 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH" \
+RUN python3.12 -m venv /opt/build-venv
+ENV PATH="/opt/build-venv/bin:$PATH" \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEX=3.7.2 \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEOCR=3.7.0
 COPY requirements.build.lock requirements.bootstrap.lock /opt/locks/
@@ -28,27 +32,37 @@ RUN curl --fail --location https://static.rust-lang.org/dist/2026-04-16/rust-1.9
  && tar -xJf /tmp/rust.tar.xz -C /tmp \
  && /tmp/rust-1.95.0-x86_64-unknown-linux-gnu/install.sh --prefix=/usr/local --without=rust-docs \
  && rm -rf /tmp/rust.tar.xz /tmp/rust-1.95.0-x86_64-unknown-linux-gnu
-COPY build/build_therock.sh build/prepare_therock.sh build/source_inventory.py /opt/ocr/build/
+COPY build/build_jobs.py build/build_therock.sh build/prepare_therock.sh build/source_inventory.py /opt/ocr/build/
 COPY ocr_service/targets.py /opt/ocr/ocr_service/targets.py
 ARG AMDGPU_TARGETS
-ARG BUILD_JOBS=8
-RUN BUILD_JOBS="$BUILD_JOBS" AMDGPU_TARGETS="$AMDGPU_TARGETS" bash /opt/ocr/build/build_therock.sh \
+ARG BUILD_JOBS=auto
+ARG OCR_ROCM_TRANSPORT=dual
+# Upstream verifies every content-addressed cache hit against its pinned DVC pointer.
+RUN --mount=type=cache,id=vision-bill-therock-dvc,target=/root/.cache/therock-dvc,sharing=locked \
+    OCR_ROCM_TRANSPORT="$OCR_ROCM_TRANSPORT" BUILD_JOBS="$BUILD_JOBS" AMDGPU_TARGETS="$AMDGPU_TARGETS" bash /opt/ocr/build/build_therock.sh \
  && rm -rf /opt/native-src/TheRock /opt/native-src/therock-build /opt/native-src/win32metadata
 COPY build/build_rocm.sh build/hip-rdna2-v1.patch build/hip-device-info.cpp /opt/ocr/build/
 RUN BUILD_JOBS="$BUILD_JOBS" AMDGPU_TARGETS="$AMDGPU_TARGETS" bash /opt/ocr/build/build_rocm.sh --paddle-only \
  && rm -rf /opt/native-src/Paddle
 COPY requirements.runtime.lock /opt/locks/requirements.runtime.lock
-RUN --mount=type=cache,target=/root/.cache/pip python -m pip install --require-hashes --no-deps --no-build-isolation -r /opt/locks/requirements.runtime.lock \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip wheel --require-hashes --no-deps --no-build-isolation \
+      --wheel-dir /tmp/runtime-wheels -r /opt/locks/requirements.runtime.lock \
  && cd / && sha256sum -c /opt/ocr/build-evidence/native-wheels.sha256 \
- && python -m pip install --no-deps /opt/wheels/*.whl \
- && python -m pip check
+ && python3.12 -m venv /opt/venv \
+ && python -m pip --python /opt/venv install --no-index --no-deps /tmp/runtime-wheels/*.whl /opt/wheels/*.whl \
+ && python -m pip --python /opt/venv check \
+ && rm -rf /tmp/runtime-wheels
 ENV LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib:/opt/rocm/lib/rocm_sysdeps/lib
 COPY build/inspect_kernels.py /opt/ocr/build/inspect_kernels.py
 RUN python /opt/ocr/build/inspect_kernels.py --sdk /opt/rocm \
     --paddle /opt/venv/lib/python3.12/site-packages/paddle \
     --output /opt/ocr/build-evidence/kernels.json \
     --target-profile /opt/ocr/build-evidence/targets.json \
-    --compile-log /opt/ocr/build-evidence/paddle-build.log
+    --transport-file /opt/ocr/build-evidence/rocm-transport.txt \
+    --compile-log /opt/ocr/build-evidence/paddle-build.log \
+ && gzip -n /opt/ocr/build-evidence/paddle-build.log \
+ && if [ -f /opt/ocr/build-evidence/paddle-compile-commands.json ]; then gzip -n /opt/ocr/build-evidence/paddle-compile-commands.json; fi
 # Candidate native source/build caches stay out of the final artifact.
 FROM ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5
 COPY --from=apt-ca /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/

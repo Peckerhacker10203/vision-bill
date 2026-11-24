@@ -571,6 +571,17 @@ def test_metadata_probe_uses_driver_only(tmp_path, monkeypatch, accelerator):
         monkeypatch.setattr(device_inventory.ctypes, "CDLL", lambda name: driver)
         expected["uuid"] = "000102030405060708090a0b0c0d0e0f"
     assert device_inventory.inspect_device_identity(accelerator, 0) == expected
+    if accelerator == "cuda":
+        monkeypatch.setenv("OCR_CUDA_EXPECTED_UUID", expected["uuid"])
+        driver.cuDeviceGetCount = integer(1)
+        assert device_inventory.inspect_device_identity("cuda", 0) == expected
+        driver.cuDeviceGetCount = integer(2)
+        with pytest.raises(device_inventory.DeviceIdentityUnavailable):
+            device_inventory.inspect_device_identity("cuda", 0)
+        driver.cuDeviceGetCount = integer(1)
+        monkeypatch.setenv("OCR_CUDA_EXPECTED_UUID", "a" * 32)
+        with pytest.raises(device_inventory.DeviceIdentityUnavailable):
+            device_inventory.inspect_device_identity("cuda", 0)
 
 
 def test_wsl_probe_binds_driver_metadata_and_host_shim(monkeypatch):

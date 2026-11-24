@@ -36,7 +36,8 @@ def test_native_context_admits_contract_and_build_inputs_without_app_or_private_
         "ocr_contract/__init__.py", "ocr_contract/document_image.py", "ocr_contract/limits.py",
         "ocr_contract/wire_json.py",
         "ocr_service/api.py", "ocr_service/worker.py", "build/build_rocm.sh",
-        "build/prepare_therock.sh", "build/hip-rdna2-v1.patch", "profile.json", "runtime-lock.json",
+        "build/prepare_therock.sh", "build/build_jobs.py", "build/hip-rdna2-v1.patch",
+        "profile.json", "runtime-lock.json", "requirements.cuda-build.lock",
         "requirements.runtime.lock", "requirements.cuda.attestation.json", "server.py",
     ]
     excluded = [

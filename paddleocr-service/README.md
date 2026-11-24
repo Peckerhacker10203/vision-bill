@@ -67,8 +67,9 @@ The source setup command builds a local candidate, selects the accelerator
 profile, binds approved inputs to the exact Docker image and selected device, and
 starts Compose with an idle OCR controller. Run it from the repository root with
 Python 3.12+, a local Linux x86_64 Docker engine and Docker Compose 2.30+.
-Automatic fixture preparation uses `uv`. CUDA builds also use `make` and access
-the official Paddle wheel host. Prepare the
+Automatic fixture preparation uses `uv`. CUDA builds also use `make`. A cold
+CUDA build needs access to the official Paddle wheel host and dependency
+sources. Keep the validated inputs for later builds. Prepare the
 app's private `.env` once and reuse its Compose project name, app settings and
 data on subsequent starts. The command supplies the OCR image and bundle metadata
 automatically. [Source app configuration](../README.md#advanced-develop-from-source)
@@ -93,8 +94,15 @@ The following steps are for building a candidate from this checkout.
 [Windows bundle setup](../distribution/README.md#start-a-verified-windows-bundle)
 
 On native Linux, configure the NVIDIA driver and NVIDIA Container Toolkit for
-Docker GPU access. `OCR_CUDA_DEVICE_ID` selects one host GPU by index or UUID
-and defaults to `0`. Run the source launcher from this checkout.
+Docker GPU access. `OCR_CUDA_DEVICE_ID` selects the host GPU by index or UUID
+and defaults to `0`. When the host driver exposes the selected GPU, the source
+launcher can detect an unsupported architecture or driver before downloading
+build inputs. On a multi-GPU host where the numeric selection is ambiguous,
+set the full `GPU-…` UUID. When the host probe is unavailable, the launcher
+checks the selected GPU inside the built image. Source setup records the
+full UUID observed there and the service rechecks it at runtime. A changed
+device ordering cannot silently move OCR to a different GPU. Run the launcher
+from this checkout.
 
 ```bash
 python3 scripts/ocr_source_up.py cuda
@@ -107,8 +115,11 @@ Windows or Linux host supplies its own GPU driver. Installing these models
 does not install host graphics drivers or firmware. Automatic CUDA source preparation
 uses the official CUDA 12.9 candidate by default. Set `OCR_CUDA_CHANNEL=cu126`
 to select CUDA 12.6. Use a host driver that supports the selected runtime and
-check driver compatibility before starting. PaddleOCR lists compute capability 7.0+ and
-CUDA 11.8+ for PaddlePaddle generally. Its separate Blackwell instructions use
+check driver compatibility before starting. PaddleOCR lists compute capability
+7.0+ and CUDA 11.8+ for PaddlePaddle generally. Vision Bill's preflight accepts
+SM 7.0 (Volta) and newer with a CUDA 12-capable driver for its CUDA 12 wheels.
+The project's consumer qualification targets start at GeForce RTX 20 (Turing,
+SM 7.5). PaddleOCR's separate Blackwell instructions use
 a driver supporting CUDA 12.9 or later. For a fresh RTX 50-series install,
 use Vision Bill's default `cu129`. [PaddleOCR device requirements](https://www.paddleocr.ai/main/en/version3.x/pipeline_usage/PaddleOCR-VL.html#environment-requirements) · [Blackwell setup](https://www.paddleocr.ai/main/en/version3.x/pipeline_usage/PaddleOCR-VL-NVIDIA-Blackwell.html) · [CUDA build inputs](#build-inputs)
 
@@ -133,13 +144,13 @@ establish vendor support or successful receipt inference.
 
 **Native Linux.** Install a compatible AMD kernel driver and Docker Engine.
 
-Use the host's `/dev/kfd` and the selected `/dev/dri/renderD*` node. The source
-command derives the two container group IDs from those device nodes and reads
-the selected node's GFX architecture from the Linux KFD topology. Set
-`OCR_RENDER_NODE` when choosing a different GPU from the default render node.
-Set `OCR_AMDGPU_TARGETS` explicitly for a multi-target build or when the host
-cannot report the selected architecture. The candidate checks the actual HIP
-target before starting the service. [ROCm build inputs](#build-inputs)
+Use the host's `/dev/kfd` and an AMD `/dev/dri/renderD*` node. The source
+launcher selects the sole AMD KFD render node automatically. With several
+AMD nodes, set `OCR_RENDER_NODE` to the one you want. The launcher reads its
+GFX architecture from the host's KFD topology and derives the two container
+group IDs from the device nodes. Set `OCR_AMDGPU_TARGETS` to the board's known
+GFX target if topology cannot identify it. The built image checks the actual
+HIP target before startup. [ROCm build inputs](#build-inputs)
 
 ```bash
 python3 scripts/ocr_source_up.py rocm
@@ -149,11 +160,19 @@ python3 scripts/ocr_source_up.py rocm
 Ubuntu distro with Docker Engine inside it. The Windows host supplies the GPU
 driver. Check that the distro exposes `/dev/dxg` and
 `/usr/lib/wsl/lib/libdxcore.so`. Run the same source command inside
-Ubuntu. Select the GPU with `OCR_ROCM_DEVICE_ID` (default `0`). The launcher adds
-`docker-compose.rocm-wsl.yml` to the ROCm configuration. Set `OCR_AMDGPU_TARGETS` to the selected board’s GFX
-architecture to narrow the build. The default profile includes the listed
-RX 6000, 7000 and 9000 discrete Radeon targets. Host driver and firmware
-installation are outside the model installer.
+Ubuntu. The launcher selects the WSL build and adds `docker-compose.rocm-wsl.yml`
+to the ROCm configuration. For one AMD GPU at HIP index `0`, it can read the
+GFX target from an existing `rocminfo`. If discovery is unavailable, or there
+are multiple GPUs, set `OCR_AMDGPU_TARGETS` to the selected board's actual GFX
+architecture and `OCR_ROCM_DEVICE_ID` to its HIP index. The Windows display
+index can differ. For example, on a machine where HIP device 0 is `gfx1100`:
+
+```bash
+OCR_AMDGPU_TARGETS=gfx1100 OCR_ROCM_DEVICE_ID=0 python3 scripts/ocr_source_up.py rocm
+```
+
+The launcher needs an unambiguous selection before building. The host driver
+and firmware are installed separately.
 [AMD WSL setup](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/wsl/install-radeon.html) · [Pinned ROCm DXG design](https://github.com/ROCm/TheRock/blob/b324869fb3116353ac7eec5e6926aa3d452ac987/docs/development/wsl_rocdxg.md)
 
 To test different approved inputs, pass their directory as a second argument
@@ -205,9 +224,25 @@ activation and handoff state. [Stop, cut over and recover](../distribution/READM
 python3 scripts/ocr_source_up.py cuda --restart
 ```
 
+During a source build, `ocr_source_phase` reports the CUDA or ROCm image
+build, native image configuration verification and app image build. The final
+line for each phase includes `elapsed_s` and a status of `complete` or
+`interrupted`. Within a running ROCm build, BuildKit logs report
+`ocr_rocm_phase` and wall-clock `elapsed_s` for TheRock source preparation
+(`therock_sources`), the SDK compilation (`sdk_compile`), Paddle source
+preparation (`paddle_sources`) and the Paddle wheel build (`paddle_compile`).
+Use `BUILDKIT_PROGRESS=plain` to retain the lines. A cached layer has no new
+phase timing. The `ocr_source_image` line gives the image ID and Docker's
+logical `image_size_bytes`. Shared layers, the build cache and downloaded
+model files affect actual disk usage separately.
+
 If the native image finished building before initial preparation was interrupted,
 use `--reuse-native-image` with the local `source-build-…` tag printed by the launcher.
 It checks the selected image against this checkout and continues preparing the app.
+For CUDA it reads the saved image's lock hash offline and requires a match in
+the validated checkout lock and attestation or a retained private build
+snapshot for that channel. Reusing the native image skips wheel resolution
+and download. Any remaining app build steps still need their own inputs.
 An interrupted first installation uses this flag without `--upgrade`. For an
 existing installation, follow the [upgrade procedure](#upgrade-an-existing-source-installation).
 
@@ -456,9 +491,11 @@ The release report records which physical device passed the full diagnostic.
 
 These are qualification targets. Release evidence records the architecture,
 driver and host environment for actual runs of the configured OCR pipeline.
-On native Linux the source launcher reads the selected ROCm device's architecture
-from KFD. WSL uses the candidate build profile or explicit `OCR_AMDGPU_TARGETS`.
-The standalone ROCm build defaults to the nine listed RDNA2, RDNA3 and RDNA4 candidates.
+Both the local source launcher and `make ocr-build-rocm` build for the
+selected architecture and host GPU interface. The nine Radeon targets in the
+table are recognized for automatic selection. A detected architecture outside
+this list needs an explicit `OCR_AMDGPU_TARGETS` for an experimental build.
+A developer can explicitly request multiple target architectures for a compatibility build.
 [NVIDIA GPU architectures](https://developer.nvidia.com/cuda/gpus) ·
 [TheRock targets at the pinned revision](https://github.com/ROCm/TheRock/blob/b324869fb3116353ac7eec5e6926aa3d452ac987/cmake/therock_amdgpu_targets.cmake) ·
 [Docker Desktop GPU support](https://docs.docker.com/desktop/features/gpu/)
@@ -486,7 +523,7 @@ and LLM formatting. [Native qualification](#what-qualifies)
 
 `runtime-lock.json` records the immutable Ubuntu base, Ubuntu package snapshot,
 APT TLS bootstrap image, Paddle/PaddleOCR/PaddleX/TheRock source pins,
-compatibility patch hash, Rust archive hash, default Radeon target list and
+compatibility patch hash, Rust archive hash, Radeon compatibility targets and
 upstream optional exclusions. The selected build candidate profile is recorded
 in build evidence/kernels.json.
 The common Python execution and native build locks contain real resolved hashes.
@@ -496,9 +533,10 @@ Source packages are built without dependency resolution, using the hashed build
 bootstrap. The archived PaddleOCR/PaddleX sources use their pinned release
 versions through `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_*`.
 
-The checked-in `requirements.cuda.lock` is unresolved. The source setup command
-resolves the selected channel on a connected host when a matching lock is
-unavailable. To resolve it manually, run `make ocr-lock-cuda` for `cu129` or
+The checked-in `requirements.cuda.lock` is unresolved. The source launcher uses
+a valid matching lock or restores a validated cached resolution for the same
+channel and resolver inputs. A cold resolution needs a connected host.
+To refresh from the official index, run `make ocr-lock-cuda` for `cu129` or
 `OCR_CUDA_CHANNEL=cu126 make ocr-lock-cuda` for `cu126`. The resolver selects the
 exact official Paddle GPU 3.3.1 cp312 x86_64 wheel for that channel, inspects its
 METADATA, freezes the full closure, hashes the bytes, and emits the lock plus
@@ -506,6 +544,16 @@ METADATA, freezes the full closure, hashes the bytes, and emits the lock plus
 channel for `make ocr-build-cuda`. Keep the lock, its attestation and the host
 cache at `${XDG_CACHE_HOME:-~/.cache}/vision-bill/cuda-wheels`. With a
 matching lock and cached SHA-256, the build reuses those bytes locally.
+Each CUDA build consumes an immutable `build-…` snapshot in this private
+cache containing the lock, its attestation and a hard link to the verified
+wheel. Concurrent builds using different channels can therefore share a
+checkout. Release builds resolve the official channel afresh and use the same
+snapshot mechanism for the wheel, installed lock and release attestation.
+The resolver reports verified wheel cache hits or the official download URL on stderr.
+During a transfer it reports bytes, elapsed time and average throughput. It makes at most
+three requests in total per transfer. It resumes a partial download
+when the server supplies a known length, a strong ETag and a matching byte range.
+Without a usable validator it restarts at byte zero.
 A source upgrade from `936c26d` can need one download of the full Paddle
 wheel. With a matching lock, the launcher first checks the previous image's
 pip cache for that URL and verifies any bytes it finds. If the wheel is
@@ -514,7 +562,9 @@ An offline upgrade needs the matching lock and verified wheel, along with the
 other required build inputs. Starting the previously recorded images with
 `--restart` skips this build. BuildKit
 can reuse the app dependency layers and, on ROCm, the built TheRock SDK when
-only Paddle or the app changes. PostgreSQL uses a separate prebuilt image.
+only Paddle or the app changes. CUDA and ROCm use separate Python build and
+runtime environments. The ROCm runtime retains its SDK libraries and GPU kernel
+assets. PostgreSQL uses a separate prebuilt image.
 The Docker build requires a valid, resolved
 lock and attestation for the official GPU wheel. Validation parses actual
 executable requirements, preserves every entry of the pinned common runtime lock,
@@ -522,22 +572,34 @@ and requires the complete attestation. Includes, install options, duplicate or
 conditional native requirements and comment-only evidence are rejected. The Make
 targets provide the pinned packaging parser in an isolated uv tool environment.
 
-`make ocr-build-rocm` builds the full TheRock SDK and Paddle from the approved
-source pins. The builder fetches the pinned TheRock root commit at depth one
+`make ocr-build-rocm` builds the TheRock SDK and Paddle from the approved
+source pins for the selected targets. A native Linux build uses KFD. A WSL
+build also compiles the DXG bridge against pinned Windows headers. The KFD
+build skips those WSL-only inputs. The builder fetches the pinned TheRock root commit at depth one
 with all its files in the initial transfer. Checking out that commit works
 offline. Paddle and the recursive submodules still use `--filter=blob:none`
 and need access to their public remotes to retrieve file contents.
-The recipe initializes TheRock's recursive Git submodules at their
-recorded pins before applying upstream patches. It checks the source inventory
+Before applying upstream patches, the recipe initializes the recursive
+submodules at their recorded pins, including MIOpen's nested dependencies.
+It skips the documentation-only root submodule `rocm-docs`. Its exact Git
+pin remains in the root gitlink inventory and in `omitted_root_gitlinks`.
+The builder checks the source inventory
 before building `patchelf` and reports the path and pin of a missing checkout.
+Retries on the same BuildKit builder can reuse verified upstream DVC downloads.
 
 Upstream estimates approximately 200 GB free and several hours for a TheRock
 source build. Check free space on the filesystem used by the Docker builder.
 [TheRock source build requirements at the selected commit](https://github.com/ROCm/TheRock/blob/b324869fb3116353ac7eec5e6926aa3d452ac987/README.md#building-from-source)
 
-`OCR_BUILD_JOBS` sets the job limit for each CMake build (including TheRock subprojects) and
-concurrent Git submodule fetches. TheRock can run multiple subprojects at once,
-so their combined compiler count can exceed this setting. Model weights
+`OCR_BUILD_JOBS=auto` is the local ROCm default. Inside the builder it selects
+at least one job, limited by available CPUs, the cgroup CPU quota and one job
+per 4 GiB of available memory (including the cgroup limit). Set a positive
+integer to override it, for example `OCR_BUILD_JOBS=2 make ocr-build-rocm`.
+The setting applies to each CMake build and concurrent submodule fetches.
+TheRock can run multiple subprojects at once,
+so their combined compiler count can exceed this setting. LLVM linking and
+background builds each use one job, and Flang compilation uses at most two.
+The local SDK omits Mirage and hipDNN samples. Model weights
 are provisioned separately for qualification. The versioned patch replaces both
 legacy HIP target lists, uses the flat SDK and same-pin legacy FindHIP helpers,
 requires MIOpen, and stops the forced download of FlashAttention. FP32 runs with
@@ -546,12 +608,22 @@ FlashAttention off.
 Build evidence is retained under `/opt/ocr/build-evidence`: original gitlinks,
 recursive actual checkout HEADs and dirty patches, patch/`.smrev` hashes, native
 wheel hashes, CMake caches, compiler commands/log, OS packages, and required
-library/payload hashes. Default build candidates are gfx1030/1031/1032/1034, gfx1100/1101/1102 and gfx1200/1201.
-`OCR_AMDGPU_TARGETS` selects a semicolon-separated **build-only** candidate list:
+library/payload hashes. New ROCm images store `paddle-build.log.gz` and,
+when generated, `paddle-compile-commands.json.gz` after kernel inspection.
+Older images can contain the uncompressed files.
+
+For a developer build spanning Linux KFD and Windows
+WSL DXG, explicitly request both interfaces and a semicolon-separated **build-only**
+target list. This example builds without a GPU:
 
 ```sh
-OCR_AMDGPU_TARGETS='gfx1030;gfx1100' make ocr-build-rocm
+OCR_ROCM_TRANSPORT=dual OCR_AMDGPU_TARGETS='gfx1030;gfx1100' make ocr-build-rocm
 ```
+
+For a local KFD or WSL build using raw Compose, set `OCR_AMDGPU_TARGETS`
+explicitly. The Make target and source launcher perform host discovery.
+For a direct Dockerfile build, pass the target list as the build argument
+`AMDGPU_TARGETS` and the chosen interface as `OCR_ROCM_TRANSPORT`.
 
 Selection changes both TheRock settings and Paddle HIP compiler inputs and is
 sealed into `kernels.json`. It does not prove support: even syntactically accepted

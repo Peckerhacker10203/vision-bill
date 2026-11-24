@@ -361,6 +361,57 @@ function inspectArchive(path) {
     config_digest: manifest.config.digest,
   };
 }
+export function prepareCudaReleaseBuild(
+  channel,
+  nativeDirectory,
+  execute = run,
+) {
+  const context = execute(
+    "uv",
+    [
+      "run",
+      "--no-project",
+      "--with",
+      "packaging==26.2",
+      "python",
+      "paddleocr-service/build/resolve_cuda.py",
+      "--channel",
+      channel,
+      "--check",
+      "paddleocr-service/requirements.cuda.lock",
+      "--build-context",
+      "--refresh",
+    ],
+    { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] },
+  ).trim();
+  const attestation = readFileSync(
+    join(context, "requirements.cuda.attestation.json"),
+  );
+  const lock = readFileSync(join(context, "requirements.cuda.lock"));
+  const metadata = JSON.parse(attestation);
+  validateCudaLock(metadata, channel);
+  const digest = hash(lock);
+  check(
+    digest === metadata.lock_sha256,
+    "Resolved CUDA lock differs from attestation",
+  );
+  writeFileSync(join(nativeDirectory, "requirements.cuda.lock"), lock);
+  writeFileSync(join(nativeDirectory, "lock-attestation.json"), attestation);
+  return {
+    digest,
+    args: [
+      "--build-arg",
+      `OCR_CUDA_CHANNEL=${channel}`,
+      "--build-context",
+      `cuda-wheel=${context}`,
+      "--build-context",
+      `cuda-locks=${context}`,
+      "--label",
+      cudaLockDigestLabel + "=" + digest,
+    ],
+  };
+}
+
 export function candidateBundleEvidence(tag, bundle, execute = run) {
   return JSON.parse(
     execute("docker", [
@@ -505,55 +556,9 @@ function build(request, inputs, output) {
       const args = [];
       let cudaLockDigest;
       if (accelerator === "cuda") {
-        const channel = plan.cuda_channel;
-        const resolver = [
-          "run",
-          "--no-project",
-          "--with",
-          "packaging==26.2",
-          "python",
-          "paddleocr-service/build/resolve_cuda.py",
-          "--channel",
-          channel,
-        ];
-        run("uv", resolver, { stdio: "inherit" });
-        const wheelContext = run(
-          "uv",
-          [
-            ...resolver,
-            "--check",
-            "paddleocr-service/requirements.cuda.lock",
-            "--wheel-context",
-          ],
-          { encoding: "utf8" },
-        ).trim();
-        const attestation = readFileSync(
-          "paddleocr-service/requirements.cuda.attestation.json",
-        );
-        const lock = readFileSync("paddleocr-service/requirements.cuda.lock");
-        const metadata = JSON.parse(attestation);
-        validateCudaLock(metadata, channel);
-        cudaLockDigest = hash(lock);
-        check(
-          cudaLockDigest === metadata.lock_sha256,
-          "Resolved CUDA lock differs from attestation",
-        );
-        writeFileSync(
-          join(nativeDirectory, "requirements.cuda.lock"),
-          lock,
-        );
-        writeFileSync(
-          join(nativeDirectory, "lock-attestation.json"),
-          attestation,
-        );
-        args.push(
-          "--build-arg",
-          `OCR_CUDA_CHANNEL=${channel}`,
-          "--build-context",
-          `cuda-wheel=${wheelContext}`,
-          "--label",
-          cudaLockDigestLabel + "=" + cudaLockDigest,
-        );
+        const prepared = prepareCudaReleaseBuild(plan.cuda_channel, nativeDirectory);
+        cudaLockDigest = prepared.digest;
+        args.push(...prepared.args);
       } else
         args.push(
           "--build-arg",

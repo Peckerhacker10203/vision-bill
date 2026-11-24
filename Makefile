@@ -55,7 +55,7 @@ fe-test-e2e: ## Run Playwright in a unique owned stack
 	$(NODE) uv run python e2e/run.py run --policy fallback $(E2E_OVERRIDE_ARG) -- npm --prefix frontend run test:e2e
 
 PYTHON_CHECK_PATHS := src paddleocr-service/ocr_contract paddleocr-service/ocr_service paddleocr-service/server.py \
-	paddleocr-service/build e2e scripts/ocr_harness scripts/ocr_source_up.py scripts/ocr_stopped_recovery.py \
+	paddleocr-service/build e2e scripts/ocr_harness scripts/ocr_build_rocm.py scripts/ocr_cuda_probe.py scripts/ocr_source_up.py scripts/ocr_stopped_recovery.py \
 	scripts/receipt_split_experiment.py scripts/standalone_benchmark.py scripts/test_ocr_service.py
 
 .PHONY: compose-check
@@ -143,12 +143,12 @@ ocr-lock-cuda: ## Resolve official CUDA lock (default cu129, optional OCR_CUDA_C
 	SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEX=3.7.2 SETUPTOOLS_SCM_PRETEND_VERSION_FOR_PADDLEOCR=3.7.0 uv run --no-project --with packaging==26.2 python paddleocr-service/build/resolve_cuda.py --channel="$${OCR_CUDA_CHANNEL:-cu129}"
 
 ocr-build-cuda: ## Build candidate CUDA image after official lock resolution
-	OCR_CUDA_WHEEL_CONTEXT="$$(uv run --no-project --with packaging==26.2 python paddleocr-service/build/resolve_cuda.py --check paddleocr-service/requirements.cuda.lock --channel="$${OCR_CUDA_CHANNEL:-cu129}" --wheel-context)" && \
-	export OCR_CUDA_WHEEL_CONTEXT && \
+	OCR_CUDA_WHEEL_CONTEXT="$${VISION_BILL_VERIFIED_CUDA_WHEEL_CONTEXT:-$$(uv run --no-project --with packaging==26.2 python paddleocr-service/build/resolve_cuda.py --check paddleocr-service/requirements.cuda.lock --channel="$${OCR_CUDA_CHANNEL:-cu129}" --build-context)}" && \
+	export OCR_CUDA_WHEEL_CONTEXT OCR_CUDA_LOCK_CONTEXT="$$OCR_CUDA_WHEEL_CONTEXT" && \
 	docker compose --profile ocr -f docker-compose.yml -f docker-compose.cuda.yml build paddleocr-service
 
 ocr-build-rocm: ## Build the native Radeon SDK candidate
-	docker compose --profile ocr -f docker-compose.yml -f docker-compose.rocm.yml build paddleocr-service
+	python3 -m scripts.ocr_build_rocm
 
 ocr-qualify-cuda ocr-qualify-rocm: ## Run an explicit supervised CUDA/ROCm source qualification
 	@set -eu; \

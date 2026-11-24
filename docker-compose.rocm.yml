@@ -17,7 +17,8 @@ services:
       context: ./paddleocr-service
       dockerfile: Dockerfile.rocm
       args:
-        BUILD_JOBS: ${OCR_BUILD_JOBS:-8}
+        BUILD_JOBS: ${OCR_BUILD_JOBS:-auto}
+        OCR_ROCM_TRANSPORT: ${OCR_ROCM_TRANSPORT:-kfd}
         AMDGPU_TARGETS: ${OCR_AMDGPU_TARGETS:-}
     image: vision-bill-ocr-rocm:${OCR_IMAGE_TAG:-candidate}
     command: ["python", "-m", "ocr_service.activation"]

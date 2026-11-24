@@ -28,23 +28,22 @@ def require_targets(found: set[str], required: set[str]) -> None:
 
 
 def validate_compile_targets(path: Path, required_targets: set[str] = TARGETS) -> None:
-    if path.suffix == ".json":
-        commands = [
-            row.get("command", " ".join(row.get("arguments", [])))
-            for row in json.loads(path.read_text())
-        ]
-    else:
-        commands = path.read_text().splitlines()
     matched = 0
-    for command in commands:
-        if "hipcc" not in command and "clang++" not in command:
-            continue
-        found = set(re.findall(r"--offload-arch=(gfx[0-9a-f]+)", command))
-        if not found:
-            continue
-        if found != required_targets:
-            raise ValueError("Native compile target flags differ from selected candidate set")
-        matched += 1
+    with path.open() as stream:
+        # Verbose Paddle build logs can be much larger than available memory.
+        commands = (
+            (row.get("command") or " ".join(row.get("arguments", [])) for row in json.load(stream))
+            if path.suffix == ".json" else iter(stream)
+        )
+        for command in commands:
+            if "hipcc" not in command and "clang++" not in command:
+                continue
+            found = set(re.findall(r"--offload-arch=(gfx[0-9a-f]+)", command))
+            if not found:
+                continue
+            if found != required_targets:
+                raise ValueError("Native compile target flags differ from selected candidate set")
+            matched += 1
     if not matched:
         raise ValueError("Native compile target commands are unavailable")
 
@@ -108,6 +107,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--compile-log", type=Path, required=True)
     parser.add_argument("--target-profile", type=Path, required=True)
+    parser.add_argument("--transport-file", type=Path)
     args = parser.parse_args()
     target_profile = validate_profile(json.loads(args.target_profile.read_text()))
     selected = set(target_profile["candidate_targets"])
@@ -122,4 +122,9 @@ if __name__ == "__main__":
             list(library.glob("libMIOpen.so*")) + [args.sdk / "share/miopen"], tool, selected
         ),
     }
+    if args.transport_file is not None:
+        transport = args.transport_file.read_text().strip()
+        if transport not in ("kfd", "wsl", "dual"):
+            raise ValueError("Invalid ROCm build transport")
+        result["transport"] = transport
     args.output.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n")
