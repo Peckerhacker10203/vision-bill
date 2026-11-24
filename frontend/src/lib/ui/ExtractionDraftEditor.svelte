@@ -36,11 +36,11 @@
 	let policy = $state<AmountPolicy | null>(null);
 	let error = $state('');
 	let invalidFields = $state<string[]>([]);
-	function fieldLabel(path: string) {
+	function fieldLabel(path: string, format: (key: string) => string) {
 		const parts = path.replace(/\[(\d+)\]/g, '.$1').split('.');
 		return (
 			(parts.length > 1 ? `${Number(parts[1]) + 1} · ` : '') +
-			translate(
+			format(
 				parts[0] === 'taxes' && parts.length === 1
 					? 'editor.taxes'
 					: (labelKeys[parts.at(-1)!] ?? 'editor.lineItems')
@@ -321,7 +321,7 @@
 		{#if invalidFields.length}<ul class="my-3 space-y-2 text-error">
 				{#each invalidFields as path (path)}<li>
 						<button type="button" class="underline" onclick={() => focusField(path)}
-							>{fieldLabel(path)}</button
+							>{fieldLabel(path, $t)}</button
 						>
 					</li>{/each}
 			</ul>{/if}
@@ -336,8 +336,9 @@
 							>{$t(groupIndex === 0 ? 'editor.details' : 'editor.amounts')}</legend
 						>
 						<div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
-							{#each group as field (field)}<label class="block text-sm"
-									>{$t(labelKeys[field])}{#if field === 'payment_method' || field === 'category'}
+							{#each group as field (field)}<div class="block text-sm">
+									<label for={`draft-${field}`}>{$t(labelKeys[field])}</label
+									>{#if field === 'payment_method' || field === 'category'}
 										{@const options = field === 'payment_method' ? PAYMENT_METHODS : CATEGORIES}
 										{@const current = document[field]}
 										<select
@@ -370,8 +371,8 @@
 															? numeric(e.currentTarget.value)
 															: e.currentTarget.value.trim() || null
 												})}
-										/>{/if}</label
-								>{/each}
+										/>{/if}
+								</div>{/each}
 						</div>
 					</fieldset>{/each}
 				<h3 id="draft-line_items" tabindex="-1">{$t('editor.lineItems')}</h3>
@@ -379,8 +380,10 @@
 					<div
 						class="grid grid-cols-1 gap-2 rounded border border-outline-variant p-3 sm:grid-cols-2"
 					>
-						{#each ['description', 'quantity', 'unit_price', 'total_price', 'spending_category'] as field (field)}<label
-								>{$t(labelKeys[field])}{#if field === 'spending_category'}<select
+						{#each ['description', 'quantity', 'unit_price', 'total_price', 'spending_category'] as field (field)}<div
+							>
+								<label for={`draft-line_items.${index}.${field}`}>{$t(labelKeys[field])}</label
+								>{#if field === 'spending_category'}<select
 										class="block w-full rounded border p-2"
 										id={`draft-line_items.${index}.spending_category`}
 										aria-invalid={invalidFields.includes(`line_items.${index}.spending_category`)}
@@ -403,8 +406,8 @@
 											Object.assign(line, {
 												[field]: e.currentTarget.value.trim() || null
 											})}
-									/>{/if}</label
-							>{/each}
+									/>{/if}
+							</div>{/each}
 						{#if line.tags !== null && line.tags !== undefined}<TagEditor
 								disabled={busy}
 								value={line.tags}
@@ -486,7 +489,7 @@
 						onChange={(value) => (policy = value)}
 					/>{/if}
 				{#each Object.entries(sourceDecisions) as [path, refs] (path)}<p>
-						{fieldLabel(path)}
+						{fieldLabel(path, $t)}
 						<button type="button" onclick={() => (selectedSources = [...refs])}
 							>{$t('review.showSource')}</button
 						>
@@ -545,7 +548,7 @@
 				{$t('review.draftSavedFindings', { values: { revision: draft.revision } })}
 			</p>{/if}
 		<ReviewFindings
-			fieldName={(path) => (isFormField(path) ? fieldLabel(path) : undefined)}
+			fieldName={(path) => (isFormField(path) ? fieldLabel(path, $t) : undefined)}
 			onField={draft.finalized_receipt_id ? undefined : focusField}
 			findings={draft.findings}
 			revision={draft.revision}

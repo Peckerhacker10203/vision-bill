@@ -94,6 +94,7 @@
 		"zoomOut": "Verkleinern",
 		"working": "Arbeitsbild",
 		"selection": "{count} / 10 Fotos · Upload-Reihenfolge",
+		"namedField": "Zum Feld {name}",
 		"field": "Zum Feld"
 	},
 	"submission": {

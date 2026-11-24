@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import ExtractionDraftEditor from './ExtractionDraftEditor.svelte';
+import { setLocale } from '$lib/i18n';
 import { api, ApiError } from '$lib/api/client';
 import { queryClient } from '$lib/query/client';
 import type { DraftView } from '$lib/types';
@@ -592,8 +593,18 @@ it('saves selected cash and numeric confidence before finalizing the newly check
 	const patch = vi.spyOn(api, 'patchDraft').mockResolvedValue(saved);
 	const finalize = vi.spyOn(api, 'finalizeDraft').mockResolvedValue({ id: 'receipt' } as never);
 	render(ExtractionDraftEditor, { id: 'job' });
-	const select = await screen.findByRole('combobox', { name: 'Payment method' });
-	await fireEvent.click(screen.getByRole('button', { name: 'Payment method' }));
+	const select = await screen.findByLabelText('Payment method', { exact: true });
+	expect((select as HTMLSelectElement).labels?.[0].textContent).toBe('Payment method');
+	await fireEvent.click(screen.getByRole('button', { name: 'Finalize draft' }));
+	expect(screen.getByRole('button', { name: 'Payment method' })).toBeTruthy();
+	try {
+		setLocale('de');
+		expect(await screen.findByLabelText('Zahlungsart', { exact: true })).toBe(select);
+		expect(await screen.findByRole('button', { name: 'Zum Feld Zahlungsart' })).toBeTruthy();
+	} finally {
+		setLocale('en');
+	}
+	await fireEvent.click(await screen.findByRole('button', { name: 'Go to field Payment method' }));
 	expect(document.activeElement).toBe(select);
 	await fireEvent.change(select, { target: { value: 'cash' } });
 	await fireEvent.input(screen.getByLabelText('Confidence (%)'), { target: { value: '100' } });
@@ -604,7 +615,9 @@ it('saves selected cash and numeric confidence before finalizing the newly check
 		expected_revision: 7,
 		changes: { payment_method: 'cash', confidence: 100 }
 	});
-	await waitFor(() => expect(screen.queryByRole('button', { name: 'Payment method' })).toBeNull());
+	await waitFor(() =>
+		expect(screen.queryByRole('button', { name: 'Go to field Payment method' })).toBeNull()
+	);
 	await fireEvent.click(screen.getByRole('button', { name: 'Finalize draft' }));
 	expect(finalize).toHaveBeenCalledWith('job', {
 		expected_revision: 8,
@@ -672,7 +685,7 @@ it('keeps findings visible when revisiting a finalized draft without offering fi
 	});
 	render(ExtractionDraftEditor, { id: 'job' });
 	expect(await screen.findByRole('article')).toBeTruthy();
-	expect(screen.queryByRole('button', { name: 'Payment method' })).toBeNull();
+	expect(screen.queryByRole('button', { name: 'Go to field Payment method' })).toBeNull();
 	expect(screen.queryByLabelText('Payment method')).toBeNull();
 });
 

@@ -94,6 +94,7 @@
 		"zoomOut": "Zoom out",
 		"working": "Working image",
 		"selection": "{count} / 10 photos · Upload order",
+		"namedField": "Go to field {name}",
 		"field": "Go to field"
 	},
 	"submission": {

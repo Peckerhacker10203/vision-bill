@@ -49,7 +49,9 @@
 					type="button"
 					class="text-sm text-primary underline"
 					onclick={() => onField?.(finding.field_path)}
-					>{name ?? $t('receiptWorkspace.field')}</button
+					>{name
+						? $t('receiptWorkspace.namedField', { values: { name } })
+						: $t('receiptWorkspace.field')}</button
 				>{/if}
 			<details class="text-xs text-on-surface-variant">
 				<summary>{$t('editor.details')}</summary>{finding.code} · {finding.field_path}
