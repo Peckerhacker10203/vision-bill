@@ -448,11 +448,13 @@ def _guarded_admin_overrides(data: dict[str, Any], sources: list[dict[str, Any]]
         origin = llm_origin(host, LLMProviderEnum.OLLAMA) if host else None
         operator_host = deployment.get("host")
         native_pin = data.get("ollama_credential_origin", pinned_origin)
-        if (
-            (native_pin is not None and origin != native_pin)
-            or (operator_host and llm_origin(operator_host, LLMProviderEnum.OLLAMA) != origin)
-            or deployment.get("provider", "ollama") != "ollama"
-        ):
+        operator_origin = llm_origin(operator_host, LLMProviderEnum.OLLAMA) if operator_host else None
+        operator_native = deployment.get("provider", "ollama") == "ollama"
+        if operator_native and operator_origin and native_pin and operator_origin != native_pin:
+            # A deployment rotation supersedes the previously adopted origin.
+            if origin != operator_origin:
+                adopted.get("llm", {}).pop("host", None)
+        elif not operator_native or any(pin and pin != origin for pin in (native_pin, operator_origin)):
             adopted.setdefault("llm", {})["authentication"] = {"mode": "none", "provider": "ollama"}
     if pinned_origin is None or not has_legacy_llm_credentials(effective.get("api_key", "")):
         return adopted
@@ -646,7 +648,11 @@ def _publish_config_file(
         if credential_origin is not None:
             if expected_llm is not None and expected_llm.provider == LLMProviderEnum.OLLAMA:
                 native_origin = llm_origin(expected_llm.host, expected_llm.provider)
-                if native_origin != credential_origin:
+                native_pin = data.get("ollama_credential_origin", data.get("llm_credential_origin"))
+                if native_deployment_key() and native_pin and native_origin != native_pin:
+                    # A same-origin edit after rotation records the current deployment destination.
+                    data["ollama_credential_origin"] = native_origin
+                elif native_origin != credential_origin:
                     data.setdefault("ollama_credential_origin", native_origin)
             if has_legacy_llm_credentials(config.llm.api_key):
                 data["llm_credential_origin"] = credential_origin

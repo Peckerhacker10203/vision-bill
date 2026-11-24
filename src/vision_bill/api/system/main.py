@@ -238,7 +238,9 @@ async def test_llm_connection(request: LlmConnectionRequest) -> LlmConnectionVie
     return LlmConnectionView(status=result.status, models=result.models)
 
 
-def _validated_llm_origin(host: str, provider: LLMProviderEnum | None = None) -> str:
+def _validated_llm_origin(host: str, provider: LLMProviderEnum, *, changed_endpoint: bool = False) -> str:
+    if changed_endpoint and ("?" in host or "#" in host):
+        raise HTTPException(status_code=422, detail="Host must not contain a query or fragment")
     try:
         supplied = "http://" + host if provider == LLMProviderEnum.OLLAMA and "://" not in host else host
         parsed = TypeAdapter(AnyHttpUrl).validate_python(supplied)
@@ -291,21 +293,21 @@ async def update_settings(request: Request, update: SettingsUpdate) -> SettingsV
     authentication = update.llm_authentication
     credential_origin = None
     llm_authentication_expected_origin = None
-    candidate_origin = None
     endpoint_change = bool(changed & {"llm.provider", "llm.host"})
+    candidate_origin = (
+        _validated_llm_origin(candidate.llm.host, candidate.llm.provider, changed_endpoint=True) if endpoint_change else None
+    )
     if (
         endpoint_change and native_deployment_key() and candidate.llm.provider == LLMProviderEnum.OLLAMA
         and (
             settings.llm.provider != candidate.llm.provider
-            or _validated_llm_origin(settings.llm.host, settings.llm.provider)
-            != _validated_llm_origin(candidate.llm.host, candidate.llm.provider)
+            or _validated_llm_origin(settings.llm.host, settings.llm.provider) != candidate_origin
         )
     ):
         raise HTTPException(status_code=409, detail="Remove the deployment's Ollama key before changing the endpoint.")
     if "llm.provider" in changed and authentication is None and settings.llm.authentication is not None:
         raise HTTPException(status_code=409, detail="Select a new key or None for the new provider.")
     if "llm.host" in changed:
-        candidate_origin = _validated_llm_origin(candidate.llm.host, candidate.llm.provider)
         if (
             has_ambient_openai_headers() and not has_real_api_key(settings.llm.api_key)
             and llm_origin(settings.llm.host) != llm_origin(candidate.llm.host)

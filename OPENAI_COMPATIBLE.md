@@ -31,7 +31,9 @@ loaded. Use the router setup below for a shared GPU.
 Under **Settings → Receipt formatter**, choose the provider and enter its base
 URL. For native Ollama, use the server root (for example,
 `http://host.docker.internal:11434`). For an OpenAI-compatible service, use
-its API base (for example, `http://host.docker.internal:8083/v1`).
+its API base (for example, `http://host.docker.internal:8083/v1`). A reverse
+proxy path can be part of either base URL. Remove query parameters and URL
+fragments before saving the host. Enter credentials in the authentication field.
 
 Choose **None** for the standard local Ollama API or a credentialless local
 OpenAI-compatible server. Choose **Bearer API key** for a proxy that requires
@@ -46,7 +48,10 @@ only the model list, using `GET /api/tags` for Ollama or `GET /models` under
 the configured OpenAI-compatible API base. The test sends no receipt or prompt
 and runs no inference. Select a returned model ID, or enter an exact ID manually
 if discovery is unavailable or the list omits your model. Save the model choice.
-A listed ID confirms that the endpoint advertises the model. For direct vision,
+A listed ID confirms that the endpoint advertises the model. If the model server
+includes a connection credential in a published ID or model detail, Vision Bill
+rejects that catalog response. Check the model server's catalog configuration
+if it reports an invalid model list. For direct vision,
 check the model's documented image-input support separately.
 [Ollama list models](https://docs.ollama.com/api/tags) ·
 [OpenAI list models](https://developers.openai.com/api/reference/resources/models/methods/list)
@@ -54,6 +59,10 @@ check the model's documented image-input support separately.
 A Bearer key saved in Settings is bound to the selected provider and endpoint
 origin (scheme, hostname and port). Settings only shows whether a credential is
 configured. Existing deployments can keep their original credential source.
+For inherited OpenAI authentication, the connection test uses the deployment's
+organization and project headers, including custom header overrides, just as
+the active model client does. Selecting **None** or **Bearer API key** uses the
+explicit settings for that connection and omits those inherited headers.
 `LLM__API_KEY` applies to OpenAI-compatible endpoints and a deployment-supplied
 `OLLAMA_API_KEY` applies to Ollama. Choosing **None** explicitly disables
 authentication for that connection. Restart the app service when Settings

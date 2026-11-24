@@ -9,6 +9,7 @@ from typing import Any, Literal, cast
 
 import httpx2
 
+from ...config import has_real_api_key
 from ...model.receipt import Receipt
 from ...provider.llm.base import (
     TEXT_CAPABILITIES,
@@ -19,7 +20,13 @@ from ...provider.llm.base import (
     inference_endpoint_identity,
 )
 from ...service.activation_admission import direct_inference_call, inference_admission
-from . import DEFAULT_FORMATTER_MAX_OUTPUT_TOKENS, OPENAI_CREDENTIALLESS_API_KEY, valid_model_id
+from . import (
+    DEFAULT_FORMATTER_MAX_OUTPUT_TOKENS,
+    OPENAI_CREDENTIALLESS_API_KEY,
+    contains_catalog_credential,
+    header_credentials,
+    valid_model_id,
+)
 from .experiment import chat_telemetry
 from .llamacpp import LlamaCppLifecycle
 
@@ -47,16 +54,21 @@ def _format_parameter_size(n_params: int) -> str:
     return str(n_params)
 
 
-def _model_capabilities(*entries: dict[str, Any], declared: bool) -> list[str]:
-    """Read image input support without inferring it from outputs or names."""
+def _model_capabilities(*entries: dict[str, Any], declared: bool) -> tuple[list[str], bool]:
+    """Return normalized capabilities and eligibility for text formatting."""
     capabilities: dict[str, None] = {}
     input_modalities = []
+    output_modalities = []
     for entry in entries:
         advertised = entry.get("capabilities")
         if isinstance(advertised, list):
             capabilities.update({capability: None for capability in advertised if isinstance(capability, str)})
         for descriptor in (entry, entry.get("architecture"), entry.get("meta")):
-            if isinstance(descriptor, dict) and isinstance(descriptor.get("input_modalities"), list):
+            if not isinstance(descriptor, dict):
+                continue
+            if isinstance(descriptor.get("output_modalities"), list):
+                output_modalities.append(descriptor["output_modalities"])
+            if isinstance(descriptor.get("input_modalities"), list):
                 input_modalities.append(descriptor["input_modalities"])
 
     has_vision_marker = any(capability in capabilities for capability in VISION_CAPABILITY_FIELDS)
@@ -66,10 +78,14 @@ def _model_capabilities(*entries: dict[str, Any], declared: bool) -> list[str]:
     else:
         vision = has_vision_marker or (declared and not capabilities)
     if not vision:
-        return [capability for capability in capabilities if capability not in VISION_CAPABILITY_FIELDS]
-    if not has_vision_marker:
+        for marker in VISION_CAPABILITY_FIELDS:
+            capabilities.pop(marker, None)
+    elif not has_vision_marker:
         capabilities["vision"] = None
-    return list(capabilities)
+    text = (not capabilities or bool(TEXT_CAPABILITIES.intersection(capabilities))) and all(
+        "text" in modalities for modalities in (*input_modalities, *output_modalities)
+    )
+    return list(capabilities), text
 
 
 class OpenAIProvider(LLMProvider):
@@ -123,6 +139,16 @@ class OpenAIProvider(LLMProvider):
             self._client._custom_headers = {}
             self._client.organization = None
             self._client.project = None
+        self._catalog_credentials = set()
+        if api_key and (explicit_authentication or has_real_api_key(api_key)):
+            self._catalog_credentials.add(api_key)
+        if not enforce_authentication:
+            custom_headers = self._client._custom_headers
+            if isinstance(custom_headers, Mapping):
+                self._catalog_credentials.update(header_credentials(custom_headers))
+            self._catalog_credentials.update(
+                value for value in (self._client.organization, self._client.project) if isinstance(value, str) and value
+            )
         self._temperature = temperature
         from ...service.gpu_handoff import configure_handoff
         configure_handoff(self)
@@ -183,19 +209,17 @@ class OpenAIProvider(LLMProvider):
 
         result: list[ModelInfo] = []
         for model_id in dict.fromkeys([*native_by_id, *data_by_id]):
+            if contains_catalog_credential(model_id, self._catalog_credentials):
+                raise ModelDiscoveryError("Invalid formatter model list")
             entry = native_by_id.get(model_id, {})
             data_entry = data_by_id.get(model_id, {})
-            capabilities = _model_capabilities(
+            capabilities, supports_text = _model_capabilities(
                 entry, data_entry, declared=model_id in self._vision_model_ids,
             )
             if capability == "vision" and not any(c in VISION_CAPABILITY_FIELDS for c in capabilities):
                 continue
 
-            if (
-                capability == "text"
-                and capabilities
-                and not any(c in capabilities for c in TEXT_CAPABILITIES)
-            ):
+            if capability == "text" and not supports_text:
                 continue
 
             details = entry.get("details")
@@ -216,6 +240,7 @@ class OpenAIProvider(LLMProvider):
             digest = str(entry.get("digest") or data_entry.get("digest") or "")
             mi.digest = digest or None
             mi.parameter_size = parameter_size or None
+            mi.validate_catalog_metadata(self._catalog_credentials)
             result.append(mi)
 
         return result

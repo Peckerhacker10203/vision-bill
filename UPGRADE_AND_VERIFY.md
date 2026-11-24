@@ -401,7 +401,10 @@ Benchmark selections take effect without a restart and apply only to that run.
 Choose a mode, then select the models to run. **Image directly to LLM** sends
 the originals to the selected vision models. **OCR + LLM** uses the dedicated
 OCR service and sends the resulting text and evidence to selected text-capable
-models. Each choice creates a single run. **Compare both** explicitly requests
+models. OpenAI-compatible models that explicitly advertise audio-only input
+or embedding-only output are excluded from the OCR list. Older endpoints can
+still offer models without capability metadata for text formatting.
+Each choice creates a single run. **Compare both** explicitly requests
 two linked runs over the same ordered inputs and frozen expectations. It needs
 OCR and at least one model that supports both paths. A selected text-only
 model participates on the OCR side, with the direct side marked inapplicable.
@@ -524,13 +527,20 @@ PUT; these legacy requests retain environment locks. Adopting an environment
 default requires an explicit `changed_paths` mask, as sent by Settings. Each formatter save refreshes Dedicated OCR status so a binding or restart
 requirement remains visible.
 
-A real private API key is bound to its trusted endpoint origin: browser host edits
-may change paths within that origin, but cannot send the key to another origin.
-With an empty or `none` key, a host edit is allowed and records the original
-`llm_credential_origin` in private YAML. Adding a real key later refuses startup
-when the effective endpoint differs from that origin. An explicit operator
-rotation of the deployment host takes precedence over stale browser host adoption
-so a newly rotated key follows its deployment endpoint. The operator must verify
-the new endpoint and approve the credential binding in private configuration
-before restarting; removing the origin marker after that review permits the
-verified endpoint. Never put keys in a host URL.
+Origin bindings protect credentials when the endpoint changes. An admin can
+edit the path on the same origin. To move a key saved in Settings to a new
+origin, select the new host and explicitly supply its key, then restart the app.
+
+For inherited Ollama authentication, set `LLM__HOST` and `OLLAMA_API_KEY`
+together in the deployment and recreate the app service. An explicitly rotated
+deployment origin takes precedence over a stale host previously adopted in
+the browser. An explicit **None** or **Bearer API key** selection in Settings
+continues to control that connection.
+
+For legacy OpenAI-compatible deployments, a host edit with an empty or `none`
+key records the original `llm_credential_origin` in private YAML. If an added
+deployment key would go to a different browser-selected origin, startup
+requires operator review. Verify the destination before updating the private
+binding. A host and key explicitly rotated together in the deployment take
+precedence over a stale browser host. After recreating the app, verify the host
+with **Test saved connection**.

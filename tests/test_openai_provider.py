@@ -488,3 +488,21 @@ async def test_hybrid_model_list_keeps_data_only_ids_without_assuming_vision(moc
     provider = OpenAIProvider(host="http://localhost:8642/v1", api_key="none")
     assert [model.id for model in await provider.get_available_models()] == ["native", "extra"]
     assert [model.id for model in await provider.get_available_models(capability="text")] == ["native", "chat", "extra"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hybrid", [False, True])
+async def test_text_discovery_requires_compatible_advertised_modalities(mock_client, hybrid):
+    entries = [
+        {"id": "opaque"},
+        {"id": "formatter", "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]}},
+        {"id": "audio", "meta": {"input_modalities": ["audio"]}},
+        {"id": "embedding", "input_modalities": ["text"], "output_modalities": ["embedding"]},
+        {"id": "image-input", "input_modalities": ["image"], "capabilities": ["completion"]},
+        {"id": "mixed", "input_modalities": ["text", "image"], "output_modalities": ["audio", "text"]},
+    ]
+    native = [_ollama_entry("audio", ["completion"]), _ollama_entry("embedding", ["chat"])] if hybrid else []
+    mock_client.models.with_raw_response.list.return_value = _raw_response(_hybrid_body(native, entries))
+    provider = OpenAIProvider(host="http://localhost:8642/v1", api_key="none")
+    assert {m.id for m in await provider.get_available_models(capability="text")} == {"opaque", "formatter", "mixed"}
+    assert {m.id for m in await provider.get_available_models(capability="vision")} == {"mixed", "image-input"}

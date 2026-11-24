@@ -18,7 +18,7 @@ from ...provider.llm.base import (
     inference_endpoint_identity,
 )
 from ...service.activation_admission import direct_inference_call, inference_admission
-from . import DEFAULT_FORMATTER_MAX_OUTPUT_TOKENS, valid_model_id
+from . import DEFAULT_FORMATTER_MAX_OUTPUT_TOKENS, contains_catalog_credential, valid_model_id
 from .experiment import chat_telemetry
 
 try:
@@ -55,6 +55,7 @@ class OllamaProvider(LLMProvider):
         if api_key is None and "authorization" in self._client._client.headers:
             # The SDK imports OLLAMA_API_KEY even when trust_env is disabled.
             del self._client._client.headers["authorization"]
+        self._catalog_credentials = {api_key} if api_key else set()
         self._temperature = temperature
         self.supports_thinking_control = True
         self.supports_model_release = True
@@ -123,7 +124,7 @@ class OllamaProvider(LLMProvider):
         result = []
         for model in models.models:
             # model.model is the name of the model, e.g., "gemma4:e4b", we need this for all further calls.
-            if not valid_model_id(model.model):
+            if not valid_model_id(model.model) or contains_catalog_credential(model.model, self._catalog_credentials):
                 raise ModelDiscoveryError("Invalid formatter model list")
 
             details = await self._client.show(model.model)
@@ -152,6 +153,7 @@ class OllamaProvider(LLMProvider):
             ]
             mi.context_window_tokens = min(capacities) if capacities else None
 
+            mi.validate_catalog_metadata(self._catalog_credentials)
             result.append(mi)
 
         return result

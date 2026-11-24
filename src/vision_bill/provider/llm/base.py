@@ -49,7 +49,7 @@ from ...service.activation_admission import inference_admission
 from ...service.gpu_handoff import current_owner
 from ...service.observation_admission import admit_observations
 from ...service.receipt_review import observation_values
-from . import DEFAULT_FORMATTER_MAX_OUTPUT_TOKENS
+from . import DEFAULT_FORMATTER_MAX_OUTPUT_TOKENS, contains_catalog_credential
 from .errors import UnreadableReceiptError
 from .experiment import extraction_prompt, source_extraction_prompt
 from .merchant_choice import candidates_for, merchant_instructions, validated_display_name
@@ -127,6 +127,13 @@ class ModelInfo:
     capabilities: list[str] | None = None
     digest: str | None = None
     context_window_tokens: int | None = None
+
+    def validate_catalog_metadata(self, credentials: set[str]) -> None:
+        if self.context_window_tokens is not None and str(self.context_window_tokens) in credentials:
+            raise ModelDiscoveryError("Invalid formatter model list")
+        for value in (self.digest, self.parameter_size, *(self.capabilities or [])):
+            if isinstance(value, str) and contains_catalog_credential(value, credentials):
+                raise ModelDiscoveryError("Invalid formatter model list")
 
 
 @dataclass

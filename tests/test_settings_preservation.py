@@ -1039,3 +1039,70 @@ def test_native_bare_host_path_edit_retains_deployment_key(saved_settings, monke
     monkeypatch.setenv("OLLAMA_API_KEY", "native-only")
     assert client.put("/system/settings", json=explicit_payload(active, host="proxy/v1")).status_code == 200
     assert config.Settings().llm.request_api_key() == "native-only"
+
+
+@pytest.mark.parametrize("approved", ["https://approved-{}.example", "approved-{}"])
+def test_native_operator_rotation_follows_deployment_across_restarts(saved_settings, monkeypatch, approved):
+    _, _, _, client = saved_settings
+    monkeypatch.setenv("LLM__API_KEY", "none")
+    for deployment in ("a", "b", "c"):
+        host = approved.format(deployment)
+        monkeypatch.setenv("LLM__HOST", host)
+        monkeypatch.setenv("OLLAMA_API_KEY", f"native-{deployment}")
+        active = config.Settings()
+        assert active.llm.host == host
+        assert active.llm.request_api_key() == f"native-{deployment}"
+        monkeypatch.setattr(system, "settings", active)
+        edited = f"{host}/v2"
+        assert client.put("/system/settings", json=explicit_payload(active, host=edited)).status_code == 200
+        restarted = config.Settings()
+        assert restarted.llm.host == edited
+        assert restarted.llm.request_api_key() == f"native-{deployment}"
+        monkeypatch.delenv("LLM__HOST")
+        assert config.Settings().llm.request_api_key() == f"native-{deployment}"
+
+
+@pytest.mark.parametrize("provider", ["ollama", "openai"])
+@pytest.mark.parametrize("suffix", ["?access=private", "#private", "?", "#"])
+def test_changed_formatter_host_rejects_url_components(saved_settings, provider, suffix):
+    path, _, active, client = saved_settings
+    host = ("ollama:11434" if provider == "ollama" else "http://ollama:11434") + "/proxy" + suffix
+    original = path.read_bytes()
+    response = client.put("/system/settings", json=explicit_payload(active, provider=provider, host=host))
+    assert response.status_code == 422
+    assert "private" not in response.text
+    assert path.read_bytes() == original
+
+
+def test_legacy_formatter_query_allows_model_edit_and_host_repair(saved_settings, monkeypatch):
+    path, document, active, client = saved_settings
+    monkeypatch.setenv("OLLAMA_API_KEY", "native-key")
+    host = active.llm.host
+    document["llm"]["host"] = active.llm.host = host + "/proxy?old"
+    path.write_text(yaml.safe_dump(document))
+    assert client.put("/system/settings", json=explicit_payload(active, model_name="new")).status_code == 200
+    assert client.put("/system/settings", json=explicit_payload(active, host=host + "/proxy")).status_code == 200
+
+
+def test_provider_only_change_validates_saved_host_for_new_provider(saved_settings):
+    path, document, active, client = saved_settings
+    document["llm"]["host"] = active.llm.host = "ollama:11434/proxy"
+    path.write_text(yaml.safe_dump(document))
+    before = path.read_bytes()
+    response = client.put("/system/settings", json=explicit_payload(active, provider="openai"))
+    assert response.status_code == 422
+    assert path.read_bytes() == before
+    assert active.llm.provider == config.LLMProviderEnum.OLLAMA
+    corrected = explicit_payload(active, provider="openai", host="http://ollama:11434/proxy")
+    assert client.put("/system/settings", json=corrected).status_code == 200
+    assert config.Settings().llm.authentication is None
+
+
+def test_legacy_formatter_query_allows_authentication_only_edit(saved_settings):
+    path, document, active, client = saved_settings
+    document["llm"]["host"] = active.llm.host = active.llm.host + "/proxy?old"
+    path.write_text(yaml.safe_dump(document))
+    body = {**explicit_payload(active), "llm_authentication": {"mode": "none"}}
+    assert client.put("/system/settings", json=body).status_code == 200
+    assert config.Settings().llm.host == active.llm.host
+    assert config.Settings().llm.request_api_key() is None
