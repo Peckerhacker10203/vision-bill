@@ -74,6 +74,12 @@ empty `runtime.env` if the saved configuration already specifies the intended
 endpoint. The app reuses credentials, settings, receipts and uploads on these
 volumes. The retired LLM model volume is separate and stays operator-managed.
 
+To verify the formatter after upgrading, open **Settings → Receipt formatter**
+as an admin and use **Test saved connection**. Check the returned model IDs
+against the intended service. Discovery sends no receipt and runs no inference.
+The exact model ID can also be entered manually. Both providers support a
+credentialless connection or a Bearer key saved through Settings.
+
 If a saved configuration points to a removed bundled Ollama hostname, the app
 retains that selection. Pending work waits until you deliberately configure a
 reachable endpoint and installed model or restore the old reachable service.
@@ -382,6 +388,16 @@ and an explicit `confirm: true` for confirmation. A stale revision returns 409.
 
 ### Choose and compare pipelines
 
+The benchmark form lists models from the active formatter endpoint. After changing
+provider, host or authentication in Settings, restart the app when prompted.
+Click **Refresh models** to query the active endpoint again after models or
+capabilities change. Select one or more eligible model IDs explicitly. If an
+ID disappears on refresh, remove it from the selection before starting the run.
+
+The optional run temperature accepts values from 0 to 2, including an explicit
+zero. Leave it blank to use the active formatter temperature at queue time.
+Benchmark selections take effect without a restart and apply only to that run.
+
 Choose a mode, then select the models to run. **Image directly to LLM** sends
 the originals to the selected vision models. **OCR + LLM** uses the dedicated
 OCR service and sends the resulting text and evidence to selected text-capable
@@ -390,6 +406,8 @@ two linked runs over the same ordered inputs and frozen expectations. It needs
 OCR and at least one model that supports both paths. A selected text-only
 model participates on the OCR side, with the direct side marked inapplicable.
 Each model and input on the OCR side runs its own OCR step in the live worker.
+A worker claims one model/input task at a time. The order in which you click
+model names does not set the execution order.
 
 For an API run, send `POST /api/v1/benchmarks` with explicit `model_ids`,
 `receipt_ids` and/or `case_ids`, and `experiment.pipeline` set to
@@ -474,6 +492,15 @@ services; they cannot replace real operator/hardware acceptance. Publishing rema
 a separate [manual release](RELEASES.md) action; no tag/release/deployment is implied.
 
 ### Admin formatter settings and environment defaults
+
+New installations default to 32768 formatter output tokens per generation. Source
+Compose on Linux and WSL reads the existing checkout’s `.env` on container
+creation. If it pins `LLM__MAX_OUTPUT_TOKENS=8192`, change that line to
+`LLM__MAX_OUTPUT_TOKENS=32768` to adopt the new budget, or leave your chosen
+value in place. Recreate the app with the same Compose project and overlays
+during the upgrade. Existing installations can also retain a value in the mounted
+YAML under `llm.max_output_tokens`. Settings shows the effective formatter output
+limit after startup.
 
 Existing `.env` and container values continue to supply settings until an admin
 changes a field and clicks **Save** in Settings. Changed provider, HTTP(S) host,

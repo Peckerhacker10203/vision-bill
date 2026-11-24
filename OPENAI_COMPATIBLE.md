@@ -26,11 +26,37 @@ GPU** and save under **Settings → Dedicated OCR** before enabling OCR. An
 OpenAI-compatible endpoint can use model lifecycle `none` and keep its models
 loaded. Use the router setup below for a shared GPU.
 
-Under **Settings → Receipt formatter → Authentication**, select **None** for a
-server that accepts requests without a key, or **Bearer API key** to enter a
-key or an existing access token. **Test saved connection** checks read-only
-model discovery. The saved credential is tied to the endpoint origin and the
-UI only shows whether a key is configured. Restart the app service when Settings
+### Authenticate and discover models in Settings
+
+Under **Settings → Receipt formatter**, choose the provider and enter its base
+URL. For native Ollama, use the server root (for example,
+`http://host.docker.internal:11434`). For an OpenAI-compatible service, use
+its API base (for example, `http://host.docker.internal:8083/v1`).
+
+Choose **None** for the standard local Ollama API or a credentialless local
+OpenAI-compatible server. Choose **Bearer API key** for a proxy that requires
+a Bearer token, direct access to Ollama Cloud, or OpenAI's hosted API. Enter
+the key or access token for the chosen service. A local Ollama server can also
+sign in to Ollama Cloud itself. In that setup the local server handles cloud
+authentication. [Ollama authentication](https://docs.ollama.com/api/authentication) ·
+[OpenAI authentication](https://developers.openai.com/api/reference/overview#authentication)
+
+Save the settings, then click **Test saved connection**. Vision Bill requests
+only the model list, using `GET /api/tags` for Ollama or `GET /models` under
+the configured OpenAI-compatible API base. The test sends no receipt or prompt
+and runs no inference. Select a returned model ID, or enter an exact ID manually
+if discovery is unavailable or the list omits your model. Save the model choice.
+A listed ID confirms that the endpoint advertises the model. For direct vision,
+check the model's documented image-input support separately.
+[Ollama list models](https://docs.ollama.com/api/tags) ·
+[OpenAI list models](https://developers.openai.com/api/reference/resources/models/methods/list)
+
+A Bearer key saved in Settings is bound to the selected provider and endpoint
+origin (scheme, hostname and port). Settings only shows whether a credential is
+configured. Existing deployments can keep their original credential source.
+`LLM__API_KEY` applies to OpenAI-compatible endpoints and a deployment-supplied
+`OLLAMA_API_KEY` applies to Ollama. Choosing **None** explicitly disables
+authentication for that connection. Restart the app service when Settings
 reports a pending configuration. [Installation guide](distribution/README.md)
 
 ## Configure a dedicated llama.cpp router
@@ -83,7 +109,7 @@ metadata, `LLM__VISION_MODEL_IDS=["receipt-vision"]` can declare known image sup
 it never overrides explicit contrary metadata. Output/context limits still apply;
 this setting does not give a text model vision support.
 
-The normal formatter output cap is 8192 tokens. Native PaddleOCR-VL 1.6 uses
+The normal formatter output cap is 32768 tokens. Native PaddleOCR-VL 1.6 uses
 up to 4096 output tokens and 2,000,000 input pixels per region. Document
 orientation is enabled and geometric unwarping is disabled. The lifecycle API is independent of the GPU backend selected when
 deploying llama.cpp.

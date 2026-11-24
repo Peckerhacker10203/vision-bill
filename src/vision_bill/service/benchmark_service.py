@@ -31,7 +31,7 @@ from ..model.receipt import LineItem, Receipt, TaxLine
 from ..model.workflow import AccessScope
 from ..provider.db.benchmark_db import BenchmarkDB, QueuedArm
 from ..provider.db.deadline import connection
-from ..provider.llm.base import LLMProvider
+from ..provider.llm.base import LLMProvider, discover_models
 from ..provider.llm.errors import UnreadableReceiptError
 from ..provider.llm.experiment import endpoint_fingerprint
 from .activation_admission import inference_admission
@@ -104,14 +104,14 @@ class BenchmarkService:
             raise ValueError("An OCR-only pipeline conflicts with comparison mode")
         explicit_ocr = request.comparison or pipeline == ExtractionPipeline.OCR
         use_ocr = explicit_ocr or (pipeline == ExtractionPipeline.UPLOAD and self._receipts._ocr_settings.enabled)
-        models = await self._provider.get_available_models(capability="text" if use_ocr else "vision")
+        models = await discover_models(self._provider, capability="text" if use_ocr else "vision")
         available = {m.id: m for m in models}
         unknown = set(selected_models) - set(available)
         if unknown:
             raise ValueError(f"Selected model(s) unavailable: {', '.join(sorted(unknown))}")
         primary_models = selected_models
         if request.comparison:
-            vision = await self._provider.get_available_models(capability="vision")
+            vision = await discover_models(self._provider, capability="vision")
             pairable = {m.id: m for m in vision if {"vision", "multimodal"}.intersection(m.capabilities or [])}
             primary_models = [model for model in selected_models if model in pairable]
             if not primary_models:
@@ -201,7 +201,7 @@ class BenchmarkService:
         manifest = await self._db.manifest(run_id)
         if manifest:
             self._require_current_prompt(run)
-            available = {m.id: m for m in await self._provider.get_available_models(capability="all")}
+            available = {m.id: m for m in await discover_models(self._provider, capability="all")}
             current = available.get(model_id)
             digest = (await self._run_digests(run)).get(model_id)
             if current is None or (digest and digest != current.digest):

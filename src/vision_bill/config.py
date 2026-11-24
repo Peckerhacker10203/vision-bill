@@ -33,6 +33,8 @@ from pydantic_settings import (
     YamlConfigSettingsSource,
 )
 
+from .provider.llm import DEFAULT_FORMATTER_MAX_OUTPUT_TOKENS
+
 logger = logging.getLogger(__name__)
 
 CONFIG_PATH_ENV = "VISION_BILL_CONFIG_PATH"
@@ -70,6 +72,7 @@ def valid_bearer_key(value: str) -> bool:
 class LlmAuthentication(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
+    provider: LLMProviderEnum = LLMProviderEnum.OPENAI
     mode: Literal["none", "bearer"]
     api_key: SecretStr | None = None
     origin: str | None = None
@@ -100,7 +103,7 @@ class LLMSettings(BaseModel):
     temperature: float
     # Keep the complete extraction deadline below the 15-minute image claim lease.
     analysis_timeout_seconds: float = Field(default=600, gt=0, le=600)
-    max_output_tokens: int = Field(default=8192, gt=0)
+    max_output_tokens: int = Field(default=DEFAULT_FORMATTER_MAX_OUTPUT_TOKENS, gt=0)
     vision_model_ids: list[str] = Field(default_factory=list)
     # OpenAI-only option; other providers keep their own lifecycle after a switch.
     model_lifecycle: Literal["none", "llamacpp"] = "none"
@@ -125,11 +128,11 @@ class LLMSettings(BaseModel):
         """Resolve the key for the selected endpoint, including an explicit omission."""
         auth = self.authentication
         if auth is None:
-            return self.api_key
-        if auth.api_key is None:
+            return self.api_key if self.provider == LLMProviderEnum.OPENAI else native_deployment_key()
+        if auth.provider != self.provider or auth.api_key is None:
             return None
         try:
-            if auth.origin == llm_origin(self.host):
+            if auth.origin == llm_origin(self.host, self.provider):
                 return auth.api_key.get_secret_value()
         except ValueError:
             pass
@@ -376,13 +379,22 @@ def has_legacy_llm_credentials(api_key: str) -> bool:
     return has_real_api_key(api_key) or has_ambient_openai_headers()
 
 
-def llm_origin(host: str) -> str:
+def native_deployment_key() -> str | None:
+    return os.environ.get("OLLAMA_API_KEY") or None
+
+
+def llm_origin(host: str, provider: LLMProviderEnum | None = None) -> str:
     try:
         url = httpx.URL(host if "://" in host else "http://" + host)
     except httpx.InvalidURL:
         raise ValueError("LLM endpoint origin is invalid") from None
     if url.userinfo or not url.raw_host or url.scheme not in ("http", "https"):
         raise ValueError("LLM endpoint origin is invalid")
+    if provider == LLMProviderEnum.OLLAMA:
+        from ollama._client import _parse_host
+
+        # Resolve the actual SDK destination (including bare-host default port).
+        url = httpx.URL(_parse_host(host))
     port = url.port if url.port is not None else (443 if url.scheme == "https" else 80)
     return f"{url.scheme}://{url.raw_host.decode()}:{port}"
 
@@ -408,12 +420,13 @@ def _guarded_admin_overrides(data: dict[str, Any], sources: list[dict[str, Any]]
     """Use the actual instance sources to keep a credential with its operator endpoint."""
     adopted = _admin_settings_overrides(data)
     authentication = data.get(LLM_AUTHENTICATION_KEY)
+    native = data.get("ollama_authentication")
+    if native is not None and authentication == {"mode": "none"}:
+        authentication = LlmAuthentication.model_validate(native).model_copy(update={"provider": LLMProviderEnum.OLLAMA})
     if authentication is not None:
         adopted.setdefault("llm", {})["authentication"] = authentication
         return adopted
     pinned_origin = data.get("llm_credential_origin")
-    if pinned_origin is None:
-        return adopted
 
     def llm_values(source: dict[str, Any]) -> dict[str, Any]:
         value = source.get("llm", {})
@@ -429,7 +442,19 @@ def _guarded_admin_overrides(data: dict[str, Any], sources: list[dict[str, Any]]
     for source in reversed(sources[:-1]):
         deployment.update(llm_values(source))
     effective.update(deployment)
-    if not has_legacy_llm_credentials(effective.get("api_key", "")):
+    endpoint = {**effective, **adopted.get("llm", {}), **llm_values(sources[0])}
+    if native_deployment_key() and endpoint.get("provider", "ollama") == "ollama":
+        host = endpoint.get("host")
+        origin = llm_origin(host, LLMProviderEnum.OLLAMA) if host else None
+        operator_host = deployment.get("host")
+        native_pin = data.get("ollama_credential_origin", pinned_origin)
+        if (
+            (native_pin is not None and origin != native_pin)
+            or (operator_host and llm_origin(operator_host, LLMProviderEnum.OLLAMA) != origin)
+            or deployment.get("provider", "ollama") != "ollama"
+        ):
+            adopted.setdefault("llm", {})["authentication"] = {"mode": "none", "provider": "ollama"}
+    if pinned_origin is None or not has_legacy_llm_credentials(effective.get("api_key", "")):
         return adopted
     deployment_host = deployment.get("host")
     if deployment_host is not None and llm_origin(deployment_host) != pinned_origin:
@@ -480,15 +505,15 @@ class SavedLlmEndpointChanged(ValueError):
     """The shared settings document changed to a different LLM origin."""
 
 
-def _saved_llm_host(data: dict[str, Any]) -> str | None:
+def _saved_llm_connection(data: dict[str, Any]) -> dict[str, Any]:
     env = EnvSettingsSource(Settings)()
     dotenv = DotEnvSettingsSource(Settings)()
     adopted = _guarded_admin_overrides(data, [{}, env, dotenv, {}])
-    for source in (adopted, env, dotenv, data):
-        llm = source.get("llm")
-        if isinstance(llm, dict) and isinstance(llm.get("host"), str):
-            return str(llm["host"])
-    return None
+    connection: dict[str, Any] = {}
+    for source in (data, dotenv, env, adopted):
+        if isinstance(source.get("llm"), dict):
+            connection.update(source["llm"])
+    return connection
 
 
 def saved_llm_settings() -> LLMSettings:
@@ -505,11 +530,12 @@ def saved_llm_settings() -> LLMSettings:
 def write_config_file(
     config: Settings, *, changed_paths: frozenset[str] | None = None,
     credential_origin: str | None = None, llm_authentication_expected_origin: str | None = None,
+    expected_llm: LLMSettings | None = None,
 ) -> None:
     """Merge a save under the bootstrap lock without discarding private metadata."""
     _publish_config_file(
         get_config_path(), config, changed_paths=changed_paths, credential_origin=credential_origin,
-        llm_authentication_expected_origin=llm_authentication_expected_origin,
+        llm_authentication_expected_origin=llm_authentication_expected_origin, expected_llm=expected_llm,
     )
 
 
@@ -521,6 +547,7 @@ def _publish_config_file(
     create_only: bool = False,
     credential_origin: str | None = None,
     llm_authentication_expected_origin: str | None = None,
+    expected_llm: LLMSettings | None = None,
 ) -> bool:
     from .distribution.bootstrap import (
         BootstrapError,
@@ -562,9 +589,15 @@ def _publish_config_file(
             raise BootstrapError("Incomplete installation requires explicit recovery")
         resolved = config.model_dump(mode="json", exclude={"pg": {"database_url", "pg_dsn"}})
         data = read_mapping(path) if existing else (resolved if changed_paths is None else {})
-        if llm_authentication_expected_origin is not None:
-            saved_host = _saved_llm_host(data)
-            if saved_host is not None and llm_origin(saved_host) != llm_authentication_expected_origin:
+        if expected_llm is not None:
+            saved = _saved_llm_connection(data)
+            record = saved.get("authentication")
+            authentication = LlmAuthentication.model_validate(record) if record is not None else None
+            if (
+                saved.get("provider", LLMProviderEnum.OLLAMA) != expected_llm.provider
+                or saved.get("host", expected_llm.host) != expected_llm.host
+                or authentication != expected_llm.authentication
+            ):
                 raise SavedLlmEndpointChanged
         if existing:
             # Source deployments can keep credentials and other required fields in
@@ -597,12 +630,24 @@ def _publish_config_file(
                     raise BootstrapError("Persistent configuration has a conflicting section type")
                 section_data[key] = resolved[section][key]
         if llm_authentication_expected_origin is not None and config.llm.authentication is not None:
-            data[LLM_AUTHENTICATION_KEY] = config.llm.authentication.private_record()
+            record = config.llm.authentication.private_record()
+            if config.llm.provider == LLMProviderEnum.OLLAMA:
+                # Older releases understand only OpenAI secrets. Leave an explicit
+                # omission for them even if another process switches providers.
+                data["ollama_authentication"] = record
+                data[LLM_AUTHENTICATION_KEY] = {"mode": "none"}
+            else:
+                data.pop("ollama_authentication", None)
+                data[LLM_AUTHENTICATION_KEY] = record
             if data.get("llm_credential_origin") is None:
                 # Older loaders ignore the explicit mode. Keep the retained deployment key bound
                 # to its original origin even when the same save changes the host.
                 data["llm_credential_origin"] = llm_authentication_expected_origin
         if credential_origin is not None:
+            if expected_llm is not None and expected_llm.provider == LLMProviderEnum.OLLAMA:
+                native_origin = llm_origin(expected_llm.host, expected_llm.provider)
+                if native_origin != credential_origin:
+                    data.setdefault("ollama_credential_origin", native_origin)
             if has_legacy_llm_credentials(config.llm.api_key):
                 data["llm_credential_origin"] = credential_origin
             else:
@@ -633,7 +678,7 @@ def initialize_config_file(config: Settings) -> None:
 
 def _llm_runtime_identity(config: Settings) -> tuple[LLMProviderEnum, str, str | None]:
     llm = config.llm
-    key = llm.request_api_key() if llm.provider == LLMProviderEnum.OPENAI else None
+    key = llm.request_api_key()
     policy = "settings" if llm.authentication is not None else "deployment"
     fingerprint = sha256(f"{policy}\0{key}".encode()).hexdigest() if key is not None else None
     return llm.provider, llm.host, fingerprint

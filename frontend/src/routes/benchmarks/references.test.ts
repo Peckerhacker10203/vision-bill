@@ -301,6 +301,7 @@ it('submits one explicit paired request for the selected receipt and model after
 	);
 	await fireEvent.click(screen.getByRole('radio', { name: 'Compare both' }));
 	await fireEvent.click(screen.getByLabelText('text-only'));
+	await fireEvent.input(screen.getByLabelText('Temperature'), { target: { value: '0.35' } });
 	await fireEvent.click(await screen.findByRole('checkbox', { name: /Corner shop/ }));
 	await fireEvent.click(await screen.findByRole('checkbox', { name: /Private shop/ }));
 	await fireEvent.click(screen.getByRole('button', { name: 'Create benchmark' }));
@@ -314,7 +315,7 @@ it('submits one explicit paired request for the selected receipt and model after
 		model_ids: ['vision-model', 'text-only'],
 		receipt_ids: ['receipt'],
 		case_ids: ['case'],
-		experiment: { pipeline: 'direct_vision' }
+		experiment: { pipeline: 'direct_vision', temperature: 0.35 }
 	});
 });
 
@@ -452,4 +453,36 @@ it('keeps the created run reachable when results navigation fails', async () => 
 		(screen.getByRole('button', { name: 'Create benchmark' }) as HTMLButtonElement).disabled
 	).toBe(true);
 	expect(writes).toEqual(['/api/v1/benchmarks']);
+});
+
+it('preserves selections across rediscovery and requires explicit removal of a missing model', async () => {
+	session.set({ id: 'owner', username: 'admin', is_admin: true, can_see_all: false });
+	let ids = ['alpha', 'beta'];
+	vi.stubGlobal(
+		'fetch',
+		vi.fn(async (url: string) => {
+			if (url.endsWith('/capabilities')) return Response.json({ ocr_available: false });
+			if (url.endsWith('/llm/models')) return Response.json(ids.map((id) => ({ id })));
+			return Response.json([]);
+		})
+	);
+	render(Page);
+	await fireEvent.click(await screen.findByLabelText('alpha'));
+	await fireEvent.click(screen.getByLabelText('beta'));
+	await fireEvent.input(screen.getByLabelText('Explicit receipt IDs'), {
+		target: { value: 'receipt' }
+	});
+	const create = screen.getByRole('button', { name: 'Create benchmark' }) as HTMLButtonElement;
+	expect(create.disabled).toBe(false);
+	ids = ['alpha', 'gamma'];
+	await fireEvent.click(screen.getByRole('button', { name: 'Refresh models' }));
+	await screen.findByLabelText('gamma');
+	expect((screen.getByLabelText('alpha') as HTMLInputElement).checked).toBe(true);
+	expect(create.disabled).toBe(true);
+	await fireEvent.click(screen.getByRole('button', { name: 'Remove beta' }));
+	expect(create.disabled).toBe(false);
+	ids = ['delta'];
+	window.dispatchEvent(new Event('focus'));
+	await screen.findByLabelText('delta');
+	expect(create.disabled).toBe(true);
 });

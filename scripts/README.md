@@ -46,7 +46,7 @@ with `num_predict=1`, bounding requested context by reported capacity and diagno
 `--num-ctx-cap` (default 16384). Missing/zero/truncated counts are rejected; show metadata
 can supply context if tags metadata does not. It counts image/reserved output once;
 projected tag growth is an estimate. `--output-budget` defaults 2000 and `--tag-probe`
-defaults 250. These diagnostic values do not set the app's formatter 8192, OCR 4096 or
+defaults 250. These diagnostic values do not set the app's formatter 32768, OCR 4096 or
 model context window and do not automatically alter resolution/precision/limits.
 With managed OCR enabled, generation probes use the shared handoff and release
 their exact selected model before another OCR phase.

@@ -126,7 +126,49 @@ async def test_partial_null_draft_retains_actual_model_finish_and_bounded_attemp
     )
     assert (
         call.kwargs["options"]["num_predict"] if backend == "ollama" else call.kwargs["max_tokens"]
-    ) == 8192
+    ) == 32768
+
+
+@pytest.mark.parametrize("backend", ["ollama", "openai"])
+@pytest.mark.parametrize(
+    ("finish", "body_kind", "expected_calls", "expected_code"),
+    [
+        ("length", "malformed", 1, "formatter_output_limit"),
+        ("stop", "malformed", 3, "analysis_incomplete"),
+        ("length", "complete", 1, None),
+    ],
+)
+async def test_provider_stop_controls_only_unusable_formatter_output(
+    backend, finish, body_kind, expected_calls, expected_code
+):
+    from test_experiment_scoring import receipt
+
+    from vision_bill.service.submission_service import SubmissionService
+
+    body = receipt().model_dump_json() if body_kind == "complete" else '{"merchant_name":'
+    if backend == "ollama":
+        provider = OllamaProvider("http://local")
+        transport = provider._client.chat = AsyncMock(return_value=ChatResponse(
+            done_reason=finish, message={"role": "assistant", "content": body},
+        ))
+    else:
+        provider = OpenAIProvider("http://local", "local")
+        transport = provider._client.chat.completions.create = AsyncMock(return_value=SimpleNamespace(
+            model="fixture", usage=None, choices=[SimpleNamespace(
+                finish_reason=finish, message=SimpleNamespace(content=body),
+            )],
+        ))
+    result = await provider.extract_observations(
+        "model", ocr_input(), tags=[], deadline=time.monotonic() + 3
+    )
+    assert transport.await_count == len(result.telemetry.calls) == expected_calls
+    if expected_code is None:
+        assert result.receipt is not None
+        assert result.draft is not None
+    else:
+        outcome = SubmissionService._outcome(result, [], [])
+        assert outcome.result_code == expected_code
+        assert outcome.kind == ("terminal" if finish == "length" else "retry")
 
 
 async def test_ollama_text_discovery_includes_completion_without_changing_default():

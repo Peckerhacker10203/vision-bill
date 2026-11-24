@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from vision_bill.provider.llm.base import ModelDiscoveryError
 from vision_bill.provider.llm.openai import OpenAIProvider
 
 
@@ -203,15 +204,14 @@ async def test_get_available_models_falls_back_to_data_entries(mock_client):
 
 
 @pytest.mark.asyncio
-async def test_get_available_models_skips_empty_ids(mock_client):
+async def test_get_available_models_rejects_empty_ids(mock_client):
     entry = _ollama_entry("", ["completion", "multimodal"])
     body = _hybrid_body([entry], [_openai_entry("", 1000000)])
     mock_client.models.with_raw_response.list.return_value = _raw_response(body)
 
     provider = OpenAIProvider(host="http://localhost:8642/v1", api_key="none")
-    models = await provider.get_available_models()
-
-    assert models == []
+    with pytest.raises(ModelDiscoveryError, match="Invalid formatter model list"):
+        await provider.get_available_models()
 
 
 def _chat_response(content: str | None):
@@ -476,3 +476,15 @@ async def test_discovery_distinguishes_image_input_from_unrelated_modalities(moc
     assert {
         model.id for model in all_models if {"vision", "multimodal"}.intersection(model.capabilities)
     } == expected
+
+
+@pytest.mark.asyncio
+async def test_hybrid_model_list_keeps_data_only_ids_without_assuming_vision(mock_client):
+    body = _hybrid_body(
+        [{}, _ollama_entry("native", ["vision"])],
+        [{"id": "native"}, {"id": "chat"}, {"id": "extra", "input_modalities": ["image", "text"]}],
+    )
+    mock_client.models.with_raw_response.list.return_value = _raw_response(body)
+    provider = OpenAIProvider(host="http://localhost:8642/v1", api_key="none")
+    assert [model.id for model in await provider.get_available_models()] == ["native", "extra"]
+    assert [model.id for model in await provider.get_available_models(capability="text")] == ["native", "chat", "extra"]

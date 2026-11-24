@@ -100,11 +100,14 @@ page reports sources and lets an admin edit formatter provider, endpoint, model
 and temperature, including safe fields initially supplied by environment defaults.
 An explicit save adopts changed fields into persistent settings. Model, temperature
 and registration changes apply immediately. Restart the app after changing the
-provider, endpoint or effective authentication. For OpenAI-compatible endpoints,
-an admin can save a Bearer key bound to the endpoint origin. Settings shows only
-the credential status.
+provider, endpoint or effective authentication. Both providers support **None**
+or **Bearer API key** in Settings. Save the connection, then use **Test saved
+connection** to list model IDs without sending a receipt or running inference.
+Choose a listed ID or enter the exact ID manually, then save your selection.
+Settings shows only the credential status.
+
 Formatter output
-defaults to 8192 tokens; OCR's 4096-token cap and model context capacity are separate.
+defaults to 32768 tokens; OCR's 4096-token cap and model context capacity are separate.
 Unknown context stays unknown. Managed same-GPU OCR/LLM work requires verified
 Ollama or the explicit dedicated llama.cpp router lifecycle, stable identities and
 shared coordination storage. Explicitly adopt the dedicated endpoint and selected
@@ -114,7 +117,9 @@ owned models and leaves the physical GPU available to independent processes.
 In **Benchmarks**, admins can pick human-verified receipts or upload separate
 test cases. A case stores its photos without running OCR or an LLM and stays
 outside the receipt ledger and spending reports. Confirm its expected values,
-then choose an image-model run, an OCR-plus-LLM run, or both. In a paired run,
+then choose an image-model run, an OCR-plus-LLM run, or both. Refresh the live
+model list and select one or more eligible IDs. Set a temperature for this run,
+including zero, or leave it blank to use the formatter default. In a paired run,
 results show each model’s scores side by side. Models that finish both pipelines
 on the same inputs also show the difference in percentage points. [Benchmark walkthrough and API](UPGRADE_AND_VERIFY.md#benchmarks-and-reproducibility)
 

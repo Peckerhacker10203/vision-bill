@@ -14,11 +14,12 @@ from ...provider.llm.base import (
     TEXT_CAPABILITIES,
     AnalysisResult,
     LLMProvider,
+    ModelDiscoveryError,
     ModelInfo,
     inference_endpoint_identity,
 )
 from ...service.activation_admission import direct_inference_call, inference_admission
-from . import OPENAI_CREDENTIALLESS_API_KEY
+from . import DEFAULT_FORMATTER_MAX_OUTPUT_TOKENS, OPENAI_CREDENTIALLESS_API_KEY, valid_model_id
 from .experiment import chat_telemetry
 from .llamacpp import LlamaCppLifecycle
 
@@ -78,7 +79,7 @@ class OpenAIProvider(LLMProvider):
         api_key: str | None,
         temperature: float = 0.0,
         analysis_timeout_seconds: float = 600,
-        max_output_tokens: int = 8192,
+        max_output_tokens: int = DEFAULT_FORMATTER_MAX_OUTPUT_TOKENS,
         vision_model_ids: Sequence[str] = (),
         model_lifecycle: Literal["none", "llamacpp"] = "none",
         *,
@@ -158,19 +159,31 @@ class OpenAIProvider(LLMProvider):
         # array. Parse the raw JSON so both are available; fall back to
         # "data" entries alone for other OpenAI-compatible servers.
         body = json.loads(response.http_response.content)
-        data_entries: list[dict[str, Any]] = list(body.get("data") or [])
-        ollama_entries: list[dict[str, Any]] = list(body.get("models") or [])
-        data_by_id: dict[str, dict[str, Any]] = {
-            str(d.get("id")): d for d in data_entries if isinstance(d, dict)
-        }
+        if not isinstance(body, dict) or not any(key in body for key in ("data", "models")):
+            raise ModelDiscoveryError("Invalid formatter model list")
+        data_entries = body.get("data", [])
+        ollama_entries = body.get("models", [])
+        if not isinstance(data_entries, list) or not isinstance(ollama_entries, list):
+            raise ModelDiscoveryError("Invalid formatter model list")
+        data_by_id = {}
+        for entry in data_entries:
+            if not isinstance(entry, dict) or not valid_model_id(entry.get("id")):
+                raise ModelDiscoveryError("Invalid formatter model list")
+            data_by_id[entry["id"]] = entry
+
+        native_by_id = {}
+        for entry in ollama_entries:
+            model_id = (entry.get("model") or entry.get("name")) if isinstance(entry, dict) else None
+            if not valid_model_id(model_id):
+                # Some hybrid catalogs include supplementary rows without a join key.
+                if data_by_id:
+                    continue
+                raise ModelDiscoveryError("Invalid formatter model list")
+            native_by_id[model_id] = entry
 
         result: list[ModelInfo] = []
-        for entry in ollama_entries:
-            if not isinstance(entry, dict):
-                continue
-            model_id = str(entry.get("model") or entry.get("name") or "")
-            if not model_id:
-                continue
+        for model_id in dict.fromkeys([*native_by_id, *data_by_id]):
+            entry = native_by_id.get(model_id, {})
             data_entry = data_by_id.get(model_id, {})
             capabilities = _model_capabilities(
                 entry, data_entry, declared=model_id in self._vision_model_ids,
@@ -191,7 +204,7 @@ class OpenAIProvider(LLMProvider):
                 parameter_size = str(details.get("parameter_size") or "")
 
             meta = data_entry.get("meta")
-            if not parameter_size and isinstance(meta, dict):
+            if entry and not parameter_size and isinstance(meta, dict):
                 n_params = meta.get("n_params")
                 if isinstance(n_params, int) and n_params > 0:
                     parameter_size = _format_parameter_size(n_params)
@@ -200,42 +213,10 @@ class OpenAIProvider(LLMProvider):
             capacity = data_entry.get("context_length")
             mi.context_window_tokens = capacity if type(capacity) is int and capacity > 0 else None
             mi.capabilities = capabilities
-            digest = str(entry.get("digest") or "")
+            digest = str(entry.get("digest") or data_entry.get("digest") or "")
             mi.digest = digest or None
             mi.parameter_size = parameter_size or None
             result.append(mi)
-
-        # Servers without the ollama-style array: use data entries directly.
-        if not ollama_entries:
-            for entry in data_entries:
-                if not isinstance(entry, dict):
-                    continue
-                model_id = str(entry.get("id") or "")
-                if not model_id:
-                    continue
-                capabilities = _model_capabilities(
-                    entry, declared=model_id in self._vision_model_ids,
-                )
-                if (
-                    capability == "text"
-                    and capabilities
-                    and not any(c in capabilities for c in TEXT_CAPABILITIES)
-                ):
-                    continue
-                if capability == "vision" and not any(
-                    c in VISION_CAPABILITY_FIELDS for c in capabilities
-                ):
-                    continue
-                mi = ModelInfo(id=model_id)
-                capacity = entry.get("context_length")
-                mi.context_window_tokens = (
-                    capacity if type(capacity) is int and capacity > 0 else None
-                )
-                mi.capabilities = capabilities
-                digest = str(entry.get("digest") or "")
-                mi.digest = digest or None
-                mi.parameter_size = None
-                result.append(mi)
 
         return result
 

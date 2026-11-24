@@ -26,16 +26,6 @@
 		() => ({ queryKey: queryKeys.uiConfig(), queryFn: () => api.getUiConfig() }),
 		() => queryClient
 	);
-	const capability = $derived(uiConfig.data?.ocr_enabled ? 'text' : 'vision');
-	const models = createQuery(
-		() => ({
-			queryKey: queryKeys.models(capability),
-			queryFn: () => api.listModels(capability),
-			enabled: !!uiConfig.data
-		}),
-		() => queryClient
-	);
-
 	let form = $state<SettingsUpdate>({
 		llm: { provider: 'ollama', host: '', model_name: '', temperature: 0 },
 		allow_registration: true
@@ -47,6 +37,9 @@
 	let error = $state('');
 	let authMode = $state<'keep' | LlmAuthenticationUpdate['mode']>('keep');
 	let bearerKey = $state('');
+	let discoveredModels = $state<string[]>([]);
+	let manualModel = $state(false);
+	let connectionRevision = 0;
 	let testingConnection = $state(false);
 	let connectionResult = $state<
 		LlmConnectionResult['status'] | 'request_failed' | 'settings_changed' | null
@@ -75,9 +68,22 @@
 	});
 
 	$effect(() => {
-		if (form.llm.provider !== 'openai' || $session === null || !isCurrentView()) authMode = 'keep';
+		if ($session === null || !isCurrentView()) resetEndpoint();
 		if (authMode !== 'bearer') bearerKey = '';
 	});
+
+	function clearDiscovery() {
+		connectionRevision++;
+		connectionResult = null;
+		discoveredModels = [];
+		manualModel = false;
+	}
+
+	function resetEndpoint() {
+		clearDiscovery();
+		authMode = 'keep';
+		bearerKey = '';
+	}
 
 	function source(field: string): string {
 		return settings.data?.sources[field] ?? 'default';
@@ -89,13 +95,17 @@
 
 	async function testConnection() {
 		if (!isCurrentView() || connectionEdited || testingConnection || saving) return;
+		clearDiscovery();
+		const revision = connectionRevision;
 		testingConnection = true;
-		connectionResult = null;
 		try {
-			const result = await api.testLlmConnection(form.llm.host);
-			if (isCurrentView()) connectionResult = result.status;
+			const result = await api.testLlmConnection(form.llm.host, form.llm.provider);
+			if (isCurrentView() && revision === connectionRevision) {
+				connectionResult = result.status;
+				if (result.status === 'connected') discoveredModels = result.models;
+			}
 		} catch (cause) {
-			if (isCurrentView())
+			if (isCurrentView() && revision === connectionRevision)
 				connectionResult =
 					cause instanceof ApiError && cause.status === 409 ? 'settings_changed' : 'request_failed';
 		} finally {
@@ -118,15 +128,11 @@
 			if (form.allow_registration !== baseline?.allow_registration)
 				changed_paths.push('auth.allow_registration');
 			let llm_authentication: LlmAuthenticationUpdate | undefined;
-			if (form.llm.provider === 'openai') {
-				if (authMode === 'none') llm_authentication = { mode: 'none' };
-				if (authMode === 'bearer') llm_authentication = { mode: 'bearer', api_key: bearerKey };
-			}
+			if (authMode === 'none') llm_authentication = { mode: 'none' };
+			if (authMode === 'bearer') llm_authentication = { mode: 'bearer', api_key: bearerKey };
 			const result = await api.updateSettings({ ...form, changed_paths, llm_authentication });
 			if (!isCurrentView()) return;
-			authMode = 'keep';
-			bearerKey = '';
-			connectionResult = null;
+			resetEndpoint();
 			form = { llm: { ...result.llm }, allow_registration: result.allow_registration };
 			baseline = structuredClone($state.snapshot(form));
 			queryClient.setQueryData(queryKeys.settings(), result);
@@ -178,6 +184,7 @@
 						>
 						<select
 							class="mt-1 block w-full rounded-lg border border-outline-variant bg-surface p-2.5"
+							onchange={resetEndpoint}
 							bind:value={form.llm.provider}
 						>
 							<option value="ollama">Ollama</option><option value="openai">OpenAI</option>
@@ -191,15 +198,17 @@
 						>
 						<input
 							class="mt-1 block w-full rounded-lg border border-outline-variant bg-surface p-2.5"
+							oninput={resetEndpoint}
 							bind:value={form.llm.host}
 						/>
 					</label>
-					{#if form.llm.provider === 'openai' && settings.data.llm_authentication}
+					{#if settings.data.llm_authentication}
 						<div class="space-y-2">
 							<label class="block text-sm">
 								{$t('settings.authentication.label')}
 								<select
 									class="mt-1 block w-full rounded-lg border border-outline-variant bg-surface p-2.5"
+									onchange={clearDiscovery}
 									bind:value={authMode}
 									disabled={saving}
 								>
@@ -244,7 +253,11 @@
 									class="text-sm {connectionResult === 'connected' ? 'text-primary' : 'text-error'}"
 									role="status"
 								>
-									{$t(`settings.authentication.result.${connectionResult}`)}
+									{$t(
+										connectionResult === 'connected' && !discoveredModels.length
+											? 'settings.authentication.emptyModels'
+											: `settings.authentication.result.${connectionResult}`
+									)}
 								</p>
 							{/if}
 						</div>
@@ -255,20 +268,38 @@
 								>{sourceLabel(source('llm.model_name'))}</span
 							></span
 						>
-						<input
-							class="mt-1 block w-full rounded-lg border border-outline-variant bg-surface p-2.5"
-							list="formatter-models"
-							bind:value={form.llm.model_name}
-						/>
-					</label>
-					<datalist id="formatter-models">
-						{#each models.data ?? [] as model (model.id)}
-							<option value={model.id}
-								>{model.parameter_size ?? ''} · {$t('settings.contextWindow')}: {model.context_window_tokens ??
-									$t('settings.unknown')}</option
+						{#if discoveredModels.length && !manualModel && !connectionEdited}
+							<select
+								class="mt-1 block w-full rounded-lg border border-outline-variant bg-surface p-2.5"
+								bind:value={form.llm.model_name}
 							>
-						{/each}
-					</datalist>
+								{#if !discoveredModels.includes(form.llm.model_name)}
+									<option value={form.llm.model_name}
+										>{form.llm.model_name || $t('settings.authentication.chooseModel')}</option
+									>
+								{/if}
+								{#each discoveredModels as id (id)}
+									<option value={id}>{id}</option>
+								{/each}
+							</select>
+						{:else}
+							<input
+								class="mt-1 block w-full rounded-lg border border-outline-variant bg-surface p-2.5"
+								bind:value={form.llm.model_name}
+							/>
+						{/if}
+					</label>
+					{#if discoveredModels.length && !connectionEdited}
+						<button
+							type="button"
+							class="text-sm text-primary underline"
+							onclick={() => (manualModel = !manualModel)}
+						>
+							{$t(
+								manualModel ? 'settings.authentication.fromList' : 'settings.authentication.manual'
+							)}
+						</button>
+					{/if}
 					<p class="text-xs text-on-surface-variant">
 						{$t('settings.formatterLimit')}: {uiConfig.data?.formatter_max_output_tokens ??
 							$t('settings.unknown')}
@@ -276,9 +307,6 @@
 					{#if uiConfig.data?.ocr_enabled}
 						<p class="text-xs text-on-surface-variant">{$t('settings.ocrLimitUnknown')}</p>
 					{/if}
-					{#if models.error}<p class="text-xs text-error">
-							{$t('settings.modelsUnavailable')}
-						</p>{/if}
 					<label class="block text-sm">
 						<span class="flex items-center justify-between gap-2"
 							><span>{$t('settings.temperature')}</span><span

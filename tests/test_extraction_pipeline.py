@@ -488,7 +488,7 @@ async def test_ocr_and_formatter_limits_remain_separate(photos):
         tags=[],
     )
     assert result.telemetry.ocr_max_new_tokens == 4096
-    assert result.telemetry.max_output_tokens == 8192
+    assert result.telemetry.max_output_tokens == 32768
     assert result.telemetry.context_window_tokens is None
 
 

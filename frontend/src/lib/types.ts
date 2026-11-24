@@ -384,6 +384,7 @@ export interface LlmAuthenticationView {
 }
 
 export interface LlmConnectionResult {
+	models: string[];
 	status:
 		| 'connected'
 		| 'authentication_failed'

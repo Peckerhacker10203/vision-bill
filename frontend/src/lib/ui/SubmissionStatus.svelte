@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { captureSessionActor, isCurrentSessionActor } from '$lib/session-lifetime';
-	import { diagnosticLabel } from '$lib/diagnostics';
+	import { diagnosticLabel, hasPreviousAttemptResult } from '$lib/diagnostics';
 	import { createQuery } from '@tanstack/svelte-query';
 	import { resolve } from '$app/paths';
 	import { api, ApiError } from '$lib/api/client';
@@ -55,6 +55,14 @@
 			!job.data.receipt_id
 	);
 
+	const retryWithCurrentSettings = $derived(
+		policyHeld ||
+			(job.data?.status === 'failed' &&
+				job.data.terminal &&
+				(job.data.result_code === 'formatter_output_limit' ||
+					job.data.result_code === 'analysis_incomplete'))
+	);
+
 	async function retry(policy: 'preserve' | 'current' = 'preserve') {
 		if (
 			!isCurrentSessionActor(actor) ||
@@ -62,7 +70,7 @@
 			activeView.id !== id ||
 			retrying ||
 			!job.data ||
-			!(policy === 'current' ? policyHeld : job.data.terminal) ||
+			!(policy === 'current' ? retryWithCurrentSettings : job.data.terminal) ||
 			job.data.status === 'analyzed'
 		)
 			return;
@@ -173,8 +181,11 @@
 		{#if job.data.result_code && !(editingDraft && job.data.result_code === 'needs_review')}<p
 				class="mt-2 text-sm"
 			>
-				{$t('submission.resultCode')}: {diagnosticLabel($t, 'reasons', job.data.result_code)} ({job
-					.data.result_code})
+				{$t(
+					hasPreviousAttemptResult(job.data)
+						? 'submission.previousAttempt'
+						: 'submission.resultCode'
+				)}: {diagnosticLabel($t, 'reasons', job.data.result_code)} ({job.data.result_code})
 			</p>{/if}
 		{#if job.data.error && job.data.error !== job.data.result_code}<p
 				class="mt-2 break-words text-sm text-error"
@@ -194,7 +205,7 @@
 					href={resolve(`/upload?job=${id}&draft=1`)}>{$t('submission.openDraft')}</a
 				>
 			{/if}
-			{#if job.data.terminal && job.data.status !== 'analyzed'}
+			{#if job.data.terminal && job.data.status !== 'analyzed' && job.data.result_code !== 'formatter_output_limit'}
 				<button
 					type="button"
 					class="rounded-lg border border-outline px-3 py-2 text-on-surface hover:bg-surface-container-high disabled:opacity-50"
@@ -202,7 +213,7 @@
 					onclick={() => retry()}>{$t('submission.retry')}</button
 				>
 			{/if}
-			{#if policyHeld}
+			{#if retryWithCurrentSettings}
 				<button
 					type="button"
 					class="rounded-lg bg-action px-4 py-2 text-on-primary disabled:opacity-50"

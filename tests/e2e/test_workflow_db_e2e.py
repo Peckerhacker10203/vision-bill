@@ -335,6 +335,39 @@ async def test_expiry_tokens_generation_and_three_attempt_limit(workflow_db):
     assert (await w.finish_attempt(claim3, complete())).stale
 
 
+@pytest.mark.parametrize("code", ["formatter_output_limit", "analysis_incomplete"])
+@pytest.mark.parametrize("policy,expected_limit", [("preserve", 8192), ("current", 32768)])
+async def test_failed_formatter_retry_uses_selected_generation_budget(
+    workflow_db, settings, code, policy, expected_limit
+):
+    from vision_bill.service.execution_policy import current_snapshot
+
+    w, scope = workflow_db
+    current = current_snapshot(settings, inference_identity=ENDPOINT) | {"max_output_tokens": 32768}
+    frozen = current | {"max_output_tokens": 8192}
+    create = submission().model_copy(update={"effective_options": frozen})
+    image = (await w.enqueue_submission(create, scope=scope, idempotency_key=None)).submission
+    # The historical worker exhausted its three ordinary attempts; the new worker
+    # can stop on the first explicit output-limit finding.
+    if code == "analysis_incomplete":
+        for _ in range(2):
+            await w.finish_attempt(await w.claim_next(), AttemptOutcome(
+                kind="retry", result_code=code, retry_delay_seconds=0,
+            ))
+    kind = "terminal" if code == "formatter_output_limit" else "retry"
+    finished = await w.finish_attempt(await w.claim_next(), AttemptOutcome(kind=kind, result_code=code))
+    assert finished.submission.status == "failed" and finished.submission.result_code == code
+    assert await w.claim_next() is None
+    retried = await w.retry_submission(
+        image.id, RetryRequest(expected_generation=1, request_key="next", policy=policy),
+        scope=scope, replacement_snapshot=current,
+    )
+    assert retried.generation == 2 and retried.attempt_count == 0
+    claim = await w.claim_next()
+    assert claim.attempt_number == 1
+    assert claim.image.effective_options["max_output_tokens"] == expected_limit
+
+
 async def test_upload_idempotency_is_owner_scoped_and_conflicts(workflow_db):
     w, scope = workflow_db
     request = submission()

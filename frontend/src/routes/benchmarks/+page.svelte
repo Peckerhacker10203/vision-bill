@@ -86,6 +86,8 @@
 	let textModels = $state<ModelInfo[]>([]);
 	let modelErrors = $state({ vision: false, text: false });
 	let loadingModels = $state(true);
+	let discoveryGeneration = 0;
+	let capabilityError = $state(false);
 	let chosenModels = $state<string[]>([]);
 	let models = $derived(experiment.pipeline === 'direct_vision' ? visionModels : textModels);
 	let visionIds = $derived(new Set(visionModels.map((item) => item.id)));
@@ -116,6 +118,10 @@
 	);
 	let canCreate = $derived(
 		selected.length > 0 &&
+			!loadingModels &&
+			!modelError &&
+			unavailableSelections.length === 0 &&
+			(experiment.pipeline === 'direct_vision' || capabilities.ocr_available) &&
 			(experiment.pipeline !== 'compare' || pairedModels.length > 0) &&
 			validCases &&
 			(hasReceipts || caseIds.length > 0 || filterSelection) &&
@@ -151,20 +157,26 @@
 			} else error = $t('benchmarkForm.reuseError');
 		}
 		void loadCases();
-		const available = await api.getBenchmarkCapabilities(actor).catch(() => null);
-		if (!current()) return;
-		if (available) capabilities = available;
-		else error = $t('benchmarkForm.capabilitiesError');
 		await loadModels();
 	}
 	async function loadModels() {
-		if (!actor || !current()) return;
+		if (!actor || !current() || creating || createdRunId) return;
+		const generation = ++discoveryGeneration;
 		loadingModels = true;
+		confirm = false;
+		const available = await api.getBenchmarkCapabilities(actor).catch(() => null);
+		if (!current() || generation !== discoveryGeneration) return;
+		capabilities = available ?? {
+			ocr_available: false,
+			ocr_enabled: false,
+			thinking_control: false
+		};
+		capabilityError = !available;
 		const [vision, text] = await Promise.allSettled([
 			api.listModels('vision', actor),
 			capabilities.ocr_available ? api.listModels('text', actor) : Promise.resolve([])
 		]);
-		if (!current()) return;
+		if (!current() || generation !== discoveryGeneration) return;
 		visionModels = vision.status === 'fulfilled' ? vision.value : [];
 		textModels = text.status === 'fulfilled' ? text.value : [];
 		modelErrors = { vision: vision.status === 'rejected', text: text.status === 'rejected' };
@@ -185,6 +197,8 @@
 	}
 	onMount(() => {
 		void initialize();
+		window.addEventListener('focus', loadModels);
+		return () => window.removeEventListener('focus', loadModels);
 	});
 	function toggle(id: string) {
 		chosenModels = chosenModels.includes(id)
@@ -304,7 +318,10 @@
 					</label>
 				{/each}
 			</div>
-			{#if !capabilities.ocr_available && !loadingModels}<p
+			{#if capabilityError}<p role="alert" class="mt-2 text-sm text-error">
+					{$t('benchmarkForm.capabilitiesError')}
+				</p>
+			{:else if !capabilities.ocr_available && !loadingModels}<p
 					class="mt-2 text-sm text-on-surface-variant"
 				>
 					{$t('benchmarkForm.noOcr')}
@@ -320,12 +337,15 @@
 							: 'diagnostics.visionModels'
 				)}</legend
 			>
+			<button
+				type="button"
+				class="mb-2 block text-sm text-primary underline"
+				disabled={loadingModels || creating}
+				onclick={loadModels}>{$t('benchmarkForm.refreshModels')}</button
+			>
 			{#if loadingModels}<p class="text-sm">{$t('common.loading')}</p>
 			{:else if modelError}<p class="text-sm">
 					{$t('benchmarkUi.modelsError')}
-					<button type="button" class="text-primary underline" onclick={loadModels}
-						>{$t('benchmarkForm.retry')}</button
-					>
 				</p>
 			{:else if !models.length}<p class="text-sm">{$t('benchmarkForm.noModels')}</p>
 			{:else}
@@ -355,10 +375,16 @@
 			{/if}
 			{#if unavailableSelections.length && !loadingModels && !modelError}
 				<p class="mt-2 text-sm text-on-surface-variant">
-					{$t('benchmarkForm.unavailableModels', {
-						values: { names: unavailableSelections.join(', ') }
-					})}
+					{$t('benchmarkForm.unavailableModels')}
 				</p>
+				{#each unavailableSelections as id (id)}
+					<button
+						type="button"
+						class="mr-3 text-sm text-primary underline"
+						onclick={() => toggle(id)}
+						>{$t('benchmarkForm.remove', { values: { name: id } })}</button
+					>
+				{/each}
 			{/if}
 		</fieldset>
 		<fieldset class="rounded-xl border border-outline-variant p-4">

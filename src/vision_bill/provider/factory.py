@@ -11,6 +11,7 @@ def get_llm_provider(llm_settings: LLMSettings) -> LLMProvider:
         from .llm.ollama import OllamaProvider
 
         return OllamaProvider(
+            api_key=llm_settings.request_api_key(),
             host=llm_settings.host,
             temperature=llm_settings.temperature,
             analysis_timeout_seconds=llm_settings.analysis_timeout_seconds,

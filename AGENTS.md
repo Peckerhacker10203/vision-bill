@@ -6,7 +6,9 @@ vision-bill is a local-first, multi-user receipt API and bundled SvelteKit SPA.
 Operators supply an existing Ollama or OpenAI-compatible endpoint and explicitly
 select a model. The app and OCR distributions include no LLM runtime or weights.
 Use only the operator's configured endpoint. Keep receipt contents out of
-general logs. Preserve original bytes, human corrections, exact money and owners.
+general logs. For either provider, admin connection tests use the saved formatter
+connection and read only the model list. Preserve manual model entry and require
+separate evidence of image capability. Preserve original bytes, human corrections, exact money and owners.
 
 Public operator contracts are in [UPGRADE_AND_VERIFY.md](UPGRADE_AND_VERIFY.md),
 [MULTI_IMAGE_RECEIPTS.md](MULTI_IMAGE_RECEIPTS.md),
@@ -156,7 +158,7 @@ including tables, OCR 4096. Official upstream grid alignment is not a whole-phot
 UVDoc assets and saved working views with the installation that produced them. Only the VLM text decoder uses BF16 on selected CUDA SM80+ devices.
 Turing, ROCm, static models and visual/projector layers use FP32. Keep the
 backend, pixel and token policy fixed. EXIF applies independently. Formatter output defaults
-8192; discovered context capacity remains separate and may be unknown.
+32768; discovered context capacity remains separate and may be unknown.
 
 `/health` is liveness. `/ready` is worker readiness and `/info` carries the
 capability, profile and runtime identity. Dedicated OCR serves a verified

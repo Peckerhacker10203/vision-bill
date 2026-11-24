@@ -40,6 +40,8 @@ MODELS = [
 ]
 if EXACT_MODEL_ID:
     MODELS = [{**MODELS[0], "id": EXACT_MODEL_ID}]
+else:
+    MODELS.append({**MODELS[0], "id": "e2e-alternate-vision"})
 
 # `broken` tracks which image digests already got their one broken response in
 # the current repair_first mode (cleared on every mode change) so the "first

@@ -48,6 +48,15 @@ bound; unreadable input is terminal. A later photo failure never saves a success
 prefix as a completed receipt or all-photo checkpoint. A validated exact OCR prefix
 may be retained/reused across retries; formatting requires every ordered photo.
 
+For `analysis_incomplete`, the authenticated `GET /api/v1/images/<id>` gives
+the `latest_extraction_id` of the most recently recorded attempt. Read
+`GET /api/v1/images/<id>/extractions/<latest_extraction_id>` and check
+`attempt_number`, `envelope.findings[].code` and `envelope.telemetry.finish_reason`.
+A provider-reported `length` finish indicates that generation reached a limit.
+An absent finish reason leaves the cause open. Extraction records can contain
+private receipt content. The application log event `analysis_no_draft` summarizes
+the recorded call count, timing and token usage using bounded diagnostic categories.
+
 `POST /api/v1/images/<id>/retry` takes `expected_generation` and a nonempty
 `request_key`. Replaying that key returns its original outcome; a new retry must
 use the current generation and a new key. Conflicts return 409. Retrying preserves

@@ -62,6 +62,91 @@ it.each(['pending', 'processing'])(
 );
 
 describe('SubmissionStatus', () => {
+	it.each(['current', 'preserve'] as const)(
+		'offers explicit %s retry after a generic incomplete failure',
+		async (policy) => {
+			setLocale('en');
+			const failed = status({
+				terminal: true,
+				wait_reason: null,
+				retry_at: null,
+				result_code: 'analysis_incomplete'
+			});
+			vi.spyOn(api, 'getImage').mockResolvedValue(failed as never);
+			const retry = vi
+				.spyOn(api, 'retrySubmission')
+				.mockResolvedValue(status({ generation: 2, status: 'pending' }) as never);
+			render(SubmissionStatus, { id: 'job' });
+			await screen.findByText(/The extraction did not produce a complete receipt/);
+			expect(screen.queryByText(/reached its output token limit/)).toBeNull();
+			const preserve = screen.getByRole('button', { name: 'Retry analysis' });
+			const current = screen.getByRole('button', { name: 'Retry using current server settings' });
+			expect(retry).not.toHaveBeenCalled();
+			await fireEvent.click(policy === 'current' ? current : preserve);
+			expect(retry).toHaveBeenCalledWith('job', {
+				expected_generation: 1,
+				request_key: expect.any(String),
+				...(policy === 'current' ? { policy } : {})
+			});
+		}
+	);
+	it.each([
+		['en', /increase the output token allowance/, 'Retry using current server settings'],
+		['de', /mehr Ausgabetokens zuzulassen/, 'Mit aktuellen Servereinstellungen wiederholen']
+	] as const)(
+		'adopts current settings only on manual retry after an output limit in %s',
+		async (locale, message, buttonLabel) => {
+			setLocale(locale);
+			try {
+				const failed = status({
+					terminal: true,
+					wait_reason: null,
+					retry_at: null,
+					result_code: 'formatter_output_limit'
+				});
+				vi.spyOn(api, 'getImage').mockResolvedValue(failed as never);
+				const retry = vi
+					.spyOn(api, 'retrySubmission')
+					.mockResolvedValue(status({ generation: 2, status: 'pending' }) as never);
+				render(SubmissionStatus, { id: 'job' });
+				await screen.findByText(message);
+				expect(retry).not.toHaveBeenCalled();
+				await fireEvent.click(screen.getByRole('button', { name: buttonLabel }));
+				expect(retry).toHaveBeenCalledWith('job', {
+					policy: 'current',
+					expected_generation: 1,
+					request_key: expect.any(String)
+				});
+			} finally {
+				setLocale('en');
+			}
+		}
+	);
+	it.each([
+		['de', 'processing', 2, 'Vorheriger Versuch'],
+		['en', 'pending', 1, 'Previous attempt']
+	] as const)('identifies the saved result during %s %s', async (locale, state, count, label) => {
+		setLocale(locale);
+		try {
+			const retry = vi.spyOn(api, 'retrySubmission');
+			vi.spyOn(api, 'getImage').mockResolvedValue(
+				status({
+					status: state,
+					attempt_count: count,
+					result_code: 'analysis_incomplete',
+					error: 'analysis_incomplete',
+					wait_reason: null,
+					retry_at: state === 'processing' ? null : '2030-01-02T03:04:05Z'
+				}) as never
+			);
+			render(SubmissionStatus, { id: 'job' });
+			await screen.findByText(new RegExp('^' + label + ': .*analysis_incomplete'));
+			expect(screen.queryByRole('button')).toBeNull();
+			expect(retry).not.toHaveBeenCalled();
+		} finally {
+			setLocale('en');
+		}
+	});
 	it.each([
 		['en', 'The local OCR GPU ran out of video memory.'],
 		['de', 'Die lokale OCR-GPU hat nicht genug Grafikspeicher.']

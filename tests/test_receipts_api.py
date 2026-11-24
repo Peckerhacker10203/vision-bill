@@ -1299,3 +1299,13 @@ def test_put_decodes_unquoted_decimal_observations_exactly(api_context: ApiConte
     writes = {call.args[0]: call.args for call in ctx.conn.execute.call_args_list}
     assert writes[receipt_db_module.INSERT_LINE_ITEM_SQL][3] == Decimal("1.0000000000000001")
     assert writes[receipt_db_module.INSERT_TAX_SQL][3] == Decimal("0.20000000000000001")
+
+
+def test_current_formatter_model_listing_hides_upstream_authentication_error(api_context: ApiContext) -> None:
+    from ollama import ResponseError
+
+    api_context.provider.get_available_models.side_effect = ResponseError("private upstream response", 401)
+    response = api_context.client.get("/api/v1/llm/models?capability=text")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Formatter authentication failed"}
+    api_context.provider.get_available_models.assert_any_await(capability="text")

@@ -17,7 +17,7 @@
 				type="number"
 				min="0"
 				max="2"
-				step="0.1"
+				step="any"
 				placeholder={$t('benchmarkUi.providerSetting')}
 				bind:value={settings.temperature}
 			/>

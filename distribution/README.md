@@ -93,13 +93,15 @@ LLM__API_KEY=none
 
 Use the endpoint's actual model ID and reachable URL. Supply the real key for an
 authenticated endpoint. Fresh credentialless OpenAI installs can omit the key or
-use `none`. Ollama ignores it. On restored installations, a private empty runtime
-file takes its values from the saved configuration. Admin Settings can adopt
+use `none`. For a Bearer-protected Ollama endpoint, configure the key in admin
+Settings. On restored installations, a private empty runtime file takes its values
+from the saved configuration. Admin Settings can adopt
 changed safe formatter fields from environment defaults through an explicit save.
 Model and temperature changes apply live. Restart the app after changing the
-provider, endpoint or effective authentication. An admin can save a replacement
-Bearer key in Settings for the chosen OpenAI-compatible endpoint origin.
-The UI shows the credential status. [Endpoint authentication](../OPENAI_COMPATIBLE.md)
+provider, endpoint or effective authentication. For either provider, save the
+connection and use **Test saved connection** to list available model IDs. Select
+an ID or type it manually, then save. The UI shows only the credential status.
+[Endpoint authentication](../OPENAI_COMPATIBLE.md)
 
 For external OCR, a nonblank `OCR__ENDPOINT` selects its endpoint and an explicit
 blank value starts with OCR Off. In a prepared combined profile the browser

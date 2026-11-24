@@ -28,6 +28,7 @@ from ...config import (
     has_legacy_llm_credentials,
     has_real_api_key,
     llm_origin,
+    native_deployment_key,
     runtime_restart_required,
     saved_llm_settings,
     settings,
@@ -112,10 +113,12 @@ class SettingsView(EditableSettings):
 
 class LlmConnectionView(BaseModel):
     status: ConnectionStatus
+    models: list[str]
 
 
 class LlmConnectionRequest(BaseModel):
     host: str
+    provider: LLMProviderEnum = LLMProviderEnum.OPENAI
 
 
 @router.get(
@@ -183,6 +186,10 @@ def _authentication_view() -> LlmAuthenticationView:
     llm = settings.llm
     auth = llm.authentication
     if auth is None:
+        if llm.provider == LLMProviderEnum.OLLAMA:
+            if llm.request_api_key():
+                return LlmAuthenticationView(mode="bearer", source="environment", status="configured")
+            return LlmAuthenticationView(mode="none", source="default", status="none")
         if has_ambient_openai_credentials():
             return LlmAuthenticationView(mode="bearer", source="environment", status="configured")
         if has_real_api_key(llm.api_key):
@@ -225,20 +232,22 @@ async def test_llm_connection(request: LlmConnectionRequest) -> LlmConnectionVie
         llm = saved_llm_settings()
     except RuntimeError:
         raise HTTPException(status_code=503, detail="Could not read saved LLM settings") from None
-    if request.host != llm.host:
+    if request.host != llm.host or request.provider != llm.provider:
         raise HTTPException(status_code=409, detail="The saved connection changed. Reload settings before testing.")
-    return LlmConnectionView(status=await check_saved_connection(llm))
+    result = await check_saved_connection(llm)
+    return LlmConnectionView(status=result.status, models=result.models)
 
 
-def _validated_llm_origin(host: str) -> str:
+def _validated_llm_origin(host: str, provider: LLMProviderEnum | None = None) -> str:
     try:
-        parsed = TypeAdapter(AnyHttpUrl).validate_python(host)
+        supplied = "http://" + host if provider == LLMProviderEnum.OLLAMA and "://" not in host else host
+        parsed = TypeAdapter(AnyHttpUrl).validate_python(supplied)
     except ValidationError:
         raise HTTPException(status_code=422, detail="Host must be an HTTP(S) URL") from None
     if parsed.username is not None or parsed.password is not None:
         raise HTTPException(status_code=422, detail="Host must not contain credentials")
     try:
-        return llm_origin(host)
+        return llm_origin(host, provider)
     except ValueError:
         raise HTTPException(status_code=422, detail="Host must be an HTTP(S) URL without credentials") from None
 
@@ -283,11 +292,23 @@ async def update_settings(request: Request, update: SettingsUpdate) -> SettingsV
     credential_origin = None
     llm_authentication_expected_origin = None
     candidate_origin = None
+    endpoint_change = bool(changed & {"llm.provider", "llm.host"})
+    if (
+        endpoint_change and native_deployment_key() and candidate.llm.provider == LLMProviderEnum.OLLAMA
+        and (
+            settings.llm.provider != candidate.llm.provider
+            or _validated_llm_origin(settings.llm.host, settings.llm.provider)
+            != _validated_llm_origin(candidate.llm.host, candidate.llm.provider)
+        )
+    ):
+        raise HTTPException(status_code=409, detail="Remove the deployment's Ollama key before changing the endpoint.")
+    if "llm.provider" in changed and authentication is None and settings.llm.authentication is not None:
+        raise HTTPException(status_code=409, detail="Select a new key or None for the new provider.")
     if "llm.host" in changed:
-        candidate_origin = _validated_llm_origin(candidate.llm.host)
+        candidate_origin = _validated_llm_origin(candidate.llm.host, candidate.llm.provider)
         if (
             has_ambient_openai_headers() and not has_real_api_key(settings.llm.api_key)
-            and llm_origin(settings.llm.host) != candidate_origin
+            and llm_origin(settings.llm.host) != llm_origin(candidate.llm.host)
         ):
             # Previous releases cannot bind custom header credentials on their own.
             raise HTTPException(
@@ -302,6 +323,7 @@ async def update_settings(request: Request, update: SettingsUpdate) -> SettingsV
                 except ValueError:
                     raise HTTPException(status_code=409, detail="Select authentication for the new endpoint") from None
                 protected_origin = credential_origin if has_legacy_llm_credentials(settings.llm.api_key) else None
+                candidate_origin = llm_origin(candidate.llm.host)  # Rollback uses the legacy OpenAI origin.
             else:
                 protected_origin = existing.origin
             if protected_origin is not None and candidate_origin != protected_origin:
@@ -309,15 +331,18 @@ async def update_settings(request: Request, update: SettingsUpdate) -> SettingsV
                     status_code=409,
                     detail="Endpoint origin is bound to private credentials. Select a new key or None for the new endpoint.",
                 )
+    if "llm.provider" in changed and authentication is None and candidate.llm.provider == LLMProviderEnum.OLLAMA:
+        # A later deployment key must not authenticate a browser-selected provider implicitly.
+        authentication = LlmAuthenticationUpdate(mode="none")
     if authentication is not None:
-        if candidate.llm.provider != LLMProviderEnum.OPENAI:
-            raise HTTPException(status_code=422, detail="LLM authentication settings require the OpenAI provider")
-        origin = candidate_origin or _validated_llm_origin(candidate.llm.host)
-        if origin != _validated_llm_origin(update.llm.host):
+        if candidate.llm.provider != update.llm.provider:
+            raise HTTPException(status_code=409, detail="The provider changed. Reload settings before changing authentication.")
+        origin = _validated_llm_origin(candidate.llm.host, candidate.llm.provider)
+        if origin != _validated_llm_origin(update.llm.host, update.llm.provider):
             raise HTTPException(status_code=409, detail="The endpoint changed. Reload settings before changing authentication.")
         llm_authentication_expected_origin = llm_origin(settings.llm.host)
         candidate.llm.authentication = LlmAuthentication(
-            mode=authentication.mode, api_key=authentication.api_key,
+            provider=candidate.llm.provider, mode=authentication.mode, api_key=authentication.api_key,
             origin=origin if authentication.mode == "bearer" else None,
         )
     try:
@@ -325,6 +350,7 @@ async def update_settings(request: Request, update: SettingsUpdate) -> SettingsV
             candidate,
             changed_paths=changed,
             credential_origin=credential_origin,
+            expected_llm=settings.llm if endpoint_change or authentication is not None else None,
             llm_authentication_expected_origin=llm_authentication_expected_origin,
         )
     except SavedLlmEndpointChanged:

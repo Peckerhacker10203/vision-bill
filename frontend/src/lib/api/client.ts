@@ -381,11 +381,14 @@ export const api = {
 		});
 	},
 
-	testLlmConnection(host: string): Promise<LlmConnectionResult> {
+	testLlmConnection(
+		host: string,
+		provider: SettingsUpdate['llm']['provider']
+	): Promise<LlmConnectionResult> {
 		return request<LlmConnectionResult>('/system/settings/llm/connection-test', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ host })
+			body: JSON.stringify({ host, provider })
 		});
 	},
 

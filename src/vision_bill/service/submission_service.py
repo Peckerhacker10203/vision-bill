@@ -710,9 +710,23 @@ class SubmissionService:
                 "vision_model_unavailable",
                 "vision_fallback_unavailable",
             }:
-                code = "analysis_incomplete"
+                telemetry = envelope.telemetry
+                pipeline = envelope.provenance.used_pipeline
+                finish = telemetry.finish_reason
+                logger.info(
+                    "analysis_no_draft finding=%s pipeline=%s finish_reason=%s "
+                    "recorded_calls=%d elapsed_ms=%.0f output_tokens=%s max_output_tokens=%d",
+                    code if code in {"formatter_output_limit", "formatter_invalid_response"} else "unknown",
+                    pipeline if pipeline in {"direct_vision", "ocr", "none"} else "unknown",
+                    finish if finish in {"length", "stop", "max_tokens", "content_filter"} else "unknown",
+                    len(telemetry.calls), telemetry.elapsed_ms, telemetry.output_tokens,
+                    telemetry.max_output_tokens,
+                )
+                if code != "formatter_output_limit":
+                    code = "analysis_incomplete"
             return AttemptOutcome(
-                kind="retry", result_code=code, envelope=envelope, persisted_views=views
+                kind="terminal" if code == "formatter_output_limit" else "retry",
+                result_code=code, envelope=envelope, persisted_views=views
             )
         admitted: Receipt | None
         try:

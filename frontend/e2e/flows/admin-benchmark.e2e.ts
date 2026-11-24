@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { qualifyGold } from '../helpers/api';
+import { getSettings, qualifyGold } from '../helpers/api';
 import { loginAdmin } from '../helpers/auth';
 import { loadFixture } from '../helpers/fixtures';
 import { stubGuard } from '../helpers/stub';
@@ -11,11 +11,16 @@ test.describe('admin: benchmarks', () => {
 	test('create a run and watch it complete in the results view', async ({ page, context }) => {
 		test.setTimeout(180_000);
 		await loginAdmin(context);
+		const defaults = (await getSettings(context)).llm;
 		const receiptId = await uploadFixture(page, context, await loadFixture('a'));
 
 		await page.getByRole('link', { name: 'Use this receipt in a benchmark' }).click();
 		await expect(page).toHaveURL(new RegExp('\\?receipt=' + receiptId));
 		await page.getByRole('checkbox', { name: 'e2e-vision' }).check();
+		await page.getByRole('checkbox', { name: 'e2e-alternate-vision' }).check();
+		await page.getByLabel('Temperature').fill('0');
+		await page.getByRole('button', { name: 'Refresh models' }).click();
+		await expect(page.getByRole('checkbox', { name: 'e2e-alternate-vision' })).toBeChecked();
 		await page.getByRole('button', { name: 'Preview human references' }).click();
 		await page.locator('summary').filter({ hasText: receiptId }).click();
 		await expect(page.locator('pre')).toContainText('Aldi Test');
@@ -31,13 +36,23 @@ test.describe('admin: benchmarks', () => {
 		// The run is picked up by the benchmark worker and finishes fast
 		// (the stub answers instantly; ground truth = the verified receipt).
 		await expect(page.getByText('Completed', { exact: true })).toBeVisible();
-		await expect(page.getByText('1 / 1')).toBeVisible({ timeout: 60_000 });
+		await expect(page.getByText('2 / 2')).toBeVisible({ timeout: 60_000 });
 		await expect(page.getByRole('cell', { name: /e2e-vision/ })).toBeVisible();
+		await expect(page.getByRole('cell', { name: /e2e-alternate-vision/ })).toBeVisible();
+		const runId = new URL(page.url()).searchParams.get('run');
+		const run = await context.request.get('/api/v1/benchmarks/' + runId);
+		expect(run.status()).toBe(200);
+		expect((await run.json()).run.experiment.options.temperature).toBe(0);
+		expect((await getSettings(context)).llm).toEqual(defaults);
 		await page.getByRole('button', { name: 'Load individual results' }).click();
-		const individual = page.locator('summary').filter({ hasText: receiptId });
+		const individual = page
+			.locator('summary')
+			.filter({ hasText: receiptId })
+			.filter({ hasText: 'e2e-vision' });
 		await expect(individual).toContainText('Extraction 100.0%');
 		await individual.click();
-		await expect(page.getByText(/Strict:/)).toBeVisible();
+		const details = page.locator('details').filter({ has: individual });
+		await expect(details.getByText('All confirmed fields correct', { exact: true })).toBeVisible();
 		await page.getByRole('link', { name: 'Reuse this receipt selection' }).click();
 		await expect(page).toHaveURL(/\/benchmarks$/);
 		await expect(page.getByPlaceholder('Comma-separated receipt UUIDs')).toHaveValue(receiptId);

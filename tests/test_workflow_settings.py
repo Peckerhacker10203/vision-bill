@@ -38,7 +38,10 @@ def test_worker_attempt_budget_fits_claim_lease():
 
 def test_formatter_limit_is_separate_from_context_and_ocr_limits():
     llm = LLMSettings(host="local", api_key="none", model_name="model", temperature=0)
-    assert llm.max_output_tokens == 8192
+    assert llm.max_output_tokens == 32768
+    for explicit_limit in (8192, 65536):
+        overridden = LLMSettings.model_validate({**llm.model_dump(), "max_output_tokens": explicit_limit})
+        assert overridden.max_output_tokens == explicit_limit
     with pytest.raises(ValidationError):
         LLMSettings(
             host="local", api_key="none", model_name="model", temperature=0, max_output_tokens=0

@@ -18,6 +18,9 @@ from typing import Any, TypeVar, get_args
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
+import httpx
+from ollama import ResponseError
+from openai import APIError
 from PIL import Image, ImageOps
 from pydantic import ValidationError
 
@@ -46,6 +49,7 @@ from ...service.activation_admission import inference_admission
 from ...service.gpu_handoff import current_owner
 from ...service.observation_admission import admit_observations
 from ...service.receipt_review import observation_values
+from . import DEFAULT_FORMATTER_MAX_OUTPUT_TOKENS
 from .errors import UnreadableReceiptError
 from .experiment import extraction_prompt, source_extraction_prompt
 from .merchant_choice import candidates_for, merchant_instructions, validated_display_name
@@ -133,6 +137,10 @@ class AnalysisResult:
     model_digest: str | None = None
 
 
+class _FormatterOutputLimit(ValueError):
+    """The provider stopped generation at its limit without yielding a usable draft."""
+
+
 class _PartialDraftError(ValueError):
     def __init__(self, envelope: InferenceEnvelope, *, incomplete: bool = False):
         super().__init__("receipt_incomplete")
@@ -185,6 +193,19 @@ class _FieldCorrection(_PartialDraftError):
         return json.dumps(payload, default=str, allow_nan=False)
 
 
+class ModelDiscoveryError(RuntimeError):
+    """Safe to expose when discovery on the active formatter fails."""
+
+
+async def discover_models(provider: "LLMProvider", *, capability: str) -> list[ModelInfo]:
+    try:
+        return await provider.get_available_models(capability=capability)
+    except (APIError, ResponseError, httpx.HTTPError, ConnectionError, TimeoutError, ValueError) as exc:
+        if getattr(exc, "status_code", None) in (401, 403):
+            raise ModelDiscoveryError("Formatter authentication failed") from None
+        raise ModelDiscoveryError("Formatter model list is unavailable") from None
+
+
 class LLMProvider(ABC):
     """Interface every LLM backend must implement."""
 
@@ -192,7 +213,7 @@ class LLMProvider(ABC):
     analysis_timeout_seconds: float = 600
     experiment_options: ExperimentOptions | None = None
     experiment_trace: list[dict[str, Any]] | None = None
-    max_output_tokens: int = 8192
+    max_output_tokens: int = DEFAULT_FORMATTER_MAX_OUTPUT_TOKENS
     supports_model_release: bool = False
     lifecycle_identity: str = "unsupported"
     inference_identity: str = "unsupported"
@@ -318,6 +339,10 @@ class LLMProvider(ABC):
                     break
                 if isinstance(exc, _PartialDraftError):
                     partial_error = exc
+                if call.get("finish_reason") in ("length", "max_tokens"):
+                    if partial_error is not None:
+                        break
+                    raise _FormatterOutputLimit("formatter_output_limit") from exc
                 last_error = exc
                 messages = [
                     *messages,
@@ -446,10 +471,11 @@ class LLMProvider(ABC):
             if isinstance(exc, _PartialDraftError):
                 result = exc.envelope
             # A validated nullable draft is useful even when no complete Receipt can be built.
+            finding = "formatter_output_limit" if isinstance(exc, _FormatterOutputLimit) else "formatter_invalid_response"
             result.findings.append(
                 ReviewFinding(
-                    id="formatter_invalid_response",
-                    code="formatter_invalid_response",
+                    id=finding,
+                    code=finding,
                     severity="review",
                     field_path="draft",
                     source_refs=input.source_refs,

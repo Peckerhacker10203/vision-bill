@@ -17,6 +17,7 @@ from ..model.benchmark import (
 from ..model.handoff import HandoffWait
 from ..model.ocr_errors import OCR_RESULT_STATUS, OcrWorkerFailure
 from ..model.workflow import AccessScope
+from ..provider.llm.base import ModelDiscoveryError
 from ..security.dependencies import require_admin
 from ..security.models import User
 from ..service.benchmark_service import BenchmarkService
@@ -47,6 +48,8 @@ async def create_benchmark_run(
     """Queue a benchmark run and return immediately with its durable run id."""
     try:
         run = await benchmark_service.create_run(request, scope=AccessScope(user_id=user.id, can_see_all=user.can_see_all))
+    except ModelDiscoveryError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from None
     except HandoffWait as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     except OcrWorkerFailure as error:
@@ -154,6 +157,8 @@ async def reevaluate_receipt(
             model_id=request.model_id,
             scope=AccessScope(user_id=user.id, can_see_all=user.can_see_all),
         )
+    except ModelDiscoveryError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from None
     except HandoffWait as error:
         raise HTTPException(status_code=409, detail=str(error)) from error
     except OcrWorkerFailure as error:

@@ -13,10 +13,12 @@ from ...provider.llm.base import (
     TEXT_CAPABILITIES,
     AnalysisResult,
     LLMProvider,
+    ModelDiscoveryError,
     ModelInfo,
     inference_endpoint_identity,
 )
 from ...service.activation_admission import direct_inference_call, inference_admission
+from . import DEFAULT_FORMATTER_MAX_OUTPUT_TOKENS, valid_model_id
 from .experiment import chat_telemetry
 
 try:
@@ -41,13 +43,18 @@ class OllamaProvider(LLMProvider):
         host: str,
         temperature: float = 0.0,
         analysis_timeout_seconds: float = 600,
-        max_output_tokens: int = 8192,
+        max_output_tokens: int = DEFAULT_FORMATTER_MAX_OUTPUT_TOKENS,
+        api_key: str | None = None,
     ):
         self.analysis_timeout_seconds = analysis_timeout_seconds
         self.max_output_tokens = max_output_tokens
         self._client = AsyncClient(
-            host=host, timeout=httpx.Timeout(analysis_timeout_seconds, connect=5), trust_env=False
+            host=host, timeout=httpx.Timeout(analysis_timeout_seconds, connect=5), trust_env=False,
+            follow_redirects=False, headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
         )
+        if api_key is None and "authorization" in self._client._client.headers:
+            # The SDK imports OLLAMA_API_KEY even when trust_env is disabled.
+            del self._client._client.headers["authorization"]
         self._temperature = temperature
         self.supports_thinking_control = True
         self.supports_model_release = True
@@ -116,8 +123,8 @@ class OllamaProvider(LLMProvider):
         result = []
         for model in models.models:
             # model.model is the name of the model, e.g., "gemma4:e4b", we need this for all further calls.
-            if not model.model:
-                continue
+            if not valid_model_id(model.model):
+                raise ModelDiscoveryError("Invalid formatter model list")
 
             details = await self._client.show(model.model)
             # If the model does not support vision, we skip it.

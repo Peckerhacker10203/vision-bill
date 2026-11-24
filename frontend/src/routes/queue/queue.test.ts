@@ -31,6 +31,39 @@ it('offers a receipt review action and describes the displayed queue scope', asy
 	expect(screen.getByText('1 jobs shown (up to 100)')).toBeTruthy();
 });
 
+it('identifies the previous result while another attempt is processing', async () => {
+	vi.spyOn(api, 'listImages').mockResolvedValue([
+		{
+			id: 'job',
+			status: 'processing',
+			result_code: 'analysis_incomplete',
+			attempt_count: 2,
+			max_attempts: 3
+		}
+	] as never);
+	render(Page);
+	await screen.findByText(/Previous attempt: The extraction did not produce a complete receipt/);
+});
+
+it('explains how to recover from a confirmed formatter output limit', async () => {
+	vi.spyOn(api, 'listImages').mockResolvedValue([
+		{
+			id: 'job',
+			status: 'failed',
+			result_code: 'formatter_output_limit',
+			attempt_count: 1,
+			max_attempts: 3
+		}
+	] as never);
+	render(Page);
+	await screen.findByText(
+		/increase the output token allowance, then retry using the current server settings/
+	);
+	expect(screen.getByRole('link', { name: 'Open job' }).getAttribute('href')).toBe(
+		'/upload?job=job'
+	);
+});
+
 it.each([
 	['vision_model_unavailable', false],
 	['A distinct provider detail', true]

@@ -14,7 +14,7 @@ const directVision = {
 	bypass_review_default: false,
 	registration_open: true,
 	ocr_enabled: false,
-	formatter_max_output_tokens: 8192
+	formatter_max_output_tokens: 32768
 };
 
 beforeEach(() => {
@@ -217,7 +217,7 @@ it('shows that a GPU profile is required and offers no activation', async () => 
 	expect(options.headers.get('X-Vision-Bill-Expected-User')).toBe('admin');
 });
 
-it('submits one explicit activation and polls until the formatter switches to text models', async () => {
+it('submits one explicit activation and polls until the formatter shows OCR limits', async () => {
 	let finishRequest!: (response: Response) => void;
 	const post = new Promise<Response>((resolve) => (finishRequest = resolve));
 	const fetchStatus = vi.fn(async (_url: string, options: RequestInit) =>
@@ -227,7 +227,7 @@ it('submits one explicit activation and polls until the formatter switches to te
 
 	render(Settings);
 	const enable = await screen.findByRole('switch', { name: 'Dedicated OCR' });
-	await waitFor(() => expect(api.listModels).toHaveBeenCalledWith('vision'));
+	await waitFor(() => expect(screen.queryByText(/Reported OCR output limit/)).toBeNull());
 	expect((enable as HTMLButtonElement).disabled).toBe(true);
 	await fireEvent.click(enable);
 	expect(fetchStatus).toHaveBeenCalledOnce();
@@ -252,13 +252,13 @@ it('submits one explicit activation and polls until the formatter switches to te
 		{},
 		{ timeout: 3_000 }
 	);
-	expect(api.listModels).not.toHaveBeenCalledWith('text');
+	expect(screen.queryByText(/Reported OCR output limit/)).toBeNull();
 	await screen.findByText(
 		'Dedicated OCR is ready to process receipts. The first request loads the model on the GPU.',
 		{},
 		{ timeout: 3_000 }
 	);
-	await waitFor(() => expect(api.listModels).toHaveBeenCalledWith('text'));
+	await screen.findByText(/Reported OCR output limit/);
 	const requestCount = fetchStatus.mock.calls.length;
 	await new Promise((resolve) => setTimeout(resolve, 2_100));
 	expect(fetchStatus).toHaveBeenCalledTimes(requestCount);
@@ -336,8 +336,7 @@ it('turns installed OCR off and on without downloading or reconfirming handoff',
 	render(Settings);
 	const toggle = await screen.findByRole('switch', { name: 'Dedicated OCR' });
 	await waitFor(() => expect(toggle.getAttribute('aria-checked')).toBe('true'));
-	await waitFor(() => expect(api.listModels).toHaveBeenCalledWith('text'));
-	vi.mocked(api.listModels).mockClear();
+	await screen.findByText(/Reported OCR output limit/);
 	vi.mocked(api.getUiConfig).mockResolvedValue(directVision);
 	await fireEvent.click(toggle);
 	await screen.findByText(
@@ -345,15 +344,14 @@ it('turns installed OCR off and on without downloading or reconfirming handoff',
 	);
 	expect(fetchStatus.mock.calls[1][1].body).toBe('{"enabled":false,"confirm_handoff":false}');
 	expect(screen.queryByRole('checkbox', { name: /I confirm the LLM endpoint/ })).toBeNull();
-	await waitFor(() => expect(api.listModels).toHaveBeenCalledWith('vision'));
-	vi.mocked(api.listModels).mockClear();
+	await waitFor(() => expect(screen.queryByText(/Reported OCR output limit/)).toBeNull());
 	vi.mocked(api.getUiConfig).mockResolvedValue({ ...directVision, ocr_enabled: true });
 	await fireEvent.click(toggle);
 	await screen.findByText(
 		'Dedicated OCR is ready to process receipts. The first request loads the model on the GPU.'
 	);
 	expect(fetchStatus.mock.calls[2][1].body).toBe('{"enabled":true,"confirm_handoff":false}');
-	await waitFor(() => expect(api.listModels).toHaveBeenCalledWith('text'));
+	await screen.findByText(/Reported OCR output limit/);
 });
 
 it('keeps the confirmed switch on when pausing fails and permits retry', async () => {

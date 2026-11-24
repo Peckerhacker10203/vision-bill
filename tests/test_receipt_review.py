@@ -387,6 +387,38 @@ def test_approved_overlap_reviews_final_receipt_without_reinterpreting_raw_rows(
     assert SubmissionService._outcome(envelope, [], ORIGINALS).kind == "retry"
 
 
+@pytest.mark.parametrize(
+    ("finding", "finish", "pipeline", "expected"),
+    [
+        ("formatter_invalid_response", "length", "direct_vision",
+         "finding=formatter_invalid_response pipeline=direct_vision finish_reason=length"),
+        ("private-finding", "private-provider-text", "private-pipeline",
+         "finding=unknown pipeline=unknown finish_reason=unknown"),
+    ],
+)
+def test_incomplete_retry_logs_only_safe_diagnostics(caplog, finding, finish, pipeline, expected):
+    from vision_bill.model.extraction import InferenceEnvelope
+    from vision_bill.service.submission_service import SubmissionService
+
+    envelope = InferenceEnvelope.model_validate({
+        "findings": [{"id": "private-id", "code": finding, "severity": "review", "field_path": "draft"}],
+        "provenance": {
+            "requested_pipeline": pipeline, "used_pipeline": pipeline, "source_image_count": 1,
+            "ordered_source_sha256": ["a" * 64], "model_id": "private-model",
+        },
+        "telemetry": {
+            "elapsed_ms": 415, "max_output_tokens": 512, "output_tokens": 512,
+            "finish_reason": finish, "calls": [{"raw_response": "private-receipt"}],
+        },
+    })
+    with caplog.at_level("INFO"):
+        outcome = SubmissionService._outcome(envelope, [], ORIGINALS)
+    assert (outcome.kind, outcome.result_code) == ("retry", "analysis_incomplete")
+    assert expected in caplog.text
+    assert "recorded_calls=1 elapsed_ms=415 output_tokens=512 max_output_tokens=512" in caplog.text
+    assert "private" not in caplog.text
+
+
 async def test_legacy_availability_does_not_fabricate_persisted_part_ids(tmp_path):
     from vision_bill.model.db.image import ImagePart
     from vision_bill.service.image_service import ImageService

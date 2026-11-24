@@ -41,6 +41,32 @@ test.describe('settings (admin)', () => {
 		await expect(page).toHaveURL(/\/settings\/?$/);
 	});
 
+	test('selects and saves an exact model from the saved formatter endpoint', async ({
+		page,
+		context
+	}) => {
+		await loginAdmin(context);
+		const before = await getSettings(context);
+		const selected = 'e2e-alternate-vision';
+		try {
+			await page.goto('/settings');
+			await page.getByRole('button', { name: 'Test saved connection' }).click();
+			const models = page.getByRole('combobox', { name: /Default model/ });
+			await expect(models).toHaveValue(before.llm.model_name);
+			await models.selectOption(selected);
+			await page.getByRole('button', { name: 'Save', exact: true }).click();
+			await expect(page.getByText('Settings saved.')).toBeVisible();
+			await page.reload();
+			await expect(page.getByLabel(/Default model/)).toHaveValue(selected);
+			expect((await getSettings(context)).llm.model_name).toBe(selected);
+		} finally {
+			const restored = await context.request.put('/api/v1/system/settings', {
+				data: { ...before, changed_paths: ['llm.model_name'] }
+			});
+			expect(restored.ok()).toBeTruthy();
+		}
+	});
+
 	test('temperature edit saves and persists', async ({ page, context }) => {
 		test.setTimeout(90_000);
 		await loginAdmin(context);

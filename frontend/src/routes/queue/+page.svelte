@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { diagnosticLabel } from '$lib/diagnostics';
+	import { diagnosticLabel, hasPreviousAttemptResult } from '$lib/diagnostics';
 	import { createQuery } from '@tanstack/svelte-query';
 	import { sessionViewGuard } from '$lib/session-view';
 	import { resolve } from '$app/paths';
@@ -211,7 +211,11 @@
 							</p>{/if}
 						{#if image.result_code}
 							<p class="mt-2 break-words text-sm text-on-surface-variant">
-								{diagnosticLabel($t, 'reasons', image.result_code)}
+								{#if hasPreviousAttemptResult(image)}{`${$t('submission.previousAttempt')}: `}{/if}{diagnosticLabel(
+									$t,
+									'reasons',
+									image.result_code
+								)}
 							</p>
 						{/if}
 						{#if image.error && image.error !== image.result_code}

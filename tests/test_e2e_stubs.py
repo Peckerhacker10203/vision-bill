@@ -132,7 +132,7 @@ def test_llm_stub_stock_wire_behavior_without_opt_in(monkeypatch):
     server = module("llm_stub_stock_wire", "e2e/llm_stub/server.py")
     status, discovery = llm_request(server, "/v1/models")
     assert status == 200
-    assert [model["id"] for model in discovery["data"]] == ["e2e-vision", "e2e-text"]
+    assert [model["id"] for model in discovery["data"]] == ["e2e-vision", "e2e-text", "e2e-alternate-vision"]
     status, completion = llm_request(server, "/v1/chat/completions", model="e2e-text")
     assert status == 200
     assert completion["model"] == "e2e-vision"

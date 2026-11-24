@@ -679,7 +679,10 @@ def test_invalid_bearer_input_is_never_reflected(saved_settings, invalid, caplog
     ("status_code", "encoding", "result"),
     [(200, None, "connected"), (401, None, "authentication_failed"), (503, None, "unreachable"),
      (200, "gzip", "invalid_response"), (200, "long_integer", "invalid_response"),
-     (200, "rotated_key", "connected")],
+     (200, "rotated_key", "connected"), (307, "redirect", "unreachable"),
+     (200, "missing_id", "invalid_response"), (200, "secret_id", "invalid_response"),
+     (200, "oversize_id", "invalid_response"), (200, "many_ids", "invalid_response"),
+     (200, "oversize_response", "invalid_response")],
 )
 def test_saved_connection_probe_only_reads_bounded_model_discovery(saved_settings, status_code, encoding, result):
     import gzip
@@ -699,6 +702,18 @@ def test_saved_connection_probe_only_reads_bounded_model_discovery(saved_setting
                 response_body = gzip.compress(response_body)
             elif encoding == "long_integer":
                 response_body = b'{"data": [' + b"9" * 6000 + b"]}"
+            elif encoding == "redirect":
+                self.send_header("Location", "/forbidden")
+            elif encoding == "missing_id":
+                response_body = b'{"data":[{"id":"valid"},{}]}'
+            elif encoding == "secret_id":
+                response_body = b'{"data":[{"id":"echo-selected-secret"}]}'
+            elif encoding == "oversize_id":
+                response_body = b'{"data":[{"id":"' + b"x" * 1025 + b'"}]}'
+            elif encoding == "oversize_response":
+                response_body += b" " * (2 * 1024 * 1024)
+            elif encoding == "many_ids":
+                response_body = b'{"data":[' + b'{"id":"id"},' * 4096 + b'{"id":"id"}]}'
             self.end_headers()
             self.wfile.write(response_body)
 
@@ -722,7 +737,7 @@ def test_saved_connection_probe_only_reads_bounded_model_discovery(saved_setting
             previous = path.read_bytes()
             response = client.post("/system/settings/llm/connection-test", json={"host": host})
             assert response.status_code == 200
-            assert response.json() == {"status": result}
+            assert response.json() == {"status": result, "models": []}
             assert "selected-secret" not in response.text
             assert "rotated-secret" not in response.text
             assert path.read_bytes() == previous
@@ -736,6 +751,7 @@ def test_saved_connection_probe_only_reads_bounded_model_discovery(saved_setting
 @pytest.mark.parametrize("stale_replica", [False, True])
 def test_stale_none_cannot_disable_credentials_for_a_changed_origin(saved_settings, monkeypatch, stale_replica):
     path, _, active, client = saved_settings
+    monkeypatch.setenv("LLM__PROVIDER", "openai")
     active.llm.provider = config.LLMProviderEnum.OPENAI
     replica = active.model_copy(deep=True)
     stale_body = {**explicit_payload(active), "llm_authentication": {"mode": "none"}}
@@ -803,6 +819,7 @@ def test_legacy_ambient_authorization_prevents_cross_origin_host_edit(saved_sett
 @pytest.mark.parametrize("header", ["Authorization", "X-API-Key", "X-Private-Credential"])
 def test_explicit_none_does_not_expose_retained_ambient_credentials_on_rollback(saved_settings, monkeypatch, header):
     path, _, active, client = saved_settings
+    monkeypatch.setenv("LLM__PROVIDER", "openai")
     active.llm.provider = config.LLMProviderEnum.OPENAI
     active.llm.api_key = "none"
     monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", f"{header}: legacy-ambient-key")
@@ -834,6 +851,7 @@ def test_inherited_ambient_credentials_report_environment_without_values(saved_s
 
 def test_explicit_bearer_with_the_same_key_still_requires_restart(saved_settings, monkeypatch):
     _, _, active, client = saved_settings
+    monkeypatch.setenv("LLM__PROVIDER", "openai")
     active.llm.provider = config.LLMProviderEnum.OPENAI
     monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", "Host: legacy-route.example")
     config.mark_startup_settings(active)
@@ -869,3 +887,155 @@ def test_ordinary_model_discovery_uses_the_running_provider(monkeypatch):
     app.dependency_overrides[get_current_user] = lambda: None
     with TestClient(app) as client:
         assert [model["id"] for model in client.get("/models?capability=text").json()] == ["live-model"]
+
+
+@pytest.mark.parametrize(
+    ("provider", "auth", "path_suffix", "expected_key"),
+    [("ollama", "bearer", "api/tags", "selected-secret"), ("ollama", "none", "api/tags", None),
+     ("ollama", "inherit", "api/tags", "native-secret"), ("openai", "bearer", "models", "selected-secret")],
+)
+def test_saved_endpoint_discovery_lists_exact_ids(saved_settings, monkeypatch, provider, auth, path_suffix, expected_key):
+    import json
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+
+    path, document, active, client = saved_settings
+    calls = []
+    monkeypatch.setenv("OLLAMA_API_KEY", "native-secret")
+    monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", "X-Private: openai-secret")
+
+    class Stub(BaseHTTPRequestHandler):
+        def do_GET(self):
+            calls.append((self.path, self.headers.get_all("Authorization"), self.headers.get("X-Private")))
+            self.send_response(200)
+            self.end_headers()
+            field = "model" if provider == "ollama" else "id"
+            rows = [{field: value, "description": "private-value"} for value in ["Repo/x:latest", "other", "Repo/x:latest"]]
+            self.wfile.write(json.dumps({"models" if provider == "ollama" else "data": rows}).encode())
+
+        def log_message(self, *_args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Stub) as server:
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            host = f"http://127.0.0.1:{server.server_port}/formatter"
+            document["llm"].update(provider=provider, host=host)
+            path.write_text(yaml.safe_dump(document))
+            active.llm.provider = config.LLMProviderEnum(provider)
+            active.llm.host = host
+            if auth != "inherit":
+                choice = {"mode": auth}
+                if auth == "bearer":
+                    choice["api_key"] = "selected-secret"
+                body = {**explicit_payload(active), "llm_authentication": choice}
+                assert client.put("/system/settings", json=body).status_code == 200
+            before = path.read_bytes()
+            other = "ollama" if provider == "openai" else "openai"
+            route = "/system/settings/llm/connection-test"
+            assert client.post(route, json={"host": host, "provider": other}).status_code == 409
+            if provider == "ollama":
+                assert client.post(route, json={"host": host}).status_code == 409
+            response = client.post(route, json={"host": host, "provider": provider})
+            assert response.json() == {"status": "connected", "models": ["Repo/x:latest", "other"]}
+            assert path.read_bytes() == before
+            assert active.llm.model_name == document["llm"]["model_name"]
+        finally:
+            server.shutdown()
+            thread.join()
+    assert calls == [(f"/formatter/{path_suffix}", [f"Bearer {expected_key}"] if expected_key else None, None)]
+
+
+def test_native_secret_is_private_and_provider_bound_across_restart_and_switch(saved_settings, monkeypatch):
+    path, _, active, client = saved_settings
+    assert client.get("/system/settings").json()["llm_authentication"]["mode"] == "none"
+    replica = active.model_copy(deep=True)
+    choice = {"llm_authentication": {"mode": "bearer", "api_key": "native-only"}}
+    response = client.put("/system/settings", json={**explicit_payload(active), **choice})
+    assert response.status_code == 200
+    assert response.json()["restart_required"]
+    assert "native-only" not in response.text
+    saved = yaml.safe_load(path.read_text())
+    assert saved["llm_authentication"] == {"mode": "none"}  # A pre-native-auth release reads this.
+    assert config.Settings().llm.request_api_key() == "native-only"
+
+    assert client.put("/system/settings", json=explicit_payload(active, provider="openai")).status_code == 409
+    monkeypatch.setattr(system, "settings", replica)
+    assert client.put("/system/settings", json=explicit_payload(replica, provider="openai")).status_code == 409
+    monkeypatch.setenv("LLM__PROVIDER", "openai")
+    assert config.Settings().llm.request_api_key() is None
+
+
+def test_legacy_openai_private_record_cannot_authenticate_native_ollama(saved_settings):
+    path, document, active, _ = saved_settings
+    document["llm_authentication"] = {
+        "mode": "bearer", "origin": config.llm_origin(active.llm.host), "api_key": "legacy-openai-only",
+    }
+    path.write_text(yaml.safe_dump(document))
+    assert config.Settings().llm.request_api_key() is None
+
+
+def test_native_deployment_key_can_be_masked_but_never_moved_on_rollback(saved_settings, monkeypatch):
+    path, _, active, client = saved_settings
+    monkeypatch.setenv("OLLAMA_API_KEY", "native-ambient")
+    assert client.get("/system/settings").json()["llm_authentication"]["source"] == "environment"
+    selection = {"llm_authentication": {"mode": "none"}}
+    assert client.put("/system/settings", json={**explicit_payload(active), **selection}).status_code == 200
+    assert config.Settings().llm.request_api_key() is None
+    assert "native-ambient" not in path.read_text()
+    move = {**explicit_payload(active, host="http://other.example"), **selection}
+    assert client.put("/system/settings", json=move).status_code == 409
+
+
+def test_stale_native_secret_write_cannot_replace_same_host_openai_selection(saved_settings, monkeypatch):
+    path, _, active, client = saved_settings
+    replica = active.model_copy(deep=True)
+    switch = {**explicit_payload(active, provider="openai"), "llm_authentication": {"mode": "none"}}
+    assert client.put("/system/settings", json=switch).status_code == 200
+    previous = path.read_bytes()
+    monkeypatch.setattr(system, "settings", replica)
+    stale = {**explicit_payload(replica), "llm_authentication": {"mode": "bearer", "api_key": "stale-native"}}
+    assert client.put("/system/settings", json=stale).status_code == 409
+    assert path.read_bytes() == previous
+
+
+@pytest.mark.parametrize("host", ["ollama", "ollama:11434"])
+@pytest.mark.parametrize("selection", [{"mode": "none"}, {"mode": "bearer", "api_key": "native-bare-host"}])
+def test_native_authentication_on_existing_bare_hosts(saved_settings, host, selection):
+    path, document, active, client = saved_settings
+    document["llm"]["host"] = active.llm.host = host
+    path.write_text(yaml.safe_dump(document))
+    result = client.put("/system/settings", json={**explicit_payload(active), "llm_authentication": selection})
+    assert result.status_code == 200
+    reloaded = config.Settings().llm
+    assert reloaded.request_api_key() == selection.get("api_key")
+    if selection["mode"] == "bearer":
+        assert reloaded.authentication.origin == "http://ollama:11434"
+
+
+def test_native_host_change_understands_sdk_default_port(saved_settings):
+    _, _, active, client = saved_settings
+    selection = {"llm_authentication": {"mode": "bearer", "api_key": "native-bare-host"}}
+    assert client.put("/system/settings", json={**explicit_payload(active), **selection}).status_code == 200
+    assert client.put("/system/settings", json=explicit_payload(active, host="ollama")).status_code == 200
+    assert config.Settings().llm.request_api_key() == "native-bare-host"
+    assert client.put("/system/settings", json=explicit_payload(active, host="http://ollama")).status_code == 409
+
+
+def test_later_native_deployment_key_does_not_follow_browser_provider_switch(saved_settings, monkeypatch):
+    _, _, active, client = saved_settings
+    active.llm.provider = config.LLMProviderEnum.OPENAI
+    monkeypatch.setenv("LLM__PROVIDER", "openai")
+    assert client.put("/system/settings", json=explicit_payload(active, provider="ollama")).status_code == 200
+    monkeypatch.setenv("OLLAMA_API_KEY", "for-deployment-only")
+    assert config.Settings().llm.request_api_key() is None
+
+
+def test_native_bare_host_path_edit_retains_deployment_key(saved_settings, monkeypatch):
+    path, document, active, client = saved_settings
+    document["llm"]["host"] = active.llm.host = "proxy"
+    path.write_text(yaml.safe_dump(document))
+    monkeypatch.setenv("OLLAMA_API_KEY", "native-only")
+    assert client.put("/system/settings", json=explicit_payload(active, host="proxy/v1")).status_code == 200
+    assert config.Settings().llm.request_api_key() == "native-only"
