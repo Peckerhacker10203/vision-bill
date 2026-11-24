@@ -163,7 +163,7 @@ Run from a prepared checkout/environment on a network that reaches the intended
 DB. Clear conflicting process/dotenv settings and use a private
 `VISION_BILL_CONFIG_PATH` as appropriate: process env > dotenv > YAML precedence
 still applies. No DSN/password needs to appear in public commands or shell history.
-The resulting head is **0023**. Before starting uvicorn with runtime credentials,
+The resulting head is **0024**. Before starting uvicorn with runtime credentials,
 complete owner migration and grants. The current image still executes Alembic at
 startup using the runtime `PG__*` identity; it can only check an already-current
 schema, not apply pending owner DDL. Future upgrades must repeat the owner step.
@@ -171,8 +171,8 @@ Do not temporarily leave the app serving as the owner to simplify migration.
 
 ### Fresh and legacy mapping
 
-Fresh installations apply 0001 through 0023. An installation at 0021 applies
-0022 and 0023. An installation at 0010 first applies 0011–0021 for workflow,
+Fresh installations apply 0001 through 0024. An installation at 0021 applies
+0022 through 0024. An installation at 0010 first applies 0011–0021 for workflow,
 review, benchmark references, claim fencing, cleanup and optional receipt values.
 Migration 0011 preserves linked receipts, verified flags, amounts and historical
 paths and marks their submissions analyzed; they are not re-OCRed. Receipt-free
@@ -188,6 +188,8 @@ Migration 0022 creates owner-scoped benchmark cases and distinguishes their
 tasks from ordinary receipt tasks. Existing tasks keep their receipt identity
 and deletion protection. Migration 0023 records the comparison group and
 pipeline on each paired run. Existing single runs retain their original history.
+Migration 0024 adds everyday product tags. Existing vocabulary rows and receipt
+labels retain their identities. A downgrade to 0023 leaves vocabulary entries in place.
 
 A downgrade from 0023 to 0022 refuses if a comparison exists. A downgrade
 from 0022 to 0021 refuses if any case exists, including an unconfirmed draft.

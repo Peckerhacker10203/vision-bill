@@ -1,13 +1,18 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
-	import { t } from '$lib/i18n';
+	import { locale, t } from '$lib/i18n';
+	import {
+		collidingProductTagLabels,
+		hasCustomTagCollision,
+		productTagLabel
+	} from '$lib/i18n/product-tag-label';
 	import { api } from '$lib/api/client';
 	import { currentSessionGeneration } from '$lib/session-lifetime';
 	import { queryClient } from '$lib/query/client';
 	import { queryKeys } from '$lib/query/keys';
 	import { snackbar } from '$lib/ui/snackbar.svelte';
 	import Icon from './Icon.svelte';
-	import { buildTagRows, moveActiveIndex, normalizeTag, type TagRow } from './tag-editor-logic';
+	import { buildTagRows, moveActiveIndex, type TagRow } from './tag-editor-logic';
 
 	let {
 		value,
@@ -91,6 +96,15 @@
 		return value.filter((tag) => !isStandard(tag));
 	});
 
+	let collisions = $derived(
+		collidingProductTagLabels([...tagOptions, ...standardTags, ...suggestedTags], $locale)
+	);
+	function tagName(tag: string) {
+		return hasCustomTagCollision(tag, collisions)
+			? $t('editor.customTagName', { values: { tag } })
+			: productTagLabel(tag, $locale);
+	}
+
 	/** Replace the standard tags while preserving any suggested ones. */
 	function setStandardTags(nextStandard: string[]): void {
 		const next = [...nextStandard, ...suggestedTags];
@@ -144,15 +158,14 @@
 	}
 
 	/** Create the tag currently typed into the search and attach it to the line. */
-	async function createFromQuery(): Promise<void> {
-		const name = normalizeTag(query);
+	async function createTag(name: string): Promise<void> {
 		if (name === '' || creating || disabled) return;
 		const origin = ownerLifetime();
 		creating = true;
 		try {
 			const { name: created } = await api.createTag(name);
 			if (origin.current()) {
-				if (!value.includes(created)) {
+				if (!value.some((tag) => tag.toLowerCase() === created.toLowerCase())) {
 					value.push(created);
 					revision++;
 				}
@@ -171,19 +184,19 @@
 	// derived here would be re-evaluated by the reactivity scheduler between
 	// two synchronous key events, clobbering the highlight.
 	function computeSelectableRows(): Array<Extract<TagRow, { kind: 'tag' | 'create' }>> {
-		return buildTagRows(tagOptions, query, standardTags).filter(
+		return buildTagRows(tagOptions, query, standardTags, $locale).filter(
 			(row): row is Extract<TagRow, { kind: 'tag' | 'create' }> =>
 				row.kind === 'tag' || row.kind === 'create'
 		);
 	}
 
-	let rows = $derived(buildTagRows(tagOptions, query, standardTags));
+	let rows = $derived(buildTagRows(tagOptions, query, standardTags, $locale));
 
 	function activateRow(row: Extract<TagRow, { kind: 'tag' | 'create' }>): void {
 		if (row.kind === 'tag') {
 			toggleStandardTag(row.tag);
 		} else {
-			void createFromQuery();
+			void createTag(row.tag);
 		}
 	}
 
@@ -275,6 +288,7 @@
 <div>
 	<span id="{id}-tags-label" class={labelClass}>{$t('editor.tags')}</span>
 	<div
+		{id}
 		bind:this={boxEl}
 		class="relative"
 		role="button"
@@ -296,11 +310,11 @@
 				<span
 					class="inline-flex items-center gap-1 rounded-full bg-primary-container py-1 pl-3 pr-1 text-sm font-medium text-on-primary-container"
 				>
-					{tag}
+					{tagName(tag)}
 					<button
 						type="button"
 						class="flex size-5 items-center justify-center rounded-full text-xs hover:bg-on-primary-container/10 max-sm:min-h-11 max-sm:min-w-11"
-						aria-label={$t('editor.tagsRemove', { values: { tag } })}
+						aria-label={$t('editor.tagsRemove', { values: { tag: tagName(tag) } })}
 						onclick={(event) => {
 							event.stopPropagation();
 							removeStandardTag(tag);
@@ -319,12 +333,12 @@
 					>
 						{$t('editor.tagsSuggestedBadge')}
 					</span>
-					{tag}
+					{tagName(tag)}
 					<button
 						type="button"
 						class="flex size-5 items-center justify-center rounded-full text-xs font-bold hover:bg-on-warning-container/10 max-sm:min-h-11 max-sm:min-w-11"
-						title={$t('editor.tagsKeep', { values: { tag } })}
-						aria-label={$t('editor.tagsKeep', { values: { tag } })}
+						title={$t('editor.tagsKeep', { values: { tag: tagName(tag) } })}
+						aria-label={$t('editor.tagsKeep', { values: { tag: tagName(tag) } })}
 						disabled={creating}
 						onclick={(event) => {
 							event.stopPropagation();
@@ -336,8 +350,8 @@
 					<button
 						type="button"
 						class="flex size-5 items-center justify-center rounded-full text-xs hover:bg-error-container hover:text-on-error-container max-sm:min-h-11 max-sm:min-w-11"
-						title={$t('editor.tagsRemove', { values: { tag } })}
-						aria-label={$t('editor.tagsRemove', { values: { tag } })}
+						title={$t('editor.tagsRemove', { values: { tag: tagName(tag) } })}
+						aria-label={$t('editor.tagsRemove', { values: { tag: tagName(tag) } })}
 						disabled={creating}
 						onclick={(event) => {
 							event.stopPropagation();
@@ -408,7 +422,7 @@
 									}
 								}}
 							>
-								<span>{row.tag}</span>
+								<span>{tagName(row.tag)}</span>
 								{#if row.selected}
 									<span class="text-primary"><Icon icon="check" /></span>
 								{/if}
@@ -435,7 +449,7 @@
 								}}
 							>
 								<Icon icon="plus" />
-								{$t('editor.tagsCreate', { values: { tag: row.tag } })}
+								{$t('editor.tagsCreate', { values: { tag: tagName(row.tag) } })}
 							</li>
 						{:else if row.kind === 'nomatch'}
 							<li class="px-2.5 py-2 text-xs text-on-surface-variant">

@@ -115,6 +115,15 @@ class DraftPatch(BaseModel):
     expected_revision: int = Field(ge=1)
     changes: dict[str, Any]
 
+    @field_validator("changes")
+    @classmethod
+    def normalize_cash_edit(cls, changes: dict[str, Any]) -> dict[str, Any]:
+        # Older review forms accepted the German cash label as free text.
+        payment = changes.get("payment_method")
+        if isinstance(payment, str) and payment.strip().casefold() == "bar":
+            return {**changes, "payment_method": "cash"}
+        return changes
+
 
 class DraftFinalize(BaseModel):
     expected_revision: int = Field(ge=1)

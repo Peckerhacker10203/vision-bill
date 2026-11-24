@@ -74,7 +74,8 @@ export class ApiError extends Error {
 	constructor(
 		status: number,
 		detail: string,
-		public imageId?: string
+		public imageId?: string,
+		public problem?: { code: string; fields: string[] }
 	) {
 		super(detail);
 		this.name = 'ApiError';
@@ -122,6 +123,7 @@ export async function request<T>(
 		}
 		let detail = `${response.status} ${response.statusText}`;
 		let imageId: string | undefined;
+		let problem: ApiError['problem'];
 		try {
 			const body: unknown = await response.json();
 			if (
@@ -135,6 +137,15 @@ export async function request<T>(
 			if (body && typeof body === 'object' && 'detail' in body) {
 				const raw = (body as { detail: unknown }).detail;
 				detail = typeof raw === 'string' ? raw : JSON.stringify(raw);
+				if (raw && typeof raw === 'object' && 'code' in raw && typeof raw.code === 'string') {
+					problem = {
+						code: raw.code,
+						fields:
+							'fields' in raw && Array.isArray(raw.fields)
+								? raw.fields.filter((path): path is string => typeof path === 'string')
+								: []
+					};
+				}
 			}
 		} catch {
 			// Non-JSON error body: keep the status text.
@@ -144,7 +155,7 @@ export async function request<T>(
 			sessionActorChangedHandler?.();
 			requireCurrent();
 		}
-		throw new ApiError(response.status, detail, imageId);
+		throw new ApiError(response.status, detail, imageId, problem);
 	}
 
 	if (response.status === 204) {

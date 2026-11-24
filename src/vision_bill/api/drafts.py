@@ -9,7 +9,7 @@ from pydantic import ValidationError
 
 from ..helper.deadline import run_sync_before
 from ..model.db.receipt import ReceiptRow
-from ..model.extraction import DraftView
+from ..model.extraction import DraftLineItem, DraftTaxLine, DraftView, ExtractionDraft
 from ..model.handoff import HandoffWait
 from ..model.workflow import AccessScope, DraftFinalize, DraftPatch, RetryRequest, SubmissionStatus
 from ..security.dependencies import get_current_user
@@ -34,17 +34,42 @@ def access_scope(user: User = Depends(get_current_user)) -> AccessScope:  # noqa
     return AccessScope(user_id=user.id, can_see_all=user.can_see_all)
 
 
+def _draft_error_fields(error: ValidationError) -> list[str]:
+    # Dictionary keys and validation inputs can contain private receipt text.
+    if error.title != ExtractionDraft.__name__:
+        return []
+    row_fields = {"line_items": DraftLineItem.model_fields, "taxes": DraftTaxLine.model_fields}
+    fields = set()
+    for issue in error.errors(include_input=False, include_context=False, include_url=False):
+        loc = issue["loc"]
+        if not loc or not isinstance(loc[0], str) or loc[0] not in ExtractionDraft.model_fields:
+            continue
+        field = loc[0]
+        allowed = row_fields.get(field)
+        if allowed and len(loc) >= 3:
+            index, key = loc[1:3]
+            if isinstance(index, int) and index >= 0 and isinstance(key, str) and key in allowed:
+                field = f"{field}.{index}.{key}"
+        fields.add(field)
+    return sorted(fields)
+
+
 def mutation_error(error: ValueError) -> HTTPException:
-    conflict = str(error) in {
+    if isinstance(error, ValidationError):
+        return HTTPException(
+            status_code=422, detail={"code": "draft_invalid_fields", "fields": _draft_error_fields(error)}
+        )
+    code = str(error)
+    if code in {
         "draft_revision_conflict",
         "draft_already_finalized",
         "draft_processing_conflict",
         "draft_state_conflict",
-    }
-    return HTTPException(
-        status_code=409 if conflict else 422,
-        detail="Draft conflict" if conflict else "Draft cannot be finalized or updated",
-    )
+    }:
+        return HTTPException(status_code=409, detail={"code": code})
+    if code in {"draft_incomplete", "draft_integrity_failed", "original_integrity_failed", "draft_unknown_field"}:
+        return HTTPException(status_code=422, detail={"code": code})
+    return HTTPException(status_code=422, detail="Draft cannot be finalized or updated")
 
 
 @router.get("/{image_id}/draft")
@@ -68,7 +93,7 @@ async def patch_draft(
 ) -> DraftView:
     try:
         draft = await service.patch_draft(image_id, patch, scope=scope)
-    except (ValueError, ValidationError) as exc:
+    except ValueError as exc:
         raise mutation_error(exc) from None
     if draft is None:
         raise HTTPException(status_code=404, detail="Draft not found")

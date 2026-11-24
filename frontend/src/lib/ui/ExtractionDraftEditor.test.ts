@@ -50,6 +50,7 @@ const completeDraft: DraftView = {
 beforeEach(() => {
 	queryClient.clear();
 	vi.spyOn(api, 'listTags').mockResolvedValue([]);
+	vi.spyOn(api, 'listSpendingCategories').mockResolvedValue([]);
 	vi.stubGlobal('matchMedia', () => ({ matches: false }));
 	vi.spyOn(api, 'getImage').mockResolvedValue({ additional_images: [] } as never);
 	vi.spyOn(api, 'getDraft').mockResolvedValue(draft);
@@ -565,4 +566,134 @@ it('saves and reloads an explicitly printed net subtotal independently of gross 
 	const rate = screen.getByLabelText('Tax rate (fraction)') as HTMLInputElement;
 	expect(rate.value).toBe('19.0');
 	expect(rate.getAttribute('aria-describedby')).toBe(screen.getByText(/Enter 0.19 for 19%/).id);
+});
+
+it('saves selected cash and numeric confidence before finalizing the newly checked revision', async () => {
+	const loaded: DraftView = {
+		...completeDraft,
+		document: { ...completeDraft.document, payment_method: null },
+		findings: [
+			{
+				id: 'missing',
+				code: 'missing_mandatory_field',
+				field_path: 'payment_method',
+				severity: 'integrity',
+				comparison: {},
+				source_refs: []
+			}
+		]
+	};
+	vi.mocked(api.getDraft).mockResolvedValue(loaded);
+	const saved: DraftView = {
+		...completeDraft,
+		revision: 8,
+		document: { ...completeDraft.document, confidence: 100 }
+	};
+	const patch = vi.spyOn(api, 'patchDraft').mockResolvedValue(saved);
+	const finalize = vi.spyOn(api, 'finalizeDraft').mockResolvedValue({ id: 'receipt' } as never);
+	render(ExtractionDraftEditor, { id: 'job' });
+	const select = await screen.findByRole('combobox', { name: 'Payment method' });
+	await fireEvent.click(screen.getByRole('button', { name: 'Payment method' }));
+	expect(document.activeElement).toBe(select);
+	await fireEvent.change(select, { target: { value: 'cash' } });
+	await fireEvent.input(screen.getByLabelText('Confidence (%)'), { target: { value: '100' } });
+	await fireEvent.click(screen.getByRole('button', { name: 'Finalize draft' }));
+	expect(finalize).not.toHaveBeenCalled();
+	await fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+	expect(patch).toHaveBeenCalledWith('job', {
+		expected_revision: 7,
+		changes: { payment_method: 'cash', confidence: 100 }
+	});
+	await waitFor(() => expect(screen.queryByRole('button', { name: 'Payment method' })).toBeNull());
+	await fireEvent.click(screen.getByRole('button', { name: 'Finalize draft' }));
+	expect(finalize).toHaveBeenCalledWith('job', {
+		expected_revision: 8,
+		request_key: expect.any(String)
+	});
+});
+
+it('shows the editable field from a server validation error and preserves the rejected changes', async () => {
+	vi.mocked(api.getDraft).mockResolvedValue(completeDraft);
+	vi.spyOn(api, 'patchDraft').mockRejectedValue(
+		new ApiError(422, 'details', undefined, { code: 'draft_invalid_fields', fields: ['time'] })
+	);
+	render(ExtractionDraftEditor, { id: 'job' });
+	const time = await screen.findByLabelText('Time');
+	await fireEvent.input(time, { target: { value: 'missing' } });
+	await fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+	expect((await screen.findByRole('alert')).textContent).toContain('Invalid fields');
+	await fireEvent.click(screen.getByRole('button', { name: 'Time' }));
+	expect(document.activeElement).toBe(time);
+	expect((time as HTMLInputElement).value).toBe('missing');
+});
+
+it('submits canonical receipt and spending categories while retaining a historical option until changed', async () => {
+	const loaded: DraftView = {
+		...completeDraft,
+		document: {
+			...completeDraft.document,
+			line_items: [{ description: 'Item', spending_category: 'historical' }]
+		}
+	};
+	vi.mocked(api.getDraft).mockResolvedValue(loaded);
+	vi.mocked(api.listSpendingCategories).mockResolvedValue([{ code: 'milk' }]);
+	const patch = vi.spyOn(api, 'patchDraft').mockResolvedValue(loaded);
+	render(ExtractionDraftEditor, { id: 'job' });
+	const spending = await screen.findByRole('combobox', { name: 'Spending category' });
+	expect((spending as HTMLSelectElement).value).toBe('historical');
+	await fireEvent.change(spending, { target: { value: 'milk' } });
+	await fireEvent.change(screen.getByRole('combobox', { name: 'Category' }), {
+		target: { value: 'restaurant' }
+	});
+	await fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+	expect(patch).toHaveBeenCalledWith('job', {
+		expected_revision: 7,
+		changes: {
+			category: 'restaurant',
+			line_items: [{ description: 'Item', spending_category: 'milk' }]
+		}
+	});
+});
+
+it('keeps findings visible when revisiting a finalized draft without offering field actions', async () => {
+	vi.mocked(api.getDraft).mockResolvedValue({
+		...completeDraft,
+		finalized_receipt_id: 'receipt',
+		findings: [
+			{
+				id: 'missing',
+				code: 'missing_mandatory_field',
+				field_path: 'payment_method',
+				severity: 'integrity',
+				comparison: {},
+				source_refs: []
+			}
+		]
+	});
+	render(ExtractionDraftEditor, { id: 'job' });
+	expect(await screen.findByRole('article')).toBeTruthy();
+	expect(screen.queryByRole('button', { name: 'Payment method' })).toBeNull();
+	expect(screen.queryByLabelText('Payment method')).toBeNull();
+});
+
+it('focuses a nested server validation field and omits unavailable row actions', async () => {
+	vi.mocked(api.getDraft).mockResolvedValue(completeDraft);
+	vi.spyOn(api, 'patchDraft').mockRejectedValue(
+		new ApiError(422, 'details', undefined, {
+			code: 'draft_invalid_fields',
+			fields: ['line_items[0].total_price', 'line_items.0.tags', 'line_items.9.description']
+		})
+	);
+	render(ExtractionDraftEditor, { id: 'job' });
+	const merchant = await screen.findByLabelText('Merchant');
+	await fireEvent.input(merchant, { target: { value: 'Edited' } });
+	await fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
+	await screen.findByRole('alert');
+	const jump = screen.getByRole('button', { name: '1 · Total' });
+	await fireEvent.click(jump);
+	expect(document.activeElement?.id).toBe('draft-line_items.0.total_price');
+	expect(document.activeElement?.getAttribute('aria-invalid')).toBe('true');
+	expect(screen.queryByRole('button', { name: /^10 · / })).toBeNull();
+	await fireEvent.click(screen.getByRole('button', { name: '1 · Tags' }));
+	expect(document.activeElement?.id).toBe('draft-line_items.0.tags');
 });

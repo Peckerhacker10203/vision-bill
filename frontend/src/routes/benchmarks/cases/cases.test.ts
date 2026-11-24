@@ -230,17 +230,53 @@ it('authors optional receipt and item labels without changing the shared tag voc
 	const flags = screen.getAllByLabelText('Score tags for this item');
 	await fireEvent.click(flags[0]);
 	await fireEvent.click(flags[1]);
-	const tags = screen.getAllByLabelText('Tags (one per line)')[0];
-	await fireEvent.input(tags, { target: { value: 'dairy\nweekly' } });
+	const tags = screen.getAllByLabelText('Tags (one per line)')[0] as HTMLTextAreaElement;
+	setLocale('de');
+	await fireEvent.input(tags, { target: { value: 'Kaffee\nMy WEEKLY tag\nfrischware' } });
+	expect(tags.value).toBe('Kaffee\nMy WEEKLY tag\nfrischware');
 	await fireEvent.blur(tags);
+	expect(tags.value).toBe('Kaffee\nMy WEEKLY tag\nFrischware');
+	setLocale('en');
+	await screen.findByDisplayValue('Coffee My WEEKLY tag Fresh produce and perishables');
 	await fireEvent.click(screen.getByRole('button', { name: 'Save draft' }));
 	await screen.findByText('Draft saved.');
 	expect(updated.expected!.category).toBe('grocery');
 	expect(updated.expected!.line_items[0]).toMatchObject({
 		spending_category: 'milk',
-		tags: ['dairy', 'weekly']
+		tags: ['coffee', 'My WEEKLY tag', 'fresh']
 	});
 	expect(updated.expected!.line_items[1].tags).toEqual([]);
 	expect(updated.expected!.line_items[2].tags ?? null).toBeNull();
 	expect(requests).toEqual([base, base + '/sample', base + '/sample']);
+});
+
+it('retains the exact custom identity when removing its German display-name twin from a benchmark', async () => {
+	session.set(admin);
+	let saved: string[] | undefined;
+	vi.stubGlobal(
+		'fetch',
+		vi.fn(async (url: string, init: RequestInit) => {
+			if (url === base) return Response.json([specimen]);
+			if (init.method === 'PATCH')
+				saved = JSON.parse(init.body as string).expected.line_items[0].tags;
+			return Response.json({
+				...specimen,
+				expected: { line_items: [{ description: 'sample', tags: saved ?? ['milk', 'Milch'] }] }
+			});
+		})
+	);
+	render(Page);
+	await fireEvent.click(await screen.findByRole('button', { name: 'Corner shop' }));
+	setLocale('de');
+	const field = (await screen.findByLabelText(
+		'Schlagwörter (eines pro Zeile)'
+	)) as HTMLTextAreaElement;
+	expect(field.value).toBe('milk\nMilch');
+	expect(screen.getByText('Milch (Eigenes Schlagwort)')).toBeTruthy();
+	await fireEvent.input(field, { target: { value: 'Milch' } });
+	await fireEvent.blur(field);
+	setLocale('en');
+	await fireEvent.click(await screen.findByRole('button', { name: 'Save draft' }));
+	await screen.findByText('Draft saved.');
+	expect(saved).toEqual(['Milch']);
 });

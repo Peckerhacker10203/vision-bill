@@ -6,9 +6,10 @@ Alembic/entrypoint does not consume MIGRATION_DATABASE_URL; that variable belong
 only to `make db-configure-roles`. Drain old analysis/benchmark workers first.
 
 Revision 0022 adds private benchmark cases and preserves the receipt deletion
-fence. Revision 0023 records paired benchmark runs. The respective downgrade
-refuses to discard existing private cases or links between runs. Back up both
-PostgreSQL and the configured image store, including benchmark_cases/ originals.
+fence. Revision 0023 records paired benchmark runs. Their downgrade paths
+refuse to discard existing cases or links between runs. Revision 0024 seeds
+everyday product tags. Its downgrade preserves entries that receipts may use.
+Back up PostgreSQL and the configured image store, including benchmark_cases/ originals.
 
 Read ../UPGRADE_AND_VERIFY.md for the upgrade sequence from 0010 or 0021,
 role bootstrap/grants, runtime-credential startup and compatible recovery.

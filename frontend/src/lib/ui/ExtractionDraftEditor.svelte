@@ -9,6 +9,7 @@
 	import { api, ApiError } from '$lib/api/client';
 	import { requestKey } from '$lib/api/upload';
 	import { t, translate } from '$lib/i18n';
+	import { CATEGORIES, PAYMENT_METHODS } from '$lib/types';
 	import type { DraftView, ExtractionDraft, AmountPolicy, SourceRef, DraftPatch } from '$lib/types';
 	import ReviewFindings from './ReviewFindings.svelte';
 	import ReceiptWorkspace from './ReceiptWorkspace.svelte';
@@ -22,6 +23,14 @@
 		() => ({ queryKey: queryKeys.tags(), queryFn: () => api.listTags() }),
 		() => queryClient
 	);
+	const categoryList = createQuery(
+		() => ({
+			queryKey: queryKeys.spendingCategories(),
+			queryFn: () => api.listSpendingCategories()
+		}),
+		() => queryClient
+	);
+	let spendingCategories = $derived(categoryList.data?.map(({ code }) => code) ?? []);
 	let draft = $state<DraftView | null>(null);
 	let document = $state<ExtractionDraft>({});
 	let policy = $state<AmountPolicy | null>(null);
@@ -89,6 +98,7 @@
 		unit_price: 'editor.unitPrice',
 		total_price: 'editor.totalPrice',
 		spending_category: 'editor.spendingCategory',
+		tags: 'editor.tags',
 		name: 'editor.taxName',
 		rate: 'editor.taxRate',
 		amount: 'editor.amount'
@@ -178,6 +188,38 @@
 		}
 		return errors;
 	}
+	function mutationError(e: unknown, fallback: string) {
+		if (!(e instanceof ApiError)) return translate(fallback);
+		const messages: Record<string, string> = {
+			draft_invalid_fields: 'review.invalidFields',
+			draft_unknown_field: 'review.invalidFields',
+			draft_incomplete: 'review.missingFields',
+			draft_integrity_failed: 'review.draftIntegrity',
+			original_integrity_failed: 'review.originalIntegrity',
+			draft_revision_conflict: 'review.conflict',
+			draft_already_finalized: 'review.draftFinalized',
+			draft_processing_conflict: 'review.draftProcessing',
+			draft_state_conflict: 'review.conflict'
+		};
+		invalidFields = (e.problem?.fields ?? [])
+			.map((path) => path.replace(/\[(\d+)\]/g, '.$1'))
+			.filter(isFormField);
+		return translate(
+			messages[e.problem?.code ?? ''] ?? (e.status === 409 ? 'review.conflict' : fallback)
+		);
+	}
+	function isFormField(path: string) {
+		if (fields.some((field) => field === path) || path === 'line_items' || path === 'taxes')
+			return true;
+		const normalized = path.replace(/\[(\d+)\]/g, '.$1');
+		const line =
+			/^line_items\.(0|[1-9]\d*)\.(description|quantity|unit_price|total_price|spending_category|tags)$/.exec(
+				normalized
+			);
+		if (line) return Number(line[1]) < (document.line_items?.length ?? 0);
+		const tax = /^taxes\.(0|[1-9]\d*)\.(name|rate|amount)$/.exec(normalized);
+		return !!tax && Number(tax[1]) < (document.taxes?.length ?? 0);
+	}
 	async function save() {
 		invalidFields = [];
 		if (!draft || busy || childPending) return;
@@ -203,9 +245,7 @@
 			}
 			finalizeKey = null;
 		} catch (e) {
-			if (active === view)
-				error =
-					e instanceof ApiError && e.status === 409 ? translate('review.conflict') : String(e);
+			if (active === view) error = mutationError(e, 'review.draftSaveFailed');
 		} finally {
 			if (active === view) busy = false;
 		}
@@ -262,9 +302,7 @@
 			});
 			if (active === view) await goto(resolve(`/receipts/${result.id}`));
 		} catch (e) {
-			if (active === view)
-				error =
-					e instanceof ApiError && e.status === 409 ? translate('review.conflict') : String(e);
+			if (active === view) error = mutationError(e, 'review.draftFinalizeFailed');
 		} finally {
 			if (active === view) busy = false;
 		}
@@ -299,19 +337,40 @@
 						>
 						<div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
 							{#each group as field (field)}<label class="block text-sm"
-									>{$t(labelKeys[field])}<input
-										class="block w-full rounded border p-2"
-										id={`draft-${field}`}
-										aria-invalid={invalidFields.includes(field)}
-										value={document[field] ?? ''}
-										oninput={(e) =>
-											Object.assign(document, {
-												[field]:
-													field === 'confidence'
-														? numeric(e.currentTarget.value)
-														: e.currentTarget.value.trim() || null
-											})}
-									/></label
+									>{$t(labelKeys[field])}{#if field === 'payment_method' || field === 'category'}
+										{@const options = field === 'payment_method' ? PAYMENT_METHODS : CATEGORIES}
+										{@const current = document[field]}
+										<select
+											class="block w-full rounded border p-2"
+											id={`draft-${field}`}
+											aria-invalid={invalidFields.includes(field)}
+											value={current ?? ''}
+											onchange={(e) =>
+												Object.assign(document, { [field]: e.currentTarget.value || null })}
+										>
+											<option value="">—</option>
+											{#if current && !options.some((option) => option === current)}<option
+													value={current}>{current}</option
+												>{/if}
+											{#each options as option (option)}<option value={option}
+													>{$t(
+														`${field === 'payment_method' ? 'payment' : 'categories'}.${option}`
+													)}</option
+												>{/each}
+										</select>
+									{:else}<input
+											class="block w-full rounded border p-2"
+											id={`draft-${field}`}
+											aria-invalid={invalidFields.includes(field)}
+											value={document[field] ?? ''}
+											oninput={(e) =>
+												Object.assign(document, {
+													[field]:
+														field === 'confidence'
+															? numeric(e.currentTarget.value)
+															: e.currentTarget.value.trim() || null
+												})}
+										/>{/if}</label
 								>{/each}
 						</div>
 					</fieldset>{/each}
@@ -321,25 +380,41 @@
 						class="grid grid-cols-1 gap-2 rounded border border-outline-variant p-3 sm:grid-cols-2"
 					>
 						{#each ['description', 'quantity', 'unit_price', 'total_price', 'spending_category'] as field (field)}<label
-								>{$t(labelKeys[field])}<input
-									class="block w-full rounded border p-2"
-									id={`draft-line_items.${index}.${field}`}
-									aria-invalid={invalidFields.includes(`line_items.${index}.${field}`)}
-									value={line[field as keyof typeof line] ?? ''}
-									oninput={(e) =>
-										Object.assign(line, {
-											[field]: e.currentTarget.value.trim() || null
-										})}
-								/></label
+								>{$t(labelKeys[field])}{#if field === 'spending_category'}<select
+										class="block w-full rounded border p-2"
+										id={`draft-line_items.${index}.spending_category`}
+										aria-invalid={invalidFields.includes(`line_items.${index}.spending_category`)}
+										value={line.spending_category ?? ''}
+										onchange={(e) => (line.spending_category = e.currentTarget.value || null)}
+									>
+										<option value="">—</option>
+										{#if line.spending_category && !spendingCategories.includes(line.spending_category)}<option
+												value={line.spending_category}>{line.spending_category}</option
+											>{/if}
+										{#each spendingCategories as option (option)}<option value={option}
+												>{$t(`spendingCategories.${option}`)}</option
+											>{/each}
+									</select>{:else}<input
+										class="block w-full rounded border p-2"
+										id={`draft-line_items.${index}.${field}`}
+										aria-invalid={invalidFields.includes(`line_items.${index}.${field}`)}
+										value={line[field as keyof typeof line] ?? ''}
+										oninput={(e) =>
+											Object.assign(line, {
+												[field]: e.currentTarget.value.trim() || null
+											})}
+									/>{/if}</label
 							>{/each}
 						{#if line.tags !== null && line.tags !== undefined}<TagEditor
 								disabled={busy}
 								value={line.tags}
 								onPendingChange={(pending) => tagPending(line, pending)}
 								tagOptions={tags.data ?? []}
-								id={`draft-line-${index}`}
-							/>{:else}<button type="button" onclick={() => (line.tags = [])}
-								>{$t('review.addTags')}</button
+								id={`draft-line_items.${index}.tags`}
+							/>{:else}<button
+								type="button"
+								id={`draft-line_items.${index}.tags`}
+								onclick={() => (line.tags = [])}>{$t('review.addTags')}</button
 							>{/if}
 						<button
 							type="button"
@@ -466,8 +541,12 @@
 				</div>
 			</fieldset>
 		{/if}
+		{#if dirty && draft.findings.length}<p class="my-3" role="status">
+				{$t('review.draftSavedFindings', { values: { revision: draft.revision } })}
+			</p>{/if}
 		<ReviewFindings
-			onField={focusField}
+			fieldName={(path) => (isFormField(path) ? fieldLabel(path) : undefined)}
+			onField={draft.finalized_receipt_id ? undefined : focusField}
 			findings={draft.findings}
 			revision={draft.revision}
 			editable={false}

@@ -129,3 +129,69 @@ async def test_draft_patch_preserves_numeric_observations_and_metadata_types(set
     assert changes["line_items"][0]["quantity"] == "1.00000000000000001"
     assert changes["taxes"][0]["rate"] == "0.10000000000000001"
     assert changes["overlap_decisions"][0]["score"] == 0.75
+
+
+def test_legacy_draft_cash_edit_rechecks_missing_payment():
+    from vision_bill.model.extraction import ExtractionDraft
+    from vision_bill.model.review import AmountPolicy
+    from vision_bill.model.workflow import DraftPatch
+    from vision_bill.service.receipt_review import evaluate_receipt, persistent_findings
+
+    old = ExtractionDraft(confidence=90)
+    policy = AmountPolicy()
+    findings = evaluate_receipt(old, policy, {}, [], []).findings
+    assert any(f.field_path == "payment_method" for f in findings)
+    change = DraftPatch(expected_revision=1, changes={"payment_method": "BAR", "confidence": 100})
+    edited = ExtractionDraft.model_validate({**old.model_dump(), **change.changes})
+    assert edited.payment_method == "cash" and edited.confidence == 100
+    current = evaluate_receipt(edited, policy, {}, [], [], retained_findings=persistent_findings(findings))
+    assert not any(f.field_path == "payment_method" for f in current.findings)
+
+
+async def test_invalid_draft_payment_reports_field_without_value(setup_api):
+    from vision_bill.model.extraction import ExtractionDraft
+
+    app, service, _ = setup_api
+    def validate(_id, patch, **kwargs):
+        ExtractionDraft.model_validate(patch.changes)
+
+    service.patch_draft.side_effect = validate
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.patch(
+            f"/api/v1/images/{uuid4()}/draft",
+            json={"expected_revision": 1, "changes": {"payment_method": "private-invalid-value"}},
+        )
+    assert response.status_code == 422
+    assert response.json()["detail"] == {"code": "draft_invalid_fields", "fields": ["payment_method"]}
+
+
+def test_validation_error_reports_each_invalid_row_without_private_values():
+    from pydantic import ValidationError
+
+    from vision_bill.api.drafts import mutation_error
+    from vision_bill.model.extraction import ExtractionDraft
+
+    with pytest.raises(ValidationError) as caught:
+        ExtractionDraft.model_validate({
+            "line_items": [{"quantity": "private quantity"}, {"unit_price": "private price"}],
+            "taxes": [{"amount": -1}, {"rate": "private rate"}],
+        })
+    assert mutation_error(caught.value).detail == {
+        "code": "draft_invalid_fields",
+        "fields": ["line_items.0.quantity", "line_items.1.unit_price", "taxes.0.amount", "taxes.1.rate"],
+    }
+
+
+def test_validation_error_redacts_untrusted_locations():
+    from pydantic import ValidationError
+
+    from vision_bill.api.drafts import mutation_error
+
+    locations = [
+        ("private root",), ("taxes", 2, "private key"), ("line_items", -1, "quantity"),
+        ("line_items", "private index", "description"), ("taxes", 0, "description"),
+    ]
+    error = ValidationError.from_exception_data("ExtractionDraft", [
+        {"type": "string_type", "loc": loc, "input": "private text"} for loc in locations
+    ])
+    assert mutation_error(error).detail == {"code": "draft_invalid_fields", "fields": ["line_items", "taxes"]}

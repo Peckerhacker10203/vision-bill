@@ -166,6 +166,18 @@ blank discount, tip, quantity or unit price when the printed information is
 absent. Each line still needs a description and a total. Where both quantity
 and unit price are known, their product is checked against the line total.
 
+In the review form, **Cash** in English and **Bar** in German both save
+`cash`. Confidence accepts whole percentages from 0 through 100. **Save
+draft** stores the edits and refreshes the findings for that revision. A
+field link in the findings opens the relevant input. Use **Finalize draft**
+after the saved revision meets the required checks. If saving fails, the
+form keeps your edits available for correction.
+
+Line-item tag suggestions use the selected interface language. Choosing
+**Kaffee** in German or **Coffee** in English records `coffee`. Switching
+languages relabels built-in tags on existing receipts. Custom names outside
+the built-in catalog retain their spelling.
+
 Receipt review uses checks version 3. See the
 [amount policy and human acknowledgement contract](UPGRADE_AND_VERIFY.md#review-and-financial-contract).
 **Verify** and **Save & verify** fetch the current server preview. Enter comments

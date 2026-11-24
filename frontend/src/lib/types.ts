@@ -3,18 +3,28 @@ export type ImageStatus =
 
 export type ReceiptStatus = 'unverified' | 'verified';
 
-export type Category =
-	| 'grocery'
-	| 'electronics'
-	| 'clothing'
-	| 'restaurant'
-	| 'fuel'
-	| 'pharmacy'
-	| 'entertainment'
-	| 'other';
+export const CATEGORIES = [
+	'grocery',
+	'electronics',
+	'clothing',
+	'restaurant',
+	'fuel',
+	'pharmacy',
+	'entertainment',
+	'other'
+] as const;
+export type Category = (typeof CATEGORIES)[number];
 
-export type PaymentMethod =
-	'cash' | 'credit_card' | 'debit_card' | 'mobile_payment' | 'check' | 'other' | 'unknown';
+export const PAYMENT_METHODS = [
+	'cash',
+	'credit_card',
+	'debit_card',
+	'mobile_payment',
+	'check',
+	'other',
+	'unknown'
+] as const;
+export type PaymentMethod = (typeof PAYMENT_METHODS)[number];
 
 export type EnrichmentReason =
 	| 'invalid_response'

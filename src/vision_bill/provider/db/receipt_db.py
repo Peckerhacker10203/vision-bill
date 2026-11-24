@@ -241,7 +241,15 @@ LIST_COLLECTION_IDS_FOR_RECEIPT_SQL = (
     "SELECT collection_id FROM receipt_collections WHERE receipt_id = $1"
 )
 LIST_TAGS_SQL = "SELECT name FROM tags ORDER BY name"
-INSERT_TAG_SQL = "INSERT INTO tags (name) VALUES ($1) ON CONFLICT (name) DO NOTHING RETURNING name"
+INSERT_TAG_SQL = """
+    INSERT INTO tags (name) SELECT $1::text
+    WHERE NOT EXISTS (SELECT FROM tags WHERE lower(name) = lower($1))
+    ON CONFLICT (name) DO NOTHING RETURNING name
+"""
+EXISTING_TAG_SQL = """
+    SELECT name FROM tags WHERE lower(name) = lower($1)
+    ORDER BY (name = $1) DESC, name LIMIT 1
+"""
 VERIFY_RECEIPT_SQL = (
     "UPDATE receipts SET status = 'verified', verified = TRUE WHERE id = $1 RETURNING *"
 )
@@ -1392,12 +1400,12 @@ class ReceiptDB:
             rows = await conn.fetch(LIST_TAGS_SQL)
         return [row["name"] for row in rows]
 
-    async def create_tag(self, name: str) -> bool:
-        """Insert a tag, returning True when it was newly created.
-
-        Returns False when a tag with this name already exists (ON CONFLICT
-        makes the insert a no-op rather than an error).
-        """
+    async def create_tag(self, name: str) -> tuple[str, bool]:
+        """Return the stored spelling and whether the normalized tag was inserted."""
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(INSERT_TAG_SQL, name)
-        return row is not None
+            if row is not None:
+                return row["name"], True
+            # A new statement also sees a concurrent creator that won ON CONFLICT.
+            stored = await conn.fetchval(EXISTING_TAG_SQL, name)
+            return stored, False

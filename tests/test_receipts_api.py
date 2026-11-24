@@ -681,18 +681,15 @@ def test_create_tag_endpoint_new(api_context: ApiContext) -> None:
 
 
 def test_create_tag_endpoint_existing_is_idempotent(api_context: ApiContext) -> None:
-    """POST /tags for a known name is a no-op (200, created=false), not an error.
-
-    ON CONFLICT DO NOTHING yields no RETURNING row, which the service maps to
-    created=False.
-    """
+    """POST /tags preserves the spelling of a known tag and returns 200."""
     ctx = api_context
     ctx.conn.fetchrow = AsyncMock(return_value=None)
 
+    ctx.conn.fetchval = AsyncMock(return_value="Coffee")
     response = ctx.client.post(TAGS_URL, json={"name": "coffee"})
 
     assert response.status_code == 200
-    assert response.json() == {"name": "coffee", "created": False}
+    assert response.json() == {"name": "Coffee", "created": False}
 
 
 def test_create_tag_endpoint_blank_rejected(api_context: ApiContext) -> None:

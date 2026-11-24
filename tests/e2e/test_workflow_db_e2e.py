@@ -6,6 +6,7 @@ No operator connection settings are used. Run explicitly with -m e2e.
 
 import asyncio
 import importlib
+import json
 import os
 import secrets
 import subprocess
@@ -209,10 +210,48 @@ def complete(*, total="90071992547.91"):
 async def test_bootstrap_and_empty_downgrade(db):
     migrate(db)
     conn = await asyncpg.connect(db.pg_dsn)
-    assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0023"
+    assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0024"
     await conn.close()
     migrate(db, "0010", "downgrade")
     migrate(db)
+
+
+async def test_product_tag_upgrade_preserves_identity_and_matches_translations(db):
+    from vision_bill.provider.db.receipt_db import ReceiptDB
+
+    migrate(db, "0023")
+    catalog = json.loads((ROOT / "frontend/src/lib/i18n/product-tags.json").read_text())
+    assert all(set(labels) == {"en", "de"} and all(labels.values()) for labels in catalog.values())
+    conn = await asyncpg.connect(db.pg_dsn)
+    provider = ReceiptDB(db)
+    try:
+        await conn.execute("INSERT INTO tags(name) VALUES ('milk'), ('Berries'), ('wochenmarkt')")
+        historical = dict(await conn.fetch("SELECT name, id FROM tags"))
+        receipt = await conn.fetchval(
+            "INSERT INTO receipts(merchant_name,date,total) VALUES('shop','2026-01-01',1) RETURNING id"
+        )
+        item = await conn.fetchval(
+            "INSERT INTO line_items(receipt_id,description,original_description,total_price,tags) "
+            "VALUES($1,'Milch','Milch',1,ARRAY['milk','Berries','wochenmarkt']) RETURNING id", receipt
+        )
+        for attempt in range(2):
+            if attempt:
+                migrate(db, "0023", "downgrade")
+            migrate(db)
+            actual = dict(await conn.fetch("SELECT name, id FROM tags"))
+            assert set(actual) == (set(catalog) - {"berries"}) | {"Berries", "wochenmarkt"}
+            assert historical.items() <= actual.items()
+            assert await conn.fetchval("SELECT tags FROM line_items WHERE id=$1", item) == [
+                "milk", "Berries", "wochenmarkt"
+            ]
+            historical = actual
+        await provider.init_db()
+        assert set(await provider.list_tags()) == set(historical)
+        assert await provider.create_tag("berries") == ("Berries", False)
+        assert set(await provider.list_tags()) == set(historical)
+    finally:
+        await provider.destroy_db()
+        await conn.close()
 
 
 async def test_retry_policy_migration_preserves_legacy_identity_and_refuses_lossy_backout(db):
@@ -507,7 +546,7 @@ async def test_finish_atomic_decimal_and_immutable_history(workflow_db, db):
         )
     assert migrate(db, "0010", "downgrade", check=False).returncode != 0
     async with w.pool.acquire() as conn:
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0023"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0024"
         assert await conn.fetchval("SELECT count(*) FROM receipt_review_revisions") == 1
 
 
@@ -808,7 +847,7 @@ async def test_upgrade_0010_preserves_precise_local_times_and_legacy_evidence(db
                 assert await conn.fetchval("SELECT image_path FROM images WHERE id=$1", image) == str(original)
         finally:
             await reader.destroy_db()
-        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0023"
+        assert await conn.fetchval("SELECT version_num FROM alembic_version") == "0024"
     finally:
         await conn.close()
 
@@ -1353,7 +1392,7 @@ async def test_finalized_draft_preserves_optional_amounts_and_item_values(workfl
     ]
     document = {
         "confidence": 90, "merchant_name": "Shop", "date": "2026-01-01",
-        "currency": "EUR", "payment_method": "cash", "subtotal": "2.33",
+        "currency": "EUR", "payment_method": None, "subtotal": "2.33",
         "tax_total": "0.16", "total": "2.49", "tip": None, "discount_total": None,
         "taxes": [{"name": "VAT", "rate": 0.07, "amount": "0.16"}],
         "line_items": [
@@ -1368,8 +1407,16 @@ async def test_finalized_draft_preserves_optional_amounts_and_item_values(workfl
         image.id, DraftPatch(expected_revision=1, changes=document), scope=scope,
     )
     assert draft is not None and draft.revision == 2
+    assert any(f.code == "missing_mandatory_field" and f.field_path == "payment_method" for f in draft.findings)
+    corrected = await workflow.patch_draft(
+        image.id, DraftPatch(expected_revision=2, changes={"payment_method": "BAR", "confidence": 100}),
+        scope=scope,
+    )
+    assert corrected is not None and corrected.revision == 3
+    assert corrected.document.payment_method == "cash" and corrected.document.confidence == 100
+    assert all(f.field_path != "payment_method" for f in corrected.findings)
     result = await workflow.finalize_draft(
-        image.id, DraftFinalize(expected_revision=2, request_key="optional-values"),
+        image.id, DraftFinalize(expected_revision=3, request_key="optional-values"),
         scope=scope, originals=originals,
     )
     assert result is not None and not result.verified

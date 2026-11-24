@@ -30,7 +30,7 @@ test.describe('receipt editor', () => {
 		// Fixture 'a' has multiple line items all tagged 'food'; use .first()
 		// to avoid Playwright strict-mode violation.
 		await page.getByText('Optional tags').first().click();
-		await expect(page.getByText('food').first()).toBeVisible();
+		await expect(page.getByText('Food').first()).toBeVisible();
 		await expect(page.getByRole('button', { name: 'Verify' })).toBeVisible();
 	});
 
@@ -279,18 +279,18 @@ test.describe('receipt editor', () => {
 		// Classification already selected food. Add a different vocabulary tag
 		// and check selected pills, not matching text in the open options list.
 		await page.getByText('Optional tags').first().click();
-		await expect(page.getByRole('button', { name: 'Remove “food”', exact: true })).toBeVisible();
-		await expect(page.getByRole('button', { name: 'Remove “beverage”', exact: true })).toHaveCount(
+		await expect(page.getByRole('button', { name: 'Remove “Food”', exact: true })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Remove “Beverages”', exact: true })).toHaveCount(
 			0
 		);
 		await page.getByRole('button', { name: 'Tags' }).click();
-		await page.getByRole('option', { name: 'beverage', exact: true }).click();
+		await page.getByRole('option', { name: 'Beverages', exact: true }).click();
 		await page.getByRole('heading', { name: 'Billa Test', exact: true }).click();
 		await expect(page.getByRole('listbox')).toBeHidden();
 		await expect(
-			page.getByRole('button', { name: 'Remove “beverage”', exact: true })
+			page.getByRole('button', { name: 'Remove “Beverages”', exact: true })
 		).toBeVisible();
-		await expect(page.getByRole('button', { name: 'Remove “food”', exact: true })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Remove “Food”', exact: true })).toBeVisible();
 
 		// Save and verify persistence.
 		await page.getByRole('button', { name: 'Save', exact: true }).click();
@@ -299,9 +299,9 @@ test.describe('receipt editor', () => {
 		await page.reload();
 		await page.getByText('Optional tags').first().click();
 		await expect(
-			page.getByRole('button', { name: 'Remove “beverage”', exact: true })
+			page.getByRole('button', { name: 'Remove “Beverages”', exact: true })
 		).toBeVisible();
-		await expect(page.getByRole('button', { name: 'Remove “food”', exact: true })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Remove “Food”', exact: true })).toBeVisible();
 	});
 
 	test('taxes can be added and removed', async ({ page, context }) => {

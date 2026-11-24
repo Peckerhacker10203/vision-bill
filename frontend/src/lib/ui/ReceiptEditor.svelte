@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { CATEGORIES, PAYMENT_METHODS } from '$lib/types';
 	import { untrack } from 'svelte';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { createQuery } from '@tanstack/svelte-query';
@@ -24,27 +25,6 @@
 		ReceiptWrite,
 		TaxLineRow
 	} from '$lib/types';
-
-	const CATEGORIES: Category[] = [
-		'grocery',
-		'electronics',
-		'clothing',
-		'restaurant',
-		'fuel',
-		'pharmacy',
-		'entertainment',
-		'other'
-	];
-
-	const PAYMENT_METHODS: PaymentMethod[] = [
-		'cash',
-		'credit_card',
-		'debit_card',
-		'mobile_payment',
-		'check',
-		'other',
-		'unknown'
-	];
 
 	const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 

@@ -17,7 +17,10 @@ using the same frozen references. Admins can select existing receipts or upload
 independent photo cases. Receipt-only runs use scoring version 4. Runs containing
 independent cases use version 5 across the dataset and score confirmed observations.
 Migrations 0022 and 0023 preserve existing runs and add private cases and paired
-run identity. Back up the database and image store together before upgrading.
+run identity. Migration 0024 extends the product tag vocabulary for new and
+existing installations. The English and German interfaces display localized
+built-in labels and save the same tag identifiers. Back up the database and
+image store together before upgrading.
 The update also includes account and view isolation. Dedicated
 OCR downloads and verifies its three pinned models when enabled. Its first prediction
 uses the first submitted receipt. The source launcher supports upgrading the admitted

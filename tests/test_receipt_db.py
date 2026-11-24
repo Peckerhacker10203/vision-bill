@@ -605,7 +605,7 @@ async def test_create_tag_new(db: ReceiptDB) -> None:
 
     created = await db.create_tag("coffee")
 
-    assert created is True
+    assert created == ("coffee", True)
     fetchrow_call = mock_conn.fetchrow.await_args
     assert fetchrow_call is not None
     assert fetchrow_call.args[0] == INSERT_TAG_SQL
@@ -614,14 +614,15 @@ async def test_create_tag_new(db: ReceiptDB) -> None:
 
 @pytest.mark.asyncio
 async def test_create_tag_existing_is_not_an_error(db: ReceiptDB) -> None:
-    """ON CONFLICT DO NOTHING returns no row for a known tag -> False, no raise."""
+    """Look up the stored spelling after the insert skips an existing name."""
     mock_conn = AsyncMock()
     db._pool = _make_pool(mock_conn)
     mock_conn.fetchrow = AsyncMock(return_value=None)
 
+    mock_conn.fetchval = AsyncMock(return_value="Coffee")
     created = await db.create_tag("coffee")
 
-    assert created is False
+    assert created == ("Coffee", False)
     # The insert must be conflict-safe, not a plain INSERT.
     insert_sql = mock_conn.fetchrow.await_args.args[0]
     assert "ON CONFLICT (name) DO NOTHING" in insert_sql

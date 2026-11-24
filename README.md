@@ -53,7 +53,11 @@ and applies classification downstream. A complete saved observation can finish
 after interruption without repeating inference once ownership is settled. Missing
 printed observations stay null. A receipt without a discount, tip, quantity or
 unit price can be finalized if the required figures reconcile. Unavailable
-categories or tags remain visible. Human corrections and original bytes survive review.
+categories or tags remain visible. When correcting a draft, select the payment
+method in the current language and enter confidence as a whole percentage from
+0 to 100. Saving refreshes the checks before finalization. Product tags such
+as **Coffee** or **Kaffee** use the same stored value across both languages.
+You can also add your own tags. Human corrections and original bytes survive review.
 Verify changes database workflow state without moving files. See the
 [multi-photo/API workflow](MULTI_IMAGE_RECEIPTS.md).
 

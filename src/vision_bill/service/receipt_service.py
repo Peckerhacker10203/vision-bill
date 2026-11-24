@@ -168,8 +168,7 @@ class ReceiptService:
             raise ValueError("Tag name must not be blank")
         if len(name) > 100:
             raise ValueError("Tag name must be at most 100 characters long")
-        created = await self._db.create_tag(name)
-        return name, created
+        return await self._db.create_tag(name)
 
     async def persist_receipt(
         self,

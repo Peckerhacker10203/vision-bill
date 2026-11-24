@@ -1,8 +1,15 @@
 <script lang="ts">
-	import { t } from '$lib/i18n';
+	import {
+		collidingProductTagLabels,
+		hasCustomTagCollision,
+		referenceTagText,
+		productTagValue
+	} from '$lib/i18n/product-tag-label';
+	import { locale, t } from '$lib/i18n';
 	import messages from '$lib/i18n/en.json';
-	import type { Category, ExtractionDraft, PaymentMethod } from '$lib/types';
+	import type { Category, DraftLineItem, ExtractionDraft, PaymentMethod } from '$lib/types';
 	let { expected = $bindable() }: { expected: ExtractionDraft } = $props();
+	let tagInput = $state.raw<{ line: DraftLineItem; text: string } | null>(null);
 	const headers = [
 		['merchant_name', 'merchant'],
 		['merchant_address', 'address'],
@@ -153,15 +160,31 @@
 					/>{$t('benchmarkCase.scoreTags')}</label
 				>
 				{#if line.tags != null}
+					{@const collisions = collidingProductTagLabels(line.tags, $locale)}
+					{@const lines = line.tags.map((tag) => referenceTagText(tag, $locale, collisions))}
 					<label
 						>{$t('benchmarkCase.tags')}<textarea
 							rows="3"
-							value={line.tags.join('\n')}
-							oninput={(e) => (line.tags = e.currentTarget.value.split('\n'))}
-							onblur={() =>
-								(line.tags = (line.tags ?? []).map((tag) => tag.trim()).filter(Boolean))}
-						></textarea></label
+							value={tagInput?.line === line ? tagInput.text : lines.join('\n')}
+							oninput={(e) => {
+								const previous = line.tags ?? [];
+								const displayed = tagInput?.line === line ? tagInput.text.split('\n') : lines;
+								tagInput = { line, text: e.currentTarget.value };
+								line.tags = e.currentTarget.value.split('\n').map((text, index) => {
+									const match = displayed[index] === text ? index : displayed.indexOf(text);
+									return match >= 0 ? previous[match] : productTagValue(text, $locale);
+								});
+							}}
+							onblur={() => {
+								tagInput = null;
+								line.tags = (line.tags ?? []).map((tag) => tag.trim()).filter(Boolean);
+							}}></textarea></label
 					>
+					{#each new Set(line.tags.filter( (tag) => hasCustomTagCollision(tag, collisions) )) as tag (tag)}
+						<p class="text-sm text-on-surface-variant">
+							{$t('editor.customTagName', { values: { tag } })}
+						</p>
+					{/each}
 					<p class="text-sm text-on-surface-variant">{$t('benchmarkCase.tagsHint')}</p>
 				{/if}
 			</details>

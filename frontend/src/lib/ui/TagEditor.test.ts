@@ -57,18 +57,25 @@ afterEach(() => {
 describe('TagEditor', () => {
 	it('renders standard tags as chips and suggested tags with a badge', () => {
 		mount(['food', 'custom-tag']);
-		expect(screen.getByText('food')).not.toBeNull();
+		expect(screen.getByText('Food')).not.toBeNull();
 		expect(screen.getByText('Suggested')).not.toBeNull();
 		expect(screen.getByText('custom-tag')).not.toBeNull();
 		// The vocabulary itself is not rendered until the dropdown opens.
-		expect(screen.queryByText('alcohol')).toBeNull();
+		expect(screen.queryByText('Alcohol')).toBeNull();
 	});
 
 	it('opens the dropdown on click and lists every option', async () => {
 		mount([]);
 		expect(screen.queryByRole('listbox')).toBeNull();
 		await openDropdown();
-		for (const option of OPTIONS) {
+		for (const option of [
+			'Alcohol',
+			'Beverages',
+			'Coffee',
+			'Food',
+			'Fresh produce and perishables',
+			'Household goods'
+		]) {
 			expect(screen.getByRole('option', { name: option })).not.toBeNull();
 		}
 	});
@@ -76,8 +83,8 @@ describe('TagEditor', () => {
 	it('marks selected options with aria-selected', async () => {
 		mount(['food']);
 		await openDropdown();
-		expect(screen.getByRole('option', { name: 'food' }).getAttribute('aria-selected')).toBe('true');
-		expect(screen.getByRole('option', { name: 'beverage' }).getAttribute('aria-selected')).toBe(
+		expect(screen.getByRole('option', { name: 'Food' }).getAttribute('aria-selected')).toBe('true');
+		expect(screen.getByRole('option', { name: 'Beverages' }).getAttribute('aria-selected')).toBe(
 			'false'
 		);
 	});
@@ -87,19 +94,19 @@ describe('TagEditor', () => {
 		await openDropdown();
 		const search = screen.getByPlaceholderText('Search tags…');
 		await fireEvent.input(search, { target: { value: 'f' } });
-		expect(screen.getByRole('option', { name: 'food' })).not.toBeNull();
-		expect(screen.getByRole('option', { name: 'fresh' })).not.toBeNull();
-		expect(screen.queryByRole('option', { name: 'beverage' })).toBeNull();
+		expect(screen.getByRole('option', { name: 'Food' })).not.toBeNull();
+		expect(screen.getByRole('option', { name: 'Fresh produce and perishables' })).not.toBeNull();
+		expect(screen.queryByRole('option', { name: 'Beverages' })).toBeNull();
 	});
 
 	it('toggles tags when options are clicked and keeps the dropdown open', async () => {
 		const value = ['food'];
 		mount(value);
 		await openDropdown();
-		await fireEvent.click(screen.getByRole('option', { name: 'beverage' }));
+		await fireEvent.click(screen.getByRole('option', { name: 'Beverages' }));
 		expect(value).toEqual(['food', 'beverage']);
 		expect(screen.getByRole('listbox')).not.toBeNull();
-		await fireEvent.click(screen.getByRole('option', { name: 'food' }));
+		await fireEvent.click(screen.getByRole('option', { name: 'Food' }));
 		expect(value).toEqual(['beverage']);
 	});
 
@@ -130,7 +137,7 @@ describe('TagEditor', () => {
 		const search = screen.getByPlaceholderText('Search tags…');
 		await fireEvent.input(search, { target: { value: 'FOOD' } });
 		expect(screen.queryByRole('option', { name: /Create/ })).toBeNull();
-		expect(screen.getByRole('option', { name: 'food' })).not.toBeNull();
+		expect(screen.getByRole('option', { name: 'Food' })).not.toBeNull();
 	});
 
 	it('removes the last chip with Backspace on an empty search', async () => {
@@ -313,5 +320,69 @@ it.each(['create', 'keep'] as const)(
 		await new Promise((r) => setTimeout(r, 0));
 		expect(notify).not.toHaveBeenCalled();
 		vi.restoreAllMocks();
+	}
+);
+
+it('searches German labels while preserving stored tag values across language changes', async () => {
+	const { setLocale } = await import('$lib/i18n');
+	setLocale('de');
+	try {
+		const value = ['CoFfEe', 'My CUSTOM tag'];
+		mount(value);
+		expect(screen.getByText('Kaffee')).toBeTruthy();
+		expect(screen.getByText('My CUSTOM tag')).toBeTruthy();
+		await openDropdown();
+		await fireEvent.input(screen.getByRole('textbox'), { target: { value: 'alkoh' } });
+		await fireEvent.click(screen.getByRole('option', { name: 'Alkohol' }));
+		expect(value).toEqual(['CoFfEe', 'alcohol', 'My CUSTOM tag']);
+		setLocale('en');
+		await waitFor(() => expect(screen.getByText('Coffee')).toBeTruthy());
+		expect(value).toEqual(['CoFfEe', 'alcohol', 'My CUSTOM tag']);
+	} finally {
+		setLocale('en');
+	}
+});
+
+it('creates a missing known vocabulary entry under its canonical code from German text', async () => {
+	const { setLocale } = await import('$lib/i18n');
+	setLocale('de');
+	try {
+		const value: string[] = [];
+		mount(value, []);
+		await openDropdown();
+		await fireEvent.input(screen.getByRole('textbox'), { target: { value: 'Getränke' } });
+		await fireEvent.click(screen.getByRole('option', { name: '„Getränke“ anlegen' }));
+		await waitFor(() => expect(value).toEqual(['beverage']));
+		expect(vi.mocked(fetch)).toHaveBeenCalledWith(
+			expect.stringContaining('/tags'),
+			expect.objectContaining({ method: 'POST', body: JSON.stringify({ name: 'beverage' }) })
+		);
+	} finally {
+		setLocale('en');
+	}
+});
+
+it.each([
+	['de', 'milk', 'Milch', 'milch', 'Eigenes Schlagwort'],
+	['en', 'soft_drinks', 'Soft drinks', 'soft drinks', 'Custom tag']
+] as const)(
+	'distinguishes and independently selects a custom tag with the same %s label',
+	async (lang, code, label, custom, hint) => {
+		const { setLocale } = await import('$lib/i18n');
+		setLocale(lang);
+		try {
+			const value: string[] = [];
+			mount(value, [code, custom]);
+			await openDropdown();
+			await fireEvent.click(screen.getByRole('option', { name: label }));
+			await fireEvent.click(screen.getByRole('option', { name: custom + ' (' + hint + ')' }));
+			expect(value).toEqual([code, custom]);
+			await fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Escape' });
+			const remove = screen.getByRole('button', { name: new RegExp(hint) });
+			await fireEvent.click(remove);
+			expect(value).toEqual([code]);
+		} finally {
+			setLocale('en');
+		}
 	}
 );

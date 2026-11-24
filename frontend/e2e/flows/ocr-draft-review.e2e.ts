@@ -3,11 +3,69 @@ import { loadFixture } from '../helpers/fixtures';
 import { stubGuard, setStubScenario } from '../helpers/stub';
 import { ensureSession, confirmDialog } from '../helpers/ui';
 import { awaitSubmission, uploadViaApi } from '../helpers/api';
-import type { ReceiptWithDetails } from '../../src/lib/types';
+import type { DraftView, ReceiptWithDetails } from '../../src/lib/types';
 
 // Uses server-selected OCR/direct extraction and deterministic CPU stub evidence.
 test.describe('draft review and versioned receipt editing', () => {
 	stubGuard();
+	test('saves a German payment correction and product tag before finalizing', async ({
+		page,
+		context
+	}) => {
+		test.setTimeout(120_000);
+		await ensureSession(context);
+		await setStubScenario('partial');
+		const fixture = await loadFixture('a');
+		const uploaded = await uploadViaApi(context, fixture.name, fixture.bytes, fixture.mimeType);
+		expect(uploaded.status).toBe(202);
+		const id = uploaded.body.id as string;
+		expect((await awaitSubmission(context, id)).status).toBe('needs_review');
+		const draftUrl = `/api/v1/images/${id}/draft`;
+		const initial = (await (await context.request.get(draftUrl)).json()) as DraftView;
+		const prepared = await context.request.patch(draftUrl, {
+			data: {
+				expected_revision: initial.revision,
+				changes: {
+					payment_method: null,
+					confidence: 90,
+					tax_total: fixture.expected.tax_total,
+					line_items: initial.document.line_items!.map((line) => ({ ...line, tags: [] }))
+				}
+			}
+		});
+		expect(prepared.status()).toBe(200);
+		const before = (await prepared.json()) as DraftView;
+		expect(before.findings.some((finding) => finding.field_path === 'payment_method')).toBe(true);
+		await page.goto(`/upload?job=${id}&draft=1`);
+		await page.locator('#locale-select').selectOption('de');
+		await page.getByLabel('Zahlungsart', { exact: true }).selectOption({ label: 'Bar' });
+		await page.getByLabel('Konfidenz (%)', { exact: true }).fill('100');
+		await page.getByRole('combobox', { name: 'Schlagwörter', exact: true }).first().click();
+		const search = page.getByRole('textbox', { name: /Schlagwörter suchen/ });
+		await search.fill('Kaffee');
+		await page.getByRole('option', { name: 'Kaffee', exact: true }).click();
+		await search.press('Escape');
+
+		const saved = page.waitForResponse(
+			(r) => r.request().method() === 'PATCH' && r.url().endsWith(draftUrl)
+		);
+		await page.getByRole('button', { name: 'Entwurf speichern' }).click();
+		const response = await saved;
+		expect(response.status()).toBe(200);
+		const after = (await response.json()) as DraftView;
+		expect(after.revision).toBe(before.revision + 1);
+		expect(after.document).toMatchObject({ confidence: 100, payment_method: 'cash' });
+		expect(after.document.line_items![0].tags).toEqual(['coffee']);
+		expect(after.findings.some((finding) => finding.field_path === 'payment_method')).toBe(false);
+		await page.getByRole('button', { name: 'Entwurf abschließen' }).click();
+		await expect(page).toHaveURL(/\/receipts\/[a-f0-9-]+/);
+		const receiptId = page.url().split('/').pop()!;
+		const persisted = (await (
+			await context.request.get(`/api/v1/receipts/${receiptId}`)
+		).json()) as ReceiptWithDetails;
+		expect(persisted.receipt).toMatchObject({ confidence: 100, payment_method: 'cash' });
+		expect(persisted.line_items[0].tags).toEqual(['coffee']);
+	});
 	test('finalizing from a draft preserves absent optional observations', async ({
 		page,
 		context

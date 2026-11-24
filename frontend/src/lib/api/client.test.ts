@@ -295,3 +295,23 @@ it('does not start another receipt page after the originating session changes', 
 		list.mockRestore();
 	}
 });
+
+it('exposes draft validation codes and field paths to the editor', async () => {
+	vi.stubGlobal(
+		'fetch',
+		vi
+			.fn()
+			.mockResolvedValue(
+				new Response(
+					JSON.stringify({ detail: { code: 'draft_invalid_fields', fields: ['payment_method'] } }),
+					{ status: 422 }
+				)
+			)
+	);
+	await expect(
+		api.patchDraft('job', { expected_revision: 7, changes: { confidence: 100 } })
+	).rejects.toMatchObject({
+		status: 422,
+		problem: { code: 'draft_invalid_fields', fields: ['payment_method'] }
+	});
+});

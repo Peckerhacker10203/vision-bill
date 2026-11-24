@@ -755,7 +755,7 @@ async def test_create_tag_normalizes_and_reports_created(
 ) -> None:
     """create_tag trims/collapses whitespace and lower-cases before insert."""
     service, mock_db, _ = delegation_context
-    mock_db.create_tag.return_value = True
+    mock_db.create_tag.return_value = (normalized, True)
 
     name, created = await service.create_tag(raw)
 
@@ -768,11 +768,11 @@ async def test_create_tag_normalizes_and_reports_created(
 async def test_create_tag_existing_is_not_created(delegation_context: DelegationContext) -> None:
     """When the DB reports the tag already exists, created is False (no error)."""
     service, mock_db, _ = delegation_context
-    mock_db.create_tag.return_value = False
+    mock_db.create_tag.return_value = ("Coffee", False)
 
     name, created = await service.create_tag("coffee")
 
-    assert name == "coffee"
+    assert name == "Coffee"
     assert created is False
 
 
