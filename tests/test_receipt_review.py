@@ -324,6 +324,20 @@ def test_upstream_finding_identity_is_bound_to_current_material():
     assert first.findings[0].id != "provider-id" and first.findings[0].id != second.findings[0].id
 
 
+def test_calculated_amount_note_follows_the_original_value():
+    from vision_bill.model.review import ReviewFinding
+
+    note = ReviewFinding(
+        id="calculated-total", code="calculated_amount", severity="info", field_path="total",
+        comparison={"calculated": "10.00"},
+    )
+    for amount, should_retain in (("10", True), ("11", False)):
+        result = review.evaluate_receipt(
+            document(total=amount), POLICY, {}, [], ORIGINALS, retained_findings=[note],
+        )
+        assert any(finding.code == "calculated_amount" for finding in result.findings) is should_retain
+
+
 def test_upstream_integrity_failure_is_not_discarded_as_recalculated_code():
     from vision_bill.model.review import ReviewFinding
 

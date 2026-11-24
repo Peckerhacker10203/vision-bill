@@ -810,6 +810,7 @@
 			"printed": "Gedruckte Zwischensumme auf derselben Basis wie die Positionspreise",
 			"printed_net": "Gedruckte Nettozwischensumme für den gesamten Beleg",
 			"derived_net": "Berechnete Nettozwischensumme",
+			"derived_gross": "Berechnete Bruttozwischensumme",
 			"missing": "Fehlend",
 			"present": "Vorhanden",
 			"explicit_zero": "Ausdrücklich null"
@@ -822,13 +823,14 @@
 	"diagnostics": {
 		"checks": {
 			"missing_mandatory_field": "Eine Pflichtangabe fehlt. Prüfe das Original und ergänze das Feld.",
+			"calculated_amount": "Dieser Wert wurde aus den erfassten Belegangaben berechnet. Prüfe ihn anhand der Quellen.",
 			"missing_original": "Das Originalfoto fehlt. Zum Bestätigen wird das Original benötigt.",
 			"original_integrity_failed": "Das Original fehlt oder seine Bytes wurden verändert. Die Bestätigung ist gesperrt.",
 			"source_integrity_failed": "Der Quellenverweis gehört nicht zu diesem Dokument.",
 			"unknown_source_mapping": "Die genaue Quellenposition ist unbekannt. Vergleiche dieses Feld mit dem Original.",
 			"ambiguous_overlap": "Die Überlappung der Fotos muss geprüft werden, bevor doppelte Zeilen entfernt werden können.",
 			"unknown_tax_basis": "Gib vor dem Vergleich der Summen an, ob die beobachteten Beträge Steuern enthalten.",
-			"unknown_subtotal_origin": "Wähle die gedruckte Zwischensumme für den gesamten Beleg oder kennzeichne eine berechnete Nettozwischensumme. Ein einzelner Steuersatz kann nur einen Teil des Belegs abdecken.",
+			"unknown_subtotal_origin": "Wähle die gedruckte Zwischensumme für den gesamten Beleg oder kennzeichne die berechnete Zwischensumme als netto oder brutto. Ein einzelner Steuersatz kann nur einen Teil des Belegs abdecken.",
 			"missing_tax_information": "Steuerangaben fehlen. Prüfe das Original; fehlende Angaben bedeuten nicht null Steuern.",
 			"unknown_discount_treatment": "Gib an, ob der Rabatt bereits in den Positionen enthalten ist oder abgezogen werden muss.",
 			"unknown_tip_treatment": "Gib an, ob das Trinkgeld bereits enthalten ist oder addiert werden muss.",
@@ -890,6 +892,8 @@
 		"comparison": {
 			"observed": "Beobachtet",
 			"expected": "Erwartet",
+			"calculated": "Berechnet",
+			"inputs": "Ursprüngliche Belegfelder",
 			"tolerance": "Toleranz"
 		},
 		"unknown": "Zusätzlicher Hinweis: {label}. Prüfe das Original oder den Verarbeitungsstatus.",

@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
@@ -20,13 +21,12 @@ from uuid import uuid4
 
 import httpx
 from ollama import ResponseError
-from openai import APIError
+from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError
 from PIL import Image, ImageOps
 from pydantic import ValidationError
 
 from ...helper.deadline import check_deadline, run_sync_before
 from ...helper.document_image import NORMALIZER_VERSION, document_rgb
-from ...helper.duplicates import verify_duplicate
 from ...model.experiment import ExperimentOptions
 from ...model.extraction import (
     SOURCE_PROJECTION_VERSION,
@@ -43,11 +43,18 @@ from ...model.item_category import CATEGORY_CODE_SET, CATEGORY_DEFINITIONS
 from ...model.ocr import SourceRef, WorkingImage
 from ...model.product_tags import canonical_product_tag, product_tag_catalog
 from ...model.receipt import Category, LineItem, Receipt
-from ...model.receipt_extraction import DuplicateCandidate, MultiImageReceipt, validate_overlap
+from ...model.receipt_extraction import (
+    DuplicateCandidate,
+    MultiImageReceipt,
+    SourceLineItem,
+    validate_overlap,
+    verified_overlap_indices,
+)
 from ...model.review import AmountPolicy, ReviewFinding
 from ...service.activation_admission import inference_admission
 from ...service.gpu_handoff import current_owner
 from ...service.observation_admission import admit_observations
+from ...service.receipt_amounts import derive_missing_amounts
 from ...service.receipt_review import observation_values
 from . import DEFAULT_FORMATTER_MAX_OUTPUT_TOKENS, contains_catalog_credential
 from .errors import UnreadableReceiptError
@@ -55,6 +62,10 @@ from .experiment import extraction_prompt, source_extraction_prompt
 from .merchant_choice import candidates_for, merchant_instructions, validated_display_name
 
 TEXT_CAPABILITIES = {"completion", "text", "chat", "vision", "multimodal"}
+FORMATTER_REPAIR_SECONDS = 60.0
+FIELD_CORRECTION_MAX_TOKENS = 2048
+_SAFE_FINISH_REASONS = {"stop", "length", "max_tokens", "content_filter", "load", "unload", "tool_calls"}
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -296,23 +307,33 @@ class LLMProvider(ABC):
         *,
         deadline: float,
         attempts: list[dict[str, Any]],
+        bound_repairs: bool = False,
     ) -> T:
         """One parser/repair loop for live typed input and legacy/replay wrappers."""
         last_error: ValueError | None = None
         partial_error: _PartialDraftError | None = None
+        call_deadline = deadline
         for attempt in range(3):
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                raise TimeoutError("extraction_deadline")
-            before = len(self.experiment_trace or [])
-            async with asyncio.timeout(remaining):
-                content = await self.send_message(model_id, messages)
-            check_deadline(deadline)
-            call = (
-                dict(self.experiment_trace[-1])
-                if self.experiment_trace and len(self.experiment_trace) > before
-                else {}
-            )
+            field_correction = partial_error if isinstance(partial_error, _FieldCorrection) else None
+            phase = "formatter_repair" if attempt else "formatter"
+            sender = self
+            if field_correction is not None:
+                phase = "field_correction"
+                sender = copy(self)
+                sender.max_output_tokens = min(self.max_output_tokens, FIELD_CORRECTION_MAX_TOKENS)
+            try:
+                content, call = await sender._send_logged(
+                    model_id, messages, phase=phase, attempt=attempt + 1, deadline=call_deadline,
+                )
+            except (
+                TimeoutError, APIConnectionError, APIStatusError, ConnectionError, ResponseError,
+                httpx.TransportError, httpx.HTTPStatusError,
+            ) as exc:
+                if partial_error is not None:
+                    owner = current_owner()
+                    if owner is None or not owner.unsettled:
+                        raise partial_error from exc
+                raise
             # These bounded artifacts are owner-scoped by the caller, never general logs.
             call.update(
                 attempt=attempt + 1,
@@ -325,14 +346,18 @@ class LLMProvider(ABC):
                 if not content or len(content) > 200000:
                     raise ValueError("invalid_response_size")
                 candidate = (
-                    await run_sync_before(deadline, partial_error.apply, content)
-                    if isinstance(partial_error, _FieldCorrection)
+                    await run_sync_before(call_deadline, field_correction.apply, content)
+                    if field_correction is not None
                     else content
                 )
-                parsed = await run_sync_before(deadline, parse, candidate)
+                parsed = await run_sync_before(call_deadline, parse, candidate)
                 if isinstance(parsed, InferenceEnvelope):
                     self._record_supplied_fields(call, parsed)
                 return parsed
+            except TimeoutError as exc:
+                if partial_error is not None:
+                    raise partial_error from exc
+                raise
             except ValueError as exc:
                 if isinstance(exc, _FieldCorrection):
                     call["repair_fields"] = list(exc.fields)
@@ -342,7 +367,7 @@ class LLMProvider(ABC):
                         return exc.envelope  # type: ignore[return-value]
                 # A typed draft gets one narrow correction within the original
                 # three-call budget. Keep its observations if the patch fails.
-                if isinstance(partial_error, _FieldCorrection):
+                if field_correction is not None:
                     break
                 if isinstance(exc, _PartialDraftError):
                     partial_error = exc
@@ -351,6 +376,29 @@ class LLMProvider(ABC):
                         break
                     raise _FormatterOutputLimit("formatter_output_limit") from exc
                 last_error = exc
+                if attempt == 2:
+                    break
+                if isinstance(exc, _FieldCorrection):
+                    reason = "invalid_fields"
+                elif isinstance(exc, json.JSONDecodeError):
+                    reason = "invalid_json"
+                elif isinstance(exc, ValidationError):
+                    reason = "invalid_schema"
+                else:
+                    reason = "invalid_response"
+                if bound_repairs and attempt == 0:
+                    now = monotonic()
+                    # Leave room for packaging the draft. A managed request may also
+                    # need its existing cancellation settlement and GPU cleanup windows.
+                    reserve = 65 if current_owner() is not None else min(10, (deadline - now) / 10)
+                    call_deadline = min(now + FORMATTER_REPAIR_SECONDS, deadline - reserve)
+                    if call_deadline <= now:
+                        logger.info("receipt_model_repair state=skipped reason=out_of_time repair_reason=%s", reason)
+                        break
+                logger.info(
+                    "receipt_model_repair state=planned repair_reason=%s next_attempt=%d remaining_ms=%.0f",
+                    reason, attempt + 2, max(0.0, call_deadline - monotonic()) * 1000,
+                )
                 messages = [
                     *messages,
                     {"role": "assistant", "content": content[:200000]},
@@ -366,6 +414,48 @@ class LLMProvider(ABC):
         if partial_error is not None:
             raise partial_error
         raise ValueError("Failed to get a valid response after 3 attempts") from last_error
+
+    async def _send_logged(
+        self, model_id: str, messages: Sequence[Mapping[str, Any]], *,
+        phase: str, attempt: int, deadline: float | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Log local timings and allowlisted telemetry independently of draft publication."""
+        started = perf_counter()
+        before = len(self.experiment_trace or [])
+        call: dict[str, Any] = {}
+        state = "failed"
+        logger.info("receipt_model_call phase=%s state=start attempt=%d max_output_tokens=%d",
+                    phase, attempt, self.max_output_tokens)
+        try:
+            async with asyncio.timeout(None if deadline is None else max(0.0, deadline - monotonic())):
+                if deadline is not None:
+                    check_deadline(deadline)
+                content = await self.send_message(model_id, messages)
+            if deadline is not None:
+                check_deadline(deadline)
+            if self.experiment_trace and len(self.experiment_trace) > before:
+                call = dict(self.experiment_trace[-1])
+            state = "finished"
+            return content, call
+        except (TimeoutError, APITimeoutError, httpx.TimeoutException):
+            state = "timeout"
+            raise
+        except asyncio.CancelledError:
+            state = "cancelled"
+            raise
+        finally:
+            input_tokens = call.get("prompt_tokens", call.get("prompt_eval_count"))
+            output_tokens = call.get("completion_tokens", call.get("eval_count"))
+            reason = call.get("finish_reason")
+            logger.info(
+                "receipt_model_call phase=%s state=%s attempt=%d elapsed_ms=%.0f "
+                "input_tokens=%s output_tokens=%s finish_reason=%s max_output_tokens=%d",
+                phase, state, attempt, (perf_counter() - started) * 1000,
+                input_tokens if type(input_tokens) is int else None,
+                output_tokens if type(output_tokens) is int else None,
+                reason if isinstance(reason, str) and reason in _SAFE_FINISH_REASONS else "unknown",
+                self.max_output_tokens,
+            )
 
     @staticmethod
     def _record_supplied_fields(call: dict[str, Any], envelope: InferenceEnvelope) -> None:
@@ -473,6 +563,7 @@ class LLMProvider(ABC):
                 partial(probe._parse_receipt_input, input=input, prototype=result, vocabulary=tags),
                 deadline=deadline,
                 attempts=attempts,
+                bound_repairs=True,
             )
         except ValueError as exc:
             if isinstance(exc, _PartialDraftError):
@@ -642,7 +733,7 @@ class LLMProvider(ABC):
                 path = ".".join(map(str, error["loc"]))
                 if re.fullmatch(r"line_items\.[0-9]+\.quantity", path):
                     hint = "Use the printed positive quantity, or null when uncertain."
-                elif re.fullmatch(r"taxes\.[0-9]+\.rate", path):
+                elif re.fullmatch(r"taxes\.[0-9]+\.rate|line_items\.[0-9]+\.tax_rate", path):
                     hint = _TAX_RATE_HINT
                 elif re.fullmatch(r"taxes\.[0-9]+\.amount|tax_total|discount_total|tip", path):
                     hint = "Use the printed nonnegative amount, or null when uncertain."
@@ -738,6 +829,7 @@ class LLMProvider(ABC):
         if not isinstance(decisions, list) or any(not isinstance(d, dict) for d in decisions):
             raise ValueError("invalid_overlap_decisions")
         observed_values = observation_values(draft)
+        groups: dict[int, list[tuple[int, int]]] = {}
         if count > 1:
             if "duplicate_candidates" in values:
                 observed_values["duplicate_candidates"] = candidates
@@ -748,7 +840,7 @@ class LLMProvider(ABC):
                     type(i) is not int or not 0 <= i < count for i in sources
                 ) or sources != sorted(sources):
                     raise ValueError("invalid_row_source_order")
-                validate_overlap(
+                groups = validate_overlap(
                     sources, [DuplicateCandidate.model_validate(pair) for pair in candidates]
                 )
                 for index, source in enumerate(sources):
@@ -781,32 +873,36 @@ class LLMProvider(ABC):
                     )
             raise _FieldCorrection(result, payload, corrections)
         removed: set[int] = set()
+        if groups:
+            try:
+                boundary_rows = [SourceLineItem.model_validate(row) for row in observed_values["line_items"]]
+            except ValidationError:
+                pass  # Incomplete rows remain in the raw draft.
+            else:
+                removed = verified_overlap_indices(boundary_rows, groups)
+        if (values.get("line_items_complete") is True and draft.line_items
+                and (count == 1 or "duplicate_candidates" in values)
+                and len(removed) == len(candidates)
+                and all(decision.get("verified") is True for decision in decisions)):
+            relevant = [i for i in range(len(draft.line_items)) if i not in removed]
+            result.findings.extend(derive_missing_amounts(
+                draft, result.amount_policy, relevant, field_sources,
+                tax_summary_complete=values.get("tax_summary_complete") is True,
+            ))
+            result.raw_field_sources = {key: list(refs) for key, refs in field_sources.items()}
+            refreshed = observation_values(draft)
+            observed_values.update({k: v for k, v in refreshed.items() if k != "line_items"})
         try:
             if count > 1:
                 multi = MultiImageReceipt.model_validate(observed_values)
                 receipt = multi.reconciled(count)
-                verified_groups: dict[int, bool] = {}
-                for pair in multi.duplicate_candidates:
-                    source = multi.line_items[pair.first_index].source_image
-                    matches = verify_duplicate(
-                        multi.line_items[pair.first_index], multi.line_items[pair.second_index]
-                    )
-                    verified_groups[source] = verified_groups.get(source, True) and matches
                 result.overlap_decisions = decisions + [
                     dict(
-                        pair.model_dump(),
-                        verified=verified_groups[multi.line_items[pair.first_index].source_image],
-                        removed_index=pair.second_index
-                        if verified_groups[multi.line_items[pair.first_index].source_image]
-                        else None,
+                        pair.model_dump(), verified=pair.second_index in removed,
+                        removed_index=pair.second_index if pair.second_index in removed else None,
                     )
                     for pair in multi.duplicate_candidates
                 ]
-                removed = {
-                    pair.second_index
-                    for pair in multi.duplicate_candidates
-                    if verified_groups[multi.line_items[pair.first_index].source_image]
-                }
                 positions = {
                     old: new
                     for new, old in enumerate(
@@ -956,6 +1052,7 @@ class LLMProvider(ABC):
         class_deadline = min(now + 30, work_deadline - 60)
         reason: EnrichmentReason = "classification_budget_exhausted"
         if class_deadline <= now:
+            logger.info("receipt_classification state=skipped reason=%s", reason)
             return result.model_copy(update={
                 "classification_enrichment": ClassificationEnrichment(
                     state="skipped", reason_code=reason,
@@ -975,8 +1072,9 @@ class LLMProvider(ABC):
                 prompt = await asyncio.to_thread(probe._classification_prompt, result, tuple(tags))
                 if monotonic() < class_deadline:
                     entered_send = True
-                    content = await probe.send_message(model_id, [{"role": "user", "content": prompt}])
-                    call = dict(probe.experiment_trace[-1]) if probe.experiment_trace else {}
+                    content, call = await probe._send_logged(
+                        model_id, [{"role": "user", "content": prompt}], phase="classification", attempt=1,
+                    )
                     call.update(
                         stage="classification",
                         requested_model=model_id,
@@ -997,6 +1095,7 @@ class LLMProvider(ABC):
                 and owner.dispatch_disposition == "settled" and not owner.unsettled
             )
             if entered_send and call is None and not settled:
+                logger.info("receipt_classification state=deferred reason=classification_request_unsettled")
                 raise TimeoutError("classification_request_unsettled")
             result = result.model_copy(deep=True)
             result.classification_enrichment = ClassificationEnrichment(
@@ -1007,6 +1106,8 @@ class LLMProvider(ABC):
             result.telemetry.calls.append(call)
             if isinstance(call.get("elapsed_ms"), (float, int)):
                 result.telemetry.stage_ms["classification"] = call["elapsed_ms"]
+        logger.info("receipt_classification state=%s reason=%s",
+                    result.classification_enrichment.state, result.classification_enrichment.reason_code)
         result.telemetry.elapsed_ms += (perf_counter() - started) * 1000
         check_deadline(work_deadline)
         return result

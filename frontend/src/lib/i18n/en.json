@@ -810,6 +810,7 @@
 			"printed": "Printed subtotal on the same basis as line prices",
 			"printed_net": "Printed net subtotal for the entire receipt",
 			"derived_net": "Calculated net subtotal",
+			"derived_gross": "Calculated gross subtotal",
 			"missing": "Missing",
 			"present": "Present",
 			"explicit_zero": "Explicit zero"
@@ -822,13 +823,14 @@
 	"diagnostics": {
 		"checks": {
 			"missing_mandatory_field": "A required observation is missing. Check the original and complete the field.",
+			"calculated_amount": "This value was calculated from the captured receipt details. Check it against the sources.",
 			"missing_original": "The original photo is missing. Verification requires the original.",
 			"original_integrity_failed": "The original is unavailable or its bytes have changed. Verification is blocked.",
 			"source_integrity_failed": "The source reference does not belong to this document.",
 			"unknown_source_mapping": "The exact source location is unknown. Compare this field with the original.",
 			"ambiguous_overlap": "The overlap between photos needs human review before duplicate rows can be removed.",
 			"unknown_tax_basis": "Specify whether the observed amounts include tax before comparing totals.",
-			"unknown_subtotal_origin": "Choose the subtotal shown for the entire receipt, or identify a calculated net subtotal. A single tax band may cover only part of the receipt.",
+			"unknown_subtotal_origin": "Choose the subtotal shown for the entire receipt, or identify a calculated net or gross subtotal. A single tax band may cover only part of the receipt.",
 			"missing_tax_information": "Tax information is missing. Check the original; missing tax does not mean zero tax.",
 			"unknown_discount_treatment": "Specify whether the discount is already included in the lines or must be subtracted.",
 			"unknown_tip_treatment": "Specify whether the tip is included in the amounts or must be added.",
@@ -890,6 +892,8 @@
 		"comparison": {
 			"observed": "Observed",
 			"expected": "Expected",
+			"calculated": "Calculated",
+			"inputs": "Original receipt fields",
 			"tolerance": "Tolerance"
 		},
 		"unknown": "Additional diagnostic: {label}. Check the original or processing status.",

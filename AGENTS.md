@@ -108,7 +108,9 @@ the current snapshot with history/CAS/request replay. Never overwrite completed
 receipts, human edits or live claims. See the upload guide.
 
 Printed observations live in nullable `ExtractionDraft`. Category and tags are
-optional downstream enrichment. Missing currency and amounts stay missing.
+optional downstream enrichment. Missing currency stays missing. Missing
+amounts may be computed from complete observed rows and sufficient tax and
+adjustment evidence. Record calculated values in review provenance.
 Complete observations can survive safely settled label failure with an explicit
 `classification_enrichment` status. Missing optional labels stay outside
 financial and integrity checks.
@@ -118,8 +120,9 @@ merchant directory. The shared bilingual product tag dictionary lives in
 `src/vision_bill/model/product_tags.json` and is bundled into both the SPA and
 Python package. Benchmarks use frozen references.
 Only proposed adjacent suffix/prefix overlaps that pass shared duplicate verification
-may be removed. Preserve repeated purchases; no global deduplication or blanket
-splitting. `receipt_review.py` checks version 3 performs exact Decimal diagnostics
+may be removed. Preserve repeated purchase observations. The ledger and draft
+editor may aggregate their exact quantities and amounts with projected sources.
+`receipt_review.py` checks version 3 performs exact Decimal diagnostics
 and policy-dependent financial checks without changing printed arithmetic. Review
 exceptions require one exact current finding ID/nonblank comment each; integrity
 findings cannot be waived. Local time supports valid seconds and microseconds.

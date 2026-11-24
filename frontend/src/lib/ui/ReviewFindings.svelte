@@ -55,8 +55,13 @@
 				>{/if}
 			<details class="text-xs text-on-surface-variant">
 				<summary>{$t('editor.details')}</summary>{finding.code} · {finding.field_path}
+				{#if finding.comparison.inputs}<p>
+						{diagnosticLabel($t, 'comparison', 'inputs')}: {finding.comparison.inputs}
+					</p>{/if}
 			</details>
-			{#each Object.entries(finding.comparison) as [key, value] (key)}<p class="text-sm">
+			{#each Object.entries(finding.comparison).filter(([key]) => key !== 'inputs') as [key, value] (key)}<p
+					class="text-sm"
+				>
 					{diagnosticLabel($t, 'comparison', key)}: {value ?? '—'}
 				</p>{/each}
 			{#if finding.source_refs.length && onSource}<button

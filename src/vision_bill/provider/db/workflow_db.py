@@ -59,6 +59,7 @@ from ...service.execution_policy import (
     snapshot_ocr,
 )
 from ...service.observation_admission import admit_observations
+from ...service.receipt_grouping import group_extracted_purchases
 from ...service.receipt_review import (
     editable_draft,
     evaluate_receipt,
@@ -1320,6 +1321,7 @@ class WorkflowDB:
         receipt = await self._publish_extracted_receipt(
             conn, row, extraction_id, envelope, review, checks_version=review.checks_version,
             verified=row["bypass_review"] and review.can_auto_verify,
+            originals=originals,
             completion=checkpoint,
         )
         updated = await conn.fetchrow(
@@ -1341,13 +1343,21 @@ class WorkflowDB:
     async def _publish_extracted_receipt(
         self, conn: asyncpg.Connection, image: Any, extraction_id: UUID,
         envelope: PersistedInferenceEnvelope, review: ReviewEvaluation,
-        *, checks_version: str, verified: bool, completion: ObservationCheckpoint | None = None,
+        *, checks_version: str, verified: bool, originals: list[OriginalAvailability],
+        completion: ObservationCheckpoint | None = None,
     ) -> ReceiptRow:
         assert envelope.receipt is not None
+        document, projected = group_extracted_purchases(envelope.receipt, envelope)
+        if document is not envelope.receipt:
+            review = evaluate_receipt(
+                document, envelope.amount_policy, projected, envelope.overlap_decisions, originals,
+                retained_findings=envelope.findings,
+            )
+            verified = verified and review.can_auto_verify
         fields = {key: [ref.model_dump(mode="json") for ref in refs]
-                  for key, refs in envelope.field_sources.items()}
+                  for key, refs in projected.items()}
         receipt = await self._receipts.insert_receipt(
-            conn, envelope.receipt, image_id=image["id"], user_id=image["user_id"],
+            conn, document, image_id=image["id"], user_id=image["user_id"],
             status="verified" if verified else "unverified", verified=verified,
             category_missing="category" in envelope.classification_enrichment.missing_fields,
         )
@@ -1364,7 +1374,7 @@ class WorkflowDB:
         snapshot: dict[str, Any] = {
             "receipt": receipt.model_dump(mode="json"),
             "extraction_id": str(extraction_id),
-            "document": envelope.receipt.model_dump(mode="json"),
+            "document": document.model_dump(mode="json"),
             "field_sources": fields,
             "collection_ids": [str(link["collection_id"]) for link in await conn.fetch(
                 "SELECT collection_id FROM receipt_collections WHERE receipt_id=$1 ORDER BY collection_id",
@@ -1481,17 +1491,31 @@ class WorkflowDB:
                 receipt = await self._publish_extracted_receipt(
                     conn, row, extraction_id, packed,
                     financial, checks_version=outcome.review.checks_version, verified=verified,
+                    originals=availability,
                 )
                 status = "analyzed"
             elif outcome.kind == "partial":
                 assert envelope is not None and envelope.draft is not None
                 assert payload is not None
-                document = editable_draft(envelope)
+                ungrouped = editable_draft(envelope)
+                document, grouped_sources = group_extracted_purchases(ungrouped, envelope)
                 sources = await self._receipts.suggest_draft_categories(
                     conn, row["user_id"], document,
                     candidate=envelope.receipt.merchant_display_name if envelope.receipt else None,
                 )
                 suggest_product_labels(document)
+                review = outcome.review
+                fields = payload["field_sources"]
+                if document is not ungrouped:
+                    originals = [OriginalAvailability(
+                        part_id=p.part_id, photo_index=p.photo_index, available=True, sha256_matches=True,
+                    ) for p in parts]
+                    review = evaluate_receipt(
+                        document, envelope.amount_policy, grouped_sources, envelope.overlap_decisions, originals,
+                        retained_findings=envelope.findings,
+                    )
+                    fields = {path: [ref.model_dump(mode="json") for ref in refs]
+                              for path, refs in grouped_sources.items()}
                 await conn.execute(
                     """INSERT INTO receipt_drafts(image_id,extraction_id,generation,document,
                     amount_policy,findings,field_sources,overlap_decisions,item_category_sources)
@@ -1507,11 +1531,11 @@ class WorkflowDB:
                     document.model_dump_json(),
                     envelope.amount_policy.model_dump_json(),
                     _json(
-                        [finding.model_dump(mode="json") for finding in outcome.review.findings]
-                        if outcome.review
+                        [finding.model_dump(mode="json") for finding in review.findings]
+                        if review
                         else payload["findings"]
                     ),
-                    _json(payload["field_sources"]),
+                    _json(fields),
                     _json(payload["overlap_decisions"]),
                     _json(sources),
                 )

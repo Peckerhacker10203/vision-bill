@@ -72,9 +72,9 @@ def test_category_component_is_omitted_without_expected_labels() -> None:
 
 
 def test_logical_item_and_tax_contract_versions() -> None:
-    assert PROMPT_VERSION == "6"
-    assert OBSERVATION_PROMPT_VERSION == "5"
-    assert EXTRACTION_SCHEMA_VERSION == "2"
+    assert PROMPT_VERSION == "7"
+    assert OBSERVATION_PROMPT_VERSION == "6"
+    assert EXTRACTION_SCHEMA_VERSION == "3"
     assert SCORING_VERSION == "2"
 
 

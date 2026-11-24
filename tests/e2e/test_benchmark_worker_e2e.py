@@ -65,7 +65,7 @@ async def prepare(w, scope, tmp_path, *, kind="legacy", pipeline="direct_vision"
 async def test_previous_prompt_version_cannot_run_under_current_contract(workflow_db, tmp_path):
     w, scope = workflow_db
     service, run, row, _, inference, _ = await prepare(w, scope, tmp_path, kind="manifest")
-    assert run.prompt_version == "6"
+    assert run.prompt_version == "7"
     # Even a legacy manifest without typed pipeline identity must respect its run's version.
     manifest = await service._db.manifest(run.id)
     manifest.pop("identity")

@@ -67,6 +67,27 @@ def test_classifier_projects_only_the_supported_fields_onto_the_correct_raw_rows
     assert all(row.tags is None for row in raw.line_items)
 
 
+def test_unsettled_draft_labels_recognizable_products_using_only_their_own_rows():
+    names = [
+        "Hackfl. gem. XXL", "Grillfackeln", "HFS S-Nackensteak", "Hähn. Brustf. XXL",
+        "Vitalgebäck", "Energy Editions 250 ml", "Einwegpfand", "Damen Pyjama",
+        "Kinder T-Shirt blau", "Aufkleber Set", "Bio Schweinefleisch 500 g",
+        "Energy Riegel", "Pfandkuchen", "Artikel 25671", "Shorts Aufkleber",
+    ]
+    raw = ExtractionDraft.model_validate({"line_items": [{"description": name} for name in names]})
+    document = editable_draft(make_envelope(raw, state="skipped"))
+    suggest_product_labels(document)
+    assert [(row.spending_category, row.tags) for row in document.line_items] == [
+        ("meat", ["meat"]), ("meat", ["meat"]), ("meat", ["pork", "meat"]),
+        ("meat", ["poultry", "meat"]), ("bread_bakery", ["pastries"]),
+        ("soft_drinks", ["soft_drinks", "beverage"]), ("deposit", ["deposit"]),
+        ("clothing", ["clothing"]), ("clothing", ["clothing"]), ("other", ["stationery"]),
+        ("meat", ["pork", "meat", "organic"]), (None, None), (None, None),
+        (None, None), (None, None),
+    ]
+    assert material_document(document) == material_document(raw)
+
+
 def test_unresolved_receipt_category_and_human_label_are_preserved():
     canonical = receipt(("Möhren",))
     raw = ExtractionDraft.model_validate({"line_items": [{"description": "Möhren", "tags": []}]})

@@ -40,7 +40,7 @@ class AmountPolicy(BaseModel):
     tip_treatment: Literal["included", "add", "outside_receipt", "none", "unknown"] = "unknown"
     # Existing "printed" records use the line-item tax basis. "printed_net" is an
     # explicitly printed net subtotal for the whole transaction, across tax rates.
-    subtotal_origin: Literal["printed", "printed_net", "derived_net", "unknown"] = "unknown"
+    subtotal_origin: Literal["printed", "printed_net", "derived_net", "derived_gross", "unknown"] = "unknown"
     tax_information: Literal["present", "explicit_zero", "missing"] = "missing"
 
 

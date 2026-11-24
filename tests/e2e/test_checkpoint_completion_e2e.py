@@ -158,7 +158,6 @@ async def test_last_attempt_completes_from_saved_observations(workflow_db, setti
     w, scope = workflow_db
     original, checkpoint, service, llm = await produce_checkpoint(
         w, scope, settings, tmp_path, ocr=ocr, expired=ocr, historical=historical,
-        contract_versions={"prompt_version": "5"} if historical else None,
     )
     image_id = original.image.id
     producer_before, _, _ = await state(w, image_id)
@@ -426,6 +425,7 @@ async def test_managed_checkpoint_waits_for_safe_owned_recovery(
 @pytest.mark.parametrize("contract_versions", [
     {"prompt_version": "4"}, {"extraction_schema_version": "1"},
     {"prompt_version": "4", "extraction_schema_version": "1"},
+    {"prompt_version": "5", "extraction_schema_version": "2"},
 ])
 async def test_prior_formatter_checkpoint_holds_until_explicit_new_generation(
     workflow_db, settings, tmp_path, contract_versions,

@@ -102,6 +102,14 @@ def source_extraction_prompt(
         props = obj.get("properties", {})
         for name in ("category", "spending_category", "tags", "merchant_display_name"):
             props.pop(name, None)
+    schema["properties"]["line_items_complete"] = {
+        "type": "boolean",
+        "description": "True only if all charged and credited positions and any separate "
+                       "discounts, fees and tips are legible and accounted for across all photos.",
+    }
+    schema["properties"]["tax_summary_complete"] = {
+        "type": "boolean", "description": "True only when every printed tax band and amount is legible.",
+    }
     line_schema = schema.get("$defs", {}).get("DraftLineItem", {})
     line_schema.setdefault("properties", {})["source_image"] = {"type": "integer", "minimum": 0}
     observed = (
@@ -139,13 +147,15 @@ def source_extraction_prompt(
         "no tip, otherwise unknown. Set subtotal_origin to printed for a printed subtotal on "
         "the same basis as the items, or printed_net for an explicitly printed receipt-wide "
         "net subtotal, including a net grand total in a tax table. The net base of one tax band "
-        "alone does not establish a printed receipt-wide subtotal. If no subtotal is printed, "
-        "use derived_net only when all lines and their tax evidence establish the net amount "
-        "before separate discounts and tips. For example, with gross items totaling 11.90, "
-        "included VAT of 1.90 and no adjustments, the derived net subtotal is 10.00 and the "
-        "charged total stays 11.90. Leave subtotal null and origin unknown if ambiguous. "
-        "tax_information present means observed tax "
-        "information, explicit_zero requires printed zero/exempt evidence, missing means absent "
+        "alone does not establish a printed receipt-wide subtotal. Leave missing receipt totals, "
+        "subtotal and VAT amounts null for deterministic calculation. Set line_items_complete "
+        "false if positions or adjustments may be cut off, obscured or missing. Record a printed "
+        "tax band in each position's tax_code and a directly printed percentage in tax_rate. "
+        "For a tax legend such as A 7% and B 19%, keep separate taxes rows with the printed "
+        "band as name and fractional rate. Letters vary by receipt. A missing or unreadable "
+        "percentage is null, never 0. Preserve tax-coded discounts and refunds as signed "
+        "positions if already counted in the line amounts. Tax_information present means "
+        "observed tax information, explicit_zero requires printed zero/exempt evidence, missing means absent "
         "or unreadable and must never be inferred as zero. Do not invent financial defaults. "
         "Also include duplicate_candidates as pairs {first_index,second_index} only for the "
         "complete ordered suffix/prefix overlap between adjacent photos. Never search globally "

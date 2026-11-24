@@ -76,7 +76,7 @@ async def test_old_extraction_schema_gold_requires_new_confirmation(workflow_db,
         await b.current_reference(row.id, scope=scope)
     fresh = await b.reference_preview(row.id, scope=scope)
     assert fresh.expected == old.expected and fresh.review_revision == old.review_revision
-    assert old.schema_version == "1" and fresh.schema_version == "2"
+    assert old.schema_version == "1" and fresh.schema_version == extraction.EXTRACTION_SCHEMA_VERSION
     current = await b.qualify_reference(row.id, fresh.review_revision, fresh.document_sha256, scope=scope)
     assert current.id != old.id
     async with w.pool.acquire() as conn:

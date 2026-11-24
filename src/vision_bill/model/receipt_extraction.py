@@ -1,5 +1,7 @@
 """Multi-photo extraction metadata, kept separate from the persisted receipt schema."""
 
+from decimal import Decimal
+
 from pydantic import BaseModel, Field
 
 from ..helper.duplicates import verify_duplicate
@@ -7,6 +9,8 @@ from .receipt import LineItem, Receipt
 
 
 class SourceLineItem(LineItem):
+    tax_code: str | None = None
+    tax_rate: Decimal | None = None
     source_image: int = Field(ge=0, strict=True, description="Zero-based input photo index")
 
 
@@ -29,10 +33,7 @@ class MultiImageReceipt(Receipt):
             )
         groups = validate_overlap(sources, self.duplicate_candidates)
 
-        removed: set[int] = set()
-        for pairs in groups.values():
-            if all(verify_duplicate(self.line_items[a], self.line_items[b]) for a, b in pairs):
-                removed.update(b for _, b in pairs)
+        removed = verified_overlap_indices(self.line_items, groups)
 
         payload = self.model_dump(exclude={"duplicate_candidates", "line_items"})
         payload["line_items"] = [
@@ -41,6 +42,20 @@ class MultiImageReceipt(Receipt):
             if index not in removed
         ]
         return Receipt.model_validate(payload)
+
+
+def verified_overlap_indices(
+    rows: list[SourceLineItem], groups: dict[int, list[tuple[int, int]]],
+) -> set[int]:
+    """Only collapse an entire verified boundary with consistent position tax evidence."""
+    removed: set[int] = set()
+    for pairs in groups.values():
+        if all(
+            rows[a].tax_code == rows[b].tax_code and rows[a].tax_rate == rows[b].tax_rate
+            and verify_duplicate(rows[a], rows[b]) for a, b in pairs
+        ):
+            removed.update(b for _, b in pairs)
+    return removed
 
 
 def validate_overlap(

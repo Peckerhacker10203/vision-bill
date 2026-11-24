@@ -1353,6 +1353,47 @@ async def test_draft_null_cas_human_edit_and_owner_scope(workflow_db):
         )
 
 
+@pytest.mark.parametrize("kind", ["complete", "partial"])
+async def test_purchase_grouping_keeps_raw_extraction_in_draft_and_receipt(workflow_db, kind):
+    from vision_bill.model.extraction import ExtractionDraft
+
+    w, scope = workflow_db
+    image = await enqueue(w, scope)
+    outcome = complete(total="0.58")
+    assert outcome.envelope is not None
+    receipt = outcome.envelope.receipt
+    assert receipt is not None
+    rows = [{"description": "Energy Editions", "total_price": "0.29"}] * 2
+    data = receipt.model_dump() | {"line_items": rows}
+    outcome.envelope.draft = ExtractionDraft.model_validate(data)
+    if kind == "partial":
+        outcome.envelope.draft.total = None
+        outcome.envelope.receipt = None
+        outcome = AttemptOutcome(kind="partial", envelope=outcome.envelope)
+    else:
+        outcome.envelope.receipt = Receipt.model_validate(data)
+    finished = await w.finish_attempt(await w.claim_next(), outcome)
+    assert not finished.stale
+    if kind == "complete":
+        assert finished.receipt is not None
+        stored = await w._receipts.get_receipt_with_details(finished.receipt.id, user_id=scope.user_id)
+        assert stored is not None
+        items = stored.line_items
+    else:
+        draft = await w.get_draft(image.id, scope=scope)
+        assert draft is not None and draft.document.line_items
+        items = draft.document.line_items
+        assert items[0].spending_category == "soft_drinks"
+    assert len(items) == 1
+    assert items[0].quantity == 2 and items[0].total_price == Decimal("0.58")
+    async with w.pool.acquire() as conn:
+        raw_count = await conn.fetchval(
+            "SELECT jsonb_array_length(envelope #> '{draft,line_items}') FROM receipt_extractions WHERE image_id=$1",
+            image.id,
+        )
+    assert raw_count == 2
+
+
 async def test_clear_checkpoint_is_fenced_and_retains_immutable_views(workflow_db):
     from vision_bill.model.workflow import OcrCheckpoint
 

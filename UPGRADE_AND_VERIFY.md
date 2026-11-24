@@ -255,21 +255,22 @@ It makes no new OCR, formatter or classification request. A failed optional
 classification leaves usable observations and records the label outcome. A
 request whose delivery or settlement is uncertain keeps the checkpoint on hold.
 
-New benchmark runs use prompt version 6 for the bilingual tag and category
-classifier. Historical runs keep their results and recorded prompt version.
-Create a new run to evaluate the new classifier on the same references. Changing
-a merchant display name preserves the receipt dataset fingerprint.
+New benchmark runs use prompt version 7. Historical runs keep their results
+and recorded prompt version. Reconfirm a qualified receipt reference when the
+extraction schema changes. Changing a merchant display name preserves the
+receipt dataset fingerprint. The app benchmark can match separately extracted
+purchases to a grouped receipt reference when their quantities, unit prices
+and amounts agree. Dedicated benchmark cases retain their annotated rows.
 
-Complete observation checkpoints keep formatter contract version 5 and
-extraction schema 2, so they can still complete after this upgrade. The schema
-distinguishes an explicitly printed receipt-wide net subtotal from a printed
-subtotal on the same basis as the items. Completed receipts and saved drafts
-retain their values. A complete checkpoint from prompt 4 or schema 1 waits with
+New complete observation checkpoints use formatter contract version 6 and
+extraction schema 3, including optional position tax evidence. Completed receipts
+and saved drafts retain their values. An older complete checkpoint waits with
 `execution_policy_changed`. To extract again, explicitly retry with current
 policy after reconciling any outstanding model request. The retry archives the
 old observation and starts a new generation. Pending uploads without a complete
 observation use the installed formatter once their saved routing policy permits
-inference.
+inference. See [multi-photo receipts](MULTI_IMAGE_RECEIPTS.md#extraction-and-source-evidence)
+for calculation and correction behavior.
 
 For an unmanaged classification hold, inspect and reconcile the exact submitted
 image using the configured endpoint identity. In a prepared bundle use the

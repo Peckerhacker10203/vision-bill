@@ -59,6 +59,7 @@ from .experiment_scoring import (
 )
 from .extraction_pipeline import OcrRuntimeChangedError, OriginalSourceChangedError
 from .gpu_handoff import ModelHandoff, admission_deadline, handoff_resource_identity
+from .receipt_grouping import match_grouped_reference
 from .receipt_service import ReceiptService
 
 logger = logging.getLogger(__name__)
@@ -179,6 +180,7 @@ class BenchmarkService:
             "ocr_fingerprint": ocr_fingerprint(getattr(self._receipts, "_ocr_provider", None)),
             "prompt_hashes": {str(count): sha256(probe.build_prompt(tags, image_count=count).encode()).hexdigest() for count in counts},
             "validation_schema_sha256": validation_schema_sha256(),
+            "receipt_purchase_grouping": True,
             "thinking_default": "server-controlled" if options.think is None else "explicit",
         }
 
@@ -644,6 +646,12 @@ class BenchmarkService:
         result.metadata["requested_pipeline"] = manifest["options"]["pipeline"]
         result.metadata["resolved_pipeline"] = result.metadata.get("used_pipeline", item["pipeline"])
         result.metadata["image_hashes"] = [image["sha256"] for image in item["images"]]
+        if (
+            manifest.get("receipt_purchase_grouping")
+            and "reference" in item and "case_id" not in item
+            and isinstance(expected, Receipt)
+        ):
+            result.receipt = match_grouped_reference(expected, result.receipt, result.metadata)
         return expected, result
 
     @staticmethod

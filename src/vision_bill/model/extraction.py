@@ -13,9 +13,9 @@ from .receipt import Category, Currency, LineItem, MerchantDisplayName, Receipt,
 from .review import AmountPolicy, ReviewFinding, SourceView
 
 # Completion-only recovery uses saved observations and never reruns optional classification.
-OBSERVATION_PROMPT_VERSION = "5"
-# Version 2 distinguishes an explicitly printed net subtotal from a line-basis subtotal.
-EXTRACTION_SCHEMA_VERSION = "2"
+OBSERVATION_PROMPT_VERSION = "6"
+# Version 3 captures printed per-position VAT evidence for deterministic amount derivation.
+EXTRACTION_SCHEMA_VERSION = "3"
 SOURCE_PROJECTION_VERSION = "2"
 PaymentMethod = Literal[
     "cash", "credit_card", "debit_card", "mobile_payment", "check", "other", "unknown"
@@ -87,6 +87,13 @@ class DraftLineItem(BaseModel):
             "Signed amount charged for the whole row. Preserve printed signs on returns, "
             "deposits and credits."
         ),
+    )
+    tax_code: str | None = Field(
+        None, max_length=32, description="Tax band printed on this position, e.g. A or B."
+    )
+    tax_rate: Decimal | None = Field(
+        None, ge=0, le=1,
+        description="Rate printed on this position, as a fraction. A letter alone is not a rate.",
     )
     tags: list[str] | None = None
 

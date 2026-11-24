@@ -5,7 +5,7 @@ import json
 import re
 from collections.abc import Sequence
 from datetime import date
-from decimal import Decimal, localcontext
+from decimal import Decimal, InvalidOperation, localcontext
 from typing import Any, Literal, cast
 from uuid import UUID
 
@@ -67,35 +67,67 @@ def editable_draft(envelope: InferenceEnvelope | PersistedInferenceEnvelope) -> 
 _PRODUCT_NAMES = {
     "möhre": "carrots", "möhren": "carrots", "karotte": "carrots", "carrot": "carrots",
     "remoulade": "sauces", "p&w remoulade": "sauces",
-    "shorts": "clothing",
+    "vitalgebäck": "pastries", "vitalgebäck mischung": "pastries",
+    "grillfackel": "meat", "grillfackeln": "meat", "nackensteak": "meat",
+    "rinderhack": "beef", "schweinenackensteak": "pork",
+    "flaschenpfand": "deposit", "einwegpfand": "deposit", "mehrwegpfand": "deposit",
+    "pfandrückgabe": "deposit", "leergut": "deposit", "bottle deposit": "deposit",
+    "energy editions": "soft_drinks", "energy drink": "soft_drinks", "energydrink": "soft_drinks",
+    "aufkleber": "stationery", "aufkleber set": "stationery", "sticker set": "stationery",
 }
 _PRODUCT_GROUPS = {
-    "carrots": "vegetables", "tomatoes": "vegetables", "onions": "vegetables",
-    "potatoes": "vegetables", "apples": "fruit", "bananas": "fruit", "berries": "fruit",
-    "bread": "bread_bakery", "rolls": "bread_bakery", "sauces": "sauces_spices",
-    "rice": "pasta_rice_grains", "pasta": "pasta_rice_grains", "butter": "butter_spreads",
-    "coffee": "coffee_tea", "tea": "coffee_tea",
+    tag: category for category, tags in {
+        "vegetables": "carrots tomatoes onions potatoes salad mushrooms",
+        "fruit": "apples bananas berries citrus", "bread_bakery": "bread rolls pastries",
+        "meat": "beef pork poultry sausages", "fish": "seafood", "milk": "plant_milk",
+        "pasta_rice_grains": "rice pasta", "cereals": "oats cereal",
+        "butter_spreads": "butter spreads", "sauces_spices": "sauces spices",
+        "coffee_tea": "coffee tea", "soft_drinks": "juice", "alcohol": "beer wine",
+        "snacks_sweets": "biscuits chips chocolate ice_cream sweets",
+        "cleaning": "cleaning_products laundry_detergent dish_soap dishwasher_tablets",
+        "personal_care": "hygiene cosmetics shampoo soap toothpaste deodorant menstrual_products",
+        "health": "medicines first_aid", "household": "bin_bags kitchenware paper_towels toilet_paper",
+        "services": "service subscription", "clothing": "shoes", "hardware": "tools",
+        "pet": "pet_food", "other": "books magazines stationery toys flowers",
+    }.items() for tag in tags.split()
 }
+
+
+def _product_tag(product: str) -> str | None:
+    # Strip abbreviation periods, e.g. "Hackfl. gem.", while retaining word boundaries.
+    product = re.sub(r"(?<=\w)\.(?=\s|$)", "", product)
+    if re.fullmatch(r"(?:hackfl(?:eisch)?|minced meat)(?: (?:gem|gemischt))?", product):
+        return "meat"
+    if re.fullmatch(r"(?:hfs )?s[- ]nackensteaks?", product):
+        return "pork"
+    if re.fullmatch(r"(?:hähn(?:chen)?[- ]?brust(?:f(?:ilet)?)?|chicken breast)", product):
+        return "poultry"
+    if re.fullmatch(
+        r"(?:h&m )?(?:(?:damen|herren|kinder)[ -])?"
+        r"(?:shorts|pyjamas?|schlafanzug|t[- ]?shirts?|jeans|pullover|leggings)"
+        r"(?: (?:blau|blue|schwarz|black|weiss|white|xs|s|m|l|xl))*", product,
+    ):
+        return "clothing"
+    return _PRODUCT_NAMES.get(product) or canonical_product_tag(product)
 
 
 def suggest_product_labels(document: ExtractionDraft) -> None:
     """Seed empty editable labels from identifiable products; retain explicit empty tag lists."""
     for row in document.line_items or []:
         name = " ".join((row.description or "").casefold().split())
-        # Receipt rows often include package size or a garment colour after the product.
-        name = re.sub(r"\s+\d+(?:[.,]\d+)?\s*(?:g|kg|ml|l)$", "", name)
-        if re.fullmatch(r"(?:h&m )?shorts (?:blau|blue|schwarz|black|weiss|white)", name):
-            name = "shorts"
+        name = re.sub(r"(?:\s+(?:xxl|\d+(?:[.,]\d+)?\s*(?:kg|g|ml|cl|l)))+$", "", name)
         organic = name.startswith(("bio ", "bio-", "organic "))
         product = re.sub(r"^(?:bio[ -]|organic )", "", name)
-        tag = _PRODUCT_NAMES.get(product) or canonical_product_tag(product)
+        tag = _product_tag(product)
         if tag is None:
             continue
         category = _PRODUCT_GROUPS.get(tag, tag)
         if row.tags is None:
             row.tags = [tag]
-            if tag != category and category in {"fruit", "vegetables"}:
+            if tag != category and category in {"fruit", "vegetables", "meat"}:
                 row.tags.append(category)
+            if category == "soft_drinks":
+                row.tags.append("beverage")
             if organic and tag != "organic":
                 row.tags.append("organic")
         if row.spending_category in (None, "unknown") and category in CATEGORY_CODE_SET:
@@ -168,6 +200,24 @@ def material_document(receipt: Receipt | ExtractionDraft) -> dict[str, Any]:
     for tax in data.get("taxes") or []:
         tax["rate"] = _review_factor(tax["rate"])
     return _canonical(data)  # type: ignore[no-any-return]
+
+
+def _still_calculated(receipt: Receipt | ExtractionDraft, finding: ReviewFinding) -> bool:
+    amount = finding.comparison.get("calculated")
+    if amount is None:
+        return False
+    value: Any = receipt
+    for segment in finding.field_path.split("."):
+        if isinstance(value, list):
+            if not segment.isdecimal() or int(segment) >= len(value):
+                return False
+            value = value[int(segment)]
+        else:
+            value = getattr(value, segment, None)
+    try:
+        return isinstance(value, Decimal) and value == Decimal(amount)
+    except InvalidOperation:
+        return False
 
 
 def evaluate_receipt(
@@ -362,6 +412,8 @@ def evaluate_receipt(
                     expected += tip
                 compare("amount_discrepancy", "total", complete.total, expected, "0.05")
     for retained in retained_findings:
+        if retained.code == "calculated_amount" and not _still_calculated(receipt, retained):
+            continue
         if not any(
             f.code == retained.code and f.field_path == retained.field_path for f in findings
         ):

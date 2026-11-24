@@ -93,16 +93,30 @@ Ollama and OpenAI-compatible endpoints receive the same field instructions and
 nullable draft schema. In OCR mode the formatter receives the ordered transcript,
 layout blocks and permitted source references for each photo. A product name,
 its size or colour and a price on the following line can describe one purchase.
-Two separately priced occurrences of the same product remain two items. If a
-distinct purchase has an unreadable price, its price stays open for review.
+The extraction retains every separately priced occurrence. The draft editor
+and saved receipt can combine matching purchases at the same unit price and tax
+band by adding the quantities and line amounts. Combined rows retain the
+source references of their occurrences. Unresolved photo overlaps and
+unreadable prices remain available for review.
 
 Vision Bill validates the returned JSON before preparing the review form.
 For example, a printed 19% belongs in the tax-rate field as `0.19`. If the
 model returns `19`, the formatter can ask once for just that field using the
-same evidence and the remaining time and call budget. Other observations stay
-in place. An unusable correction leaves the draft available for manual review
-when the formatting call finishes. The optional category and tag step only
-fills labels. [Review and financial contract](UPGRADE_AND_VERIFY.md#review-and-financial-contract)
+same evidence. Live formatting corrections share up to 60 seconds of the
+original attempt and reserve time to save validated observations. A targeted
+field correction uses up to 2,048 output tokens. An unusable correction can
+still leave a validated draft for manual review. The application log records
+the model phase, runtime, token counts where returned, stop reason and
+validation category. Editable drafts suggest categories and tags for recognized
+products alongside any labels already supplied.
+
+Missing totals can be calculated when the captured rows and adjustments identify
+the complete charge. VAT needs a rate and an unambiguous base for every relevant
+tax band. An unallocated discount across several tax bands can leave those
+amounts unresolved while the gross subtotal remains calculable. Calculated
+values carry an informational review notice with source evidence. Readable
+printed totals keep precedence.
+[Review and financial contract](UPGRADE_AND_VERIFY.md#review-and-financial-contract)
 
 Only model-proposed ordered suffix/prefix overlaps between adjacent photos may be
 removed. `helper/duplicates.py::verify_duplicate` checks description, quantity and
