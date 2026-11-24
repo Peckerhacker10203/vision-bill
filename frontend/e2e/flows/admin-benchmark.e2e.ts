@@ -52,7 +52,7 @@ test.describe('admin: benchmarks', () => {
 		await expect(individual).toContainText('Extraction 100.0%');
 		await individual.click();
 		const details = page.locator('details').filter({ has: individual });
-		await expect(details.getByText('All confirmed fields correct', { exact: true })).toBeVisible();
+		await expect(details.getByText('Fully correct receipt', { exact: true })).toBeVisible();
 		await page.getByRole('link', { name: 'Reuse this receipt selection' }).click();
 		await expect(page).toHaveURL(/\/benchmarks$/);
 		await expect(page.getByPlaceholder('Comma-separated receipt UUIDs')).toHaveValue(receiptId);
