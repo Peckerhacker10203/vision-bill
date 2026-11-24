@@ -37,6 +37,10 @@ def test_native_context_admits_contract_and_build_inputs_without_app_or_private_
         "ocr_contract/wire_json.py",
         "ocr_service/api.py", "ocr_service/worker.py", "build/build_rocm.sh",
         "build/prepare_therock.sh", "build/build_jobs.py", "build/hip-rdna2-v1.patch",
+        "build/build_therock.sh", "build/finish_therock.sh", "build/verify_therock_targets.py",
+        "build/verify_rccl_targets.py", "build/therock-sqlite-headers.patch",
+        "build/therock-rccl-translate.patch",
+        "build/therock-hipblaslt-rdna2.patch", "build/rocm-libraries-hipblaslt-rdna2.patch",
         "profile.json", "runtime-lock.json", "requirements.cuda-build.lock",
         "requirements.runtime.lock", "requirements.cuda.attestation.json", "server.py",
     ]

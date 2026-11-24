@@ -54,8 +54,8 @@ checkout and the documented `--upgrade` procedure after backup and drain.
 A stopped, settled original deployment with its records, release and volumes intact
 can rebuild deleted app or OCR images through `--upgrade`. The read-only handoff
 check uses a separate pinned CPU image. `--restart` needs the recorded images.
-If the native build succeeded before the app build failed, retry the upgrade
-with the saved native image tag. [Source upgrade and retry steps](paddleocr-service/README.md#upgrade-an-existing-source-installation)
+If the native build succeeded before the app build failed, retry with the
+saved native image tag if its OCR inputs match the updated checkout. [Source upgrade and retry steps](paddleocr-service/README.md#upgrade-an-existing-source-installation)
 
 For a CUDA source rebuild, keep the selected channel, resolved lock,
 attestation and private wheel cache, including its `build-…` snapshots. A
@@ -63,9 +63,9 @@ snapshot can verify a saved native image even if the checkout has since built
 another channel. Source installations recheck the recorded CUDA GPU UUID when
 present. For ROCm, use the original GPU.
 On hosts with several AMD GPUs, set its Linux render node or its WSL HIP
-device index and GFX target. New local builds select the host GPU interface
-and architecture. Keep the previous image tag and build evidence with the
-backup. [GPU selection and build inputs](paddleocr-service/README.md#build-inputs)
+device index and GFX target. To adopt the corrected SDK target lists and
+BuildKit checkpoints, rebuild the ROCm image once with `--upgrade`. Keep the
+previous image tag and build evidence with the backup. [Linux and Windows/WSL upgrade commands](paddleocr-service/README.md#upgrade-an-existing-source-installation) · [GPU selection and build inputs](paddleocr-service/README.md#build-inputs)
 
 For a prepared upgrade, keep the old Compose project name and volume mounts.
 Use a schema-v2 bundle for the new installation. Changing the extraction directory

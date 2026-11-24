@@ -227,14 +227,24 @@ python3 scripts/ocr_source_up.py cuda --restart
 During a source build, `ocr_source_phase` reports the CUDA or ROCm image
 build, native image configuration verification and app image build. The final
 line for each phase includes `elapsed_s` and a status of `complete` or
-`interrupted`. Within a running ROCm build, BuildKit logs report
-`ocr_rocm_phase` and wall-clock `elapsed_s` for TheRock source preparation
-(`therock_sources`), the SDK compilation (`sdk_compile`), Paddle source
-preparation (`paddle_sources`) and the Paddle wheel build (`paddle_compile`).
-Use `BUILDKIT_PROGRESS=plain` to retain the lines. A cached layer has no new
-phase timing. The `ocr_source_image` line gives the image ID and Docker's
-logical `image_size_bytes`. Shared layers, the build cache and downloaded
-model files affect actual disk usage separately.
+`interrupted`. Use `BUILDKIT_PROGRESS=plain` to see individual build steps.
+For ROCm, check the launcher's `Local ROCm build` line for the selected
+transport and GFX targets. Inside the build, `ocr_rocm_phase` reports
+wall-clock seconds for preparing TheRock (`therock_prepare`), compiling LLVM
+(`llvm_compile`) and finishing the SDK (`therock_finish`). Source preparation
+(`therock_sources`) is part of `therock_prepare`. The finish phase includes
+RCCL configuration and its prerequisite builds (`rccl_configure`), followed
+by the remaining SDK compilation (`sdk_compile`). Paddle reports `paddle_sources` and
+`paddle_compile`. A BuildKit cache hit shows `CACHED` and has no new phase
+timing.
+
+`ocr_rocm_checkpoint` reports the directory `path` and its `allocated_bytes`
+before cleanup. Compare the build tree after `prepare`, `llvm` and `finish`.
+Successive measurements can include the same files. The image retains the
+measurements in `/opt/ocr/build-evidence/therock-checkpoints.txt`.
+The launcher's `ocr_source_image` line gives the image ID and Docker's
+logical `image_size_bytes`. For disk usage on this builder, inspect the
+BuildKit cache separately. Downloaded models occupy their own volume.
 
 If the native image finished building before initial preparation was interrupted,
 use `--reuse-native-image` with the local `source-build-…` tag printed by the launcher.
@@ -341,10 +351,39 @@ docker compose --profile ocr -f docker-compose.yml -f docker-compose.cuda.yml \
 python3 scripts/ocr_source_up.py cuda --upgrade
 ```
 
-If you originally selected a custom project name, use that same `-p NAME` on
-the stop command. For ROCm use `rocm` in the overlay name, directory and launcher
-argument. On ROCm WSL, include `-f docker-compose.rocm-wsl.yml` between the
-ROCm overlay and the generated `compose.local.json`.
+If you originally selected a custom project name, add the same `-p NAME` to
+the stop command. For an existing **ROCm** source installation, choose the
+stop command for the host that owns the original Docker project.
+
+**Native Linux**
+
+```bash
+docker compose --profile ocr -f docker-compose.yml -f docker-compose.rocm.yml \
+  -f server_data/ocr-source/rocm/compose.local.json down
+```
+
+**Windows with WSL 2** — open the Ubuntu distro running Docker Engine, change
+to the original checkout and run this in its shell.
+
+```bash
+docker compose --profile ocr -f docker-compose.yml -f docker-compose.rocm.yml \
+  -f docker-compose.rocm-wsl.yml -f server_data/ocr-source/rocm/compose.local.json down
+```
+
+On either ROCm host, update that checkout to the desired revision, keeping
+`server_data/` and `.env`. Run the upgrade in the same shell. This Bash example
+retains the build log and propagates a failed build's exit status.
+
+```bash
+set -o pipefail
+BUILDKIT_PROGRESS=plain python3 scripts/ocr_source_up.py rocm --upgrade 2>&1 | tee -a ~/vision-bill-rocm-upgrade.log
+```
+
+Moving from the old single-step TheRock build to this recipe requires one
+rebuild to create the new intermediate layers. A normal `--restart` starts
+the recorded images. If the initial installation failed during its native
+build, update the checkout and rerun `python3 scripts/ocr_source_up.py rocm`
+with the same GPU selection. [ROCm build inputs and cache](#build-inputs)
 
 **If the native build finished but the app build failed on `server_data/config`**,
 keep that directory's private permissions. The app image builds from repository
@@ -585,10 +624,18 @@ It skips the documentation-only root submodule `rocm-docs`. Its exact Git
 pin remains in the root gitlink inventory and in `omitted_root_gitlinks`.
 The builder checks the source inventory
 before building `patchelf` and reports the path and pin of a missing checkout.
-Retries on the same BuildKit builder can reuse verified upstream DVC downloads.
+BuildKit caches the configured source/build tree and then the staged AMD LLVM
+toolchain in separate layers. If the rest of the SDK fails, retry the original
+command on the same builder. Completed layers with matching inputs can be
+reused while their cache entries exist. An interrupted step restarts at its
+beginning. LLVM is the last checkpoint before the SDK finish step, where the
+profiler and rocSHMEM follow TheRock's dependency order. The DVC download
+cache can also reuse verified assets.
 
 Upstream estimates approximately 200 GB free and several hours for a TheRock
-source build. Check free space on the filesystem used by the Docker builder.
+source build. The intermediate layers retain large trees for later retries.
+Check free space on the builder's filesystem and use `docker buildx du` to
+inspect its cache usage.
 [TheRock source build requirements at the selected commit](https://github.com/ROCm/TheRock/blob/b324869fb3116353ac7eec5e6926aa3d452ac987/README.md#building-from-source)
 
 `OCR_BUILD_JOBS=auto` is the local ROCm default. Inside the builder it selects
@@ -599,9 +646,12 @@ The setting applies to each CMake build and concurrent submodule fetches.
 TheRock can run multiple subprojects at once,
 so their combined compiler count can exceed this setting. LLVM linking and
 background builds each use one job, and Flang compilation uses at most two.
-The local SDK omits Mirage and hipDNN samples. Model weights
-are provisioned separately for qualification. The versioned patch replaces both
-legacy HIP target lists, uses the flat SDK and same-pin legacy FindHIP helpers,
+The builder supplies `/usr/bin/python3` for AMD-SMI and `tclsh` for the
+profiler's SQLite source generator. Projects that use TheRock's pinned SQLite
+receive its headers through CMake. The local SDK omits Mirage and hipDNN
+samples. Model weights are provisioned separately for qualification. The
+versioned Paddle patch replaces both legacy HIP target lists, uses the flat
+SDK and same-pin legacy FindHIP helpers,
 requires MIOpen, and stops the forced download of FlashAttention. FP32 runs with
 FlashAttention off.
 
@@ -625,16 +675,35 @@ explicitly. The Make target and source launcher perform host discovery.
 For a direct Dockerfile build, pass the target list as the build argument
 `AMDGPU_TARGETS` and the chosen interface as `OCR_ROCM_TRANSPORT`.
 
-Selection changes both TheRock settings and Paddle HIP compiler inputs and is
-sealed into `kernels.json`. It does not prove support: even syntactically accepted
-architectures must compile, provide inspected libraries/kernels and pass the
-physical gate on that exact board. The actual observed HIP architecture must
-match the embedded selected profile. Rebuild/requalify after profile changes;
-there is no runtime allowlist or architecture spoofing. Intended Linux consumer
-scope starts at RX6000/RDNA2 and includes later build candidates requiring their
-own physical qualification; no board is actually qualified here.
-Optional upstream exclusions (including hipBLASLt's gfx1100 fallback) stay intact;
-their host headers/APIs are retained, with no claim of RDNA2 fused/Lt kernels.
+The same selected GFX list goes to Paddle's HIP compiler and TheRock's
+`THEROCK_AMDGPU_TARGETS`, `THEROCK_DIST_AMDGPU_TARGETS` and
+`THEROCK_TEST_AMDGPU_TARGETS`. The pinned RCCL library uses the test target
+list even with tests disabled. Earlier builds left that list empty, so TheRock
+expanded it to every registered architecture. Before compiling LLVM, the
+recipe checks the generated communication, math and ML library toolchains.
+RCCL, rocBLAS and MIOpen must have the full selected list. Optional libraries
+may use a subset. The optional `rccl-translate` step extracts device code
+from `librccl.so` and runs only if RCCL's filtered list includes `gfx1250`.
+After LLVM, the recipe configures RCCL and inspects Ninja's kernel compile
+and link commands before running them. A missing or extra RCCL device
+target stops the build. Successful checks leave
+`therock-toolchain-targets.txt` and `therock-rccl-targets.txt` in
+`/opt/ocr/build-evidence/`. [Pinned RCCL declaration](https://github.com/ROCm/TheRock/blob/b324869fb3116353ac7eec5e6926aa3d452ac987/comm-libs/CMakeLists.txt#L30-L35) · [Upstream test-list default](https://github.com/ROCm/TheRock/blob/b324869fb3116353ac7eec5e6926aa3d452ac987/cmake/therock_amdgpu_targets.cmake#L345-L354)
+
+For a build containing only the listed RDNA2 targets, hipBLASLt retains its
+host API for rocBLAS and builds its embedded HIP helpers for the selected GPUs.
+It skips its tuned device library and clients, avoiding the upstream `gfx1100`
+fallback. hipSPARSELt likewise retains its API and selected-GPU helpers for
+all nine listed Radeon targets, which upstream excludes from its tuned sparse
+library. For mixed profiles, each library builds tuned kernels only for the
+selected architectures it supports.
+
+`kernels.json` records the selected profile and the inspected Paddle, rocBLAS
+and MIOpen payloads. The build checks cover generated target flags and the
+payloads the inspector can read. Compiler backends, source files and package
+metadata can still name other architectures. The actual HIP device must
+match the image profile at startup. Rebuild and requalify when changing that
+profile.
 
 Missing required libraries, incorrect Paddle HIP target flags and parsed missing
 required target payloads fail the build. Packed/JIT formats which LLVM cannot

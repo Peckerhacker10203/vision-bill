@@ -56,6 +56,25 @@ def test_native_apt_bootstraps_signed_https_snapshot(accelerator, stage_count):
         assert "ca-certificates" in install
 
 
+def test_rocm_builder_checkpoints_llvm_before_copying_finish_inputs():
+    recipe = (SERVICE / "Dockerfile.rocm").read_text().replace("\\\n", " ")
+    builder, runtime = recipe.split(" AS native-builder\n", 1)[1].split("\nFROM ", 1)
+    apt = next(line for line in builder.splitlines() if "apt-get install" in line)
+    for package in ("python3", "tcl"):
+        assert package in apt.split()
+        assert package not in next(line for line in runtime.splitlines() if "apt-get install" in line).split()
+    assert "test -x /usr/bin/python3" in apt and "command -v tclsh" in apt
+    assert "libsqlite3-dev" not in builder
+    phases = [line for line in builder.splitlines() if line.startswith("RUN ") and "build_therock.sh" in line]
+    assert [line.split("build_therock.sh ")[1].split()[0] for line in phases] == ["prepare", "llvm", "finish"]
+    assert "sharing=locked" in phases[0]
+    assert "rm -rf /opt/native-src" in phases[2]
+    before_llvm, after_llvm = builder.split(phases[1])
+    for name in ("finish_therock.sh", "verify_rccl_targets.py"):
+        assert name not in before_llvm
+        assert f"build/{name}" in after_llvm.split(phases[2])[0]
+
+
 def test_rocm_exact_pins_full_sdk_targets_and_no_spoofing():
     path = SERVICE / "build/build_rocm.sh"
     assert path.is_file(), "native source build missing"
@@ -64,7 +83,7 @@ def test_rocm_exact_pins_full_sdk_targets_and_no_spoofing():
     assert lock["sources"]["paddle"] == "7688495538f4d6c1893f084dd238a402e8f68ab6"
     assert lock["sources"]["therock"] == "b324869fb3116353ac7eec5e6926aa3d452ac987"
     assert lock["rdna2_targets"] == ["gfx1030", "gfx1031", "gfx1032", "gfx1034"]
-    sdk = (SERVICE / "build/build_therock.sh").read_text()
+    sdk = (SERVICE / "build/build_therock.sh").read_text() + (SERVICE / "build/finish_therock.sh").read_text()
     assert "THEROCK_ENABLE_ALL=ON" in sdk and "--target dist-rocm" in sdk
     assert "THEROCK_ENABLE_WSL_ROCDXG=ON" in sdk and '-DTHEROCK_WSL_WIN_SDK=$WIN_SDK' in sdk
     assert lock["sources"]["win32metadata"] in sdk and lock["wkmi_dvc_md5"] in sdk
@@ -113,6 +132,9 @@ def test_therock_preparation_inventories_gitlinks_omitted_by_upstream_fetch(tmp_
 
     nested = repo("fin")
     libraries = repo("libraries")
+    (libraries / "native-option").write_text("upstream\n")
+    git(libraries, "add", "native-option")
+    git(libraries, "commit", "--quiet", "-m", "Add upstream build input")
     docs = repo("docs")
     (docs / "docs-only-marker").write_text("This file should never be fetched.\n")
     git(docs, "add", "docs-only-marker")
@@ -158,8 +180,14 @@ def test_therock_preparation_inventories_gitlinks_omitted_by_upstream_fetch(tmp_
     new = tmp_path / "new-checkout"
     git(tmp_path, "init", "--quiet", str(new))
     git(new, "remote", "add", "origin", upstream.as_uri())
+    local_patch = tmp_path / "native.patch"
+    local_patch.write_text(
+        "diff --git a/native-option b/native-option\n--- a/native-option\n"
+        "+++ b/native-option\n@@ -1 +1 @@\n-upstream\n+local\n"
+    )
     subprocess.run(
-        ["bash", SERVICE / "build/prepare_therock.sh", new, output, "4", pin], env=env, check=True
+        ["bash", SERVICE / "build/prepare_therock.sh", new, output, "4", pin,
+         "rocm-libraries", local_patch], env=env, check=True,
     )
 
     assert git(new, "rev-parse", "HEAD") == pin
@@ -180,6 +208,8 @@ def test_therock_preparation_inventories_gitlinks_omitted_by_upstream_fetch(tmp_
     assert report["checkouts"]["rocm-libraries/projects/miopen/fin"]["head"] == git(nested, "rev-parse", "HEAD")
     assert report["checkouts"]["rocm-libraries"]["head"] != git(libraries, "rev-parse", "HEAD")
     assert report["checkouts"]["rocm-libraries"]["head"] == git(new / "rocm-libraries", "rev-parse", "HEAD")
+    assert (new / "rocm-libraries/native-option").read_text() == "local\n"
+    assert "+local" in report["checkouts"]["rocm-libraries"]["patch"]
     assert ".rocm-libraries.smrev" in report["patches_and_smrev"]
 
     inventory = [sys.executable, SERVICE / "build/source_inventory.py", new, tmp_path / "invalid.json",
@@ -692,15 +722,23 @@ def test_cuda_resolution_is_identical_across_scratch_paths(tmp_path, monkeypatch
     assert str(tmp_path).encode() not in outputs[0][0]
 
 
-@pytest.mark.parametrize("transport", ["kfd", "wsl", "dual", "unknown"])
-def test_therock_transport_controls_native_sources_before_build(tmp_path, transport):
+@pytest.mark.parametrize(("transport", "phased"), [
+    ("kfd", False), ("kfd", True), ("wsl", False), ("dual", False), ("unknown", False),
+])
+def test_therock_transport_controls_native_sources_before_build(tmp_path, transport, phased):
     import shutil
 
     recipe = tmp_path / "recipe"
     recipe.mkdir()
-    shutil.copy(SERVICE / "build/build_therock.sh", recipe)
-    shutil.copy(SERVICE / "build/build_jobs.py", recipe)
+    for name in ("build_therock.sh", "finish_therock.sh", "build_jobs.py"):
+        shutil.copy(SERVICE / "build" / name, recipe)
     (recipe / "prepare_therock.sh").write_text("exit 0\n")
+    for check in ("verify_therock_targets", "verify_rccl_targets"):
+        (recipe / f"{check}.py").write_text(
+            "import os, sys\n"
+            f"with open(os.environ['LOG'], 'a') as log: print('{check}', *sys.argv[1:], file=log)\n"
+            f"if os.getenv('FAIL_GUARD') == '{check}': sys.exit(46)\n"
+        )
     (tmp_path / "ocr_service").mkdir()
     shutil.copy(SERVICE / "ocr_service/targets.py", tmp_path / "ocr_service")
     commands = tmp_path / "commands"
@@ -714,33 +752,86 @@ if [[ $1 == init ]]; then
 fi
 if [[ "$*" == *win32metadata*"fetch --depth"* ]]; then exit 44; fi
 """,
-        "cmake": 'if [[ "$1" == --build ]]; then exit 45; fi',
+        "cmake": """
+if [[ "$1" == -S ]]; then mkdir -p "$4"; touch "$4/CMakeCache.txt"; fi
+if [[ "$1" == --build ]]; then
+    echo "targets=$VISION_BILL_AMDGPU_TARGETS jobs=$CMAKE_BUILD_PARALLEL_LEVEL" >> "$LOG"
+    if [[ "${@: -1}" == dist-rocm && -z "$TEST_INSTALL" ]]; then exit 45; fi
+fi
+if [[ "$1" == --install ]]; then
+    sdk="${@: -1}"
+    mkdir -p "$sdk/bin" "$sdk/lib/cmake/hip/FindHIP"
+    touch "$sdk/bin/"{hipcc,hipconfig,hipcc_cmake_linker_helper}
+    chmod +x "$sdk/bin/hipcc_cmake_linker_helper"
+    touch "$sdk/lib/cmake/hip/FindHIP.cmake" "$sdk/lib/cmake/hip/FindHIP/"{run_hipcc,run_make2cmake}.cmake
+fi
+""",
     }.items():
         executable = commands / name
         executable.write_text(f'#!/bin/bash\necho "{name} $*" >> "$LOG"\n{body}\n')
         executable.chmod(0o755)
     evidence = tmp_path / "evidence"
-    result = subprocess.run(
-        ["bash", recipe / "build_therock.sh"],
-        env={
-            **os.environ, "PATH": f"{commands}:{os.environ['PATH']}", "LOG": str(log),
-            "SOURCE_ROOT": str(tmp_path / "source"), "EVIDENCE": str(evidence),
-            "OCR_ROCM_TRANSPORT": transport, "AMDGPU_TARGETS": "gfx1032", "BUILD_JOBS": "1",
-        },
-        check=False, capture_output=True, text=True,
-    )
+
+    def run(*phases, **overrides):
+        return subprocess.run(
+            ["bash", recipe / "build_therock.sh", *phases],
+            env={
+                **os.environ, "PATH": f"{commands}:{os.environ['PATH']}", "LOG": str(log),
+                "SOURCE_ROOT": str(tmp_path / "source"), "EVIDENCE": str(evidence),
+                "OCR_ROCM_TRANSPORT": transport, "AMDGPU_TARGETS": "gfx1100;gfx1032",
+                "BUILD_JOBS": "1", "SDK": str(tmp_path / "sdk"), **overrides,
+            },
+            check=False, capture_output=True, text=True,
+        )
+
+    if phased:
+        prepared = run("prepare")
+        assert prepared.returncode == 0, prepared.stderr
+        assert "cmake --build" not in log.read_text()
+        for changed in ({"OCR_ROCM_TRANSPORT": "wsl"}, {"AMDGPU_TARGETS": "gfx1100"}):
+            assert run("llvm", **changed).returncode != 0
+        assert "cmake --build" not in log.read_text()
+        llvm = run("llvm")
+        assert llvm.returncode == 0, llvm.stderr
+        assert "--target amd-llvm" in log.read_text()
+        assert "--target rccl+configure" not in log.read_text()
+        blocked_log = tmp_path / "rejected-rccl.log"
+        assert run("finish", FAIL_GUARD="verify_rccl_targets", LOG=str(blocked_log)).returncode == 46
+        assert "--target dist-rocm" not in blocked_log.read_text()
+        result = run("finish")
+        output = prepared.stderr + llvm.stderr + result.stderr
+        installed = run("finish", TEST_INSTALL="1", LOG=str(tmp_path / "installed.log"))
+        assert installed.returncode == 0, installed.stderr
+        assert re.search(r"ocr_rocm_phase phase=therock_finish elapsed_s=[0-9.]+", installed.stderr)
+        assert installed.stderr.count("phase=sdk_compile ") == 1
+        assert "phase=finish " in (evidence / "therock-checkpoints.txt").read_text()
+    else:
+        result = run()
+        output = result.stderr
     if transport == "unknown":
         assert "Invalid OCR_ROCM_TRANSPORT" in result.stderr
         assert not log.exists()
         return
     assert (evidence / "rocm-transport.txt").read_text() == transport + "\n"
     calls = log.read_text()
-    assert re.search(r"ocr_rocm_phase phase=therock_sources elapsed_s=[0-9.]+", result.stderr)
+    assert re.search(r"ocr_rocm_phase phase=therock_sources elapsed_s=[0-9.]+", output)
     if transport in {"wsl", "dual"}:
         assert result.returncode == 44 and "win32metadata" in calls
     else:
         assert result.returncode == 45 and "win32metadata" not in calls
-        assert re.search(r"ocr_rocm_phase phase=sdk_compile elapsed_s=[0-9.]+", result.stderr)
+        assert re.search(r"ocr_rocm_phase phase=sdk_compile elapsed_s=[0-9.]+", output)
+        assert re.search(r"ocr_rocm_phase phase=llvm_compile elapsed_s=[0-9.]+", output)
+        assert re.search(r"ocr_rocm_phase phase=rccl_configure elapsed_s=[0-9.]+", output)
+        checkpoints = (evidence / "therock-checkpoints.txt").read_text()
+        for phase in ("prepare", "llvm"):
+            assert re.search(rf"phase={phase} path=\S+/therock-build allocated_bytes=\d+", checkpoints)
+        for scope in ("", "DIST_", "TEST_"):
+            assert f"-DTHEROCK_{scope}AMDGPU_FAMILIES= " in calls
+            assert f"-DTHEROCK_{scope}AMDGPU_TARGETS=gfx1032;gfx1100 " in calls
+        stages = ["verify_therock_targets", "--target amd-llvm", "--target rccl+configure",
+                  "verify_rccl_targets", "--target dist-rocm"]
+        assert [calls.index(stage) for stage in stages] == sorted(calls.index(stage) for stage in stages)
+        assert calls.count("targets=gfx1032;gfx1100 jobs=1") == 3
         for option in ("WSL", "WSL_ROCDXG", "MIRAGE", "HIPDNN_SAMPLES"):
             assert f"-DTHEROCK_ENABLE_{option}=OFF" in calls
         for option in ("LLVM_PARALLEL_LINK_JOBS", "FLANG_PARALLEL_COMPILE_JOBS"):

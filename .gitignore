@@ -267,7 +267,14 @@ paddleocr-service/build/*
 !paddleocr-service/build/build_jobs.py
 !paddleocr-service/build/build_rocm.sh
 !paddleocr-service/build/build_therock.sh
+!paddleocr-service/build/finish_therock.sh
+!paddleocr-service/build/verify_therock_targets.py
+!paddleocr-service/build/verify_rccl_targets.py
 !paddleocr-service/build/prepare_therock.sh
+!paddleocr-service/build/therock-sqlite-headers.patch
+!paddleocr-service/build/therock-rccl-translate.patch
+!paddleocr-service/build/therock-hipblaslt-rdna2.patch
+!paddleocr-service/build/rocm-libraries-hipblaslt-rdna2.patch
 !paddleocr-service/build/hip-rdna2-v1.patch
 !paddleocr-service/build/hip-device-info.cpp
 !paddleocr-service/build/source_inventory.py

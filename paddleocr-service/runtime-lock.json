@@ -4,10 +4,21 @@
   "cuda_lock_status": "unresolved-official-host-connect-403",
   "dockerfile_frontend": "docker/dockerfile:1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e",
   "flash_attention": false,
-  "hipblaslt_empty_target_fallback": "gfx1100",
+  "hipblaslt_empty_target_fallback": "selected HIP targets for host API helpers; tuned device libraries and clients disabled",
   "input_sha256": {
+    "Dockerfile.rocm": "452319a9abdf54dc64b7aa89df954d8fbbbec7503079aa07642a8cf478f119d4",
+    "build/build_rocm.sh": "4841b0de3351f6e3d9654abe14cd1ff6eaef55b3ec4cc9a272de382e5d6b197f",
+    "build/build_therock.sh": "2e8c252cbbd1cb72f9a03129de3eccca9bc9ee8d62b96998ac523ca45d2fa96a",
+    "build/finish_therock.sh": "34619e01b2530268ffbdc4d48c810b4f9409c8cc4e553b5c2d481d85a718c167",
     "build/hip-device-info.cpp": "9a7afcb81666d1515d0f4da6a85f6251c0f2c08fd3991c16cee10841ceae978a",
     "build/hip-rdna2-v1.patch": "017f955eb5a9d2adec5e416ab0dc17b58a9fd128e4665da28af2e730eba6306a",
+    "build/prepare_therock.sh": "033660360424546d342eb31ee008b603adaa7c86bf7ec6a7cb790d1956e16412",
+    "build/rocm-libraries-hipblaslt-rdna2.patch": "ff20ca08444f3063ff083ed134209367dbd94f7932c48a2b9fb77a2dff90b9fc",
+    "build/therock-hipblaslt-rdna2.patch": "b7fb65034d64dac97df91964efd520f8feea522322377c5559e1c8b4b0a1979c",
+    "build/therock-rccl-translate.patch": "1130c0841a16cb3354b7a8acb6216a6fd4397eb747de289c39368756cfe15f8b",
+    "build/therock-sqlite-headers.patch": "2735b19a47728beff23bdbbf16f88b6d3aa136c6e8285a42986b2b1006d7ef6e",
+    "build/verify_rccl_targets.py": "fd967192336861c71fad8620dffdb097e2f9e8ec22a1221000067e91a23e6875",
+    "build/verify_therock_targets.py": "b1ed7728cf81aa4efed1cf59323612ad80c5ee3e9775326500ce5d1a7a055d84",
     "ocr_contract/__init__.py": "d6c8a07a17e325de2f7a5741fec132146501cbd4a1bfab810a3b2c1e752fee16",
     "ocr_contract/activation.py": "e3bbc6b0fc47c244402834db5d84e8bafa8cc49de0e011046c49fe79a2fa24c2",
     "ocr_contract/document_image.py": "7af9acad1c00b5d99ca3c1d83e4cce938ba7374e8f5709112d9cb7e2d86e1deb",
@@ -39,10 +50,10 @@
     "paddleocr": "b03f46425e8ff4442b268ce449e3eef758146cd4",
     "paddlex": "ffb64904d23708863ff5b8da312a5cbd52a7f462",
     "therock": "b324869fb3116353ac7eec5e6926aa3d452ac987",
+    "therock_rocm_libraries_gitlink": "39d8d60365d2272a5366f76ccb3bfba24b219eaf",
     "therock_rocm_systems_gitlink": "7da43026e4f2ef7600433c38c820732f7a205d22",
     "win32metadata": "a40ed3186943620f304649a077b78f8271034736"
   },
-  "wkmi_dvc_md5": "53126f6263d5ca1381b84e8a637e6a1e",
   "ubuntu_snapshot": "20261101T000000Z",
   "upstream_optional_target_exclusions": [
     "hipBLASLt",
@@ -51,5 +62,6 @@
     "rocWMMA",
     "hipTensor",
     "rocprofiler-compute"
-  ]
+  ],
+  "wkmi_dvc_md5": "53126f6263d5ca1381b84e8a637e6a1e"
 }

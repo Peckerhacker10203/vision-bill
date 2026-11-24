@@ -45,6 +45,13 @@ jobs:
         run: make lint
       - name: Validate deployment Compose overlays (CPU, no services)
         run: make compose-check
+      - name: Fetch locked TheRock configuration for CPU-only build-plan tests
+        run: |
+          source_repo="$RUNNER_TEMP/vision-bill-therock"
+          pin=$(jq -er '.sources.therock' paddleocr-service/runtime-lock.json)
+          git init --bare --quiet "$source_repo"
+          git -C "$source_repo" fetch --no-tags --depth=1 https://github.com/ROCm/TheRock.git "$pin"
+          echo "VISION_BILL_TEST_THEROCK=$source_repo" >> "$GITHUB_ENV"
       - name: Unit tests
         run: make test
       - name: Frontend check + unit tests + build
