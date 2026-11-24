@@ -33,6 +33,10 @@ async def test_upload_deadline_atomic_recovery_and_artifacts(workflow_db, settin
     blocker = await w.pool.acquire()
     tx = blocker.transaction()
     await tx.start()
+    # Finishing includes both OCR pages, persisted views and the observation
+    # checkpoint before the transaction under test can contend on its lock.
+    budget = 2.0 if phase.startswith("finish") else .4
+    finish_ready = asyncio.Event()
     reset_active = 0
     rollback_active = 0
     release_entered = asyncio.Event()
@@ -61,7 +65,7 @@ async def test_upload_deadline_atomic_recovery_and_artifacts(workflow_db, settin
             if query == "ROLLBACK;" and slow:
                 rollback_active += 1
                 try:
-                    await asyncio.sleep(.4)
+                    await asyncio.sleep(budget)
                 finally:
                     rollback_active -= 1
             return await super().execute(query, *args, **kwargs)
@@ -72,18 +76,18 @@ async def test_upload_deadline_atomic_recovery_and_artifacts(workflow_db, settin
             reset_active += 1
             release_entered.set()
             try:
-                await asyncio.sleep(.6)
+                await asyncio.sleep(budget + .2)
             finally:
                 reset_active -= 1
 
-    pool = await asyncpg.create_pool(w._settings.pg_dsn, min_size=0, max_size=2,
+    pool = await asyncpg.create_pool(w._settings.pg_dsn, min_size=2, max_size=2,
                                     connection_class=ControlledConnection, reset=reset)
     peer = await pool.acquire()
     peer_pid = await peer.fetchval("SELECT pg_backend_pid()")
     original_pool = w._pool
     w._pool = pool
     service.receipts._db._pool = pool
-    service.worker = settings.worker.model_copy(update={"attempt_timeout_seconds": .4})
+    service.worker = settings.worker.model_copy(update={"attempt_timeout_seconds": budget})
     original_attempt = service._attempt
     original_page = native.extract_page.side_effect
     original_save = w.save_ocr_checkpoint
@@ -93,7 +97,9 @@ async def test_upload_deadline_atomic_recovery_and_artifacts(workflow_db, settin
 
     async def finish_barrier(*args, **kwargs):
         outcome = await original_attempt(*args, **kwargs)
-        await lock_image()
+        if phase == "finish":
+            await lock_image()
+        finish_ready.set()
         return outcome
 
     async def checkpoint_barrier(*args, **kwargs):
@@ -110,9 +116,9 @@ async def test_upload_deadline_atomic_recovery_and_artifacts(workflow_db, settin
             await lock_image()
         return False
 
-    if phase == "finish":
+    if phase.startswith("finish"):
         service._attempt = finish_barrier
-    elif phase == "checkpoint":
+    if phase == "checkpoint":
         native.extract_page.side_effect = checkpoint_barrier
     elif phase in {"references", "reference_release"}:
         w.save_ocr_checkpoint = stale_checkpoint
@@ -135,13 +141,15 @@ async def test_upload_deadline_atomic_recovery_and_artifacts(workflow_db, settin
     started = asyncio.get_running_loop().time()
     work = asyncio.create_task(service.process_claim(claim))
     try:
+        if phase.startswith("finish"):
+            await asyncio.wait_for(finish_ready.wait(), budget)
         if phase in {"reference_release", "finish_release"}:
             await asyncio.wait_for(release_entered.wait(), 2)
         else:
             await wait_blocked(original_pool, 1)
-        result = await asyncio.wait_for(work, .7)
+        result = await asyncio.wait_for(work, budget + .3)
         assert result.stale
-        assert asyncio.get_running_loop().time() - started < .55
+        assert asyncio.get_running_loop().time() - started < budget + .15
         assert reset_active == rollback_active == 0
         assert await peer.fetchval("SELECT pg_backend_pid()") == peer_pid
         assert pool._queue.qsize() == 1
