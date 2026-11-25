@@ -1376,16 +1376,21 @@ async def test_purchase_grouping_keeps_raw_extraction_in_draft_and_receipt(workf
     assert not finished.stale
     if kind == "complete":
         assert finished.receipt is not None
-        stored = await w._receipts.get_receipt_with_details(finished.receipt.id, user_id=scope.user_id)
-        assert stored is not None
-        items = stored.line_items
+        async with w.pool.acquire() as conn:
+            stored = await conn.fetch(
+                "SELECT quantity, total_price FROM line_items WHERE receipt_id=$1",
+                finished.receipt.id,
+            )
+        assert [(row["quantity"], row["total_price"]) for row in stored] == [
+            (Decimal(2), Decimal("0.58")),
+        ]
     else:
         draft = await w.get_draft(image.id, scope=scope)
         assert draft is not None and draft.document.line_items
         items = draft.document.line_items
+        assert len(items) == 1
+        assert items[0].quantity == 2 and items[0].total_price == Decimal("0.58")
         assert items[0].spending_category == "soft_drinks"
-    assert len(items) == 1
-    assert items[0].quantity == 2 and items[0].total_price == Decimal("0.58")
     async with w.pool.acquire() as conn:
         raw_count = await conn.fetchval(
             "SELECT jsonb_array_length(envelope #> '{draft,line_items}') FROM receipt_extractions WHERE image_id=$1",
