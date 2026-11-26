@@ -611,6 +611,10 @@
 				"action_required": "Operator action is required before Dedicated OCR setup can proceed."
 			},
 			"reasons": {
+				"native_controller_unavailable": "Restart the OCR service with the original project settings, then retry setup.",
+				"native_image_building": "The server is building the GPU image for Dedicated OCR. You can leave this page.",
+				"native_image_build_failed": "The GPU image build failed. Check the source launcher output, then retry setup.",
+				"native_build_host_unavailable": "The source launcher is offline. Restart it with the original project settings to set up Dedicated OCR.",
 				"gpu_profile_required": "Select a CUDA or ROCm profile to use Dedicated OCR.",
 				"ocr_config_managed_externally": "The server configuration controls OCR routing.",
 				"llm_lifecycle_required": "Configure a supported LLM lifecycle before setting up Dedicated OCR.",
@@ -640,7 +644,7 @@
 				"ocr_activation_state_invalid": "Restore a valid Dedicated OCR activation configuration using the recovery guide."
 			},
 			"installedOff": "Dedicated OCR is off. Installed models are retained; turn it on to resume OCR.",
-			"prerequisites": "Requires a prepared CUDA or ROCm GPU profile on the server. The browser cannot install GPU drivers or runtimes; follow the setup guide.",
+			"prerequisites": "Requires a CUDA or ROCm profile and compatible GPU drivers on the server. With a source installation, enabling Dedicated OCR starts the GPU image build.",
 			"setupGuide": "GPU setup and recovery guide",
 			"guide": {
 				"archive": "Download offline operator guides",

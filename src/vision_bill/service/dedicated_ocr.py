@@ -29,6 +29,7 @@ from .activation_admission import (
     unsettled_direct_calls,
 )
 from .gpu_handoff import ModelHandoff
+from .native_build import native_build_failed, native_build_status, resolve_failed_build
 
 
 class DedicatedOcrActivation:
@@ -77,6 +78,16 @@ class DedicatedOcrActivation:
                 return response.status_code == 200
         except httpx.HTTPError:
             return False
+
+    async def _setup_unavailable(self, *, native_started: bool = False) -> str | None:
+        build = native_build_status()
+        if not native_started and build is not None and build.phase in ("waiting", "failed"):
+            return None
+        if await self._controller_is_live():
+            return None
+        if os.environ.get("VISION_BILL_OCR_NATIVE_BUILD_STATUS"):
+            return "native_controller_unavailable" if native_started else "native_build_host_unavailable"
+        return "gpu_profile_required"
 
     async def _runtime_is_serving(self) -> bool:
         try:
@@ -151,9 +162,17 @@ class DedicatedOcrActivation:
                 return DedicatedOcrStatus(state="disabled")
             return DedicatedOcrStatus(state="failed", reason=current.reason_code or "ocr_setup_failed")
         if request:
+            if current is None and os.environ.get("VISION_BILL_OCR_NATIVE_BUILD_STATUS"):
+                build = native_build_status()
+                if build is not None and build.generation == request.generation:
+                    if build.phase == "failed":
+                        return DedicatedOcrStatus(state="failed", reason="native_image_build_failed")
+                    return DedicatedOcrStatus(state="installing", reason="native_image_building")
+                if build is None and not await self._controller_is_live():
+                    return DedicatedOcrStatus(state="unavailable", reason="native_build_host_unavailable")
             return DedicatedOcrStatus(state="installing" if current else "requested")
-        if not await self._controller_is_live():
-            return DedicatedOcrStatus(state="unavailable", reason="gpu_profile_required")
+        if unavailable := await self._setup_unavailable():
+            return DedicatedOcrStatus(state="unavailable", reason=unavailable)
         if blocker := self._blocker or (self._lifecycle_blocker() if shared_gpu else None):
             return DedicatedOcrStatus(state="action_required", reason=blocker)
         return DedicatedOcrStatus(state="disabled")
@@ -183,7 +202,8 @@ class DedicatedOcrActivation:
     async def _change_gpu_topology(self, shared_gpu: bool, confirm_handoff: bool, deadline: float) -> None:
         request = self.store.read_request()
         current = self.store.read_status(request) if request else None
-        if request is None or (current is not None and current.phase == ActivationPhase.FAILED):
+        if (request is None or (current is not None and current.phase == ActivationPhase.FAILED)
+                or (current is None and native_build_failed(request))):
             self.store.set_shared_gpu(shared_gpu)
             self._blocker = None
             return
@@ -302,12 +322,13 @@ class DedicatedOcrActivation:
                 with self.store.admission(exclusive=True):
                     current = self.store.read_request()
                     phase = self.store.read_status(current) if current else None
+                    failed_build = current is not None and phase is None and native_build_failed(current)
                     if not enabled:
                         if current is None:
                             return DedicatedOcrStatus(state="disabled")
-                        if phase is None or phase.phase != ActivationPhase.FAILED:
+                        if not failed_build and (phase is None or phase.phase != ActivationPhase.FAILED):
                             return DedicatedOcrStatus(state="action_required", reason="ocr_setup_pending")
-                        if not failed_setup_can_disable(phase) or self.settings.ocr.enabled:
+                        if not (failed_build or failed_setup_can_disable(phase)) or self.settings.ocr.enabled:
                             return DedicatedOcrStatus(state="action_required", reason="native_activation_recovery_required")
                         if not self.store.runtime_enabled(current):
                             return DedicatedOcrStatus(state="disabled")
@@ -319,10 +340,13 @@ class DedicatedOcrActivation:
                             await self.ocr_only_handoff.require_clean_for_maintenance(monotonic() + 2)
                         except HandoffWait as exc:
                             return DedicatedOcrStatus(state="action_required", reason=exc.status.reason_code)
-                        self.store.set_runtime_enabled(current, False)
+                        if failed_build:
+                            resolve_failed_build(self.store, current)
+                        else:
+                            self.store.set_runtime_enabled(current, False)
                         self.wake_receipts()
                         return DedicatedOcrStatus(state="disabled")
-                    if current and (phase is None or phase.phase != ActivationPhase.FAILED):
+                    if current and not failed_build and (phase is None or phase.phase != ActivationPhase.FAILED):
                         return await self.status()
                     shared_gpu = self.store.shared_gpu()
                     if shared_gpu:
@@ -332,9 +356,8 @@ class DedicatedOcrActivation:
                         if blocker := self._lifecycle_blocker():
                             self._blocker = blocker
                             return DedicatedOcrStatus(state="action_required", reason=blocker)
-                    if not await self._controller_is_live():
-                        self._blocker = "gpu_profile_required"
-                        return DedicatedOcrStatus(state="action_required", reason=self._blocker)
+                    if unavailable := await self._setup_unavailable(native_started=phase is not None):
+                        return DedicatedOcrStatus(state="action_required", reason=unavailable)
                     if unsettled_direct_calls(self.store):
                         self._blocker = "llm_request_recovery_required"
                         return DedicatedOcrStatus(state="action_required", reason=self._blocker)
@@ -364,9 +387,12 @@ class DedicatedOcrActivation:
                             external_eager_loading_disabled=True,
                             deadline=deadline,
                         )
-                    self.store.submit_request(
-                        intent, retry_generation=current.generation if current else None,
-                    )
+                    if failed_build and current is not None:
+                        resolve_failed_build(self.store, current, retry_intent=intent)
+                    else:
+                        self.store.submit_request(
+                            intent, retry_generation=current.generation if current else None,
+                        )
                     self._blocker = None
                     return DedicatedOcrStatus(state="requested")
         except (ActivationBusy, ActivationConflict):

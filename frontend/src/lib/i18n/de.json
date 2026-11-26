@@ -611,6 +611,10 @@
 				"action_required": "Vor der Einrichtung der dedizierten OCR muss der Serverbetreiber eingreifen."
 			},
 			"reasons": {
+				"native_controller_unavailable": "Starten Sie den OCR-Dienst mit den ursprünglichen Projekteinstellungen neu und wiederholen Sie die Einrichtung.",
+				"native_image_building": "Der Server baut das GPU-Image für die dedizierte OCR. Sie können diese Seite verlassen.",
+				"native_image_build_failed": "Das GPU-Image konnte nicht gebaut werden. Prüfen Sie die Ausgabe des Startskripts und starten Sie die Einrichtung erneut.",
+				"native_build_host_unavailable": "Das Startskript für die Quellinstallation ist offline. Starten Sie es mit den ursprünglichen Projekteinstellungen neu, um die dedizierte OCR einzurichten.",
 				"gpu_profile_required": "Wählen Sie ein CUDA- oder ROCm-Profil, um dedizierte OCR zu verwenden.",
 				"ocr_config_managed_externally": "Die Serverkonfiguration bestimmt die OCR-Verarbeitung.",
 				"llm_lifecycle_required": "Konfigurieren Sie vor der Einrichtung der dedizierten OCR eine unterstützte LLM-Modellverwaltung.",
@@ -640,7 +644,7 @@
 				"ocr_activation_state_invalid": "Stellen Sie anhand der Wiederherstellungsanleitung eine gültige Aktivierungskonfiguration für dedizierte OCR her."
 			},
 			"installedOff": "Dedizierte OCR ist ausgeschaltet. Installierte Modelle bleiben erhalten; aktivieren Sie OCR zum Fortsetzen.",
-			"prerequisites": "Erfordert ein vorbereitetes CUDA- oder ROCm-GPU-Profil auf dem Server. Der Browser kann keine GPU-Treiber oder Laufzeitumgebungen installieren; folgen Sie der Einrichtungsanleitung.",
+			"prerequisites": "Erfordert ein CUDA- oder ROCm-Profil und passende GPU-Treiber auf dem Server. Bei einer Quellinstallation startet der Bau des GPU-Images beim Einschalten der dedizierten OCR.",
 			"setupGuide": "GPU-Einrichtung und Wiederherstellung",
 			"guide": {
 				"archive": "Betriebsanleitungen zur Offline-Nutzung herunterladen",

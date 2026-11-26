@@ -145,13 +145,18 @@ provider, reachable endpoint and installed model ID,
 then use `docker compose up -d --build`. For a fresh source installation, set
 `AUTH__BOOTSTRAP_USERNAME` and `AUTH__BOOTSTRAP_PASSWORD` before the first account
 if you need admin access. Ordinary users can register from the login page.
-Base Compose starts the app and PostgreSQL. To try a local Dedicated OCR
-candidate, prepare the GPU profile once and then enable it from admin Settings.
+Base Compose starts the app and PostgreSQL. To let an administrator start the
+first local GPU build later, run `python3 scripts/ocr_source_up.py cuda`
+from the source checkout, or select `rocm` for AMD. This is the default source
+launcher flow. Use `--prepare-now` for an immediate native build. Keep the launcher running on
+the host. A vision LLM on a separate GPU can process receipts while the native
+image builds. Shared-GPU activation follows the handoff requirements in Settings. Enabling **Dedicated OCR** in Settings starts
+the build and then installs the pinned OCR models.
 The admin settings include the LLM authentication mode and the choice of a shared
 or separate OCR GPU.
 The source profiles target NVIDIA Turing (RTX 20 series) and later with CUDA,
-and AMD RDNA2 (RX 6000 series) and later with ROCm, on native Linux or Windows
-with WSL 2. NVIDIA uses Docker Desktop on Windows. AMD uses the WSL GPU bridge
+and include experimental AMD Dedicated OCR on native Linux and Windows with WSL 2
+for selected RDNA2 and later GFX targets. NVIDIA uses Docker Desktop on Windows. AMD uses the WSL GPU bridge
 and Docker Engine inside Ubuntu. For a local source installation, CUDA uses
 the official wheel for the selected channel. ROCm compiles for the selected
 Radeon's GFX architecture and host interface. Check the exact board and driver

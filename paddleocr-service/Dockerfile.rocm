@@ -46,7 +46,12 @@ RUN --mount=type=cache,id=vision-bill-therock-dvc,target=/root/.cache/therock-dv
     bash /opt/ocr/build/build_therock.sh prepare
 # Keep the staged compiler and TheRock stamps in the builder's layer cache.
 RUN bash /opt/ocr/build/build_therock.sh llvm
-COPY build/finish_therock.sh build/verify_rccl_targets.py /opt/ocr/build/
+COPY build/checkpoint_therock.sh build/verify_rccl_targets.py /opt/ocr/build/
+RUN bash /opt/ocr/build/checkpoint_therock.sh rccl
+RUN bash /opt/ocr/build/checkpoint_therock.sh miopen-configure
+COPY build/miopen-sqlite-transient.patch /opt/ocr/build/
+RUN bash /opt/ocr/build/checkpoint_therock.sh miopen
+COPY build/finish_therock.sh /opt/ocr/build/
 RUN bash /opt/ocr/build/build_therock.sh finish \
  && rm -rf /opt/native-src/TheRock /opt/native-src/therock-build /opt/native-src/win32metadata
 COPY build/build_rocm.sh build/hip-rdna2-v1.patch build/hip-device-info.cpp /opt/ocr/build/

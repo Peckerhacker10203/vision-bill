@@ -99,9 +99,9 @@ def test_rocm_qualification_rejects_remapped_or_extra_render_devices(
 
 
 @pytest.mark.parametrize("accelerator", ["cuda", "rocm"])
-@pytest.mark.parametrize("retry", [False, True])
+@pytest.mark.parametrize("mode", ["defer", "prepare", "upgrade"])
 def test_source_command_prepares_default_inputs(
-    accelerator: str, retry: bool, monkeypatch: pytest.MonkeyPatch
+    accelerator: str, mode: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from scripts import ocr_source_up
 
@@ -115,15 +115,17 @@ def test_source_command_prepares_default_inputs(
         reuse_native_image: str | None,
         upgrade: bool,
         recover_stopped_ocr: bool,
+        defer_build: bool = False,
     ) -> None:
-        calls.append((chosen, inputs, restart, reuse_native_image, upgrade, recover_stopped_ocr))
+        calls.append((chosen, inputs, restart, reuse_native_image, upgrade, recover_stopped_ocr, defer_build))
 
     candidate = f"vision-bill-ocr-{accelerator}:source-build-" + "a" * 32
-    flags = ["--upgrade", "--reuse-native-image", candidate] if retry else []
+    flags = {"defer": [], "prepare": ["--prepare-now"], "upgrade": ["--upgrade", "--reuse-native-image", candidate]}[mode]
     monkeypatch.setattr(sys, "argv", [str(SCRIPT), accelerator, *flags])
     monkeypatch.setattr(ocr_source_up, "bootstrap", bootstrap)
     assert ocr_source_up.main() == 0
-    assert calls == [(accelerator, None, False, candidate if retry else None, retry, False)]
+    assert calls == [(accelerator, None, False, candidate if mode == "upgrade" else None,
+                      mode == "upgrade", False, mode == "defer")]
 
 
 def test_source_command_rejects_restart_with_reuse_before_bootstrap(monkeypatch, capsys):

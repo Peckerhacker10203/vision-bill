@@ -18,9 +18,11 @@ build/**
 !build/build_therock.sh
 !build/prepare_therock.sh
 !build/finish_therock.sh
+!build/checkpoint_therock.sh
 !build/verify_therock_targets.py
 !build/verify_rccl_targets.py
 !build/therock-sqlite-headers.patch
+!build/miopen-sqlite-transient.patch
 !build/therock-hipblaslt-rdna2.patch
 !build/rocm-libraries-hipblaslt-rdna2.patch
 !build/therock-rccl-translate.patch

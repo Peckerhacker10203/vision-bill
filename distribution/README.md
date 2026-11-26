@@ -2,8 +2,10 @@
 
 Install a prepared bundle by downloading a verified release, configuring the
 selected variant and running Docker Compose. Public native bundles require a
-release run with physical GPU qualification. To build a local candidate before
-publication, use the source setup. [Dedicated OCR from source](../paddleocr-service/README.md#dedicated-ocr-from-source)
+release run with physical GPU qualification. Combined bundles start their
+prebuilt OCR controller, and Settings activates model installation. To compile
+a local source image when an administrator first enables OCR, use the source
+launcher. [Build OCR from Settings](../paddleocr-service/README.md#start-vision-bill-first-and-build-ocr-from-settings)
 
 ## Choose an installation
 

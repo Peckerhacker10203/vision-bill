@@ -55,7 +55,7 @@ fe-test-e2e: ## Run Playwright in a unique owned stack
 	$(NODE) uv run python e2e/run.py run --policy fallback $(E2E_OVERRIDE_ARG) -- npm --prefix frontend run test:e2e
 
 PYTHON_CHECK_PATHS := src paddleocr-service/ocr_contract paddleocr-service/ocr_service paddleocr-service/server.py \
-	paddleocr-service/build e2e scripts/ocr_harness scripts/ocr_build_rocm.py scripts/ocr_cuda_probe.py scripts/ocr_source_up.py scripts/ocr_stopped_recovery.py \
+	paddleocr-service/build e2e scripts/ocr_harness scripts/ocr_build_rocm.py scripts/ocr_cuda_probe.py scripts/ocr_source_up.py scripts/ocr_deferred.py scripts/ocr_native_reuse.py scripts/ocr_stopped_recovery.py \
 	scripts/receipt_split_experiment.py scripts/standalone_benchmark.py scripts/test_ocr_service.py
 
 .PHONY: compose-check

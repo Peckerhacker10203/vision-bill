@@ -49,8 +49,24 @@ These are correctness changes, not measured OCR accuracy or speed improvements.
 
 ## Backup and upgrade order
 
+For a base source installation running only Vision Bill and PostgreSQL, the
+first local OCR registration defaults to waiting for Settings activation.
+The explicit `--defer-build` flag selects the same behavior. Use the original
+checkout and Compose project. Before updating a still-waiting first registration, stop
+its host launcher, update that checkout, and rerun the same `--defer-build`
+command. A revision change refreshes the app image before waiting for activation.
+Once the managed OCR installation exists, use `--restart`
+to start the recorded images again. [First source registration](paddleocr-service/README.md#start-vision-bill-first-and-build-ocr-from-settings)
+
 For a source installation created with `ocr_source_up.py`, use the original
 checkout and the documented `--upgrade` procedure after backup and drain.
+An app-only update can reuse a recorded native image when its image ID, recipe,
+source and runtime locks, accelerator inputs and physical GPU pass verification.
+The launcher repeats the offline binding check. Older records without build
+evidence require one native build and verification. A shared runtime-lock change
+can trigger this once for either accelerator. Keep the model volume and, on CUDA,
+the verified wheel and lock snapshots.
+
 A stopped, settled original deployment with its records, release and volumes intact
 can rebuild deleted app or OCR images through `--upgrade`. The read-only handoff
 check uses a separate pinned CPU image. `--restart` needs the recorded images.

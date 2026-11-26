@@ -44,8 +44,9 @@ experiment reports do not certify production hardware or accuracy.
 
 ## API and ownership
 
-All `/api/v1` data routes require authentication; auth register/login/logout and
-`GET /system/ui-config` are public. Benchmarks/settings require admin. Admin access
+All `/api/v1` data routes require authentication. Auth register/login/logout,
+`GET /system/ui-config` and the boolean `GET /system/ready` health check are public.
+Benchmarks/settings require admin. Admin access
 across owners additionally requires `auth.admin_can_see_all`; preserve scope on
 all reads/mutations, sources, drafts, retries, collections and benchmark references.
 Entity IDs are UUIDs. DB-unavailable paths return 503. Browser data requests bind
@@ -137,16 +138,20 @@ encoding. See the [native contract](paddleocr-service/README.md#fixed-extraction
 
 ## Native OCR policy
 
-Base app OCR is off. CUDA/ROCm overlays and sidecar profile `ocr` prepare an
-idle controller. Admin activation or explicit startup configuration requests
+Base app OCR is off. By default the source launcher waits until the app and
+database are ready, then builds the selected CUDA/ROCm image only after the
+admin requests Dedicated OCR. The host owns Docker access. A managed source
+upgrade can reuse a compatible admitted image after offline GPU binding.
+Prepared installations start an idle OCR controller. Activation requests
 verified model downloads and a versioned prepared installation. Ordinary
 installation, restart and worker creation must make zero model predictions.
 The explicit release qualifier owns all fixture inference. Default OCR Dockerfile
 requires a selected accelerator.
 Linux x86_64 containers target NVIDIA Turing/RTX 20+ and AMD RDNA2/RX 6000+
 on native Linux and WSL 2. The CUDA probe's vendor floor is SM 7.0. Consumer
-qualification starts at Turing SM 7.5. Source installations bind and recheck
-the observed CUDA GPU UUID. AMD driver support is board- and host-specific.
+qualification starts at Turing SM 7.5. Source installations recheck the observed
+GPU UUID when reusing an admitted native image. AMD Dedicated OCR is experimental
+and driver support is board- and host-specific.
 The source launcher and `make ocr-build-rocm` select the local GFX architecture
 and KFD or WSL transport. The explicit target list selects architectures.
 The `dual` build transport includes both GPU interfaces. Release plans carry

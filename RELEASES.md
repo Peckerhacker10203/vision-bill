@@ -23,10 +23,14 @@ built-in labels and save the same tag identifiers. Migration 0025 adds an
 editable merchant display name and merchant choices learned on explicit receipt
 saves within each account. Back up the database and
 image store together before upgrading.
-The update also includes account and view isolation. Dedicated
-OCR downloads and verifies its three pinned models when enabled. Its first prediction
-uses the first submitted receipt. The source launcher supports upgrading the admitted
-installation in place. Pending uploads bind their formatter endpoint, and migrated
+The update also includes account and view isolation. The source launcher starts
+the app and database first. Dedicated OCR activation starts the local GPU build
+and verifies the three pinned models. The first prediction uses a submitted receipt.
+App-only source upgrades can reuse a verified native image. AMD Dedicated OCR is
+experimental and the first local build may take hours.
+[Source activation and upgrades](paddleocr-service/README.md#dedicated-ocr-from-source)
+
+Pending uploads bind their formatter endpoint, and migrated
 unverified receipts can be reviewed using their current findings. Historical split/CPU results retain
 their original meaning. See [upgrade prerequisites and accepted evidence](UPGRADE_AND_VERIFY.md).
 No version/tag/release or deployment has been authorized by this documentation

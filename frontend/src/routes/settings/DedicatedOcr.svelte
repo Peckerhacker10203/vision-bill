@@ -19,7 +19,8 @@
 			refetchOnWindowFocus: true,
 			refetchInterval: (query) => {
 				const state = query.state.data?.state;
-				return state === 'requested' || state === 'installing' ? 2000 : false;
+				if (state === 'requested' || state === 'installing') return 2000;
+				return query.state.data?.reason === 'native_build_host_unavailable' ? 5000 : false;
 			}
 		}),
 		() => queryClient
@@ -27,6 +28,10 @@
 
 	const reasons = new Set([
 		'gpu_profile_required',
+		'native_image_building',
+		'native_image_build_failed',
+		'native_build_host_unavailable',
+		'native_controller_unavailable',
 		'model_request_unsettled',
 		'model_handoff_model_not_adopted',
 		'model_handoff_foreign_residency',

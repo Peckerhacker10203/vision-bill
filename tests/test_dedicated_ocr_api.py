@@ -24,6 +24,16 @@ def test_activation_requires_admin() -> None:
     assert client.put("/system/dedicated-ocr/gpu-topology", json={"shared_gpu": False}).status_code == 401
 
 
+def test_app_readiness_requires_database_and_receipt_workflow() -> None:
+    app = app_with_system()
+    client = TestClient(app)
+    assert client.get("/system/ready").status_code == 503
+    app.state.receipt_service = SimpleNamespace(db_ready=True, workflow_ready=False)
+    assert client.get("/system/ready").status_code == 503
+    app.state.receipt_service.workflow_ready = True
+    assert client.get("/system/ready").json() == {"ready": True}
+
+
 def test_app_without_a_gpu_profile_reports_unavailable() -> None:
     app = app_with_system()
     app.dependency_overrides[require_admin] = lambda: None
@@ -480,3 +490,65 @@ async def test_managed_mode_does_not_imply_working_runtime(settings, tmp_path, m
         return httpx.Response(503, json=worker)
     http_client(monkeypatch, handler)
     assert not await activation._runtime_is_serving()
+
+
+async def test_deferred_host_build_generations(settings, tmp_path, monkeypatch):
+    import time
+    from unittest.mock import AsyncMock
+    from uuid import uuid4
+
+    from ocr_contract.activation import ActivationPhase, ActivationStatus, ActivationStore
+
+    from vision_bill.service.dedicated_ocr import DedicatedOcrActivation
+
+    status_file = tmp_path / "host.json"
+    monkeypatch.setenv("VISION_BILL_OCR_NATIVE_BUILD_STATUS", str(status_file))
+    store = ActivationStore(tmp_path / "request", tmp_path / "status", tmp_path / "lock")
+    store.set_shared_gpu(False)
+    activation = DedicatedOcrActivation(
+        settings, SimpleNamespace(supports_model_release=False, handoff=None),
+        lambda *_: None, lambda: None, store=store, handoff_path=tmp_path / "gpu.lock",
+    )
+    monkeypatch.setattr(activation, "_controller_is_live", AsyncMock(return_value=False))
+
+    def heartbeat(phase, generation=None, age=0):
+        status_file.write_text(json.dumps({
+            "version": 1, "phase": phase, "generation": str(generation) if generation else None,
+            "updated_at": time.time() - age,
+        }))
+
+    for age in (-60, 60):
+        heartbeat("waiting", age=age)
+        assert (await activation.status()).state == "unavailable"
+        assert (await activation.submit(confirm_handoff=False)).reason == "native_build_host_unavailable"
+        assert store.read_request() is None
+    heartbeat("waiting")
+    assert (await activation.status()).state == "disabled"
+    assert (await activation.submit(confirm_handoff=False)).state == "requested"
+    first = store.read_request()
+    heartbeat("building", first.generation)
+    assert (await activation.status()).reason == "native_image_building"
+    assert (await activation.submit(confirm_handoff=False)).state == "installing"
+    assert (await activation.submit(confirm_handoff=False, enabled=False)).reason == "ocr_setup_pending"
+    heartbeat("failed", uuid4())
+    assert (await activation.submit(confirm_handoff=False)).state == "requested"
+    assert store.read_request() == first
+    heartbeat("failed", first.generation)
+    assert (await activation.status()).reason == "native_image_build_failed"
+    assert (await activation.submit(confirm_handoff=False)).state == "requested"
+    second = store.read_request()
+    assert second != first and store.read_status(second) is None
+    assert (await activation.submit(confirm_handoff=False)).state == "requested"
+    assert store.read_request() == second
+    heartbeat("failed", second.generation)
+    assert (await activation.submit(confirm_handoff=False, enabled=False)).state == "disabled"
+    assert store.read_request() is None
+    assert (await activation.submit(confirm_handoff=False)).state == "requested"
+    third = store.read_request()
+    heartbeat("failed", third.generation)
+    store.publish_status(ActivationStatus(third.generation, ActivationPhase.PREPARING))
+    assert (await activation.submit(confirm_handoff=False)).state == "installing"
+    assert store.read_request() == third
+    store.publish_status(ActivationStatus(third.generation, ActivationPhase.FAILED, "native_model_download_failed"))
+    assert (await activation.submit(confirm_handoff=False)).reason == "native_controller_unavailable"
+    assert store.read_request() == third

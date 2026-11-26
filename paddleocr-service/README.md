@@ -63,9 +63,10 @@ setting controls the formatter. [PaddleX VLM inference services](https://github.
 
 ## Dedicated OCR from source
 
-The source setup command builds a local candidate, selects the accelerator
-profile, binds approved inputs to the exact Docker image and selected device, and
-starts Compose with an idle OCR controller. Run it from the repository root with
+By default the source launcher starts the app and waits for an administrator
+to request the GPU build from Settings. Use `--prepare-now` to build immediately.
+Both modes bind the approved inputs to the exact image and selected device.
+Run the launcher from the repository root with
 Python 3.12+, a local Linux x86_64 Docker engine and Docker Compose 2.30+.
 Automatic fixture preparation uses `uv`. CUDA builds also use `make`. A cold
 CUDA build needs access to the official Paddle wheel host and dependency
@@ -73,6 +74,53 @@ sources. Keep the validated inputs for later builds. Prepare the
 app's private `.env` once and reuse its Compose project name, app settings and
 data on subsequent starts. The command supplies the OCR image and bundle metadata
 automatically. [Source app configuration](../README.md#advanced-develop-from-source)
+
+### Start Vision Bill first and build OCR from Settings
+
+Choose the accelerator on the host. From the original checkout, run one of
+these commands for a first local OCR registration. The optional `--defer-build`
+flag explicitly selects this default.
+
+| Accelerator | Start the app and wait for activation |
+| --- | --- |
+| NVIDIA CUDA | `python3 scripts/ocr_source_up.py cuda` |
+| AMD ROCm (experimental) | `python3 scripts/ocr_source_up.py rocm` |
+
+The launcher starts Vision Bill and PostgreSQL, or verifies and reuses the
+existing base installation in the same Compose project. Keep its host process
+running to handle the first activation. To run it in the background, for example
+with ROCm, use the following command from your Linux or WSL shell.
+
+```bash
+(umask 077; nohup python3 -u scripts/ocr_source_up.py rocm --defer-build > ~/vision-bill-ocr-build.log 2>&1 < /dev/null &)
+```
+
+Sign in as an administrator and turn on **Settings → Dedicated OCR**. The host
+process uses the GPU and driver selection described below, builds and verifies
+the native image, and starts only the OCR controller. Settings shows when the
+request is waiting or has failed. The host log shows the build steps. The app
+and database stay available. On separate GPUs, the configured vision LLM can process
+receipts while OCR builds. On a shared GPU, activation still requires the LLM
+handoff shown in Settings. The controller then verifies the pinned models and
+downloads missing assets. Activation sends no test images. Docker access stays with the host process; the app
+container receives no Docker socket.
+
+AMD Dedicated OCR is experimental on native Linux and Windows with WSL 2.
+A cold TheRock and Paddle source build can take hours. Upstream estimates
+about 200 GB free for TheRock alone. Allow additional temporary disk space
+for Paddle, Docker layers and the final image on the filesystem used by
+Docker. On retry the same BuildKit builder can reuse completed stages while
+its cache is retained. [Build inputs and disk requirements](#build-inputs)
+
+To update the checkout before the first activation, stop the waiting launcher
+(Ctrl-C in its terminal, or stop that specific background process). Update the
+original checkout, then rerun the same `--defer-build` command with the original
+project and GPU selection. If the revision changed, the launcher refreshes the
+app image and waits again. The OCR image build still requires activation in Settings.
+
+To build the native image immediately, use the vendor-specific commands below.
+Once the managed installation exists, use its restart and upgrade procedures.
+[Enable and restart](#enable-and-restart) · [Upgrade an existing source installation](#upgrade-an-existing-source-installation)
 
 ### NVIDIA CUDA on Windows or Linux
 
@@ -105,7 +153,7 @@ device ordering cannot silently move OCR to a different GPU. Run the launcher
 from this checkout.
 
 ```bash
-python3 scripts/ocr_source_up.py cuda
+python3 scripts/ocr_source_up.py cuda --prepare-now
 ```
 
 The launcher binds the official model inventory to the selected image. Five
@@ -136,7 +184,8 @@ in the queue shows when processing finishes.
 
 ### AMD ROCm on Linux or Windows with WSL 2
 
-The implementation targets RDNA2 and later. AMD support depends on the exact
+Dedicated OCR on AMD is experimental on both native Linux and WSL 2. The source
+recipe includes targets for RDNA2 and later. Compatibility depends on the exact
 board, OS, ROCm version and host driver. Check the applicable AMD compatibility
 table before choosing either host. A listed GFX build target alone does not
 establish vendor support or successful receipt inference.
@@ -153,7 +202,7 @@ GFX target if topology cannot identify it. The built image checks the actual
 HIP target before startup. [ROCm build inputs](#build-inputs)
 
 ```bash
-python3 scripts/ocr_source_up.py rocm
+python3 scripts/ocr_source_up.py rocm --prepare-now
 ```
 
 **Windows with WSL 2.** Install AMD's Windows driver for WSL and use a supported
@@ -168,7 +217,7 @@ architecture and `OCR_ROCM_DEVICE_ID` to its HIP index. The Windows display
 index can differ. For example, on a machine where HIP device 0 is `gfx1100`:
 
 ```bash
-OCR_AMDGPU_TARGETS=gfx1100 OCR_ROCM_DEVICE_ID=0 python3 scripts/ocr_source_up.py rocm
+OCR_AMDGPU_TARGETS=gfx1100 OCR_ROCM_DEVICE_ID=0 python3 scripts/ocr_source_up.py rocm --prepare-now
 ```
 
 The launcher needs an unambiguous selection before building. The host driver
@@ -232,9 +281,10 @@ For ROCm, check the launcher's `Local ROCm build` line for the selected
 transport and GFX targets. Inside the build, `ocr_rocm_phase` reports
 wall-clock seconds for preparing TheRock (`therock_prepare`), compiling LLVM
 (`llvm_compile`) and finishing the SDK (`therock_finish`). Source preparation
-(`therock_sources`) is part of `therock_prepare`. The finish phase includes
-RCCL configuration and its prerequisite builds (`rccl_configure`), followed
-by the remaining SDK compilation (`sdk_compile`). Paddle reports `paddle_sources` and
+(`therock_sources`) is part of `therock_prepare`. After LLVM, separate steps
+configure and build RCCL (`rccl_configure`, `rccl_compile`), configure MIOpen
+and build its prerequisites (`miopen_configure`), then compile MIOpen
+(`miopen_compile`). The remaining SDK build reports `sdk_compile`. Paddle reports `paddle_sources` and
 `paddle_compile`. A BuildKit cache hit shows `CACHED` and has no new phase
 timing.
 
@@ -253,7 +303,8 @@ For CUDA it reads the saved image's lock hash offline and requires a match in
 the validated checkout lock and attestation or a retained private build
 snapshot for that channel. Reusing the native image skips wheel resolution
 and download. Any remaining app build steps still need their own inputs.
-An interrupted first installation uses this flag without `--upgrade`. For an
+For immediate recovery of an interrupted first installation, combine
+`--prepare-now` with `--reuse-native-image SOURCE_BUILD_TAG`. For an
 existing installation, follow the [upgrade procedure](#upgrade-an-existing-source-installation).
 
 ### Read the logs for a receipt
@@ -340,6 +391,21 @@ remote LLM loaded. After upgrading, turn OCR back on and resume the existing
 receipt in the queue. If it reports changed settings, review them and choose
 the current-policy retry for that receipt.
 
+An ordinary managed `--upgrade` can reuse the exact local OCR image when its
+recorded build recipe, source and runtime locks, and build inputs still match.
+For CUDA that includes the selected channel and validated wheel lock. For ROCm
+it includes the selected GFX target and host transport. The launcher checks the
+image identity and repeats the binding check against the physical GPU offline
+before starting the upgraded deployment. An app-only change can therefore skip
+the native image build. Keep the CUDA attestation and its private build snapshots.
+
+An older deployment without this build record goes through the normal native
+build and verification once. A change to the shared native runtime lock can
+also require one such pass on either accelerator, including CUDA when only the
+ROCm recipe prompted the lock update. Matching BuildKit layers and verified
+wheel bytes can still be reused. The model volume is separate. Activation
+verifies the required trees and can reuse valid local archives to restore files.
+
 Stop the old deployment with its original project, profile and complete
 Compose file set. Keep its named volumes, private settings and bind-mounted
 files. For a CUDA deployment with the checkout's default project name:
@@ -381,8 +447,8 @@ BUILDKIT_PROGRESS=plain python3 scripts/ocr_source_up.py rocm --upgrade 2>&1 | t
 
 Moving from the old single-step TheRock build to this recipe requires one
 rebuild to create the new intermediate layers. A normal `--restart` starts
-the recorded images. If the initial installation failed during its native
-build, update the checkout and rerun `python3 scripts/ocr_source_up.py rocm`
+the recorded images. If the initial `--prepare-now` build failed, update the
+checkout and rerun `python3 scripts/ocr_source_up.py rocm --prepare-now`
 with the same GPU selection. [ROCm build inputs and cache](#build-inputs)
 
 **If the native build finished but the app build failed on `server_data/config`**,
@@ -624,13 +690,21 @@ It skips the documentation-only root submodule `rocm-docs`. Its exact Git
 pin remains in the root gitlink inventory and in `omitted_root_gitlinks`.
 The builder checks the source inventory
 before building `patchelf` and reports the path and pin of a missing checkout.
-BuildKit caches the configured source/build tree and then the staged AMD LLVM
-toolchain in separate layers. If the rest of the SDK fails, retry the original
-command on the same builder. Completed layers with matching inputs can be
-reused while their cache entries exist. An interrupted step restarts at its
-beginning. LLVM is the last checkpoint before the SDK finish step, where the
-profiler and rocSHMEM follow TheRock's dependency order. The DVC download
-cache can also reuse verified assets.
+BuildKit saves the prepared source/build tree, LLVM, RCCL, MIOpen configuration
+with its prerequisites, and compiled MIOpen in separate layers. Retry the same
+command on the same builder with the same GFX targets and transport. Completed
+layers show `CACHED` while their inputs and cache entries match. A failure
+during MIOpen compilation restarts that step. A subsequent failure building
+the remaining SDK can reuse compiled MIOpen. The MIOpen SQLite patch is
+introduced after its configuration layer, so a change to that patch retains the
+earlier dependency builds. These layers keep intermediate build files in the
+local builder cache and use additional disk until BuildKit evicts them. Older
+recipes that put the whole post-LLVM SDK
+build in one step can reuse their completed LLVM layer. Their failed step has
+no committed per-target checkpoint. For example, an old failed MIOpen step
+showing `443/463` must rerun its uncommitted work. With the new recipe, a
+successful MIOpen configuration and prerequisite layer can survive a later
+MIOpen compile failure. The DVC cache can also reuse verified assets.
 
 Upstream estimates approximately 200 GB free and several hours for a TheRock
 source build. The intermediate layers retain large trees for later retries.

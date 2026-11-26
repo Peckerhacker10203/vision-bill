@@ -106,7 +106,10 @@ The same Bearer key authenticates inference and lifecycle requests.
 For a combined **Dedicated OCR** install, leave `OCR__ENDPOINT` unset and keep
 the LLM settings above. Enable Dedicated OCR in admin Settings after the router
 is idle. The action checks residency and records the selected handoff binding
-before native setup. Use the manual adoption below for separately managed OCR.
+on a shared GPU before native setup. For a local source installation this
+activation also starts the first native image build after the app and database
+are ready. Use the manual adoption below for separately managed OCR.
+[Source activation](paddleocr-service/README.md#start-vision-bill-first-and-build-ocr-from-settings)
 
 Replace `receipt-formatter` with its exact canonical `id` from the router's
 `GET /models` response. Managed release does not resolve aliases. OCR formatting

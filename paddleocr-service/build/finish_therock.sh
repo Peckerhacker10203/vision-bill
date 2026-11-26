@@ -1,9 +1,9 @@
 # Sourced by build_therock.sh for the SDK build after LLVM has been staged.
-# Configure RCCL (and its normal dependencies) so its actual device rules can be inspected.
-TIMEFORMAT='ocr_rocm_phase phase=rccl_configure elapsed_s=%3R'
-time CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS" cmake --build "$THEROCK_BUILD" --target rccl+configure
-python "$RECIPE/verify_rccl_targets.py" "$THEROCK_BUILD" "$EVIDENCE/targets.json" \
-  | tee "$EVIDENCE/therock-rccl-targets.txt"
+# Docker commits these stages separately. The standalone build follows the
+# same target graph, and verifies existing target/transport and patch markers.
+for stage in rccl miopen-configure miopen; do
+  bash "$RECIPE/checkpoint_therock.sh" "$stage"
+done
 
 # TheRock launches separate cmake --build processes for its subprojects.
 TIMEFORMAT='ocr_rocm_phase phase=sdk_compile elapsed_s=%3R'

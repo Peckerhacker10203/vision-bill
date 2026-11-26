@@ -70,9 +70,23 @@ def test_rocm_builder_checkpoints_llvm_before_copying_finish_inputs():
     assert "sharing=locked" in phases[0]
     assert "rm -rf /opt/native-src" in phases[2]
     before_llvm, after_llvm = builder.split(phases[1])
-    for name in ("finish_therock.sh", "verify_rccl_targets.py"):
+    for name in ("finish_therock.sh", "verify_rccl_targets.py", "checkpoint_therock.sh", "miopen-sqlite-transient.patch"):
         assert name not in before_llvm
-        assert f"build/{name}" in after_llvm.split(phases[2])[0]
+    checkpoints = [
+        "COPY build/checkpoint_therock.sh",
+        "RUN bash /opt/ocr/build/checkpoint_therock.sh rccl",
+        "RUN bash /opt/ocr/build/checkpoint_therock.sh miopen-configure",
+        "COPY build/miopen-sqlite-transient.patch",
+        "RUN bash /opt/ocr/build/checkpoint_therock.sh miopen",
+        "COPY build/finish_therock.sh",
+        phases[2],
+    ]
+    lines = after_llvm.splitlines()
+    offsets = [
+        next(i for i, line in enumerate(lines) if line == prefix or line.startswith(prefix + " "))
+        for prefix in checkpoints
+    ]
+    assert offsets == sorted(offsets)
 
 
 def test_rocm_exact_pins_full_sdk_targets_and_no_spoofing():
@@ -730,7 +744,7 @@ def test_therock_transport_controls_native_sources_before_build(tmp_path, transp
 
     recipe = tmp_path / "recipe"
     recipe.mkdir()
-    for name in ("build_therock.sh", "finish_therock.sh", "build_jobs.py"):
+    for name in ("build_therock.sh", "finish_therock.sh", "checkpoint_therock.sh", "build_jobs.py", "miopen-sqlite-transient.patch"):
         shutil.copy(SERVICE / "build" / name, recipe)
     (recipe / "prepare_therock.sh").write_text("exit 0\n")
     for check in ("verify_therock_targets", "verify_rccl_targets"):
@@ -756,6 +770,7 @@ if [[ "$*" == *win32metadata*"fetch --depth"* ]]; then exit 44; fi
 if [[ "$1" == -S ]]; then mkdir -p "$4"; touch "$4/CMakeCache.txt"; fi
 if [[ "$1" == --build ]]; then
     echo "targets=$VISION_BILL_AMDGPU_TARGETS jobs=$CMAKE_BUILD_PARALLEL_LEVEL" >> "$LOG"
+    if [[ "${@: -1}" == "$FAIL_TARGET" ]]; then exit 47; fi
     if [[ "${@: -1}" == dist-rocm && -z "$TEST_INSTALL" ]]; then exit 45; fi
 fi
 if [[ "$1" == --install ]]; then
@@ -798,12 +813,26 @@ fi
         blocked_log = tmp_path / "rejected-rccl.log"
         assert run("finish", FAIL_GUARD="verify_rccl_targets", LOG=str(blocked_log)).returncode == 46
         assert "--target dist-rocm" not in blocked_log.read_text()
+        interrupted = run("finish", FAIL_TARGET="MIOpen")
+        assert interrupted.returncode == 47
+        marker_root = tmp_path / "source/therock-build"
+        assert (marker_root / ".vision-bill-rccl").is_file()
+        assert (marker_root / ".vision-bill-miopen-configure").is_file()
+        assert not (marker_root / ".vision-bill-miopen").exists()
         result = run("finish")
-        output = prepared.stderr + llvm.stderr + result.stderr
+        assert (marker_root / ".vision-bill-miopen").is_file()
+        output = prepared.stderr + llvm.stderr + interrupted.stderr + result.stderr
         installed = run("finish", TEST_INSTALL="1", LOG=str(tmp_path / "installed.log"))
         assert installed.returncode == 0, installed.stderr
         assert re.search(r"ocr_rocm_phase phase=therock_finish elapsed_s=[0-9.]+", installed.stderr)
         assert installed.stderr.count("phase=sdk_compile ") == 1
+        resumed = (tmp_path / "installed.log").read_text()
+        assert "--target dist-rocm" in resumed and "--target MIOpen" not in resumed
+        assert "--target rccl" not in resumed and "--target amd-llvm" not in resumed
+        patch = recipe / "miopen-sqlite-transient.patch"
+        patch.write_bytes(patch.read_bytes() + b"\n")
+        mismatch = run("finish", LOG=str(tmp_path / "mismatch.log"))
+        assert mismatch.returncode != 0 and "Mismatched miopen checkpoint" in mismatch.stderr
         assert "phase=finish " in (evidence / "therock-checkpoints.txt").read_text()
     else:
         result = run()
@@ -829,9 +858,10 @@ fi
             assert f"-DTHEROCK_{scope}AMDGPU_FAMILIES= " in calls
             assert f"-DTHEROCK_{scope}AMDGPU_TARGETS=gfx1032;gfx1100 " in calls
         stages = ["verify_therock_targets", "--target amd-llvm", "--target rccl+configure",
-                  "verify_rccl_targets", "--target dist-rocm"]
+                  "verify_rccl_targets", "--target rccl\n", "--target MIOpen+configure",
+                  "miopen-sqlite-transient.patch", "--target MIOpen\n", "--target dist-rocm"]
         assert [calls.index(stage) for stage in stages] == sorted(calls.index(stage) for stage in stages)
-        assert calls.count("targets=gfx1032;gfx1100 jobs=1") == 3
+        assert calls.count("targets=gfx1032;gfx1100 jobs=1") == (7 if phased else 6)
         for option in ("WSL", "WSL_ROCDXG", "MIRAGE", "HIPDNN_SAMPLES"):
             assert f"-DTHEROCK_ENABLE_{option}=OFF" in calls
         for option in ("LLVM_PARALLEL_LINK_JOBS", "FLANG_PARALLEL_COMPILE_JOBS"):

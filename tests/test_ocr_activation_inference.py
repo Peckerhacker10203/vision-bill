@@ -558,3 +558,32 @@ def test_separate_gpu_diagnostic_keeps_direct_inference_marker(activation_store,
     monkeypatch.setattr(budget, "_post", post)
     assert budget.count("fixture") == 17
     assert unsettled_direct_calls(activation_store) == ()
+
+
+@pytest.mark.parametrize("phase", ["building", "failed"])
+def test_direct_on_separate_gpu_during_deferred_build(activation_store, tmp_path, monkeypatch, phase):
+    import time
+    from uuid import uuid4
+
+    status_file = tmp_path / "host.json"
+    monkeypatch.setenv("VISION_BILL_OCR_NATIVE_BUILD_STATUS", str(status_file))
+    store = activation_store
+    store.set_shared_gpu(False)
+    request = store.submit_request(MaintenanceIntent.SEPARATE_OCR_DEVICE)
+    published = {
+        "phase": phase, "updated_at": time.time(), "version": 1, "generation": str(uuid4()),
+    }
+    status_file.write_text(json.dumps(published))
+    with pytest.raises(HandoffWait), inference_admission(store=store):
+        pass
+    published["generation"] = str(request.generation)
+    status_file.write_text(json.dumps(published))
+    with (
+        inference_admission(store=store),
+        pytest.raises(HandoffWait, match="execution_policy_changed"),
+        inference_admission(uses_ocr=True),
+    ):
+        pass
+    store.publish_status(ActivationStatus(request.generation, ActivationPhase.WAITING_FOR_ADMISSION))
+    with pytest.raises(HandoffWait, match="dedicated_ocr_activation_pending"), inference_admission(store=store):
+        pass

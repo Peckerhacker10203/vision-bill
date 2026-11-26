@@ -446,3 +446,18 @@ it('can return to direct vision after a clean initial failure without starting a
 		enabled: false
 	});
 });
+
+it('shows the source-build failure and allows an explicit retry', async () => {
+	const fetchStatus = vi
+		.fn()
+		.mockResolvedValueOnce(status('failed', 'native_image_build_failed', 200, false, false))
+		.mockResolvedValueOnce(status('requested', null, 202, false, false));
+	vi.stubGlobal('fetch', fetchStatus);
+	render(Settings);
+	await screen.findByText(/GPU image build failed/);
+	await fireEvent.click(screen.getByRole('switch', { name: 'Dedicated OCR' }));
+	expect(JSON.parse(fetchStatus.mock.calls[1][1].body)).toEqual({
+		enabled: true,
+		confirm_handoff: false
+	});
+});

@@ -20,10 +20,12 @@ from ocr_contract.activation import (
     ActivationStateError,
     ActivationStatus,
     ActivationStore,
+    MaintenanceIntent,
 )
 
 from ..model.handoff import HandoffStatus, HandoffWait
 from .gpu_handoff import ModelHandoff, current_owner
+from .native_build import native_build_status
 
 if TYPE_CHECKING:
     from ..config import OcrSettings
@@ -188,6 +190,15 @@ def inference_admission(
             request = selected.read_request()
             status = selected.read_status(request) if request is not None else None
             direct_only = request is not None and failed_setup_can_disable(status) and not selected.runtime_enabled(request)
+            if (
+                request is not None and status is None
+                and request.maintenance_intent == MaintenanceIntent.SEPARATE_OCR_DEVICE
+                and not selected.shared_gpu()
+            ):
+                # The native controller also takes exclusive admission. Its first
+                # status closes this window while already admitted direct calls drain.
+                build = native_build_status()
+                direct_only = build is not None and build.generation == request.generation
             if request is not None and status is not None and status.phase == ActivationPhase.READY:
                 from ..config import settings
                 shared_gpu = _require_current_route(selected, request, settings.ocr)

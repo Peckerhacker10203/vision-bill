@@ -194,3 +194,25 @@ def test_runtime_intent_is_generation_bound_and_missing_defaults_enabled(tmp_pat
     store.publish_status(ActivationStatus(request.generation, ActivationPhase.FAILED))
     replacement = store.submit_request(MaintenanceIntent.EXTERNAL_LLM_QUIESCED, retry_generation=request.generation)
     assert store.runtime_enabled(replacement)
+
+
+@pytest.mark.parametrize("bad", [
+    {"updated_at": float("nan")}, {"updated_at": True}, {"version": True}, {"extra": "field"},
+    {"phase": "started"}, {"generation": "invalid"}, {"phase": "waiting"},
+])
+def test_untrusted_host_heartbeat_cannot_authorize_build_retry(store, tmp_path, monkeypatch, bad):
+    import time
+
+    from vision_bill.service.native_build import native_build_status, resolve_failed_build
+
+    status_file = tmp_path / "host.json"
+    monkeypatch.setenv("VISION_BILL_OCR_NATIVE_BUILD_STATUS", str(status_file))
+    request = store.submit_request(MaintenanceIntent.SEPARATE_OCR_DEVICE)
+    valid = {"version": 1, "phase": "failed", "generation": str(request.generation), "updated_at": time.time()}
+    status_file.write_text(json.dumps(valid | bad))
+    assert native_build_status() is None
+    with pytest.raises(ActivationConflict):
+        resolve_failed_build(store, request)
+    with pytest.raises(ActivationConflict):
+        resolve_failed_build(store, request, retry_intent=request.maintenance_intent)
+    assert store.read_request() == request

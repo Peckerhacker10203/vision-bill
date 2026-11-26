@@ -19,16 +19,18 @@ import tempfile
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
 NATIVE = "paddleocr-service"
 RECORD_LIMIT = 32 * 1024**2
 IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}")
 NATIVE_PLATFORM = "linux/amd64"
+DEFERRED_STATUS = "/native-build/status.json"
 # The official Python base also pinned in the native Dockerfiles.
 JOURNAL_INSPECTOR = "python:3.12-slim@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b"
 KFD_TOPOLOGY = Path("/sys/class/kfd/kfd/topology/nodes")
@@ -36,6 +38,35 @@ MANIFEST_TYPES = {
     "application/vnd.oci.image.manifest.v1+json",
     "application/vnd.docker.distribution.manifest.v2+json",
 }
+
+
+@dataclass(frozen=True)
+class DeferredApp:
+    project: str
+    image_id: str
+    status_dir: Path
+    revision: str
+
+    def overlay(self) -> dict[str, Any]:
+        service = app_image_service(self.image_id)
+        service["environment"].update(
+            VISION_BILL_OCR_NATIVE_BUILD_STATUS=DEFERRED_STATUS, OCR__ENDPOINT="",
+        )
+        service["healthcheck"]["test"][-1] = (
+            "import urllib.request; "
+            "urllib.request.urlopen('http://127.0.0.1:8080/api/v1/system/ready', timeout=5)"
+        )
+        service["volumes"] = [{
+            "type": "bind", "source": str(self.status_dir), "target": "/native-build",
+            "read_only": True, "bind": {"create_host_path": False},
+        }]
+        return {
+            "x-vision-bill-deferred": {
+                "project": self.project, "image_id": self.image_id,
+                "checkout": str(ROOT), "revision": self.revision,
+            },
+            "services": {"vision_bill": service},
+        }
 
 # Use the verifiers shipped in the exact built image. Neither provisioning nor
 # qualification can run during this offline metadata-only invocation.
@@ -99,6 +130,8 @@ if bundle.accelerator == 'rocm':
 bound = bundle.model_dump(mode='json')
 if bundle.accelerator == 'cuda':
     bound['_bound_cuda_uuid'] = device['uuid']
+else:
+    bound['_bound_rocm_uuid'] = device['uuid']
 print(json.dumps(bound, sort_keys=True, indent=2))
 """
 
@@ -220,6 +253,26 @@ def image_tag(accelerator: str, image_id: str) -> str:
     return f"vision-bill-ocr-{accelerator}:source-{image_id[7:]}"
 
 
+def app_image_service(image_id: str) -> dict[str, Any]:
+    if not IMAGE_ID.fullmatch(image_id):
+        raise ValueError("Invalid application Docker engine image ID")
+    return {
+        "image": f"vision-bill:source-{image_id[7:]}",
+        "pull_policy": "never",
+        "healthcheck": {
+            "test": [
+                "CMD", "python", "-c",
+                "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/v1/system/ui-config', timeout=5)",
+            ],
+            "interval": "3s",
+            "timeout": "6s",
+            "retries": 10,
+            "start_period": "20s",
+        },
+        "environment": {"OCR_ACTIVATION_ON_STARTUP": "false"},
+    }
+
+
 def managed_overlay(
     accelerator: str,
     release: Path,
@@ -231,8 +284,6 @@ def managed_overlay(
     *,
     config_id: str,
 ) -> dict[str, Any]:
-    if not IMAGE_ID.fullmatch(app_id):
-        raise ValueError("Invalid application Docker engine image ID")
     if not IMAGE_ID.fullmatch(config_id):
         raise ValueError("Invalid native Docker image configuration ID")
     return {
@@ -244,23 +295,7 @@ def managed_overlay(
             "image_config_sha256": config_id[7:],
         },
         "services": {
-            "vision_bill": {
-                "image": f"vision-bill:source-{app_id[7:]}",
-                "pull_policy": "never",
-                "healthcheck": {
-                    "test": [
-                        "CMD",
-                        "python",
-                        "-c",
-                        "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/v1/system/ui-config', timeout=5)",
-                    ],
-                    "interval": "3s",
-                    "timeout": "6s",
-                    "retries": 10,
-                    "start_period": "20s",
-                },
-                "environment": {"OCR_ACTIVATION_ON_STARTUP": "false"},
-            },
+            "vision_bill": app_image_service(app_id),
             NATIVE: {
                 "image": image_tag(accelerator, image_id),
                 "platform": NATIVE_PLATFORM,
@@ -487,8 +522,11 @@ def bootstrap(
     reuse_native_image: str | None = None,
     upgrade: bool = False,
     recover_stopped_ocr: bool = False,
+    defer_build: bool = False,
 ) -> None:
-    need_host(accelerator, build=not restart, automatic_inputs=not restart and inputs is None)
+    # An upgrade may keep its exact admitted native image and need only Compose.
+    prepare_native = not (restart or defer_build or upgrade)
+    need_host(accelerator, build=prepare_native, automatic_inputs=prepare_native and inputs is None)
     deployment = ROOT / "server_data" / "ocr-source"
     state = deployment / accelerator
     for directory in (deployment, state):
@@ -505,12 +543,16 @@ def bootstrap(
         accelerator == "rocm"
         and not restart
         and not upgrade
+        and not defer_build
         and "docker-compose.rocm-wsl.yml" not in compose
     ):
         select_rocm_render_node(compose)
     lock = deployment / "deploy.lock"
     with lock.open("a") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if defer_build:
+            start_deferred(compose, state, accelerator, inputs, reuse_native_image=reuse_native_image)
+            return
         deploy(
             compose,
             state,
@@ -580,12 +622,16 @@ def gpu_args(accelerator: str, native: dict[str, Any]) -> tuple[list[str], dict[
 
 def reject_other_profile(state: Path, accelerator: str, project: str) -> None:
     other = "cuda" if accelerator == "rocm" else "rocm"
-    record = state.parent / other / "compose.local.json"
-    if record.exists():
-        trusted_file(record)
-        identity = json.loads(record.read_bytes())["x-vision-bill-source"]
-        if identity["project"] == project:
-            raise ValueError("This Compose project is already prepared for another accelerator")
+    for filename, field in (
+        ("compose.local.json", "x-vision-bill-source"),
+        ("deferred.app.json", "x-vision-bill-deferred"),
+    ):
+        record = state.parent / other / filename
+        if record.exists():
+            trusted_file(record)
+            identity = json.loads(record.read_bytes())[field]
+            if identity["project"] == project:
+                raise ValueError("This Compose project is already prepared for another accelerator")
 
 
 def rocm_render_target(render: Path, topology: Path = KFD_TOPOLOGY) -> str:
@@ -833,7 +879,10 @@ def project_claim(
 
 
 def has_project_claim(identity: dict[str, Any], accelerator: str, release: Path) -> bool:
-    name, label, owner = project_claim(identity, accelerator, release)
+    return volume_has_claim(*project_claim(identity, accelerator, release))
+
+
+def volume_has_claim(name: str, label: str, owner: str) -> bool:
     try:
         records = json.loads(command("docker", "volume", "inspect", name, capture=True))
     except subprocess.CalledProcessError:
@@ -944,7 +993,10 @@ def verify_upgrade_handoff(
 
 
 def acquire_project_claim(identity: dict[str, Any], accelerator: str, release: Path) -> None:
-    name, label, owner = project_claim(identity, accelerator, release)
+    acquire_volume_claim(*project_claim(identity, accelerator, release), project=identity["project"])
+
+
+def acquire_volume_claim(name: str, label: str, owner: str, *, project: str) -> None:
     # Docker serializes creation by name and reuses an existing local volume
     # without replacing its creation labels, including during concurrent calls.
     command(
@@ -958,10 +1010,8 @@ def acquire_project_claim(identity: dict[str, Any], accelerator: str, release: P
         name,
         capture=True,
     )
-    if not has_project_claim(identity, accelerator, release):
-        raise ValueError(
-            f"Compose project {identity['project']!r} is already claimed by another source deployment"
-        )
+    if not volume_has_claim(name, label, owner):
+        raise ValueError(f"Compose project {project!r} is already claimed by another source deployment")
 
 
 def bind_sources(
@@ -1137,6 +1187,141 @@ def record_admission(managed: Path, replacement: Path | None = None) -> None:
     pending.replace(marker)
 
 
+READ_DEFERRED_REQUEST = """
+from ocr_contract.activation import ActivationStore
+store = ActivationStore()
+request = store.read_request()
+if request is not None and store.runtime_enabled(request):
+    print(request.generation)
+"""
+
+
+def deferred_app_container(compose: tuple[str, ...], app: DeferredApp) -> str | None:
+    containers = command(*compose, "ps", "--quiet", "vision_bill", capture=True).split()
+    if not containers:
+        return None
+    if len(containers) != 1 or not re.fullmatch(r"[0-9a-f]{12,64}", containers[0]):
+        raise ValueError("Cannot identify the deferred application container")
+    container = containers[0]
+    image, health = command(
+        "docker", "container", "inspect", "--format",
+        "{{.Image}} {{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}",
+        container, capture=True,
+    ).split()
+    if image != app.image_id:
+        raise ValueError("The deferred application image changed")
+    return container if health == "healthy" else None
+
+
+def deferred_generation(compose: tuple[str, ...], app: DeferredApp) -> str | None:
+    container = deferred_app_container(compose, app)
+    if container is None:
+        return None
+    generation = command(
+        "docker", "exec", container, "python", "-c", READ_DEFERRED_REQUEST, capture=True,
+    ).strip()
+    if not generation:
+        return None
+    try:
+        if str(UUID(generation)) == generation:
+            return generation
+    except ValueError:
+        pass
+    raise ValueError("Invalid deferred OCR activation generation")
+
+
+def start_deferred(
+    compose: tuple[str, ...], state: Path, accelerator: str, inputs: Path | None,
+    *, reuse_native_image: str | None = None,
+) -> None:
+    deferred = importlib.import_module(
+        ".ocr_deferred" if __package__ else "ocr_deferred", package=__package__,
+    )
+    managed = state / "compose.local.json"
+    if managed.exists():
+        deploy(compose, state, accelerator, None, restart=True)
+        return
+    config = json.loads(command(*compose, "config", "--no-env-resolution", "--format", "json", capture=True))
+    project = config["name"]
+    compose = (*compose, "--project-name", project)
+    reject_other_profile(state, accelerator, project)
+    revision = command("git", "rev-parse", "HEAD", capture=True).strip()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", revision):
+        raise ValueError("Cannot identify the source checkout")
+    status_dir = state / "native-build-status"
+    status_dir.mkdir(mode=0o700, exist_ok=True)
+    details = status_dir.lstat()
+    if not stat.S_ISDIR(details.st_mode) or details.st_uid != os.getuid() or details.st_mode & 0o077:
+        raise ValueError("Deferred build status must be in a private operator-owned directory")
+    record = state / "deferred.app.json"
+    saved_app: DeferredApp | None = None
+    project_hash = hashlib.sha256(project.encode()).hexdigest()
+    owner = hashlib.sha256(f"{ROOT}\n{accelerator}".encode()).hexdigest()
+    claim = (f"vision-bill-deferred-claim-{project_hash}", "io.vision-bill.source-owner", owner)
+    if record.exists():
+        if trusted_file(record).st_size > 8192:
+            raise ValueError("Deferred application record is too large")
+        saved = json.loads(record.read_bytes())
+        identity = saved["x-vision-bill-deferred"]
+        saved_app = DeferredApp(project, identity["image_id"], status_dir, identity["revision"])
+        if saved != saved_app.overlay() or existing_controllers(compose):
+            raise ValueError("The deferred application project or controller changed")
+        if inspect_image(app_image_service(saved_app.image_id)["image"]) != saved_app.image_id:
+            raise ValueError("The deferred application image changed")
+        if not volume_has_claim(*claim):
+            raise ValueError("Cannot verify the previously deferred Compose project on this Docker engine")
+    else:
+        reject_existing_ocr(compose, project)
+    verify_existing_app(compose, project, allow_orphan=saved_app is not None)
+    if saved_app is None:
+        acquire_volume_claim(*claim, project=project)
+    if saved_app is not None and saved_app.revision == revision:
+        app = saved_app
+    else:
+        with build_phase("app_image_build"):
+            command(*compose, "build", "vision_bill")
+        image_id = inspect_image(config["services"]["vision_bill"]["image"])
+        app = DeferredApp(project, image_id, status_dir, revision)
+        overlay = app.overlay()
+        command("docker", "image", "tag", image_id, overlay["services"]["vision_bill"]["image"])
+        pending = record.with_suffix(".pending")
+        pending.write_text(json.dumps(overlay))
+        pending.replace(record)
+
+    status_path = status_dir / "status.json"
+    # Only this launcher can publish the native record or start the controller.
+    deferred.initialize_status(status_path, interrupted_safe=True)
+    app_compose = (*compose, "-f", str(record))
+    command(*app_compose, "up", "--detach", "--no-build", "--wait", "--wait-timeout", "300", "vision_bill", "db")
+    if deferred_app_container(app_compose, app) is None:
+        raise ValueError("Vision Bill did not reach readiness before OCR preparation")
+    print("Vision Bill and PostgreSQL are ready. Waiting for Dedicated OCR in Settings.", flush=True)
+
+    def build_native() -> None:
+        try:
+            if command("git", "rev-parse", "HEAD", capture=True).strip() != app.revision:
+                raise ValueError("The checkout revision changed while waiting for OCR")
+            need_host(accelerator, build=True, automatic_inputs=inputs is None)
+            if accelerator == "rocm" and "docker-compose.rocm-wsl.yml" not in compose:
+                select_rocm_render_node(compose)
+            deploy(
+                compose, state, accelerator, inputs,
+                reuse_native_image=reuse_native_image, deferred_app=app,
+            )
+        except Exception as exc:
+            try:
+                handoff_possible = managed.exists() or bool(existing_controllers(compose))
+            except (OSError, subprocess.CalledProcessError):
+                handoff_possible = True
+            if handoff_possible:
+                raise deferred.DeferredHandoffError(
+                    "The native controller may have started. Inspect the original project and use --restart."
+                ) from exc
+            raise
+
+    deferred.wait_for_ocr(status_path, lambda: deferred_generation(app_compose, app), build_native)
+
+
 def deploy(
     compose: tuple[str, ...],
     state: Path,
@@ -1147,6 +1332,7 @@ def deploy(
     reuse_native_image: str | None = None,
     upgrade: bool = False,
     recover_stopped_ocr: bool = False,
+    deferred_app: DeferredApp | None = None,
 ) -> None:
     if recover_stopped_ocr and not upgrade:
         raise ValueError("--recover-stopped-ocr requires --upgrade")
@@ -1207,14 +1393,14 @@ def deploy(
         previous_digest = path_digest(managed)
         compose = (*compose, "--project-name", previous["project"])
         device_settings = dict(previous["device_environment"])
-        if "OCR_ROCM_DEVICE_ID" in device_settings:
-            # Restart always reuses the admitted ordinal. During an explicit
-            # upgrade a newly configured ordinal goes through the bind again.
-            environment = command(*compose, "config", "--environment", capture=True)
-            for line in environment.splitlines():
-                if line.startswith("OCR_ROCM_DEVICE_ID=") and line.partition("=")[2]:
-                    device_settings["OCR_ROCM_DEVICE_ID"] = line.partition("=")[2]
-                    break
+        # A previously implicit GPU override belongs to the last deployment. Explicit
+        # selectors from this upgrade's shell or .env must describe the new candidate.
+        selectors = {"OCR_ROCM_DEVICE_ID", "OCR_CUDA_DEVICE_ID", "OCR_RENDER_NODE"}
+        environment = command(*compose, "config", "--environment", capture=True)
+        for line in environment.splitlines():
+            key, _, value = line.partition("=")
+            if key in selectors and key in device_settings and value:
+                device_settings[key] = value
         os.environ.update(device_settings)
         if command(*compose, "ps", "--all", "--quiet", "vision_bill", NATIVE, capture=True).strip():
             raise ValueError(
@@ -1235,15 +1421,34 @@ def deploy(
     reject_other_profile(state, accelerator, project)
     if previous is None:
         compose = (*compose, "--project-name", project)
-        reject_existing_ocr(compose, project)
+        if deferred_app is None:
+            reject_existing_ocr(compose, project)
+        elif deferred_app.project != project or existing_controllers(compose):
+            raise ValueError("The Compose project changed before starting deferred OCR")
     elif project != previous["project"]:
         raise ValueError("Cannot change Compose project during upgrade")
     verify_existing_app(compose, project, allow_orphan=upgrade)
     candidate = config["services"][NATIVE]
     devices, device_environment = gpu_args(accelerator, candidate)
     os.environ.update(device_environment)
+    saved_target = None
+    selection_error = None
     if accelerator == "rocm" and reuse_native_image is None:
-        configure_rocm_build(candidate, device_environment)
+        try:
+            configure_rocm_build(candidate, device_environment)
+        except ValueError as exc:
+            # An admitted WSL installation may have been built with an explicit
+            # GFX target on a host without rocminfo. Try its proven profile only
+            # for reuse; a fresh build still requires an actual target selection.
+            old_proof = (previous or {}).get("native_build", {})
+            saved_target = old_proof.get("selected_args", {}).get("AMDGPU_TARGETS")
+            args = candidate["build"]["args"]
+            if (not saved_target or args.get("AMDGPU_TARGETS")
+                    or "OCR_ROCM_DEVICE_ID" not in device_environment):
+                raise
+            resolved = {**candidate, "build": {**candidate["build"], "args": {**args, "AMDGPU_TARGETS": saved_target}}}
+            configure_rocm_build(resolved, device_environment)
+            selection_error = exc
     if accelerator == "cuda":
         channel = cuda_build_channel(
             compose, candidate, previous,
@@ -1259,10 +1464,38 @@ def deploy(
             # A managed selector may be an ordinal on WSL. Carry the original
             # hardware identity through the upgrade even if indexing changed.
             prior_uuid = prior["services"][NATIVE]["environment"].get("OCR_CUDA_EXPECTED_UUID")
-            if prior_uuid:
+            if prior_uuid and device_environment == previous["device_environment"]:
                 devices.extend(("--env", f"OCR_CUDA_EXPECTED_UUID={prior_uuid}"))
     if previous is not None:
         verify_upgrade_handoff(config, previous, recover_stopped_ocr=recover_stopped_ocr)
+    reuse = importlib.import_module(
+        ".ocr_native_reuse" if __package__ else "ocr_native_reuse", package=__package__
+    )
+    selected_args = (
+        {"OCR_CUDA_CHANNEL": channel} if accelerator == "cuda" else
+        {"AMDGPU_TARGETS": os.environ.get("OCR_AMDGPU_TARGETS", ""),
+         "OCR_ROCM_TRANSPORT": os.environ.get("OCR_ROCM_TRANSPORT", "")}
+    )
+    fingerprint = None
+    auto_reuse = False
+    if reuse_native_image is None:
+        fingerprint = reuse.build_fingerprint(ROOT / NATIVE, accelerator, candidate.get("build", {}), selected_args)
+        if previous is not None and previous.get("native_build"):
+            admitted = reuse.admitted_candidate(
+                previous, fingerprint, device_environment, old_release, checkout_sources(),
+                prior["services"][NATIVE]["image"],
+            )
+            if admitted:
+                try:
+                    local_id = inspect_image(admitted)
+                except subprocess.CalledProcessError:
+                    local_id = ""
+                if local_id == previous["image_ids"][NATIVE]:
+                    reuse_native_image = admitted
+                    auto_reuse = True
+                    print("Reusing the admitted native OCR image for this application upgrade.", flush=True)
+    if selection_error is not None and not auto_reuse:
+        raise selection_error
     native_image = reuse_native_image or candidate["image"]
     image_id = ""
     expected_sources: dict[str, str] = {}
@@ -1290,7 +1523,11 @@ def deploy(
                 "--check",
                 "paddleocr-service/requirements.cuda.lock",
             ]
-            if reuse_native_image is not None:
+            if auto_reuse and previous is not None:
+                # The admitted proof binds the originally validated lock to this
+                # immutable image. BIND_BUNDLE checks its attestation and hash again.
+                digest = previous["native_build"]["cuda_lock_sha256"]
+            elif reuse_native_image is not None:
                 lock.insert(2, "--offline")
                 digest = command(
                     *lock, "--reuse-image", image_id, "--channel", channel, capture=True
@@ -1316,7 +1553,12 @@ def deploy(
                     command(*compose, "build", NATIVE)
             image_id = inspect_image(native_image, report_size=True)
         with build_phase("verify_image_config"):
-            config_id = export_config(release, image_id)
+            if auto_reuse and previous is not None:
+                if image_id != previous["image_ids"][NATIVE]:
+                    raise ValueError("Previously admitted native image tag changed")
+                config_id = reuse.copy_proven_config(previous, old_release, release)
+            else:
+                config_id = export_config(release, image_id)
         print("Validating the native OCR packages and GPU selection…", flush=True)
         # The metadata probe has neither model cache/state mounts nor a network.
         bound = command(
@@ -1345,19 +1587,25 @@ def deploy(
             capture=True,
         )
         manifest = json.loads(bound)
-        if accelerator == "cuda":
-            bound_cuda_uuid = manifest.pop("_bound_cuda_uuid")
-            if not isinstance(bound_cuda_uuid, str) or not re.fullmatch(r"[0-9a-f]{32}", bound_cuda_uuid):
-                raise ValueError("Invalid bound CUDA UUID")
+        bound_device_uuid = manifest.pop(f"_bound_{accelerator}_uuid")
+        if not isinstance(bound_device_uuid, str) or not re.fullmatch(r"[0-9a-f]{32}", bound_device_uuid):
+            raise ValueError("Invalid bound native GPU UUID")
+        if auto_reuse and previous is not None and bound_device_uuid != previous["native_build"]["device_uuid"]:
+            raise ValueError("Selected GPU differs from the device admitted with this native image")
         if reuse_native_image is not None and (
             inspect_image(native_image) != image_id or manifest["source_files"] != expected_sources
         ):
             raise ValueError("Reused OCR image or its sources changed during verification")
         (release / "bundle.json").write_text(json.dumps(manifest, indent=2) + "\n")
         command("docker", "image", "tag", image_id, image_tag(accelerator, image_id))
-        with build_phase("app_image_build"):
-            command(*compose, "build", "vision_bill")
-        app_id = inspect_image(config["services"]["vision_bill"]["image"])
+        if deferred_app is None:
+            with build_phase("app_image_build"):
+                command(*compose, "build", "vision_bill")
+            app_id = inspect_image(config["services"]["vision_bill"]["image"])
+        else:
+            if deferred_app_container(compose, deferred_app) is None:
+                raise ValueError("The deferred application is no longer ready")
+            app_id = deferred_app.image_id
         overlay = managed_overlay(
             accelerator,
             release,
@@ -1368,11 +1616,21 @@ def deploy(
             path_digest(release / "bundle.json"),
             config_id=config_id,
         )
+        if fingerprint:
+            if fingerprint != reuse.build_fingerprint(ROOT / NATIVE, accelerator, candidate.get("build", {}), selected_args):
+                raise ValueError("Native build inputs changed during verification")
+            overlay["x-vision-bill-source"]["native_build"] = {
+                "inputs_sha256": fingerprint, "device_uuid": bound_device_uuid, "selected_args": selected_args,
+            }
+            if cuda_verification:
+                overlay["x-vision-bill-source"]["native_build"]["cuda_lock_sha256"] = digest
         if cuda_verification:
             overlay["x-vision-bill-source"]["cuda_channel"] = channel
-            overlay["services"][NATIVE]["environment"]["OCR_CUDA_EXPECTED_UUID"] = bound_cuda_uuid
+            overlay["services"][NATIVE]["environment"]["OCR_CUDA_EXPECTED_UUID"] = bound_device_uuid
         if previous is not None:
             overlay["x-vision-bill-source"]["claim_origin"] = claim_origin(previous, old_release)
+        if deferred_app is not None:
+            overlay["services"]["vision_bill"] = deferred_app.overlay()["services"]["vision_bill"]
         command("docker", "image", "tag", app_id, overlay["services"]["vision_bill"]["image"])
         pending.write_text(json.dumps(overlay))
         if previous is not None:
@@ -1396,13 +1654,16 @@ def deploy(
     # restart can retry this exact image and the device selection.
     selected = (*compose, "-f", str(managed))
     acquire_project_claim(overlay["x-vision-bill-source"], accelerator, release)
-    if upgrade and existing_controllers(selected):
-        raise ValueError("An OCR controller started during upgrade")
-    if not upgrade:
+    if (upgrade or deferred_app is not None) and existing_controllers(selected):
+        raise ValueError("An OCR controller started during source preparation")
+    if not upgrade and deferred_app is None:
         reject_existing_ocr(selected, project)
     verify_existing_app(selected, project, allow_orphan=upgrade)
     record_admission(managed)
-    start(*selected)
+    if deferred_app is None:
+        start(*selected)
+    else:
+        command(*selected, "up", "--detach", "--no-build", "--no-deps", "--wait", "--wait-timeout", "300", NATIVE)
 
 
 def inspect_image(image: str, *, report_size: bool = False) -> str:
@@ -1437,6 +1698,16 @@ def main() -> int:
         action="store_true",
         help="build updated images for the original, drained Compose project",
     )
+    mode.add_argument(
+        "--defer-build",
+        action="store_true",
+        help="start Vision Bill and PostgreSQL, then wait for an admin to request the native build (default)",
+    )
+    mode.add_argument(
+        "--prepare-now",
+        action="store_true",
+        help="explicitly build and verify the native OCR image before starting the stack",
+    )
     parser.add_argument(
         "--reuse-native-image",
         metavar="SOURCE_BUILD_TAG",
@@ -1462,6 +1733,7 @@ def main() -> int:
             reuse_native_image=args.reuse_native_image,
             upgrade=args.upgrade,
             recover_stopped_ocr=args.recover_stopped_ocr,
+            defer_build=not (args.prepare_now or args.upgrade or args.restart),
         )
     except subprocess.CalledProcessError as exc:
         print(
@@ -1471,7 +1743,7 @@ def main() -> int:
         if exc.stderr:
             print(exc.stderr, file=sys.stderr, end="")
         return 1
-    except (OSError, ValueError, TypeError, KeyError, tarfile.TarError) as exc:
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError, tarfile.TarError) as exc:
         print(f"Source OCR preparation failed: {exc}", file=sys.stderr)
         return 1
     print("Source stack started. Open Settings → Dedicated OCR to enable setup.")

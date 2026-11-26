@@ -169,6 +169,14 @@ async def set_dedicated_ocr_gpu_topology(
     return result
 
 
+@router.get("/ready", include_in_schema=False)
+async def application_ready(request: Request) -> dict[str, bool]:
+    service = getattr(request.app.state, "receipt_service", None)
+    if service is None or not service.db_ready or not service.workflow_ready:
+        raise HTTPException(status_code=503, detail="database_not_ready")
+    return {"ready": True}
+
+
 @router.get("/ui-config")
 async def get_ui_config() -> dict[str, bool | int]:
     """Return safe runtime defaults needed by the browser UI (public, pre-auth)."""
