@@ -920,23 +920,39 @@ def test_review_capabilities_distinguish_disabled_managed_and_cpu_modes(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_review_cleanup_passes_remaining_absolute_deadline_on_body_error(tmp_path):
-    from vision_bill.service.gpu_handoff import ModelHandoff
+async def test_review_cleanup_passes_remaining_absolute_deadline_on_body_error(tmp_path, monkeypatch):
+    from vision_bill.service import gpu_handoff
 
     events, park_deadlines = [], []
     llm, ocr = Llm(events), Ocr(events)
-    async def slow_park(token, deadline):
-        park_deadlines.append(deadline)
-        await asyncio.sleep(.2)
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    deadline = now + 10
+    monkeypatch.setattr(loop, "time", lambda: now)
+    monkeypatch.setattr(gpu_handoff, "monotonic", lambda: now)
+
+    def advance_past_park():
+        nonlocal now
+        now = deadline + 20
+
+    async def slow_park(token, park_deadline):
+        park_deadlines.append(park_deadline)
+        # Both timers become due. The session deadline must cancel park before its sleep finishes.
+        loop.call_soon(advance_past_park)
+        try:
+            await asyncio.sleep(15)
+        except asyncio.CancelledError:
+            events.append("park_cancelled")
+            raise
+
     ocr.park = slow_park
-    started = monotonic()
-    deadline = started + .04
     with pytest.raises(ValueError, match="body failed"):
-        async with ModelHandoff(tmp_path / "handoff", llm, ocr).session(deadline) as owner:
+        async with gpu_handoff.ModelHandoff(tmp_path / "handoff", llm, ocr).session(deadline) as owner:
             await owner.llm_phase("own")
+            now += 4
             raise ValueError("body failed")
-    assert monotonic() - started < .15
     assert park_deadlines == [deadline]
+    assert "park_cancelled" in events
     assert json.loads((tmp_path / "handoff.json").read_text())["models"] == ["own"]
 
 
