@@ -157,7 +157,7 @@ class BenchmarkDB:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch("""SELECT s.*,r.scoring_version,
                 (SELECT count(*) FROM benchmark_results b WHERE b.run_id=s.run_id
-                 AND b.model_id=s.model_id AND b.payload->>'full_receipt_correct'='true') AS full_correct
+                 AND b.model_id=s.model_id AND b.success AND b.payload->>'full_receipt_correct'='true') AS full_correct
                 FROM benchmark_summaries s JOIN benchmark_runs r ON r.id=s.run_id
                 WHERE s.run_id=$1 ORDER BY s.model_id""", run_id)
         return [BenchmarkSummary(

@@ -329,6 +329,10 @@ class BenchmarkService:
         except Exception as exc:
             if asyncio.get_running_loop().time() >= deadline:
                 raise TimeoutError("benchmark_attempt_deadline") from exc
+            if isinstance(exc, TimeoutError) and isinstance(exc.__cause__, asyncio.CancelledError):
+                evidence = exc.__cause__.__cause__
+                if isinstance(evidence, PostObservationFailure):
+                    exc = evidence
             before_inference = not task["inference_started"]
             retryable = self._retryable(exc)
             if before_inference and isinstance(exc, HandoffWait):
@@ -392,10 +396,24 @@ class BenchmarkService:
         metadata.update(self._attempt_metadata(task))
         metadata.update(elapsed_ms=elapsed, requested_pipeline=manifest["options"]["pipeline"])
         item = next(x for x in manifest["inputs"] if x["receipt_id"] == str(task["receipt_id"]))
-        failure_score = self._score(manifest, task["receipt_id"], self._reference_document(item), None) if "reference" in item else {}
+        detail: dict[str, Any] = {}
+        error = str(exc) or type(exc).__name__
+        if "reference" in item:
+            expected = self._reference_document(item)
+            actual = None
+            if isinstance(exc, ExperimentFailure) and exc.observed is not None:
+                try:
+                    actual = self._comparable_observation(manifest, item, expected, exc.observed, metadata)
+                except ValueError as identity_error:
+                    error = str(identity_error)
+            detail = await asyncio.to_thread(
+                self._score, manifest, task["receipt_id"], expected, actual, metadata, observations_only=True,
+            )
+            if actual is not None:
+                detail.update(expected=item["expected"], actual=actual.model_dump(mode="json", exclude={"merchant_display_name"}))
         finished = await self._db.finish_task(task, success=False, latency_ms=elapsed,
             attempts=len(metadata.get("calls", [])) or dispatched,
-            result={**failure_score, "error": str(exc) or type(exc).__name__, "metadata": metadata}, deadline=deadline)
+            result={**detail, "error": error, "metadata": metadata}, deadline=deadline)
         if finished:
             logger.info("Benchmark case failed run=%s pipeline=%s error_type=%s elapsed_ms=%.0f",
                         task["run_id"], manifest["options"]["pipeline"], type(exc).__name__, elapsed)
@@ -561,6 +579,8 @@ class BenchmarkService:
             # evidence that a different runtime permanently replaced this one.
             raise_for_worker_reason(runtime_reason)
             raise _ReadinessWait("ocr_unavailable")
+        if options.include_classification and "classification_budget" not in (frozen_identity or {}):
+            raise ValueError("Classifier timing policy changed; create a new run")
         if frozen_identity is not None:
             if not uses_ocr:
                 current_identity["ocr_runtime"] = frozen_identity.get("ocr_runtime")
@@ -628,44 +648,58 @@ class BenchmarkService:
                         )):
                             raise ValueError("Effective pipeline identity changed; create a new run")
                     result = await infer()
+            except asyncio.CancelledError as cancelled:
+                if result is not None:
+                    raise cancelled from PostObservationFailure("TimeoutError", result.metadata, result.receipt)
+                raise
             except Exception as exc:
                 if result is None:
                     raise
                 # The outer owner can still fail releasing the model after inference returns.
-                raise ExperimentFailure(type(exc).__name__, result.metadata) from exc
+                if isinstance(exc, TimeoutError):
+                    raise PostObservationFailure("TimeoutError", result.metadata, result.receipt) from exc
+                raise ExperimentFailure(type(exc).__name__, result.metadata, result.receipt) from exc
         assert result is not None
+        result.receipt = self._comparable_observation(manifest, item, expected, result.receipt, result.metadata)
+        return expected, result
+
+    @staticmethod
+    def _comparable_observation(manifest: dict[str, Any], item: dict[str, Any], expected: Receipt | ExtractionDraft,
+                                actual: Receipt, metadata: dict[str, Any]) -> Receipt:
         if manifest.get("identity") is not None:
-            if result.metadata.get("ordered_source_sha256") != [image["sha256"] for image in item["images"]]:
+            if metadata.get("ordered_source_sha256") != [image["sha256"] for image in item["images"]]:
                 raise ValueError("Executed source identity differs from frozen input")
             runtime = manifest["identity"].get("ocr_runtime")
-            if runtime and result.metadata.get("used_pipeline") == "ocr" and any(
-                runtime.get(key) != result.metadata.get(key)
+            if runtime and metadata.get("used_pipeline") == "ocr" and any(
+                runtime.get(key) != metadata.get(key)
                 for key in ("profile_id", "runtime_fingerprint")
             ):
                 raise ValueError("Executed OCR runtime differs from frozen input")
-        result.metadata["requested_pipeline"] = manifest["options"]["pipeline"]
-        result.metadata["resolved_pipeline"] = result.metadata.get("used_pipeline", item["pipeline"])
-        result.metadata["image_hashes"] = [image["sha256"] for image in item["images"]]
+        metadata["requested_pipeline"] = manifest["options"]["pipeline"]
+        metadata["resolved_pipeline"] = metadata.get("used_pipeline", item["pipeline"])
+        metadata["image_hashes"] = [image["sha256"] for image in item["images"]]
         if (
             manifest.get("receipt_purchase_grouping")
             and "reference" in item and "case_id" not in item
             and isinstance(expected, Receipt)
         ):
-            result.receipt = match_grouped_reference(expected, result.receipt, result.metadata)
-        return expected, result
+            return match_grouped_reference(expected, actual, metadata)
+        return actual
 
     @staticmethod
     def _score(manifest: dict[str, Any], receipt_id: UUID, expected: Receipt | ExtractionDraft,
-               actual: Receipt | None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+               actual: Receipt | None, metadata: dict[str, Any] | None = None, *, observations_only: bool = False,
+               ) -> dict[str, Any]:
         item = next(x for x in manifest["inputs"] if x["receipt_id"] == str(receipt_id))
+        classification = manifest["options"]["include_classification"] and not observations_only
         if manifest.get("scoring_version") == MASKED_SCORING_VERSION:
             missing_labels = (metadata or {}).get("classification_enrichment", {}).get("missing_fields", ())
             return masked_reference_score(item["expected"], actual, item["scored_fields"],
-                                          classification=manifest["options"]["include_classification"],
+                                          classification=classification,
                                           missing_labels=frozenset(missing_labels))
         if "reference" not in item and actual is not None and isinstance(expected, Receipt):
-            return detailed_score_v3(expected, actual, classification=manifest["options"]["include_classification"])
-        return detailed_score(item["expected"], actual, classification=manifest["options"]["include_classification"],
+            return detailed_score_v3(expected, actual, classification=classification)
+        return detailed_score(item["expected"], actual, classification=classification,
                               scored_fields=item.get("scored_fields"))
 
     async def _execute_experiment(

@@ -358,7 +358,8 @@ async def test_new_summary_counts_extraction_failures_without_redefining_success
         policy=CouncilPolicy.ALL,absolute=None,relative=None,apply_flags=False,prompt_version='4',scoring_version='4',owner_id=scope.user_id)
     tasks = {task['receipt_id']: task for task in [await b.lease_task(), await b.lease_task()]}
     await b.finish_task(await b.begin_attempt(tasks[first.id]),success=True,score=1,result={'version':'4','full_receipt_correct':True})
-    await b.finish_task(await b.begin_attempt(tasks[second.id]),success=False,result={'version':'4','full_receipt_correct':False})
+    # Extraction can be exact before classification fails. The run still has one failed case.
+    await b.finish_task(await b.begin_attempt(tasks[second.id]),success=False,result={'version':'4','full_receipt_correct':True})
     summary=(await b.summaries(run.id))[0]
     assert summary.average_score==1
     assert summary.all_case_average_score==.5

@@ -61,6 +61,26 @@ export type IndividualResult = IndividualResultBase &
 		  }
 	);
 
+export function scoredBeforeFailure(result: IndividualResult) {
+	return (
+		!result.success &&
+		(result.version === '4' || result.version === '5') &&
+		result.extraction_failed === false &&
+		Number.isFinite(result.scores?.normalized)
+	);
+}
+
+export function benchmarkErrorMessage(error: string, translate: (key: string) => string) {
+	switch (error) {
+		case 'ocr_gpu_out_of_memory':
+			return translate('settings.dedicatedOcr.reasons.ocr_gpu_out_of_memory');
+		case 'classification_request_unsettled':
+			return translate('benchmarkResults.classificationTimeout');
+		default:
+			return error;
+	}
+}
+
 export function selectedReceiptIds(value: string) {
 	return [
 		...new Set(

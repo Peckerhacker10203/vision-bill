@@ -3,7 +3,11 @@
 	import { t, locale } from '$lib/i18n';
 	import { api } from '$lib/api/client';
 	import type { BenchmarkStatus, BenchmarkSummary } from '$lib/types';
-	import type { IndividualResult } from '$lib/benchmark-experiments';
+	import {
+		benchmarkErrorMessage,
+		scoredBeforeFailure,
+		type IndividualResult
+	} from '$lib/benchmark-experiments';
 	import { isCurrentSessionActor, type SessionActor } from '$lib/session-lifetime';
 	import BenchmarkResultDetails from './BenchmarkResultDetails.svelte';
 
@@ -28,6 +32,9 @@
 		return value != null && Number.isFinite(value)
 			? percent.format(value * 100) + '%'
 			: $t('benchmarkResults.unavailable');
+	}
+	function caseContribution(detail: IndividualResult | undefined) {
+		return detail && scoredBeforeFailure(detail) ? 0 : detail?.scores?.normalized;
 	}
 	function duration(value: unknown) {
 		return typeof value === 'number' && Number.isFinite(value) ? Math.round(value) + ' ms' : '—';
@@ -208,7 +215,7 @@
 						>
 						<td class="p-3">{@render caseScore(direct, left)}</td>
 						<td class="p-3">{@render caseScore(ocr, right)}</td>
-						<td class="p-3">{delta(left?.scores?.normalized, right?.scores?.normalized)}</td>
+						<td class="p-3">{delta(caseContribution(left), caseContribution(right))}</td>
 					</tr>
 					{#if inspected === id}
 						<tr
@@ -251,13 +258,20 @@
 {#snippet caseScore(arm: BenchmarkStatus, detail: IndividualResult | undefined)}
 	{#if !arm.run.model_ids.includes(model)}{$t('benchmarkResults.notApplicable')}
 	{:else if detail}
-		<strong>{score(detail.scores?.normalized)}</strong>
+		{@const partial = scoredBeforeFailure(detail)}
+		<strong>{score(caseContribution(detail))}</strong>
 		{#if !detail.success}<span class="block text-error"
-				>{$t('benchmarkResults.failed')} · {detail.error === 'ocr_gpu_out_of_memory'
-					? $t('settings.dedicatedOcr.reasons.ocr_gpu_out_of_memory')
-					: detail.error}</span
+				>{$t('benchmarkResults.failed')}{#if detail.error}
+					· {benchmarkErrorMessage(detail.error, $t)}{/if}</span
 			>{/if}
-		{#if detail.version === '4' || detail.version === '5'}
+		{#if partial}
+			<span class="block text-xs"
+				>{$t('benchmarkResults.extractionBeforeFailure', {
+					values: { score: score(detail.scores?.normalized) }
+				})}</span
+			>
+		{/if}
+		{#if (partial || detail.success) && (detail.version === '4' || detail.version === '5')}
 			<span class="block text-xs"
 				>{$t('benchmarkResults.exactAmounts')} · {detail.exact_amounts == null
 					? '—'

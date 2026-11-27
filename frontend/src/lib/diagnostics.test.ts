@@ -15,6 +15,7 @@ describe('current safe processing reasons', () => {
 				'ocr_deadline_exceeded',
 				'ocr_queue_full',
 				'ocr_legacy_replay_only',
+				'model_request_unsettled',
 				'attempt_limit',
 				'execution_snapshot_invalid'
 			]) {

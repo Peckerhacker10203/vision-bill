@@ -153,6 +153,56 @@ it('shows a readable message for a benchmark result with a native GPU memory fai
 	await screen.findByText('The local OCR GPU ran out of video memory.');
 });
 
+it.each([true, false])(
+	'shows only measured extraction diagnostics for failed cases (scored %s)',
+	async (scored) => {
+		showResults({
+			details: [
+				{
+					model_id: 'model',
+					receipt_id: 'saved-case',
+					version: '4',
+					success: false,
+					error: scored ? 'classification_request_unsettled' : 'TimeoutError',
+					extraction_failed: !scored,
+					full_receipt_correct: false,
+					scored_fields: ['line_items'],
+					scores: { normalized: scored ? 0.8 : 0, classification: null },
+					item_fn: scored ? 1 : 25,
+					item_fp: 0,
+					item_tp: scored ? 24 : 0,
+					item_matches: [],
+					precision: scored ? 1 : 0,
+					recall: scored ? 0.96 : 0,
+					exact_item_count: false,
+					exact_item_order: false,
+					exact_amounts: false,
+					metadata: { draft: { line_items: [{ description: 'Potatoes' }] } }
+				}
+			]
+		});
+		await fireEvent.click(await screen.findByRole('button', { name: 'Load individual results' }));
+		const detail = await screen.findByText(/saved-case/);
+		await fireEvent.click(detail);
+		expect(detail.textContent).toContain('Failed');
+		if (scored) {
+			expect(
+				screen.getByText(
+					'The category and tag request timed out before the model server confirmed completion.'
+				)
+			).toBeTruthy();
+			expect(screen.getByText(/Extraction before failure/).textContent).toContain('80.0%');
+			expect(screen.getByText('Missing item occurrences').parentElement?.textContent).toContain(
+				'1'
+			);
+			expect(screen.getByText(/Classification was not scored\./)).toBeTruthy();
+		} else {
+			expect(screen.queryByText('Missing item occurrences')).toBeNull();
+			expect(screen.getByText('The saved draft has no extraction score.')).toBeTruthy();
+		}
+	}
+);
+
 it('distinguishes a successful extraction with incorrect amounts from a fully correct receipt', async () => {
 	showResults({
 		details: [

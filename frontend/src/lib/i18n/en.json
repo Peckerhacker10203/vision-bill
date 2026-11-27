@@ -217,6 +217,10 @@
 		"council": "Council",
 		"findings": "{count, plural, one {# finding} other {# findings}}",
 		"extraction": "Extraction {score}",
+		"extractionBeforeFailure": "Extraction before failure · {score}",
+		"failedCaseWeight": "This failed case counts as zero in the all-case score.",
+		"unscoredDraft": "The saved draft has no extraction score.",
+		"classificationTimeout": "The category and tag request timed out before the model server confirmed completion.",
 		"failed": "Failed",
 		"fullyCorrectReceipt": "Fully correct receipt",
 		"exactAmounts": "Exact amounts",
@@ -847,6 +851,7 @@
 			"tax_information_conflict": "Tax is marked as explicitly zero, but the tax total is not zero."
 		},
 		"reasons": {
+			"model_request_unsettled": "Vision Bill is waiting for confirmation that the previous model request has ended. An administrator can check the request on the model server and then clear the hold.",
 			"observation_recovery_required": "The receipt will finish after model recovery using its saved observations.",
 			"observation_checkpoint_invalid": "The saved observations or their working images could not be validated.",
 			"provider_unavailable": "The model provider is unavailable. Waiting for it to become ready.",

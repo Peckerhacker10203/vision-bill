@@ -48,8 +48,9 @@ function show({ completed = 51, second = ocr, history = [single, vision, ocr] } 
 					model_id: model,
 					receipt_id,
 					success: run === second,
-					error: run === second ? null : 'unreadable',
-					scores: { normalized: run === second ? 0.85 : 0 },
+					error: run === second ? null : receipt_id === 'case-50' ? 'TimeoutError' : 'unreadable',
+					extraction_failed: run !== second && receipt_id !== 'case-50',
+					scores: { normalized: run === second ? 0.85 : receipt_id === 'case-50' ? 0.75 : 0 },
 					item_fp: 0,
 					item_fn: 2,
 					exact_amounts: false,
@@ -122,7 +123,9 @@ it('joins a named case beyond the first page, displays terminal failures and rec
 		await screen.findByText('model · Weekend groceries', { selector: 'button' })
 	).closest('tr')!;
 	expect(row.textContent).toContain('+85.00 pp');
-	expect(row.textContent).toContain('unreadable');
+	expect(row.textContent).toContain('TimeoutError');
+	expect(row.textContent).toContain('Extraction before failure');
+	expect(row.textContent).toContain('75.00%');
 	expect(row.textContent).toContain('30 ms');
 	expect(row.textContent).toContain('110 ms');
 	expect(row.textContent).toContain('2');

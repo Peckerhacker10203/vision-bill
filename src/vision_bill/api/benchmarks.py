@@ -3,7 +3,9 @@
 from typing import Annotated, Any
 from uuid import UUID
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from openai import APITimeoutError
 from pydantic import BaseModel, Field
 
 from ..model.benchmark import (
@@ -164,8 +166,13 @@ async def reevaluate_receipt(
     except OcrWorkerFailure as error:
         raise HTTPException(status_code=OCR_RESULT_STATUS[str(error)], detail=str(error)) from error
     except ValueError as error:
-        if isinstance(error, ExperimentFailure) and str(error) in OCR_RESULT_STATUS:
-            raise HTTPException(status_code=OCR_RESULT_STATUS[str(error)], detail=str(error)) from error
+        if isinstance(error, ExperimentFailure):
+            if str(error) in OCR_RESULT_STATUS:
+                raise HTTPException(status_code=OCR_RESULT_STATUS[str(error)], detail=str(error)) from error
+            if str(error) == "classification_request_unsettled" or isinstance(
+                error.__cause__, (TimeoutError, httpx.TimeoutException, APITimeoutError),
+            ):
+                raise HTTPException(status_code=504, detail=str(error)) from error
         raise HTTPException(status_code=404, detail=str(error)) from error
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error

@@ -339,7 +339,47 @@ async def test_short_work_budget_skips_label_dispatch(tmp_path):
     assert result.classification_enrichment.reason_code == "classification_budget_exhausted"
 
 
-@pytest.mark.parametrize("mode", ["failed", "retry", "cancelled"])
+@pytest.mark.parametrize("mode", ["upload", "direct_vision"])
+async def test_slow_classifier_can_finish_within_remaining_work_budget(monkeypatch, tmp_path, mode):
+    path = tmp_path / "photo.png"
+    Image.new("RGB", (4, 5)).save(path)
+    llm = observation_provider()
+    formatted = llm._client.chat.return_value
+    elapsed = 0.0
+    loop = asyncio.get_running_loop()
+    real_time = loop.time
+
+    def simulated_time():
+        return real_time() + elapsed
+
+    monkeypatch.setattr(loop, "time", simulated_time)
+    monkeypatch.setattr("vision_bill.provider.llm.base.monotonic", simulated_time)
+
+    async def chat(**request):
+        nonlocal elapsed
+        if request["messages"][0].get("images"):
+            return formatted
+        elapsed += 109
+        # Let asyncio deliver any classifier timeout that expired during inference.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        return chat_reply(json.dumps({
+            "category": "grocery",
+            "line_items": [{"tags": ["food"]}, {"spending_category": "bread_bakery", "tags": ["food"]}],
+        }))
+
+    llm._client.chat.side_effect = chat
+    result = await pipeline(llm).extract(
+        "fixture", [path], options=ExperimentOptions(pipeline=mode),
+        deadline=simulated_time() + 500, tags=["food"],
+    )
+    assert llm._client.chat.await_count == 2
+    assert result.classification_enrichment.state == "completed"
+    assert result.receipt.category == "grocery"
+    assert result.receipt.line_items[1].spending_category == "bread_bakery"
+
+
+@pytest.mark.parametrize("mode", ["failed", "retry", "cancelled", "deadline"])
 async def test_benchmark_worker_preserves_observations_after_outer_release_failure(
     settings, monkeypatch, tmp_path, mode,
 ):
@@ -393,11 +433,17 @@ async def test_benchmark_worker_preserves_observations_after_outer_release_failu
     worker._timeout = AsyncMock(return_value=600)
     llm._client.chat.side_effect = [llm._client.chat.return_value, chat_reply("{")]
     release_started, release_continue = asyncio.Event(), asyncio.Event()
+    loop = asyncio.get_running_loop()
+    original_loop_time = loop.time
 
     async def unload(**request):
         assert request == {"model": "fixture", "keep_alive": 0}
         assert llm._client.chat.await_count == 2
         release_started.set()
+        if mode == "deadline":
+            # Advance to the inference deadline, leaving the worker's five-second commit reserve.
+            monkeypatch.setattr(loop, "time", lambda: original_loop_time() + 595)
+            await asyncio.sleep(.05)
         if mode == "cancelled":
             await release_continue.wait()
         raise httpx.ReadTimeout("unload response lost")
@@ -428,13 +474,14 @@ async def test_benchmark_worker_preserves_observations_after_outer_release_failu
             worker._db.retry_task.assert_not_awaited()
             failure = worker._db.finish_task.await_args.kwargs
             assert failure["success"] is False
-            assert failure["result"]["full_receipt_correct"] is False
-            assert "actual" not in failure["result"]
+            assert failure["result"]["full_receipt_correct"] is True
+            assert failure["result"]["extraction_failed"] is False
+            assert failure["result"]["actual"]["total"] == "4.00"
             metadata = failure["result"]["metadata"]
             assert metadata["draft"]["total"] == "4.00"
             assert metadata["ocr_pages"][0]["working_image"]["width"] == 3
             assert metadata["classification_enrichment"]["reason_code"] == "invalid_response"
-            assert metadata["inference_attempt_count"] == 3
+            assert metadata["inference_attempt_count"] == count + 1
     journal = extract.coordinator().read_journal()
     assert release_started.is_set() and journal.unsettled and journal.models == ["fixture"]
 
@@ -524,15 +571,33 @@ async def test_openai_classifier_distinguishes_empty_choices_from_ambiguous_tran
             assert journal.unsettled and journal.models == ["own"]
 
 
-@pytest.mark.parametrize("failure_at", ["formatter", "classifier"])
+@pytest.mark.parametrize(("failure_at", "version", "same_source"), [
+    ("formatter", "4", True),
+    ("classifier", "4", True),
+    ("classifier", "5", True),
+    ("classifier", "4", False),
+    ("classifier_deadline", "4", True),
+])
 async def test_benchmark_worker_retry_only_before_admitted_observations(
-    settings, tmp_path, failure_at,
+    settings, monkeypatch, tmp_path, failure_at, version, same_source,
 ):
     llm = observation_provider()
     failed = httpx.ReadTimeout("response status unknown")
     llm._client.chat.side_effect = (
         [failed] if failure_at == "formatter" else [llm._client.chat.return_value, failed]
     )
+    if failure_at == "classifier_deadline":
+        loop = asyncio.get_running_loop()
+        original_loop_time = loop.time
+
+        async def expire_while_classifying(**request):
+            if llm._client.chat.await_count == 1:
+                return llm._client.chat.return_value
+            monkeypatch.setattr(loop, "time", lambda: original_loop_time() + 595)
+            await asyncio.sleep(.05)
+            pytest.fail("Benchmark inference deadline should cancel the classifier")
+
+        llm._client.chat.side_effect = expire_while_classifying
     receipts = ReceiptService(settings.images, settings.pg, llm)
     worker = object.__new__(BenchmarkService)
     worker._provider, worker._settings = llm, settings.worker
@@ -542,10 +607,15 @@ async def test_benchmark_worker_retry_only_before_admitted_observations(
     receipt_id = uuid4()
     manifest = {
         "options": options.model_dump(mode="json"),
+        "scoring_version": version,
+        "identity": {},
         "inputs": [{
             "receipt_id": str(receipt_id),
             "expected": receipt().model_dump(mode="json"),
             "reference": {},
+            "pipeline": "direct_vision",
+            "images": [{"sha256": hashlib.sha256(path.read_bytes()).hexdigest() if same_source else "0" * 64}],
+            "scored_fields": ["total", "line_items"],
         }],
     }
     task = {
@@ -584,7 +654,17 @@ async def test_benchmark_worker_retry_only_before_admitted_observations(
         failure = worker._db.finish_task.await_args.kwargs
         assert failure["success"] is False
         result = failure["result"]
-        assert result["full_receipt_correct"] is False
+        assert result["extraction_failed"] is not same_source
+        assert result["full_receipt_correct"] is same_source
+        assert result["item_fn"] == (0 if same_source else 2)
+        assert failure.get("score", 0) == 0  # case still failed for the run aggregate
+        if same_source:
+            assert result["item_tp"] == 2
+            assert result["scores"]["normalized"] == 1
+            assert result["scores"]["classification"] is None
+            assert result["actual"]["total"] == "4.00"
+        else:
+            assert "actual" not in result
         assert result["metadata"]["draft"]["total"] == "4.00"
         assert result["metadata"]["classification_enrichment"]["state"] == "pending"
         assert result["metadata"]["inference_attempt_count"] == 1

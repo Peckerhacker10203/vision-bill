@@ -31,6 +31,74 @@ def test_experiment_provider_settings_do_not_mutate_live_provider():
     assert "spending_category" in live.build_prompt(["deposit", "food"])
 
 
+@pytest.mark.parametrize(("classify", "identity_kind", "admitted"), [
+    (True, "current", True), (True, "old", False), (True, "absent", False), (True, "changed", False),
+    (False, "old", True), (False, "absent", True),
+])
+async def test_replay_checks_classifier_timing_only_when_enabled(
+    settings, tmp_path, classify, identity_kind, admitted,
+):
+    import hashlib
+    from time import monotonic
+
+    from test_experiment_scoring import receipt
+    from test_extraction_pipeline import formatter
+
+    from vision_bill.provider.llm.experiment import endpoint_fingerprint
+    from vision_bill.service.benchmark_service import BenchmarkService
+    from vision_bill.service.experiment_execution import (
+        ExperimentResult,
+        image_digest,
+        pipeline_identity,
+    )
+    from vision_bill.service.receipt_service import ReceiptService
+
+    llm = formatter()
+    receipts = ReceiptService(settings.images, settings.pg, llm)
+    benchmark = object.__new__(BenchmarkService)
+    benchmark._provider, benchmark._receipts = llm, receipts
+    options = ExperimentOptions(pipeline="direct_vision", include_classification=classify)
+    identity = await pipeline_identity(receipts, options)
+    if classify and identity_kind == "current":
+        assert identity["classification_budget"] == {"policy": "remaining_attempt", "cleanup_reserve_seconds": 60}
+    if identity_kind == "old":
+        identity.pop("classification_budget", None)
+        identity.pop("managed_binding_sha256")
+        identity["execution_policy_version"] = 2
+    if identity_kind == "changed":
+        identity["classification_budget"]["cleanup_reserve_seconds"] = 5
+    image = tmp_path / "source.png"
+    image.write_bytes(b"frozen source")
+    digest = image_digest(image)
+    item_id = uuid4()
+    prompt = llm.for_experiment(options).build_prompt([], image_count=1)
+    manifest = {
+        "provider": type(llm).__name__, "endpoint_fingerprint": endpoint_fingerprint(llm),
+        "validation_schema_sha256": validation_schema_sha256(),
+        "options": options.model_dump(mode="json"), "tags": [],
+        "inputs": [{
+            "receipt_id": str(item_id), "pipeline": "direct_vision",
+            "expected": receipt().model_dump(mode="json"),
+            "images": [{"path": str(image), "sha256": digest}],
+        }],
+        "prompt_hashes": {"1": hashlib.sha256(prompt.encode()).hexdigest()},
+    }
+    if identity_kind != "absent":
+        manifest["identity"] = identity
+    receipts.analyse_submission_with_metadata = AsyncMock(return_value=ExperimentResult(
+        receipt(), 1, 1.0, {"ordered_source_sha256": [digest], "used_pipeline": "direct_vision"},
+    ))
+    run = benchmark._run_experiment(manifest, item_id, "fixture", inference_deadline=monotonic() + 10,
+                                    managed_model_ids=())
+    if admitted:
+        await run
+        receipts.analyse_submission_with_metadata.assert_awaited_once()
+    else:
+        with pytest.raises(ValueError, match="create a new run"):
+            await run
+        receipts.analyse_submission_with_metadata.assert_not_awaited()
+
+
 async def test_standalone_qualifies_with_production_llamacpp_binding(settings, tmp_path, monkeypatch):
     import tempfile
     from argparse import Namespace

@@ -146,6 +146,12 @@ categories and tags can be unavailable or skipped. Older records can have
 `not_recorded` status. Missing labels remain separate from financial and integrity
 findings. Safely settled enrichment failures preserve the valid receipt.
 
+Uploads and benchmarks give the classifier the time remaining in the attempt,
+reserving the final 60 seconds to settle the model request and release resources.
+Long receipts can therefore spend more than 30 seconds on categories and tags.
+If only the reserve remains, the worker skips optional classification and keeps
+the extracted observations.
+
 An unresolved request or teardown can hold publication with
 `wait_reason: "model_request_unsettled"`. The checkpoint retains the complete
 observations and provenance. When ownership has been safely reconciled, the

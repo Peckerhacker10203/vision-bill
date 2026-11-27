@@ -1,5 +1,9 @@
 <script lang="ts">
-	import type { IndividualResult } from '$lib/benchmark-experiments';
+	import {
+		benchmarkErrorMessage,
+		scoredBeforeFailure,
+		type IndividualResult
+	} from '$lib/benchmark-experiments';
 	import { t } from '$lib/i18n';
 	let { results, names = {} }: { results: IndividualResult[]; names?: Record<string, string> } =
 		$props();
@@ -20,6 +24,8 @@
 <div class="mt-4 space-y-3">
 	{#each results as result (`${result.model_id}:${result.receipt_id}`)}
 		{@const enrichment = result.metadata?.classification_enrichment}
+		{@const partial = scoredBeforeFailure(result)}
+		{@const measured = result.success || partial}
 		<details class="rounded-xl border border-outline-variant p-4">
 			<summary class="cursor-pointer text-sm">
 				<strong>{result.model_id}</strong> · {names[result.receipt_id] ?? result.receipt_id} · {result.success
@@ -29,11 +35,19 @@
 					: $t('benchmarkResults.failed')}
 			</summary>
 			{#if result.error}<p class="mt-3 text-sm text-error">
-					{result.error === 'ocr_gpu_out_of_memory'
-						? $t('settings.dedicatedOcr.reasons.ocr_gpu_out_of_memory')
-						: result.error}
+					{benchmarkErrorMessage(result.error, $t)}
 				</p>{/if}
-			{#if result.version === '4' || result.version === '5'}
+			{#if partial}
+				<p class="mt-3 text-sm font-medium">
+					{$t('benchmarkResults.extractionBeforeFailure', {
+						values: { score: percent(result.scores?.normalized) }
+					})}
+				</p>
+				<p class="text-sm text-on-surface-variant">{$t('benchmarkResults.failedCaseWeight')}</p>
+			{:else if !result.success && result.metadata?.draft != null}
+				<p class="mt-3 text-sm">{$t('benchmarkResults.unscoredDraft')}</p>
+			{/if}
+			{#if measured && (result.version === '4' || result.version === '5')}
 				<p class="mt-3 text-sm">
 					{$t('benchmarkResults.confirmedFields')} · {result.scored_fields
 						.map((field) => $t('editor.' + (editorLabels[field] ?? field), { default: field }))
@@ -74,12 +88,12 @@
 					{/if}
 				</p>
 			{/if}
-			{#if result.success}
+			{#if measured}
 				<p class="mt-3 text-sm">
 					{#if result.version !== '5'}
 						{$t('benchmarkResults.strict', { values: { score: percent(result.scores?.strict) } })} ·
 					{/if}
-					{#if result.version === '5' && result.scores?.classification == null}
+					{#if (result.version === '5' || partial) && result.scores?.classification == null}
 						{$t('benchmarkResults.classificationUnscored')}
 					{:else}
 						{$t('benchmarkResults.classificationScore', {
@@ -126,7 +140,7 @@
 				<summary class="cursor-pointer text-sm">{$t('benchmarkResults.processingDetails')}</summary>
 				<pre class="mt-2 overflow-x-auto whitespace-pre-wrap text-xs">{json(result.metadata)}</pre>
 			</details>
-			{#if result.success}
+			{#if measured}
 				<details class="mt-3">
 					<summary class="cursor-pointer text-sm">{$t('benchmarkResults.receiptJson')}</summary>
 					<div class="mt-2 grid gap-3 sm:grid-cols-2">

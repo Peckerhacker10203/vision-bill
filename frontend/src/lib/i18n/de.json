@@ -217,6 +217,10 @@
 		"council": "Prüfgremium",
 		"findings": "{count, plural, one {# Befund} other {# Befunde}}",
 		"extraction": "Extraktion {score}",
+		"extractionBeforeFailure": "Extraktion vor dem Abbruch · {score}",
+		"failedCaseWeight": "Dieser fehlgeschlagene Fall zählt in der Bewertung aller Fälle mit null Punkten.",
+		"unscoredDraft": "Für den gespeicherten Entwurf liegt keine Extraktionsbewertung vor.",
+		"classificationTimeout": "Die Frist für Kategorien und Schlagwörter ist abgelaufen, bevor der Modellserver den Abschluss bestätigt hat.",
 		"failed": "Fehlgeschlagen",
 		"fullyCorrectReceipt": "Vollständig korrekter Beleg",
 		"exactAmounts": "Exakte Beträge",
@@ -847,6 +851,7 @@
 			"tax_information_conflict": "Die Steuer ist ausdrücklich als null markiert, aber die Steuersumme ist nicht null."
 		},
 		"reasons": {
+			"model_request_unsettled": "Vision Bill wartet auf die Bestätigung, dass die vorherige Modellanfrage beendet ist. Die Administration kann den Status am Modellserver prüfen und die Verarbeitung anschließend freigeben.",
 			"observation_recovery_required": "Nach der Wiederherstellung des Modells wird der Beleg aus den gespeicherten Daten fertiggestellt.",
 			"observation_checkpoint_invalid": "Die gespeicherten Belegdaten oder ihre Arbeitsbilder konnten nicht geprüft werden.",
 			"provider_unavailable": "Der Modellanbieter ist nicht verfügbar. Es wird auf seine Bereitschaft gewartet.",

@@ -464,11 +464,18 @@ Previously qualified references and recorded benchmark results remain available
 in their original runs. Create a new run to execute or reevaluate a case from
 prompt version 4. A queued case bound to that version fails before model inference.
 Changed model digests wait rather than silently drifting.
+New benchmarks with classification enabled also record the classifier's time
+budget policy. To test an older selection under the updated policy, choose
+**Reuse this receipt selection** and start a new run with classification enabled.
 Observed masks prevent absent reference observations from being treated as truth.
 
 V4 reports full-receipt correctness, occurrence-aware ordered item precision/recall,
 exact item count/order, exact amounts/taxes and failed-case denominators. The full-receipt correct rate and all-case average count completed failures in
-the denominator. The historical success-only average and v3 weighted score
+the denominator. In V4 and V5, a case that fails after valid observations have
+been saved can show a separate extraction score and item comparison in its
+details. That case still counts as a failure and contributes zero to the
+all-case average. Earlier results without a separate extraction score keep
+their recorded outcome. The historical success-only average and v3 weighted score
 remain separate measures. Frozen Gold is not a population accuracy claim.
 The [standalone CLI](scripts/README.md) requires an explicit owner `--user-id` and
 uses a consistent read-only snapshot; it cannot benchmark all owners by omission.

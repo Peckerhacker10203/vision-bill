@@ -47,9 +47,10 @@ class ExperimentResult:
 
 
 class ExperimentFailure(ValueError):
-    def __init__(self, message: str, metadata: dict[str, Any]):
+    def __init__(self, message: str, metadata: dict[str, Any], observed: Receipt | None = None):
         super().__init__(message)
         self.metadata = metadata
+        self.observed = observed
 
 
 class PostObservationFailure(ExperimentFailure):
@@ -141,14 +142,13 @@ async def execute_submission(
         if provider.experiment_options
         else options.model_dump(mode="json"),
     }
-    observations_recorded = False
+    observed: Receipt | None = None
 
     async def remember_observations(envelope: InferenceEnvelope) -> None:
-        nonlocal observations_recorded
-        metadata.update(await run_sync_before(
-            work_deadline, lambda: observation_metadata(pack_inference_metadata(envelope)),
-        ))
-        observations_recorded = True
+        nonlocal observed
+        snapshot = await run_sync_before(work_deadline, pack_inference_metadata, envelope)
+        metadata.update(await run_sync_before(work_deadline, observation_metadata, snapshot))
+        observed = snapshot.receipt
 
     try:
         async with asyncio.timeout(max(0, work_deadline - monotonic())):
@@ -166,14 +166,23 @@ async def execute_submission(
                 code = persisted.findings[-1].code if persisted.findings else "receipt_incomplete"
                 raise ValueError(code)
             receipt = await run_sync_before(work_deadline, admit_observations, persisted)
+    except asyncio.CancelledError as cancelled:
+        # Preserve shutdown cancellation. An enclosing worker deadline can also
+        # cancel here, then convert this exact exception to a TimeoutError.
+        if observed is not None:
+            raise cancelled from PostObservationFailure("TimeoutError", metadata, observed)
+        raise
     except Exception as exc:
-        if isinstance(exc, HandoffWait) and not observations_recorded:
+        if isinstance(exc, HandoffWait) and observed is None:
             raise
         metadata.setdefault("calls", provider.experiment_trace or [])
         metadata["elapsed_ms"] = (perf_counter() - started) * 1000
         code = str(exc) if isinstance(exc, (OcrWorkerFailure, ValueError)) else type(exc).__name__
-        failure = PostObservationFailure if observations_recorded else ExperimentFailure
-        raise failure(code, metadata) from exc
+        if observed is not None:
+            if isinstance(exc, TimeoutError) and exc.args == ("classification_request_unsettled",):
+                code = "classification_request_unsettled"
+            raise PostObservationFailure(code, metadata, observed) from exc
+        raise ExperimentFailure(code, metadata) from exc
     metadata["llm_ms"] = sum(call.get("elapsed_ms", 0) for call in metadata["calls"])
     elapsed = (perf_counter() - started) * 1000
     metadata["elapsed_ms"] = elapsed
@@ -206,6 +215,7 @@ async def pipeline_identity(
         SOURCE_PROJECTION_VERSION,
         ReceiptInput,
     )
+    from ..provider.llm.base import CLASSIFICATION_CLEANUP_SECONDS
     from ..provider.llm.experiment import source_extraction_prompt
 
     ocr, settings, effective_options = effective_policy(service, options)
@@ -252,7 +262,7 @@ async def pipeline_identity(
     # A fixed, evidence-free rendering binds the dynamically generated output schema.
     # The source also binds input-specific branches, including OCR page serialization.
     source_template = source_extraction_prompt(ReceiptInput(mode="direct_vision", image_paths=["receipt"]))
-    return {
+    identity: dict[str, Any] = {
         "execution_policy_version": BENCHMARK_EXECUTION_POLICY_VERSION,
         "managed_binding_sha256": binding_sha256,
         "version": 1,
@@ -283,3 +293,8 @@ async def pipeline_identity(
         "context_window_tokens": getattr(provider, "context_window_tokens", None),
         "analysis_timeout_seconds": provider.analysis_timeout_seconds,
     }
+    if effective_options.include_classification:
+        identity["classification_budget"] = {
+            "policy": "remaining_attempt", "cleanup_reserve_seconds": CLASSIFICATION_CLEANUP_SECONDS,
+        }
+    return identity

@@ -5,6 +5,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from fastapi import FastAPI
+from openai import APITimeoutError
 
 from vision_bill.api.benchmarks import router
 from vision_bill.api.helper.helper import get_benchmark_service
@@ -62,10 +63,20 @@ def test_benchmark_selection_deduplicates_receipts_in_first_seen_order():
     assert request.receipt_ids == [second, first]
 
 
+def wrapped_timeout(cause):
+    wrapped = ExperimentFailure(type(cause).__name__, {})
+    wrapped.__cause__ = cause
+    return wrapped
+
+
 @pytest.mark.parametrize("method, error, status", [
     ("create_run", OcrWorkerFailure("ocr_model_load_failed"), 503),
     ("reevaluate", ExperimentFailure("ocr_invalid_result", {}), 502),
     ("reevaluate", ExperimentFailure("ocr_deadline_exceeded", {}), 504),
+    ("reevaluate", ExperimentFailure("classification_request_unsettled", {}), 504),
+    ("reevaluate", wrapped_timeout(TimeoutError()), 504),
+    ("reevaluate", wrapped_timeout(httpx.ReadTimeout("read timeout")), 504),
+    ("reevaluate", wrapped_timeout(APITimeoutError(request=httpx.Request("POST", "http://model"))), 504),
     ("reevaluate", ExperimentFailure("ocr_gpu_out_of_memory", {}), 503),
     ("reevaluate", ValueError("Receipt/model is not part of this benchmark run"), 404),
 ])

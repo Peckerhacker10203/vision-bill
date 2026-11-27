@@ -63,6 +63,7 @@ from .merchant_choice import candidates_for, merchant_instructions, validated_di
 
 TEXT_CAPABILITIES = {"completion", "text", "chat", "vision", "multimodal"}
 FORMATTER_REPAIR_SECONDS = 60.0
+CLASSIFICATION_CLEANUP_SECONDS = 60
 FIELD_CORRECTION_MAX_TOKENS = 2048
 _SAFE_FINISH_REASONS = {"stop", "length", "max_tokens", "content_filter", "load", "unload", "tool_calls"}
 logger = logging.getLogger(__name__)
@@ -1047,9 +1048,9 @@ class LLMProvider(ABC):
         if result.classification_enrichment.state != "pending":
             return result
         now = monotonic()
-        # The lifecycle owner retains its full work deadline for remote settlement
-        # and verified release after the optional classifier budget expires.
-        class_deadline = min(now + 30, work_deadline - 60)
+        # Use the remaining attempt budget for labels, reserving the last minute
+        # for remote request settlement and verified model release.
+        class_deadline = work_deadline - CLASSIFICATION_CLEANUP_SECONDS
         reason: EnrichmentReason = "classification_budget_exhausted"
         if class_deadline <= now:
             logger.info("receipt_classification state=skipped reason=%s", reason)

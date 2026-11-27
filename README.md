@@ -49,7 +49,8 @@ A successful receipt upload (one to ten ordered photos, at most 20 MiB each)
 returns `202 Accepted`, a durable job ID and a `Location` for authenticated status polling.
 The worker waits for usable capabilities before claiming an attempt, extracts
 printed observations, retains partial drafts, checks source/amount/overlap evidence,
-and applies classification downstream. A complete saved observation can finish
+and uses the remaining analysis time to classify items, with time reserved to
+release the model. A complete saved observation can finish
 after interruption without repeating inference once ownership is settled. Missing
 printed observations stay null. A receipt without a discount, tip, quantity or
 unit price can be finalized if the required figures reconcile. Unavailable
